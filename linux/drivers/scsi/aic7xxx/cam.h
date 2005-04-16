@@ -48,7 +48,7 @@ typedef enum {
 	CAM_REQ_ABORTED,	/* CCB request aborted by the host */
 	CAM_UA_ABORT,		/* Unable to abort CCB request */
 	CAM_REQ_CMP_ERR,	/* CCB request completed with an error */
-	CAM_BUSY,		/* CAM subsystem is busy */
+	CAM_BUSY,		/* CAM subsytem is busy */
 	CAM_REQ_INVALID,	/* CCB request was invalid */
 	CAM_PATH_INVALID,	/* Supplied Path ID is invalid */
 	CAM_SEL_TIMEOUT,	/* Target Selection Timeout */
@@ -103,9 +103,9 @@ typedef enum {
 } ac_code;
 
 typedef enum {
-	CAM_DIR_IN		= DMA_FROM_DEVICE,
-	CAM_DIR_OUT		= DMA_TO_DEVICE,
-	CAM_DIR_NONE		= DMA_NONE,
+	CAM_DIR_IN		= SCSI_DATA_READ,
+	CAM_DIR_OUT		= SCSI_DATA_WRITE,
+	CAM_DIR_NONE		= SCSI_DATA_NONE
 } ccb_flags;
 
 #endif /* _AIC7XXX_CAM_H */

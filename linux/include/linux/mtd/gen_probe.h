@@ -1,14 +1,14 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * Copyright © 2001      Red Hat UK Limited
- * Copyright © 2001-2010 David Woodhouse <dwmw2@infradead.org>
+ * (C) 2001, 2001 Red Hat, Inc.
+ * GPL'd
+ * $Id: gen_probe.h,v 1.3 2004/10/20 22:10:33 dwmw2 Exp $
  */
 
 #ifndef __LINUX_MTD_GEN_PROBE_H__
 #define __LINUX_MTD_GEN_PROBE_H__
 
 #include <linux/mtd/flashchip.h>
-#include <linux/mtd/map.h>
+#include <linux/mtd/map.h> 
 #include <linux/mtd/cfi.h>
 #include <linux/bitops.h>
 

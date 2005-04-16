@@ -1,41 +1,47 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- *   Copyright (C) International Business Machines Corp., 2000-2002
- *   Portions Copyright (C) Christoph Hellwig, 2001-2002
+ *   Copyright (c) International Business Machines Corp., 2000-2002
+ *   Portions Copyright (c) Christoph Hellwig, 2001-2002
+ *
+ *   This program is free software;  you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or 
+ *   (at your option) any later version.
+ * 
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY;  without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See
+ *   the GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program;  if not, write to the Free Software 
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
  */
 
-#include <linux/mm.h>
 #include <linux/fs.h>
-#include <linux/posix_acl.h>
-#include <linux/quotaops.h>
 #include "jfs_incore.h"
-#include "jfs_inode.h"
 #include "jfs_dmap.h"
 #include "jfs_txnmgr.h"
 #include "jfs_xattr.h"
 #include "jfs_acl.h"
 #include "jfs_debug.h"
 
-int jfs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+
+extern int jfs_commit_inode(struct inode *, int);
+extern void jfs_truncate(struct inode *);
+
+int jfs_fsync(struct file *file, struct dentry *dentry, int datasync)
 {
-	struct inode *inode = file->f_mapping->host;
+	struct inode *inode = dentry->d_inode;
 	int rc = 0;
 
-	rc = file_write_and_wait_range(file, start, end);
-	if (rc)
-		return rc;
-
-	inode_lock(inode);
-	if (!(inode->i_state & I_DIRTY_ALL) ||
+	if (!(inode->i_state & I_DIRTY) ||
 	    (datasync && !(inode->i_state & I_DIRTY_DATASYNC))) {
 		/* Make sure committed changes hit the disk */
 		jfs_flush_journal(JFS_SBI(inode->i_sb)->log, 1);
-		inode_unlock(inode);
 		return rc;
 	}
 
 	rc |= jfs_commit_inode(inode, 1);
-	inode_unlock(inode);
 
 	return rc ? -EIO : 0;
 }
@@ -44,7 +50,7 @@ static int jfs_open(struct inode *inode, struct file *file)
 {
 	int rc;
 
-	if ((rc = dquot_file_open(inode, file)))
+	if ((rc = generic_file_open(inode, file)))
 		return rc;
 
 	/*
@@ -61,9 +67,9 @@ static int jfs_open(struct inode *inode, struct file *file)
 		struct jfs_inode_info *ji = JFS_IP(inode);
 		spin_lock_irq(&ji->ag_lock);
 		if (ji->active_ag == -1) {
-			struct jfs_sb_info *jfs_sb = JFS_SBI(inode->i_sb);
-			ji->active_ag = BLKTOAG(addressPXD(&ji->ixpxd), jfs_sb);
-			atomic_inc(&jfs_sb->bmap->db_active[ji->active_ag]);
+			ji->active_ag = ji->agno;
+			atomic_inc(
+			    &JFS_SBI(inode->i_sb)->bmap->db_active[ji->agno]);
 		}
 		spin_unlock_irq(&ji->ag_lock);
 	}
@@ -85,69 +91,29 @@ static int jfs_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-int jfs_setattr(struct user_namespace *mnt_userns, struct dentry *dentry,
-		struct iattr *iattr)
-{
-	struct inode *inode = d_inode(dentry);
-	int rc;
-
-	rc = setattr_prepare(&init_user_ns, dentry, iattr);
-	if (rc)
-		return rc;
-
-	if (is_quota_modification(mnt_userns, inode, iattr)) {
-		rc = dquot_initialize(inode);
-		if (rc)
-			return rc;
-	}
-	if ((iattr->ia_valid & ATTR_UID && !uid_eq(iattr->ia_uid, inode->i_uid)) ||
-	    (iattr->ia_valid & ATTR_GID && !gid_eq(iattr->ia_gid, inode->i_gid))) {
-		rc = dquot_transfer(mnt_userns, inode, iattr);
-		if (rc)
-			return rc;
-	}
-
-	if ((iattr->ia_valid & ATTR_SIZE) &&
-	    iattr->ia_size != i_size_read(inode)) {
-		inode_dio_wait(inode);
-
-		rc = inode_newsize_ok(inode, iattr->ia_size);
-		if (rc)
-			return rc;
-
-		truncate_setsize(inode, iattr->ia_size);
-		jfs_truncate(inode);
-	}
-
-	setattr_copy(&init_user_ns, inode, iattr);
-	mark_inode_dirty(inode);
-
-	if (iattr->ia_valid & ATTR_MODE)
-		rc = posix_acl_chmod(&init_user_ns, inode, inode->i_mode);
-	return rc;
-}
-
-const struct inode_operations jfs_file_inode_operations = {
+struct inode_operations jfs_file_inode_operations = {
+	.truncate	= jfs_truncate,
+	.setxattr	= jfs_setxattr,
+	.getxattr	= jfs_getxattr,
 	.listxattr	= jfs_listxattr,
-	.setattr	= jfs_setattr,
-	.fileattr_get	= jfs_fileattr_get,
-	.fileattr_set	= jfs_fileattr_set,
+	.removexattr	= jfs_removexattr,
 #ifdef CONFIG_JFS_POSIX_ACL
-	.get_acl	= jfs_get_acl,
-	.set_acl	= jfs_set_acl,
+	.setattr	= jfs_setattr,
+	.permission	= jfs_permission,
 #endif
 };
 
-const struct file_operations jfs_file_operations = {
+struct file_operations jfs_file_operations = {
 	.open		= jfs_open,
 	.llseek		= generic_file_llseek,
-	.read_iter	= generic_file_read_iter,
-	.write_iter	= generic_file_write_iter,
+	.write		= generic_file_write,
+	.read		= generic_file_read,
+	.aio_read	= generic_file_aio_read,
+	.aio_write	= generic_file_aio_write,
 	.mmap		= generic_file_mmap,
-	.splice_read	= generic_file_splice_read,
-	.splice_write	= iter_file_splice_write,
+	.readv		= generic_file_readv,
+	.writev		= generic_file_writev,
+ 	.sendfile	= generic_file_sendfile,
 	.fsync		= jfs_fsync,
 	.release	= jfs_release,
-	.unlocked_ioctl = jfs_ioctl,
-	.compat_ioctl	= compat_ptr_ioctl,
 };

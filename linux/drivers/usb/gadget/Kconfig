@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: GPL-2.0
 #
 # USB Gadget support on a system involves
 #    (a) a peripheral controller, and
@@ -8,19 +7,18 @@
 #
 #  - Host systems (like PCs) need CONFIG_USB (with "A" jacks).
 #  - Peripherals (like PDAs) need CONFIG_USB_GADGET (with "B" jacks).
-#  - Some systems have both kinds of controllers.
+#  - Some systems have both kinds of of controller.
 #
 # With help from a special transceiver and a "Mini-AB" jack, systems with
 # both kinds of controller can also support "USB On-the-Go" (CONFIG_USB_OTG).
 #
+menu "USB Gadget Support"
 
-menuconfig USB_GADGET
-	tristate "USB Gadget Support"
-	select USB_COMMON
-	select NLS
+config USB_GADGET
+	tristate "Support for USB Gadgets"
 	help
-	   USB is a host/device protocol, organized with one host (such as a
-	   PC) controlling up to 127 peripheral devices.
+	   USB is a master/slave protocol, organized with one master
+	   host (such as a PC) controlling up to 127 peripheral devices.
 	   The USB hardware is asymmetric, which makes it easier to set up:
 	   you can't connect a "to-the-host" connector to a peripheral.
 
@@ -28,7 +26,7 @@ menuconfig USB_GADGET
 	   you need a low level bus controller driver, and some software
 	   talking to it.  Peripheral controllers are often discrete silicon,
 	   or are integrated with the CPU in a microcontroller.  The more
-	   familiar host side controllers have names like "EHCI", "OHCI",
+	   familiar host side controllers have names like like "EHCI", "OHCI",
 	   or "UHCI", and are usually integrated into southbridges on PC
 	   motherboards.
 
@@ -42,41 +40,11 @@ menuconfig USB_GADGET
 	   don't have this kind of hardware (except maybe inside Linux PDAs).
 
 	   For more information, see <http://www.linux-usb.org/gadget> and
-	   the kernel documentation for this API.
-
-if USB_GADGET
-
-config USB_GADGET_DEBUG
-	bool "Debugging messages (DEVELOPMENT)"
-	depends on DEBUG_KERNEL
-	help
-	   Many controller and gadget drivers will print some debugging
-	   messages if you use this option to ask for those messages.
-
-	   Avoid enabling these messages, even if you're actively
-	   debugging such a driver.  Many drivers will emit so many
-	   messages that the driver timings are affected, which will
-	   either create new failure modes or remove the one you're
-	   trying to track down.  Never enable these messages for a
-	   production build.
-
-config USB_GADGET_VERBOSE
-	bool "Verbose debugging Messages (DEVELOPMENT)"
-	depends on USB_GADGET_DEBUG
-	help
-	   Many controller and gadget drivers will print verbose debugging
-	   messages if you use this option to ask for those messages.
-
-	   Avoid enabling these messages, even if you're actively
-	   debugging such a driver.  Many drivers will emit so many
-	   messages that the driver timings are affected, which will
-	   either create new failure modes or remove the one you're
-	   trying to track down.  Never enable these messages for a
-	   production build.
+	   the kernel DocBook documentation for this API.
 
 config USB_GADGET_DEBUG_FILES
-	bool "Debugging information files (DEVELOPMENT)"
-	depends on PROC_FS
+	boolean "Debugging information files"
+	depends on USB_GADGET && PROC_FS
 	help
 	   Some of the drivers in the "gadget" framework can expose
 	   debugging information in files such as /proc/driver/udc
@@ -85,407 +53,337 @@ config USB_GADGET_DEBUG_FILES
 	   driver on a new board.   Enable these files by choosing "Y"
 	   here.  If in doubt, or to conserve kernel memory, say "N".
 
-config USB_GADGET_DEBUG_FS
-	bool "Debugging information files in debugfs (DEVELOPMENT)"
-	depends on DEBUG_FS
+#
+# USB Peripheral Controller Support
+#
+choice
+	prompt "USB Peripheral Controller"
+	depends on USB_GADGET
 	help
-	   Some of the drivers in the "gadget" framework can expose
-	   debugging information in files under /sys/kernel/debug/.
-	   The information in these files may help when you're
-	   troubleshooting or bringing up a driver on a new board.
-	   Enable these files by choosing "Y" here.  If in doubt, or
-	   to conserve kernel memory, say "N".
+	   A USB device uses a controller to talk to its host.
+	   Systems should have only one such upstream link.
+	   Many controller drivers are platform-specific; these
+	   often need board-specific hooks.
 
-config USB_GADGET_VBUS_DRAW
-	int "Maximum VBUS Power usage (2-500 mA)"
-	range 2 500
-	default 2
+config USB_GADGET_NET2280
+	boolean "NetChip 2280"
+	depends on PCI
+	select USB_GADGET_DUALSPEED
 	help
-	   Some devices need to draw power from USB when they are
-	   configured, perhaps to operate circuitry or to recharge
-	   batteries.  This is in addition to any local power supply,
-	   such as an AC adapter or batteries.
+	   NetChip 2280 is a PCI based USB peripheral controller which
+	   supports both full and high speed USB 2.0 data transfers.  
+	   
+	   It has six configurable endpoints, as well as endpoint zero
+	   (for control transfers) and several endpoints with dedicated
+	   functions.
 
-	   Enter the maximum power your device draws through USB, in
-	   milliAmperes.  The permitted range of values is 2 - 500 mA;
-	   0 mA would be legal, but can make some hosts misbehave.
+	   Say "y" to link the driver statically, or "m" to build a
+	   dynamically linked module called "net2280" and force all
+	   gadget drivers to also be dynamically linked.
 
-	   This value will be used except for system-specific gadget
-	   drivers that have more specific information.
+config USB_NET2280
+	tristate
+	depends on USB_GADGET_NET2280
+	default USB_GADGET
 
-config USB_GADGET_STORAGE_NUM_BUFFERS
-	int "Number of storage pipeline buffers"
-	range 2 256
-	default 2
+config USB_GADGET_PXA2XX
+	boolean "PXA 25x or IXP 4xx"
+	depends on (ARCH_PXA && PXA25x) || ARCH_IXP4XX
 	help
-	   Usually 2 buffers are enough to establish a good buffering
-	   pipeline. The number may be increased in order to compensate
-	   for a bursty VFS behaviour. For instance there may be CPU wake up
-	   latencies that makes the VFS to appear bursty in a system with
-	   an CPU on-demand governor. Especially if DMA is doing IO to
-	   offload the CPU. In this case the CPU will go into power
-	   save often and spin up occasionally to move data within VFS.
-	   If selecting USB_GADGET_DEBUG_FILES this value may be set by
-	   a module parameter as well.
-	   If unsure, say 2.
+	   Intel's PXA 25x series XScale ARM-5TE processors include
+	   an integrated full speed USB 1.1 device controller.  The
+	   controller in the IXP 4xx series is register-compatible.
 
-config U_SERIAL_CONSOLE
-	bool "Serial gadget console support"
-	depends on USB_U_SERIAL
+	   It has fifteen fixed-function endpoints, as well as endpoint
+	   zero (for control transfers).
+
+	   Say "y" to link the driver statically, or "m" to build a
+	   dynamically linked module called "pxa2xx_udc" and force all
+	   gadget drivers to also be dynamically linked.
+
+config USB_PXA2XX
+	tristate
+	depends on USB_GADGET_PXA2XX
+	default USB_GADGET
+
+# if there's only one gadget driver, using only two bulk endpoints,
+# don't waste memory for the other endpoints
+config USB_PXA2XX_SMALL
+	depends on USB_GADGET_PXA2XX
+	bool
+	default n if USB_ETH_RNDIS
+	default y if USB_ZERO
+	default y if USB_ETH
+	default y if USB_G_SERIAL
+
+config USB_GADGET_GOKU
+	boolean "Toshiba TC86C001 'Goku-S'"
+	depends on PCI
 	help
-	   It supports the serial gadget can be used as a console.
+	   The Toshiba TC86C001 is a PCI device which includes controllers
+	   for full speed USB devices, IDE, I2C, SIO, plus a USB host (OHCI).
+	   
+	   The device controller has three configurable (bulk or interrupt)
+	   endpoints, plus endpoint zero (for control transfers).
 
-source "drivers/usb/gadget/udc/Kconfig"
+	   Say "y" to link the driver statically, or "m" to build a
+	   dynamically linked module called "goku_udc" and to force all
+	   gadget drivers to also be dynamically linked.
+
+config USB_GOKU
+	tristate
+	depends on USB_GADGET_GOKU
+	default USB_GADGET
+
+
+config USB_GADGET_LH7A40X
+	boolean "LH7A40X"
+	depends on ARCH_LH7A40X
+	help
+    This driver provides USB Device Controller driver for LH7A40x
+
+config USB_LH7A40X
+	tristate
+	depends on USB_GADGET_LH7A40X
+	default USB_GADGET
+
+
+config USB_GADGET_OMAP
+	boolean "OMAP USB Device Controller"
+	depends on ARCH_OMAP
+	select ISP1301_OMAP if MACH_OMAP_H2 || MACH_OMAP_H3
+	help
+	   Many Texas Instruments OMAP processors have flexible full
+	   speed USB device controllers, with support for up to 30
+	   endpoints (plus endpoint zero).  This driver supports the
+	   controller in the OMAP 1611, and should work with controllers
+	   in other OMAP processors too, given minor tweaks.
+
+	   Say "y" to link the driver statically, or "m" to build a
+	   dynamically linked module called "omap_udc" and force all
+	   gadget drivers to also be dynamically linked.
+
+config USB_OMAP
+	tristate
+	depends on USB_GADGET_OMAP
+	default USB_GADGET
+
+config USB_OTG
+	boolean "OTG Support"
+	depends on USB_GADGET_OMAP && ARCH_OMAP_OTG && USB_OHCI_HCD
+	help
+	   The most notable feature of USB OTG is support for a
+	   "Dual-Role" device, which can act as either a device
+	   or a host.  The initial role choice can be changed
+	   later, when two dual-role devices talk to each other.
+
+	   Select this only if your OMAP board has a Mini-AB connector.
+
+
+config USB_GADGET_DUMMY_HCD
+	boolean "Dummy HCD (DEVELOPMENT)"
+	depends on USB && EXPERIMENTAL
+	select USB_GADGET_DUALSPEED
+	help
+	  This host controller driver emulates USB, looping all data transfer
+	  requests back to a USB "gadget driver" in the same host.  The host
+	  side is the master; the gadget side is the slave.  Gadget drivers
+	  can be high, full, or low speed; and they have access to endpoints
+	  like those from NET2280, PXA2xx, or SA1100 hardware.
+	  
+	  This may help in some stages of creating a driver to embed in a
+	  Linux device, since it lets you debug several parts of the gadget
+	  driver without its hardware or drivers being involved.
+	  
+	  Since such a gadget side driver needs to interoperate with a host
+	  side Linux-USB device driver, this may help to debug both sides
+	  of a USB protocol stack.
+
+	  Say "y" to link the driver statically, or "m" to build a
+	  dynamically linked module called "dummy_hcd" and force all
+	  gadget drivers to also be dynamically linked.
+
+config USB_DUMMY_HCD
+	tristate
+	depends on USB_GADGET_DUMMY_HCD
+	default USB_GADGET
+
+# NOTE:  Please keep dummy_hcd LAST so that "real hardware" appears
+# first and will be selected by default.
+
+endchoice
+
+config USB_GADGET_DUALSPEED
+	bool
+	depends on USB_GADGET
+	default n
+	help
+	  Means that gadget drivers should include extra descriptors
+	  and code to handle dual-speed controllers.
 
 #
 # USB Gadget Drivers
 #
-
-# composite based drivers
-config USB_LIBCOMPOSITE
-	tristate
-	select CONFIGFS_FS
+choice
+	tristate "USB Gadget Drivers"
 	depends on USB_GADGET
+	default USB_ETH
+	help
+	  A Linux "Gadget Driver" talks to the USB Peripheral Controller
+	  driver through the abstract "gadget" API.  Some other operating
+	  systems call these "client" drivers, of which "class drivers"
+	  are a subset (implementing a USB device class specification).
+	  A gadget driver implements one or more USB functions using
+	  the peripheral hardware.
 
-config USB_F_ACM
-	tristate
-
-config USB_F_SS_LB
-	tristate
-
-config USB_U_SERIAL
-	tristate
-
-config USB_U_ETHER
-	tristate
-
-config USB_U_AUDIO
-	tristate
-
-config USB_F_SERIAL
-	tristate
-
-config USB_F_OBEX
-	tristate
-
-config USB_F_NCM
-	tristate
-
-config USB_F_ECM
-	tristate
-
-config USB_F_PHONET
-	tristate
-
-config USB_F_EEM
-	tristate
-
-config USB_F_SUBSET
-	tristate
-
-config USB_F_RNDIS
-	tristate
-
-config USB_F_MASS_STORAGE
-	tristate
-
-config USB_F_FS
-	tristate
-
-config USB_F_UAC1
-	tristate
-
-config USB_F_UAC1_LEGACY
-	tristate
-
-config USB_F_UAC2
-	tristate
-
-config USB_F_UVC
-	tristate
-
-config USB_F_MIDI
-	tristate
-
-config USB_F_HID
-	tristate
-
-config USB_F_PRINTER
-	tristate
-
-config USB_F_TCM
-	tristate
+	  Gadget drivers are hardware-neutral, or "platform independent",
+	  except that they sometimes must understand quirks or limitations
+	  of the particular controllers they work with.  For example, when
+	  a controller doesn't support alternate configurations or provide
+	  enough of the right types of endpoints, the gadget driver might
+	  not be able work with that controller, or might need to implement
+	  a less common variant of a device class protocol.
 
 # this first set of drivers all depend on bulk-capable hardware.
 
-config USB_CONFIGFS
-	tristate "USB Gadget functions configurable through configfs"
-	select USB_LIBCOMPOSITE
+config USB_ZERO
+	tristate "Gadget Zero (DEVELOPMENT)"
+	depends on EXPERIMENTAL
 	help
-	  A Linux USB "gadget" can be set up through configfs.
-	  If this is the case, the USB functions (which from the host's
-	  perspective are seen as interfaces) and configurations are
-	  specified simply by creating appropriate directories in configfs.
-	  Associating functions with configurations is done by creating
-	  appropriate symbolic links.
-	  For more information see Documentation/usb/gadget_configfs.rst.
+	  Gadget Zero is a two-configuration device.  It either sinks and
+	  sources bulk data; or it loops back a configurable number of
+	  transfers.  It also implements control requests, for "chapter 9"
+	  conformance.  The driver needs only two bulk-capable endpoints, so
+	  it can work on top of most device-side usb controllers.  It's
+	  useful for testing, and is also a working example showing how
+	  USB "gadget drivers" can be written.
 
-config USB_CONFIGFS_SERIAL
-	bool "Generic serial bulk in/out"
-	depends on USB_CONFIGFS
-	depends on TTY
-	select USB_U_SERIAL
-	select USB_F_SERIAL
-	help
-	  The function talks to the Linux-USB generic serial driver.
-
-config USB_CONFIGFS_ACM
-	bool "Abstract Control Model (CDC ACM)"
-	depends on USB_CONFIGFS
-	depends on TTY
-	select USB_U_SERIAL
-	select USB_F_ACM
-	help
-	  ACM serial link.  This function can be used to interoperate with
-	  MS-Windows hosts or with the Linux-USB "cdc-acm" driver.
-
-config USB_CONFIGFS_OBEX
-	bool "Object Exchange Model (CDC OBEX)"
-	depends on USB_CONFIGFS
-	depends on TTY
-	select USB_U_SERIAL
-	select USB_F_OBEX
-	help
-	  You will need a user space OBEX server talking to /dev/ttyGS*,
-	  since the kernel itself doesn't implement the OBEX protocol.
-
-config USB_CONFIGFS_NCM
-	bool "Network Control Model (CDC NCM)"
-	depends on USB_CONFIGFS
-	depends on NET
-	select USB_U_ETHER
-	select USB_F_NCM
-	select CRC32
-	help
-	  NCM is an advanced protocol for Ethernet encapsulation, allows
-	  grouping of several ethernet frames into one USB transfer and
-	  different alignment possibilities.
-
-config USB_CONFIGFS_ECM
-	bool "Ethernet Control Model (CDC ECM)"
-	depends on USB_CONFIGFS
-	depends on NET
-	select USB_U_ETHER
-	select USB_F_ECM
-	help
-	  The "Communication Device Class" (CDC) Ethernet Control Model.
-	  That protocol is often avoided with pure Ethernet adapters, in
-	  favor of simpler vendor-specific hardware, but is widely
-	  supported by firmware for smart network devices.
-
-config USB_CONFIGFS_ECM_SUBSET
-	bool "Ethernet Control Model (CDC ECM) subset"
-	depends on USB_CONFIGFS
-	depends on NET
-	select USB_U_ETHER
-	select USB_F_SUBSET
-	help
-	  On hardware that can't implement the full protocol,
-	  a simple CDC subset is used, placing fewer demands on USB.
-
-config USB_CONFIGFS_RNDIS
-	bool "RNDIS"
-	depends on USB_CONFIGFS
-	depends on NET
-	select USB_U_ETHER
-	select USB_F_RNDIS
-	help
-	   Microsoft Windows XP bundles the "Remote NDIS" (RNDIS) protocol,
-	   and Microsoft provides redistributable binary RNDIS drivers for
-	   older versions of Windows.
-
-	   To make MS-Windows work with this, use Documentation/usb/linux.inf
-	   as the "driver info file".  For versions of MS-Windows older than
-	   XP, you'll need to download drivers from Microsoft's website; a URL
-	   is given in comments found in that info file.
-
-config USB_CONFIGFS_EEM
-	bool "Ethernet Emulation Model (EEM)"
-	depends on USB_CONFIGFS
-	depends on NET
-	select USB_U_ETHER
-	select USB_F_EEM
-	select CRC32
-	help
-	  CDC EEM is a newer USB standard that is somewhat simpler than CDC ECM
-	  and therefore can be supported by more hardware.  Technically ECM and
-	  EEM are designed for different applications.  The ECM model extends
-	  the network interface to the target (e.g. a USB cable modem), and the
-	  EEM model is for mobile devices to communicate with hosts using
-	  ethernet over USB.  For Linux gadgets, however, the interface with
-	  the host is the same (a usbX device), so the differences are minimal.
-
-config USB_CONFIGFS_PHONET
-	bool "Phonet protocol"
-	depends on USB_CONFIGFS
-	depends on NET
-	depends on PHONET
-	select USB_U_ETHER
-	select USB_F_PHONET
-	help
-	  The Phonet protocol implementation for USB device.
-
-config USB_CONFIGFS_MASS_STORAGE
-	bool "Mass storage"
-	depends on USB_CONFIGFS
-	depends on BLOCK
-	select USB_F_MASS_STORAGE
-	help
-	  The Mass Storage Gadget acts as a USB Mass Storage disk drive.
-	  As its storage repository it can use a regular file or a block
-	  device (in much the same way as the "loop" device driver),
-	  specified as a module parameter or sysfs option.
-
-config USB_CONFIGFS_F_LB_SS
-	bool "Loopback and sourcesink function (for testing)"
-	depends on USB_CONFIGFS
-	select USB_F_SS_LB
-	help
-	  Loopback function loops back a configurable number of transfers.
-	  Sourcesink function either sinks and sources bulk data.
-	  It also implements control requests, for "chapter 9" conformance.
 	  Make this be the first driver you try using on top of any new
 	  USB peripheral controller driver.  Then you can use host-side
 	  test software, like the "usbtest" driver, to put your hardware
 	  and its driver through a basic set of functional tests.
 
-config USB_CONFIGFS_F_FS
-	bool "Function filesystem (FunctionFS)"
-	depends on USB_CONFIGFS
-	select USB_F_FS
+	  Gadget Zero also works with the host-side "usb-skeleton" driver,
+	  and with many kinds of host-side test software.  You may need
+	  to tweak product and vendor IDs before host software knows about
+	  this device, and arrange to select an appropriate configuration.
+
+	  Say "y" to link the driver statically, or "m" to build a
+	  dynamically linked module called "g_zero".
+
+config USB_ZERO_HNPTEST
+	boolean "HNP Test Device"
+	depends on USB_ZERO && USB_OTG
 	help
-	  The Function Filesystem (FunctionFS) lets one create USB
-	  composite functions in user space in the same way GadgetFS
-	  lets one create USB gadgets in user space.  This allows creation
-	  of composite gadgets such that some of the functions are
-	  implemented in kernel space (for instance Ethernet, serial or
-	  mass storage) and other are implemented in user space.
+	  You can configure this device to enumerate using the device
+	  identifiers of the USB-OTG test device.  That means that when
+	  this gadget connects to another OTG device, with this one using
+	  the "B-Peripheral" role, that device will use HNP to let this
+	  one serve as the USB host instead (in the "B-Host" role).
 
-config USB_CONFIGFS_F_UAC1
-	bool "Audio Class 1.0"
-	depends on USB_CONFIGFS
-	depends on SND
-	select USB_LIBCOMPOSITE
-	select SND_PCM
-	select USB_U_AUDIO
-	select USB_F_UAC1
+config USB_ETH
+	tristate "Ethernet Gadget (with CDC Ethernet support)"
+	depends on NET
 	help
-	  This Audio function implements 1 AudioControl interface,
-	  1 AudioStreaming Interface each for USB-OUT and USB-IN.
-	  This driver doesn't expect any real Audio codec to be present
-	  on the device - the audio streams are simply sinked to and
-	  sourced from a virtual ALSA sound card created. The user-space
-	  application may choose to do whatever it wants with the data
-	  received from the USB Host and choose to provide whatever it
-	  wants as audio data to the USB Host.
+	  This driver implements Ethernet style communication, in either
+	  of two ways:
+	  
+	   - The "Communication Device Class" (CDC) Ethernet Control Model.
+	     That protocol is often avoided with pure Ethernet adapters, in
+	     favor of simpler vendor-specific hardware, but is widely
+	     supported by firmware for smart network devices.
 
-config USB_CONFIGFS_F_UAC1_LEGACY
-	bool "Audio Class 1.0 (legacy implementation)"
-	depends on USB_CONFIGFS
-	depends on SND
-	select USB_LIBCOMPOSITE
-	select SND_PCM
-	select USB_F_UAC1_LEGACY
+	   - On hardware can't implement that protocol, a simple CDC subset
+	     is used, placing fewer demands on USB.
+
+	  RNDIS support is a third option, more demanding than that subset.
+
+	  Within the USB device, this gadget driver exposes a network device
+	  "usbX", where X depends on what other networking devices you have.
+	  Treat it like a two-node Ethernet link:  host, and gadget.
+
+	  The Linux-USB host-side "usbnet" driver interoperates with this
+	  driver, so that deep I/O queues can be supported.  On 2.4 kernels,
+	  use "CDCEther" instead, if you're using the CDC option. That CDC
+	  mode should also interoperate with standard CDC Ethernet class
+	  drivers on other host operating systems.
+
+	  Say "y" to link the driver statically, or "m" to build a
+	  dynamically linked module called "g_ether".
+
+config USB_ETH_RNDIS
+	bool "RNDIS support (EXPERIMENTAL)"
+	depends on USB_ETH && EXPERIMENTAL
+	default y
 	help
-	  This Audio function implements 1 AudioControl interface,
-	  1 AudioStreaming Interface each for USB-OUT and USB-IN.
-	  This is a legacy driver and requires a real Audio codec
-	  to be present on the device.
+	   Microsoft Windows XP bundles the "Remote NDIS" (RNDIS) protocol,
+	   and Microsoft provides redistributable binary RNDIS drivers for
+	   older versions of Windows.
 
-config USB_CONFIGFS_F_UAC2
-	bool "Audio Class 2.0"
-	depends on USB_CONFIGFS
-	depends on SND
-	select USB_LIBCOMPOSITE
-	select SND_PCM
-	select USB_U_AUDIO
-	select USB_F_UAC2
+	   If you say "y" here, the Ethernet gadget driver will try to provide
+	   a second device configuration, supporting RNDIS to talk to such
+	   Microsoft USB hosts.
+	   
+	   To make MS-Windows work with this, use Documentation/usb/linux.inf
+	   as the "driver info file".  For versions of MS-Windows older than
+	   XP, you'll need to download drivers from Microsoft's website; a URL
+	   is given in comments found in that info file.
+
+config USB_GADGETFS
+	tristate "Gadget Filesystem (EXPERIMENTAL)"
+	depends on EXPERIMENTAL
 	help
-	  This Audio function is compatible with USB Audio Class
-	  specification 2.0. It implements 1 AudioControl interface,
-	  1 AudioStreaming Interface each for USB-OUT and USB-IN.
-	  This driver doesn't expect any real Audio codec to be present
-	  on the device - the audio streams are simply sinked to and
-	  sourced from a virtual ALSA sound card created. The user-space
-	  application may choose to do whatever it wants with the data
-	  received from the USB Host and choose to provide whatever it
-	  wants as audio data to the USB Host.
+	  This driver provides a filesystem based API that lets user mode
+	  programs implement a single-configuration USB device, including
+	  endpoint I/O and control requests that don't relate to enumeration.
+	  All endpoints, transfer speeds, and transfer types supported by
+	  the hardware are available, through read() and write() calls.
 
-config USB_CONFIGFS_F_MIDI
-	bool "MIDI function"
-	depends on USB_CONFIGFS
-	depends on SND
-	select USB_LIBCOMPOSITE
-	select SND_RAWMIDI
-	select USB_F_MIDI
+	  Say "y" to link the driver statically, or "m" to build a
+	  dynamically linked module called "gadgetfs".
+
+config USB_FILE_STORAGE
+	tristate "File-backed Storage Gadget"
 	help
-	  The MIDI Function acts as a USB Audio device, with one MIDI
-	  input and one MIDI output. These MIDI jacks appear as
-	  a sound "card" in the ALSA sound system. Other MIDI
-	  connections can then be made on the gadget system, using
-	  ALSA's aconnect utility etc.
+	  The File-backed Storage Gadget acts as a USB Mass Storage
+	  disk drive.  As its storage repository it can use a regular
+	  file or a block device (in much the same way as the "loop"
+	  device driver), specified as a module parameter.
 
-config USB_CONFIGFS_F_HID
-	bool "HID function"
-	depends on USB_CONFIGFS
-	select USB_F_HID
+	  Say "y" to link the driver statically, or "m" to build a
+	  dynamically linked module called "g_file_storage".
+
+config USB_FILE_STORAGE_TEST
+	bool "File-backed Storage Gadget testing version"
+	depends on USB_FILE_STORAGE
+	default n
 	help
-	  The HID function driver provides generic emulation of USB
-	  Human Interface Devices (HID).
+	  Say "y" to generate the larger testing version of the
+	  File-backed Storage Gadget, useful for probing the
+	  behavior of USB Mass Storage hosts.  Not needed for
+	  normal operation.
 
-	  For more information, see Documentation/usb/gadget_hid.rst.
-
-config USB_CONFIGFS_F_UVC
-	bool "USB Webcam function"
-	depends on USB_CONFIGFS
-	depends on VIDEO_DEV
-	depends on VIDEO_DEV
-	select VIDEOBUF2_DMA_SG
-	select VIDEOBUF2_VMALLOC
-	select USB_F_UVC
+config USB_G_SERIAL
+	tristate "Serial Gadget (with CDC ACM support)"
 	help
-	  The Webcam function acts as a composite USB Audio and Video Class
-	  device. It provides a userspace API to process UVC control requests
-	  and stream video data to the host.
+	  The Serial Gadget talks to the Linux-USB generic serial driver.
+	  This driver supports a CDC-ACM module option, which can be used
+	  to interoperate with MS-Windows hosts or with the Linux-USB
+	  "cdc-acm" driver.
 
-config USB_CONFIGFS_F_PRINTER
-	bool "Printer function"
-	select USB_F_PRINTER
-	depends on USB_CONFIGFS
-	help
-	  The Printer function channels data between the USB host and a
-	  userspace program driving the print engine. The user space
-	  program reads and writes the device file /dev/g_printer<X> to
-	  receive or send printer data. It can use ioctl calls to
-	  the device file to get or set printer status.
+	  Say "y" to link the driver statically, or "m" to build a
+	  dynamically linked module called "g_serial".
 
-	  For more information, see Documentation/usb/gadget_printer.rst
-	  which includes sample code for accessing the device file.
+	  For more information, see Documentation/usb/gadget_serial.txt
+	  which includes instructions and a "driver info file" needed to
+	  make MS-Windows work with this driver.
 
-config USB_CONFIGFS_F_TCM
-	bool "USB Gadget Target Fabric"
-	depends on TARGET_CORE
-	depends on USB_CONFIGFS
-	select USB_LIBCOMPOSITE
-	select USB_F_TCM
-	help
-	  This fabric is a USB gadget component. Two USB protocols are
-	  supported that is BBB or BOT (Bulk Only Transport) and UAS
-	  (USB Attached SCSI). BOT is advertised on alternative
-	  interface 0 (primary) and UAS is on alternative interface 1.
-	  Both protocols can work on USB2.0 and USB3.0.
-	  UAS utilizes the USB 3.0 feature called streams support.
 
-source "drivers/usb/gadget/legacy/Kconfig"
+# put drivers that need isochronous transfer support (for audio
+# or video class gadget drivers), or specific hardware, here.
 
-endif # USB_GADGET
+# - none yet
+
+endchoice
+
+endmenu

@@ -1,9 +1,8 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * linux/net/sunrpc/svcauth.c
  *
  * The generic interface for RPC authentication on the server side.
- *
+ * 
  * Copyright (C) 1995, 1996 Olaf Kirch <okir@monad.swb.de>
  *
  * CHANGES
@@ -11,6 +10,7 @@
  */
 
 #include <linux/types.h>
+#include <linux/sched.h>
 #include <linux/module.h>
 #include <linux/sunrpc/types.h>
 #include <linux/sunrpc/xdr.h>
@@ -18,10 +18,6 @@
 #include <linux/sunrpc/svcauth.h>
 #include <linux/err.h>
 #include <linux/hash.h>
-
-#include <trace/events/sunrpc.h>
-
-#include "sunrpc.h"
 
 #define RPCDBG_FACILITY	RPCDBG_AUTH
 
@@ -31,70 +27,45 @@
  */
 extern struct auth_ops svcauth_null;
 extern struct auth_ops svcauth_unix;
-extern struct auth_ops svcauth_tls;
 
-static struct auth_ops __rcu *authtab[RPC_AUTH_MAXFLAVOR] = {
-	[RPC_AUTH_NULL] = (struct auth_ops __force __rcu *)&svcauth_null,
-	[RPC_AUTH_UNIX] = (struct auth_ops __force __rcu *)&svcauth_unix,
-	[RPC_AUTH_TLS]  = (struct auth_ops __force __rcu *)&svcauth_tls,
+static DEFINE_SPINLOCK(authtab_lock);
+static struct auth_ops	*authtab[RPC_AUTH_MAXFLAVOR] = {
+	[0] = &svcauth_null,
+	[1] = &svcauth_unix,
 };
 
-static struct auth_ops *
-svc_get_auth_ops(rpc_authflavor_t flavor)
-{
-	struct auth_ops		*aops;
-
-	if (flavor >= RPC_AUTH_MAXFLAVOR)
-		return NULL;
-	rcu_read_lock();
-	aops = rcu_dereference(authtab[flavor]);
-	if (aops != NULL && !try_module_get(aops->owner))
-		aops = NULL;
-	rcu_read_unlock();
-	return aops;
-}
-
-static void
-svc_put_auth_ops(struct auth_ops *aops)
-{
-	module_put(aops->owner);
-}
-
 int
-svc_authenticate(struct svc_rqst *rqstp)
+svc_authenticate(struct svc_rqst *rqstp, u32 *authp)
 {
 	rpc_authflavor_t	flavor;
 	struct auth_ops		*aops;
 
-	rqstp->rq_auth_stat = rpc_auth_ok;
+	*authp = rpc_auth_ok;
 
-	flavor = svc_getnl(&rqstp->rq_arg.head[0]);
+	flavor = ntohl(svc_getu32(&rqstp->rq_arg.head[0]));
 
 	dprintk("svc: svc_authenticate (%d)\n", flavor);
 
-	aops = svc_get_auth_ops(flavor);
-	if (aops == NULL) {
-		rqstp->rq_auth_stat = rpc_autherr_badcred;
+	spin_lock(&authtab_lock);
+	if (flavor >= RPC_AUTH_MAXFLAVOR || !(aops = authtab[flavor])
+			|| !try_module_get(aops->owner)) {
+		spin_unlock(&authtab_lock);
+		*authp = rpc_autherr_badcred;
 		return SVC_DENIED;
 	}
-
-	rqstp->rq_auth_slack = 0;
-	init_svc_cred(&rqstp->rq_cred);
+	spin_unlock(&authtab_lock);
 
 	rqstp->rq_authop = aops;
-	return aops->accept(rqstp);
+	return aops->accept(rqstp, authp);
 }
-EXPORT_SYMBOL_GPL(svc_authenticate);
 
 int svc_set_client(struct svc_rqst *rqstp)
 {
-	rqstp->rq_client = NULL;
 	return rqstp->rq_authop->set_client(rqstp);
 }
-EXPORT_SYMBOL_GPL(svc_set_client);
 
 /* A request, which was authenticated, has now executed.
- * Time to finalise the credentials and verifier
+ * Time to finalise the the credentials and verifier
  * and release and resources
  */
 int svc_authorise(struct svc_rqst *rqstp)
@@ -103,10 +74,10 @@ int svc_authorise(struct svc_rqst *rqstp)
 	int rv = 0;
 
 	rqstp->rq_authop = NULL;
-
+	
 	if (aops) {
 		rv = aops->release(rqstp);
-		svc_put_auth_ops(aops);
+		module_put(aops->owner);
 	}
 	return rv;
 }
@@ -114,121 +85,132 @@ int svc_authorise(struct svc_rqst *rqstp)
 int
 svc_auth_register(rpc_authflavor_t flavor, struct auth_ops *aops)
 {
-	struct auth_ops *old;
 	int rv = -EINVAL;
-
-	if (flavor < RPC_AUTH_MAXFLAVOR) {
-		old = cmpxchg((struct auth_ops ** __force)&authtab[flavor], NULL, aops);
-		if (old == NULL || old == aops)
-			rv = 0;
+	spin_lock(&authtab_lock);
+	if (flavor < RPC_AUTH_MAXFLAVOR && authtab[flavor] == NULL) {
+		authtab[flavor] = aops;
+		rv = 0;
 	}
+	spin_unlock(&authtab_lock);
 	return rv;
 }
-EXPORT_SYMBOL_GPL(svc_auth_register);
 
 void
 svc_auth_unregister(rpc_authflavor_t flavor)
 {
+	spin_lock(&authtab_lock);
 	if (flavor < RPC_AUTH_MAXFLAVOR)
-		rcu_assign_pointer(authtab[flavor], NULL);
+		authtab[flavor] = NULL;
+	spin_unlock(&authtab_lock);
 }
-EXPORT_SYMBOL_GPL(svc_auth_unregister);
+EXPORT_SYMBOL(svc_auth_unregister);
 
 /**************************************************
- * 'auth_domains' are stored in a hash table indexed by name.
- * When the last reference to an 'auth_domain' is dropped,
- * the object is unhashed and freed.
- * If auth_domain_lookup fails to find an entry, it will return
- * it's second argument 'new'.  If this is non-null, it will
- * have been atomically linked into the table.
+ * cache for domain name to auth_domain
+ * Entries are only added by flavours which will normally
+ * have a structure that 'inherits' from auth_domain.
+ * e.g. when an IP -> domainname is given to  auth_unix,
+ * and the domain name doesn't exist, it will create a
+ * auth_unix_domain and add it to this hash table.
+ * If it finds the name does exist, but isn't AUTH_UNIX,
+ * it will complain.
  */
 
+/*
+ * Auth auth_domain cache is somewhat different to other caches,
+ * largely because the entries are possibly of different types:
+ * each auth flavour has it's own type.
+ * One consequence of this that DefineCacheLookup cannot
+ * allocate a new structure as it cannot know the size.
+ * Notice that the "INIT" code fragment is quite different
+ * from other caches.  When auth_domain_lookup might be
+ * creating a new domain, the new domain is passed in
+ * complete and it is used as-is rather than being copied into
+ * another structure.
+ */
 #define	DN_HASHBITS	6
 #define	DN_HASHMAX	(1<<DN_HASHBITS)
+#define	DN_HASHMASK	(DN_HASHMAX-1)
 
-static struct hlist_head	auth_domain_table[DN_HASHMAX];
-static DEFINE_SPINLOCK(auth_domain_lock);
+static struct cache_head	*auth_domain_table[DN_HASHMAX];
 
-static void auth_domain_release(struct kref *kref)
-	__releases(&auth_domain_lock)
+static void auth_domain_drop(struct cache_head *item, struct cache_detail *cd)
 {
-	struct auth_domain *dom = container_of(kref, struct auth_domain, ref);
-
-	hlist_del_rcu(&dom->hash);
-	dom->flavour->domain_release(dom);
-	spin_unlock(&auth_domain_lock);
+	struct auth_domain *dom = container_of(item, struct auth_domain, h);
+	if (cache_put(item,cd))
+		authtab[dom->flavour]->domain_release(dom);
 }
+
+
+struct cache_detail auth_domain_cache = {
+	.hash_size	= DN_HASHMAX,
+	.hash_table	= auth_domain_table,
+	.name		= "auth.domain",
+	.cache_put	= auth_domain_drop,
+};
 
 void auth_domain_put(struct auth_domain *dom)
 {
-	kref_put_lock(&dom->ref, auth_domain_release, &auth_domain_lock);
+	auth_domain_drop(&dom->h, &auth_domain_cache);
 }
-EXPORT_SYMBOL_GPL(auth_domain_put);
+
+static inline int auth_domain_hash(struct auth_domain *item)
+{
+	return hash_str(item->name, DN_HASHBITS);
+}
+static inline int auth_domain_match(struct auth_domain *tmp, struct auth_domain *item)
+{
+	return strcmp(tmp->name, item->name) == 0;
+}
 
 struct auth_domain *
-auth_domain_lookup(char *name, struct auth_domain *new)
+auth_domain_lookup(struct auth_domain *item, int set)
 {
-	struct auth_domain *hp;
-	struct hlist_head *head;
+	struct auth_domain *tmp = NULL;
+	struct cache_head **hp, **head;
+	head = &auth_domain_cache.hash_table[auth_domain_hash(item)];
 
-	head = &auth_domain_table[hash_str(name, DN_HASHBITS)];
-
-	spin_lock(&auth_domain_lock);
-
-	hlist_for_each_entry(hp, head, hash) {
-		if (strcmp(hp->name, name)==0) {
-			kref_get(&hp->ref);
-			spin_unlock(&auth_domain_lock);
-			return hp;
+	if (set)
+		write_lock(&auth_domain_cache.hash_lock);
+	else
+		read_lock(&auth_domain_cache.hash_lock);
+	for (hp=head; *hp != NULL; hp = &tmp->h.next) {
+		tmp = container_of(*hp, struct auth_domain, h);
+		if (!auth_domain_match(tmp, item))
+			continue;
+		if (!set) {
+			cache_get(&tmp->h);
+			goto out_noset;
 		}
+		*hp = tmp->h.next;
+		tmp->h.next = NULL;
+		auth_domain_drop(&tmp->h, &auth_domain_cache);
+		goto out_set;
 	}
-	if (new)
-		hlist_add_head_rcu(&new->hash, head);
-	spin_unlock(&auth_domain_lock);
-	return new;
+	/* Didn't find anything */
+	if (!set)
+		goto out_nada;
+	auth_domain_cache.entries++;
+out_set:
+	item->h.next = *head;
+	*head = &item->h;
+	cache_get(&item->h);
+	write_unlock(&auth_domain_cache.hash_lock);
+	cache_fresh(&auth_domain_cache, &item->h, item->h.expiry_time);
+	cache_get(&item->h);
+	return item;
+out_nada:
+	tmp = NULL;
+out_noset:
+	read_unlock(&auth_domain_cache.hash_lock);
+	return tmp;
 }
-EXPORT_SYMBOL_GPL(auth_domain_lookup);
 
 struct auth_domain *auth_domain_find(char *name)
 {
-	struct auth_domain *hp;
-	struct hlist_head *head;
+	struct auth_domain *rv, ad;
 
-	head = &auth_domain_table[hash_str(name, DN_HASHBITS)];
-
-	rcu_read_lock();
-	hlist_for_each_entry_rcu(hp, head, hash) {
-		if (strcmp(hp->name, name)==0) {
-			if (!kref_get_unless_zero(&hp->ref))
-				hp = NULL;
-			rcu_read_unlock();
-			return hp;
-		}
-	}
-	rcu_read_unlock();
-	return NULL;
-}
-EXPORT_SYMBOL_GPL(auth_domain_find);
-
-/**
- * auth_domain_cleanup - check that the auth_domain table is empty
- *
- * On module unload the auth_domain_table must be empty.  To make it
- * easier to catch bugs which don't clean up domains properly, we
- * warn if anything remains in the table at cleanup time.
- *
- * Note that we cannot proactively remove the domains at this stage.
- * The ->release() function might be in a module that has already been
- * unloaded.
- */
-
-void auth_domain_cleanup(void)
-{
-	int h;
-	struct auth_domain *hp;
-
-	for (h = 0; h < DN_HASHMAX; h++)
-		hlist_for_each_entry(hp, &auth_domain_table[h], hash)
-			pr_warn("svc: domain %s still present at module unload.\n",
-				hp->name);
+	ad.name = name;
+	rv = auth_domain_lookup(&ad, 0);
+	return rv;
 }

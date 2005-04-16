@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  *	linux/arch/alpha/kernel/pci_impl.h
  *
@@ -107,10 +106,15 @@ struct pci_iommu_arena;
  *   Where A = pin 1, B = pin 2 and so on and pin=0 = default = A.
  *   Thus, each swizzle is ((pin-1) + (device#-4)) % 4
  *
- *   pci_swizzle_interrupt_pin() swizzles for exactly one bridge.  The routine
- *   pci_common_swizzle() handles multiple bridges.  But there are a
- *   couple boards that do strange things.
+ *   The following code swizzles for exactly one bridge.  The routine
+ *   common_swizzle below handles multiple bridges.  But there are a
+ *   couple boards that do strange things, so we define this here.
  */
+
+static inline u8 bridge_swizzle(u8 pin, u8 slot) 
+{
+	return (((pin-1) + slot) % 4) + 1;
+}
 
 
 /* The following macro is used to implement the table-based irq mapping
@@ -144,8 +148,7 @@ struct pci_iommu_arena
 };
 
 #if defined(CONFIG_ALPHA_SRM) && \
-    (defined(CONFIG_ALPHA_CIA) || defined(CONFIG_ALPHA_LCA) || \
-     defined(CONFIG_ALPHA_AVANTI))
+    (defined(CONFIG_ALPHA_CIA) || defined(CONFIG_ALPHA_LCA))
 # define NEED_SRM_SAVE_RESTORE
 #else
 # undef NEED_SRM_SAVE_RESTORE
@@ -158,8 +161,16 @@ struct pci_iommu_arena
 #endif
 
 #ifdef ALPHA_RESTORE_SRM_SETUP
+/* Store PCI device configuration left by SRM here. */
+struct pdev_srm_saved_conf
+{
+	struct pdev_srm_saved_conf *next;
+	struct pci_dev *dev;
+};
+
 extern void pci_restore_srm_config(void);
 #else
+#define pdev_save_srm_config(dev)	do {} while (0)
 #define pci_restore_srm_config()	do {} while (0)
 #endif
 
@@ -167,10 +178,13 @@ extern void pci_restore_srm_config(void);
 extern struct pci_controller *hose_head, **hose_tail;
 extern struct pci_controller *pci_isa_hose;
 
+/* Indicate that we trust the console to configure things properly.  */
+extern int pci_probe_only;
+
 extern unsigned long alpha_agpgart_size;
 
 extern void common_init_pci(void);
-#define common_swizzle pci_common_swizzle
+extern u8 common_swizzle(struct pci_dev *, u8 *);
 extern struct pci_controller *alloc_pci_controller(void);
 extern struct resource *alloc_resource(void);
 
@@ -189,7 +203,7 @@ extern unsigned long size_for_memory(unsigned long max);
 
 extern int iommu_reserve(struct pci_iommu_arena *, long, long);
 extern int iommu_release(struct pci_iommu_arena *, long, long);
-extern int iommu_bind(struct pci_iommu_arena *, long, long, struct page **);
+extern int iommu_bind(struct pci_iommu_arena *, long, long, unsigned long *);
 extern int iommu_unbind(struct pci_iommu_arena *, long, long);
 
 

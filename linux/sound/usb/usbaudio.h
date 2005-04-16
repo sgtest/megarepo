@@ -1,194 +1,251 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef __USBAUDIO_H
 #define __USBAUDIO_H
 /*
  *   (Tentative) USB Audio Driver for ALSA
  *
  *   Copyright (c) 2002 by Takashi Iwai <tiwai@suse.de>
+ *
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  */
 
-/* handling of USB vendor/product ID pairs as 32-bit numbers */
-#define USB_ID(vendor, product) (((unsigned int)(vendor) << 16) | (product))
-#define USB_ID_VENDOR(id) ((id) >> 16)
-#define USB_ID_PRODUCT(id) ((u16)(id))
 
 /*
- *
  */
 
-struct media_device;
-struct media_intf_devnode;
+#define USB_SUBCLASS_AUDIO_CONTROL	0x01
+#define USB_SUBCLASS_AUDIO_STREAMING	0x02
+#define USB_SUBCLASS_MIDI_STREAMING	0x03
+#define USB_SUBCLASS_VENDOR_SPEC	0xff
 
-#define MAX_CARD_INTERFACES	16
+#define CS_AUDIO_UNDEFINED		0x20
+#define CS_AUDIO_DEVICE			0x21
+#define CS_AUDIO_CONFIGURATION		0x22
+#define CS_AUDIO_STRING			0x23
+#define CS_AUDIO_INTERFACE		0x24
+#define CS_AUDIO_ENDPOINT		0x25
+
+#define HEADER				0x01
+#define INPUT_TERMINAL			0x02
+#define OUTPUT_TERMINAL			0x03
+#define MIXER_UNIT			0x04
+#define SELECTOR_UNIT			0x05
+#define FEATURE_UNIT			0x06
+#define PROCESSING_UNIT			0x07
+#define EXTENSION_UNIT			0x08
+
+#define AS_GENERAL			0x01
+#define FORMAT_TYPE			0x02
+#define FORMAT_SPECIFIC			0x03
+
+#define EP_GENERAL			0x01
+
+#define MS_GENERAL			0x01
+#define MIDI_IN_JACK			0x02
+#define MIDI_OUT_JACK			0x03
+
+/* endpoint attributes */
+#define EP_ATTR_MASK			0x0c
+#define EP_ATTR_ASYNC			0x04
+#define EP_ATTR_ADAPTIVE		0x08
+#define EP_ATTR_SYNC			0x0c
+
+/* cs endpoint attributes */
+#define EP_CS_ATTR_SAMPLE_RATE		0x01
+#define EP_CS_ATTR_PITCH_CONTROL	0x02
+#define EP_CS_ATTR_FILL_MAX		0x80
+
+/* Audio Class specific Request Codes */
+
+#define SET_CUR    0x01
+#define GET_CUR    0x81
+#define SET_MIN    0x02
+#define GET_MIN    0x82
+#define SET_MAX    0x03
+#define GET_MAX    0x83
+#define SET_RES    0x04
+#define GET_RES    0x84
+#define SET_MEM    0x05
+#define GET_MEM    0x85
+#define GET_STAT   0xff
+
+/* Terminal Control Selectors */
+
+#define COPY_PROTECT_CONTROL       0x01
+
+/* Endpoint Control Selectors */
+
+#define SAMPLING_FREQ_CONTROL      0x01
+#define PITCH_CONTROL              0x02
+
+/* Format Types */
+#define USB_FORMAT_TYPE_I	0x01
+#define USB_FORMAT_TYPE_II	0x02
+#define USB_FORMAT_TYPE_III	0x03
+
+/* type I */
+#define USB_AUDIO_FORMAT_PCM	0x01
+#define USB_AUDIO_FORMAT_PCM8	0x02
+#define USB_AUDIO_FORMAT_IEEE_FLOAT	0x03
+#define USB_AUDIO_FORMAT_ALAW	0x04
+#define USB_AUDIO_FORMAT_MU_LAW	0x05
+
+/* type II */
+#define USB_AUDIO_FORMAT_MPEG	0x1001
+#define USB_AUDIO_FORMAT_AC3	0x1002
+
+/* type III */
+#define USB_AUDIO_FORMAT_IEC1937_AC3	0x2001
+#define USB_AUDIO_FORMAT_IEC1937_MPEG1_LAYER1	0x2002
+#define USB_AUDIO_FORMAT_IEC1937_MPEG2_NOEXT	0x2003
+#define USB_AUDIO_FORMAT_IEC1937_MPEG2_EXT	0x2004
+#define USB_AUDIO_FORMAT_IEC1937_MPEG2_LAYER1_LS	0x2005
+#define USB_AUDIO_FORMAT_IEC1937_MPEG2_LAYER23_LS	0x2006
+
+
+/* maximum number of endpoints per interface */
+#define MIDI_MAX_ENDPOINTS 2
+
+/*
+ */
+
+typedef struct snd_usb_audio snd_usb_audio_t;
 
 struct snd_usb_audio {
 	int index;
 	struct usb_device *dev;
-	struct snd_card *card;
-	struct usb_interface *intf[MAX_CARD_INTERFACES];
-	u32 usb_id;
-	uint16_t quirk_type;
-	struct mutex mutex;
-	unsigned int system_suspend;
-	atomic_t active;
-	atomic_t shutdown;
-	atomic_t usage_count;
-	wait_queue_head_t shutdown_wait;
-	unsigned int quirk_flags;
-	unsigned int need_delayed_register:1; /* warn for delayed registration */
+	snd_card_t *card;
+	int shutdown;
 	int num_interfaces;
-	int num_suspended_intf;
-	int sample_rate_read_error;
-
-	int badd_profile;		/* UAC3 BADD profile */
 
 	struct list_head pcm_list;	/* list of pcm streams */
-	struct list_head ep_list;	/* list of audio-related endpoints */
-	struct list_head iface_ref_list; /* list of interface refcounts */
-	struct list_head clock_ref_list; /* list of clock refcounts */
 	int pcm_devs;
 
 	struct list_head midi_list;	/* list of midi interfaces */
+	int next_midi_device;
 
-	struct list_head mixer_list;	/* list of mixer interfaces */
-
-	int setup;			/* from the 'device_setup' module param */
-	bool generic_implicit_fb;	/* from the 'implicit_fb' module param */
-	bool autoclock;			/* from the 'autoclock' module param */
-
-	bool lowlatency;		/* from the 'lowlatency' module param */
-	struct usb_host_interface *ctrl_intf;	/* the audio control interface */
-	struct media_device *media_dev;
-	struct media_intf_devnode *ctl_intf_media_devnode;
+	unsigned int ignore_ctl_error;	/* for mixer */
 };
-
-#define USB_AUDIO_IFACE_UNUSED	((void *)-1L)
-
-#define usb_audio_err(chip, fmt, args...) \
-	dev_err(&(chip)->dev->dev, fmt, ##args)
-#define usb_audio_warn(chip, fmt, args...) \
-	dev_warn(&(chip)->dev->dev, fmt, ##args)
-#define usb_audio_info(chip, fmt, args...) \
-	dev_info(&(chip)->dev->dev, fmt, ##args)
-#define usb_audio_dbg(chip, fmt, args...) \
-	dev_dbg(&(chip)->dev->dev, fmt, ##args)
 
 /*
  * Information about devices with broken descriptors
  */
 
 /* special values for .ifnum */
-#define QUIRK_NODEV_INTERFACE		-3	/* return -ENODEV */
 #define QUIRK_NO_INTERFACE		-2
 #define QUIRK_ANY_INTERFACE		-1
 
-enum quirk_type {
-	QUIRK_IGNORE_INTERFACE,
-	QUIRK_COMPOSITE,
-	QUIRK_AUTODETECT,
-	QUIRK_MIDI_STANDARD_INTERFACE,
-	QUIRK_MIDI_FIXED_ENDPOINT,
-	QUIRK_MIDI_YAMAHA,
-	QUIRK_MIDI_ROLAND,
-	QUIRK_MIDI_MIDIMAN,
-	QUIRK_MIDI_NOVATION,
-	QUIRK_MIDI_RAW_BYTES,
-	QUIRK_MIDI_EMAGIC,
-	QUIRK_MIDI_CME,
-	QUIRK_MIDI_AKAI,
-	QUIRK_MIDI_US122L,
-	QUIRK_MIDI_FTDI,
-	QUIRK_MIDI_CH345,
-	QUIRK_AUDIO_STANDARD_INTERFACE,
-	QUIRK_AUDIO_FIXED_ENDPOINT,
-	QUIRK_AUDIO_EDIROL_UAXX,
-	QUIRK_AUDIO_STANDARD_MIXER,
+/* quirk type */
+#define QUIRK_MIDI_FIXED_ENDPOINT	0
+#define QUIRK_MIDI_YAMAHA		1
+#define QUIRK_MIDI_MIDIMAN		2
+#define QUIRK_COMPOSITE			3
+#define QUIRK_AUDIO_FIXED_ENDPOINT	4
+#define QUIRK_AUDIO_STANDARD_INTERFACE	5
+#define QUIRK_MIDI_STANDARD_INTERFACE	6
+#define QUIRK_AUDIO_EDIROL_UA700_UA25	7
+#define QUIRK_AUDIO_EDIROL_UA1000	8
+#define QUIRK_IGNORE_INTERFACE		9
+#define QUIRK_MIDI_NOVATION		10
+#define QUIRK_MIDI_MOTU			11
+#define QUIRK_MIDI_EMAGIC		12
 
-	QUIRK_TYPE_COUNT
-};
+typedef struct snd_usb_audio_quirk snd_usb_audio_quirk_t;
+typedef struct snd_usb_midi_endpoint_info snd_usb_midi_endpoint_info_t;
 
 struct snd_usb_audio_quirk {
 	const char *vendor_name;
 	const char *product_name;
 	int16_t ifnum;
-	uint16_t type;
+	int16_t type;
 	const void *data;
 };
 
-#define combine_word(s)    ((*(s)) | ((unsigned int)(s)[1] << 8))
+/* data for QUIRK_MIDI_FIXED_ENDPOINT */
+struct snd_usb_midi_endpoint_info {
+	int8_t   out_ep;	/* ep number, 0 autodetect */
+	uint8_t  out_interval;	/* interval for interrupt endpoints */
+	int8_t   in_ep;	
+	uint8_t  in_interval;
+	uint16_t out_cables;	/* bitmask */
+	uint16_t in_cables;	/* bitmask */
+};
+
+/* for QUIRK_MIDI_YAMAHA, data is NULL */
+
+/* for QUIRK_MIDI_MIDIMAN, data points to a snd_usb_midi_endpoint_info
+ * structure (out_cables and in_cables only) */
+
+/* for QUIRK_COMPOSITE, data points to an array of snd_usb_audio_quirk
+ * structures, terminated with .ifnum = -1 */
+
+/* for QUIRK_AUDIO_FIXED_ENDPOINT, data points to an audioformat structure */
+
+/* for QUIRK_AUDIO/MIDI_STANDARD_INTERFACE, data is NULL */
+
+/* for QUIRK_AUDIO_EDIROL_UA700_UA25/UA1000, data is NULL */
+
+/* for QUIRK_IGNORE_INTERFACE, data is NULL */
+
+/* for QUIRK_MIDI_NOVATION and _MOTU, data is NULL */
+
+/* for QUIRK_MIDI_EMAGIC, data points to a snd_usb_midi_endpoint_info
+ * structure (out_cables and in_cables only) */
+
+/*
+ */
+
+#define combine_word(s)    ((*s) | ((unsigned int)(s)[1] << 8))
 #define combine_triple(s)  (combine_word(s) | ((unsigned int)(s)[2] << 16))
 #define combine_quad(s)    (combine_triple(s) | ((unsigned int)(s)[3] << 24))
 
-int snd_usb_lock_shutdown(struct snd_usb_audio *chip);
-void snd_usb_unlock_shutdown(struct snd_usb_audio *chip);
+unsigned int snd_usb_combine_bytes(unsigned char *bytes, int size);
 
-extern bool snd_usb_use_vmalloc;
-extern bool snd_usb_skip_validation;
+void *snd_usb_find_desc(void *descstart, int desclen, void *after, u8 dtype);
+void *snd_usb_find_csint_desc(void *descstart, int desclen, void *after, u8 dsubtype);
+
+int snd_usb_ctl_msg(struct usb_device *dev, unsigned int pipe, __u8 request, __u8 requesttype, __u16 value, __u16 index, void *data, __u16 size, int timeout);
+
+int snd_usb_create_mixer(snd_usb_audio_t *chip, int ctrlif);
+
+int snd_usb_create_midi_interface(snd_usb_audio_t *chip, struct usb_interface *iface, const snd_usb_audio_quirk_t *quirk);
+void snd_usbmidi_input_stop(struct list_head* p);
+void snd_usbmidi_input_start(struct list_head* p);
+void snd_usbmidi_disconnect(struct list_head *p, struct usb_driver *driver);
 
 /*
- * Driver behavior quirk flags, stored in chip->quirk_flags
- *
- * QUIRK_FLAG_GET_SAMPLE_RATE:
- *  Skip reading sample rate for devices, as some devices behave inconsistently
- *  or return error
- * QUIRK_FLAG_SHARE_MEDIA_DEVICE:
- *  Create Media Controller API entries
- * QUIRK_FLAG_ALIGN_TRANSFER:
- *  Allow alignment on audio sub-slot (channel samples) rather than on audio
- *  slots (audio frames)
- * QUIRK_TX_LENGTH:
- *  Add length specifier to transfers
- * QUIRK_FLAG_PLAYBACK_FIRST:
- *  Start playback stream at first even in implement feedback mode
- * QUIRK_FLAG_SKIP_CLOCK_SELECTOR:
- *  Skip clock selector setup; the device may reset to invalid state
- * QUIRK_FLAG_IGNORE_CLOCK_SOURCE:
- *  Ignore errors from clock source search; i.e. hardcoded clock
- * QUIRK_FLAG_ITF_USB_DSD_DAC:
- *  Indicates the device is for ITF-USB DSD based DACs that need a vendor cmd
- *  to switch between PCM and native DSD mode
- * QUIRK_FLAG_CTL_MSG_DELAY:
- *  Add a delay of 20ms at each control message handling
- * QUIRK_FLAG_CTL_MSG_DELAY_1M:
- *  Add a delay of 1-2ms at each control message handling
- * QUIRK_FLAG_CTL_MSG_DELAY_5M:
- *  Add a delay of 5-6ms at each control message handling
- * QUIRK_FLAG_IFACE_DELAY:
- *  Add a delay of 50ms at each interface setup
- * QUIRK_FLAG_VALIDATE_RATES:
- *  Perform sample rate validations at probe
- * QUIRK_FLAG_DISABLE_AUTOSUSPEND:
- *  Disable runtime PM autosuspend
- * QUIRK_FLAG_IGNORE_CTL_ERROR:
- *  Ignore errors for mixer access
- * QUIRK_FLAG_DSD_RAW:
- *  Support generic DSD raw U32_BE format
- * QUIRK_FLAG_SET_IFACE_FIRST:
- *  Set up the interface at first like UAC1
- * QUIRK_FLAG_GENERIC_IMPLICIT_FB
- *  Apply the generic implicit feedback sync mode (same as implicit_fb=1 option)
- * QUIRK_FLAG_SKIP_IMPLICIT_FB
- *  Don't apply implicit feedback sync mode
+ * retrieve usb_interface descriptor from the host interface
+ * (conditional for compatibility with the older API)
  */
+#ifndef get_iface_desc
+#define get_iface_desc(iface)	(&(iface)->desc)
+#define get_endpoint(alt,ep)	(&(alt)->endpoint[ep].desc)
+#define get_ep_desc(ep)		(&(ep)->desc)
+#define get_cfg_desc(cfg)	(&(cfg)->desc)
+#endif
 
-#define QUIRK_FLAG_GET_SAMPLE_RATE	(1U << 0)
-#define QUIRK_FLAG_SHARE_MEDIA_DEVICE	(1U << 1)
-#define QUIRK_FLAG_ALIGN_TRANSFER	(1U << 2)
-#define QUIRK_FLAG_TX_LENGTH		(1U << 3)
-#define QUIRK_FLAG_PLAYBACK_FIRST	(1U << 4)
-#define QUIRK_FLAG_SKIP_CLOCK_SELECTOR	(1U << 5)
-#define QUIRK_FLAG_IGNORE_CLOCK_SOURCE	(1U << 6)
-#define QUIRK_FLAG_ITF_USB_DSD_DAC	(1U << 7)
-#define QUIRK_FLAG_CTL_MSG_DELAY	(1U << 8)
-#define QUIRK_FLAG_CTL_MSG_DELAY_1M	(1U << 9)
-#define QUIRK_FLAG_CTL_MSG_DELAY_5M	(1U << 10)
-#define QUIRK_FLAG_IFACE_DELAY		(1U << 11)
-#define QUIRK_FLAG_VALIDATE_RATES	(1U << 12)
-#define QUIRK_FLAG_DISABLE_AUTOSUSPEND	(1U << 13)
-#define QUIRK_FLAG_IGNORE_CTL_ERROR	(1U << 14)
-#define QUIRK_FLAG_DSD_RAW		(1U << 15)
-#define QUIRK_FLAG_SET_IFACE_FIRST	(1U << 16)
-#define QUIRK_FLAG_GENERIC_IMPLICIT_FB	(1U << 17)
-#define QUIRK_FLAG_SKIP_IMPLICIT_FB	(1U << 18)
+#ifndef usb_pipe_needs_resubmit
+#define usb_pipe_needs_resubmit(pipe) 1
+#endif
+
+#ifndef snd_usb_complete_callback
+#define snd_usb_complete_callback(x) (x)
+#endif
+
+#ifndef snd_usb_get_speed
+#define snd_usb_get_speed(dev) ((dev)->speed)
+#endif
 
 #endif /* __USBAUDIO_H */

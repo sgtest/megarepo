@@ -1,10 +1,23 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * OSS compatible sequencer driver
  *
  * seq_oss_readq.c - MIDI input queue
  *
  * Copyright (C) 1998,99 Takashi Iwai <tiwai@suse.de>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  */
 
 #include "seq_oss_readq.h"
@@ -12,7 +25,6 @@
 #include <sound/seq_oss_legacy.h>
 #include "../seq_lock.h"
 #include <linux/wait.h>
-#include <linux/slab.h>
 
 /*
  * constants
@@ -29,17 +41,18 @@
 /*
  * create a read queue
  */
-struct seq_oss_readq *
-snd_seq_oss_readq_new(struct seq_oss_devinfo *dp, int maxlen)
+seq_oss_readq_t *
+snd_seq_oss_readq_new(seq_oss_devinfo_t *dp, int maxlen)
 {
-	struct seq_oss_readq *q;
+	seq_oss_readq_t *q;
 
-	q = kzalloc(sizeof(*q), GFP_KERNEL);
-	if (!q)
+	if ((q = kcalloc(1, sizeof(*q), GFP_KERNEL)) == NULL) {
+		snd_printk(KERN_ERR "can't malloc read queue\n");
 		return NULL;
+	}
 
-	q->q = kcalloc(maxlen, sizeof(union evrec), GFP_KERNEL);
-	if (!q->q) {
+	if ((q->q = kcalloc(maxlen, sizeof(evrec_t), GFP_KERNEL)) == NULL) {
+		snd_printk(KERN_ERR "can't malloc read queue buffer\n");
 		kfree(q);
 		return NULL;
 	}
@@ -59,7 +72,7 @@ snd_seq_oss_readq_new(struct seq_oss_devinfo *dp, int maxlen)
  * delete the read queue
  */
 void
-snd_seq_oss_readq_delete(struct seq_oss_readq *q)
+snd_seq_oss_readq_delete(seq_oss_readq_t *q)
 {
 	if (q) {
 		kfree(q->q);
@@ -71,14 +84,15 @@ snd_seq_oss_readq_delete(struct seq_oss_readq *q)
  * reset the read queue
  */
 void
-snd_seq_oss_readq_clear(struct seq_oss_readq *q)
+snd_seq_oss_readq_clear(seq_oss_readq_t *q)
 {
 	if (q->qlen) {
 		q->qlen = 0;
 		q->head = q->tail = 0;
 	}
 	/* if someone sleeping, wake'em up */
-	wake_up(&q->midi_sleep);
+	if (waitqueue_active(&q->midi_sleep))
+		wake_up(&q->midi_sleep);
 	q->input_time = (unsigned long)-1;
 }
 
@@ -86,9 +100,9 @@ snd_seq_oss_readq_clear(struct seq_oss_readq *q)
  * put a midi byte
  */
 int
-snd_seq_oss_readq_puts(struct seq_oss_readq *q, int dev, unsigned char *data, int len)
+snd_seq_oss_readq_puts(seq_oss_readq_t *q, int dev, unsigned char *data, int len)
 {
-	union evrec rec;
+	evrec_t rec;
 	int result;
 
 	memset(&rec, 0, sizeof(rec));
@@ -105,40 +119,11 @@ snd_seq_oss_readq_puts(struct seq_oss_readq *q, int dev, unsigned char *data, in
 }
 
 /*
- * put MIDI sysex bytes; the event buffer may be chained, thus it has
- * to be expanded via snd_seq_dump_var_event().
- */
-struct readq_sysex_ctx {
-	struct seq_oss_readq *readq;
-	int dev;
-};
-
-static int readq_dump_sysex(void *ptr, void *buf, int count)
-{
-	struct readq_sysex_ctx *ctx = ptr;
-
-	return snd_seq_oss_readq_puts(ctx->readq, ctx->dev, buf, count);
-}
-
-int snd_seq_oss_readq_sysex(struct seq_oss_readq *q, int dev,
-			    struct snd_seq_event *ev)
-{
-	struct readq_sysex_ctx ctx = {
-		.readq = q,
-		.dev = dev
-	};
-
-	if ((ev->flags & SNDRV_SEQ_EVENT_LENGTH_MASK) != SNDRV_SEQ_EVENT_LENGTH_VARIABLE)
-		return 0;
-	return snd_seq_dump_var_event(ev, readq_dump_sysex, &ctx);
-}
-
-/*
  * copy an event to input queue:
  * return zero if enqueued
  */
 int
-snd_seq_oss_readq_put_event(struct seq_oss_readq *q, union evrec *ev)
+snd_seq_oss_readq_put_event(seq_oss_readq_t *q, evrec_t *ev)
 {
 	unsigned long flags;
 
@@ -153,7 +138,8 @@ snd_seq_oss_readq_put_event(struct seq_oss_readq *q, union evrec *ev)
 	q->qlen++;
 
 	/* wake up sleeper */
-	wake_up(&q->midi_sleep);
+	if (waitqueue_active(&q->midi_sleep))
+		wake_up(&q->midi_sleep);
 
 	spin_unlock_irqrestore(&q->lock, flags);
 
@@ -166,7 +152,7 @@ snd_seq_oss_readq_put_event(struct seq_oss_readq *q, union evrec *ev)
  * caller must hold lock
  */
 int
-snd_seq_oss_readq_pick(struct seq_oss_readq *q, union evrec *rec)
+snd_seq_oss_readq_pick(seq_oss_readq_t *q, evrec_t *rec)
 {
 	if (q->qlen == 0)
 		return -EAGAIN;
@@ -178,7 +164,7 @@ snd_seq_oss_readq_pick(struct seq_oss_readq *q, union evrec *rec)
  * sleep until ready
  */
 void
-snd_seq_oss_readq_wait(struct seq_oss_readq *q)
+snd_seq_oss_readq_wait(seq_oss_readq_t *q)
 {
 	wait_event_interruptible_timeout(q->midi_sleep,
 					 (q->qlen > 0 || q->head == q->tail),
@@ -190,7 +176,7 @@ snd_seq_oss_readq_wait(struct seq_oss_readq *q)
  * caller must hold lock
  */
 void
-snd_seq_oss_readq_free(struct seq_oss_readq *q)
+snd_seq_oss_readq_free(seq_oss_readq_t *q)
 {
 	if (q->qlen > 0) {
 		q->head = (q->head + 1) % q->maxlen;
@@ -203,7 +189,7 @@ snd_seq_oss_readq_free(struct seq_oss_readq *q)
  * return non-zero if readq is not empty.
  */
 unsigned int
-snd_seq_oss_readq_poll(struct seq_oss_readq *q, struct file *file, poll_table *wait)
+snd_seq_oss_readq_poll(seq_oss_readq_t *q, struct file *file, poll_table *wait)
 {
 	poll_wait(file, &q->midi_sleep, wait);
 	return q->qlen;
@@ -213,10 +199,10 @@ snd_seq_oss_readq_poll(struct seq_oss_readq *q, struct file *file, poll_table *w
  * put a timestamp
  */
 int
-snd_seq_oss_readq_put_timestamp(struct seq_oss_readq *q, unsigned long curt, int seq_mode)
+snd_seq_oss_readq_put_timestamp(seq_oss_readq_t *q, unsigned long curt, int seq_mode)
 {
 	if (curt != q->input_time) {
-		union evrec rec;
+		evrec_t rec;
 		memset(&rec, 0, sizeof(rec));
 		switch (seq_mode) {
 		case SNDRV_SEQ_OSS_MODE_SYNTH:
@@ -236,15 +222,13 @@ snd_seq_oss_readq_put_timestamp(struct seq_oss_readq *q, unsigned long curt, int
 }
 
 
-#ifdef CONFIG_SND_PROC_FS
 /*
  * proc interface
  */
 void
-snd_seq_oss_readq_info_read(struct seq_oss_readq *q, struct snd_info_buffer *buf)
+snd_seq_oss_readq_info_read(seq_oss_readq_t *q, snd_info_buffer_t *buf)
 {
 	snd_iprintf(buf, "  read queue [%s] length = %d : tick = %ld\n",
 		    (waitqueue_active(&q->midi_sleep) ? "sleeping":"running"),
 		    q->qlen, q->input_time);
 }
-#endif /* CONFIG_SND_PROC_FS */

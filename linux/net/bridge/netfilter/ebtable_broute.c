@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  *  ebtable_broute
  *
@@ -16,8 +15,6 @@
 #include <linux/module.h>
 #include <linux/if_bridge.h>
 
-#include "../br_private.h"
-
 /* EBT_ACCEPT means the frame will be bridged
  * EBT_DROP means the frame will be routed
  */
@@ -26,7 +23,8 @@ static struct ebt_entries initial_chain = {
 	.policy		= EBT_ACCEPT,
 };
 
-static struct ebt_replace_kernel initial_table = {
+static struct ebt_replace initial_table =
+{
 	.name		= "broute",
 	.valid_hooks	= 1 << NF_BR_BROUTING,
 	.entries_size	= sizeof(struct ebt_entries),
@@ -43,103 +41,46 @@ static int check(const struct ebt_table_info *info, unsigned int valid_hooks)
 	return 0;
 }
 
-static const struct ebt_table broute_table = {
+static struct ebt_table broute_table =
+{
 	.name		= "broute",
 	.table		= &initial_table,
 	.valid_hooks	= 1 << NF_BR_BROUTING,
+	.lock		= RW_LOCK_UNLOCKED,
 	.check		= check,
 	.me		= THIS_MODULE,
 };
 
-static unsigned int ebt_broute(void *priv, struct sk_buff *skb,
-			       const struct nf_hook_state *s)
+static int ebt_broute(struct sk_buff **pskb)
 {
-	struct net_bridge_port *p = br_port_get_rcu(skb->dev);
-	struct nf_hook_state state;
-	unsigned char *dest;
 	int ret;
 
-	if (!p || p->state != BR_STATE_FORWARDING)
-		return NF_ACCEPT;
+	ret = ebt_do_table(NF_BR_BROUTING, pskb, (*pskb)->dev, NULL,
+	   &broute_table);
+	if (ret == NF_DROP)
+		return 1; /* route it */
+	return 0; /* bridge it */
+}
 
-	nf_hook_state_init(&state, NF_BR_BROUTING,
-			   NFPROTO_BRIDGE, s->in, NULL, NULL,
-			   s->net, NULL);
+static int __init init(void)
+{
+	int ret;
 
-	ret = ebt_do_table(priv, skb, &state);
-	if (ret != NF_DROP)
+	ret = ebt_register_table(&broute_table);
+	if (ret < 0)
 		return ret;
-
-	/* DROP in ebtables -t broute means that the
-	 * skb should be routed, not bridged.
-	 * This is awkward, but can't be changed for compatibility
-	 * reasons.
-	 *
-	 * We map DROP to ACCEPT and set the ->br_netfilter_broute flag.
-	 */
-	BR_INPUT_SKB_CB(skb)->br_netfilter_broute = 1;
-
-	/* undo PACKET_HOST mangling done in br_input in case the dst
-	 * address matches the logical bridge but not the port.
-	 */
-	dest = eth_hdr(skb)->h_dest;
-	if (skb->pkt_type == PACKET_HOST &&
-	    !ether_addr_equal(skb->dev->dev_addr, dest) &&
-	     ether_addr_equal(p->br->dev->dev_addr, dest))
-		skb->pkt_type = PACKET_OTHERHOST;
-
-	return NF_ACCEPT;
+	/* see br_input.c */
+	br_should_route_hook = ebt_broute;
+	return ret;
 }
 
-static const struct nf_hook_ops ebt_ops_broute = {
-	.hook		= ebt_broute,
-	.pf		= NFPROTO_BRIDGE,
-	.hooknum	= NF_BR_PRE_ROUTING,
-	.priority	= NF_BR_PRI_FIRST,
-};
-
-static int broute_table_init(struct net *net)
+static void __exit fini(void)
 {
-	return ebt_register_table(net, &broute_table, &ebt_ops_broute);
+	br_should_route_hook = NULL;
+	synchronize_net();
+	ebt_unregister_table(&broute_table);
 }
 
-static void __net_exit broute_net_pre_exit(struct net *net)
-{
-	ebt_unregister_table_pre_exit(net, "broute");
-}
-
-static void __net_exit broute_net_exit(struct net *net)
-{
-	ebt_unregister_table(net, "broute");
-}
-
-static struct pernet_operations broute_net_ops = {
-	.exit = broute_net_exit,
-	.pre_exit = broute_net_pre_exit,
-};
-
-static int __init ebtable_broute_init(void)
-{
-	int ret = ebt_register_template(&broute_table, broute_table_init);
-
-	if (ret)
-		return ret;
-
-	ret = register_pernet_subsys(&broute_net_ops);
-	if (ret) {
-		ebt_unregister_template(&broute_table);
-		return ret;
-	}
-
-	return 0;
-}
-
-static void __exit ebtable_broute_fini(void)
-{
-	unregister_pernet_subsys(&broute_net_ops);
-	ebt_unregister_template(&broute_table);
-}
-
-module_init(ebtable_broute_init);
-module_exit(ebtable_broute_fini);
+module_init(init);
+module_exit(fini);
 MODULE_LICENSE("GPL");

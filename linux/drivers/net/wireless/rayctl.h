@@ -1,6 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-#ifndef _RAYCTL_H_
-#define _RAYCTL_H_
+#ifndef RAYLINK_H
 
 typedef unsigned char UCHAR;
 
@@ -568,9 +566,9 @@ struct phy_header {
     UCHAR hdr_3;
     UCHAR hdr_4;
 };
-struct ray_rx_msg {
+struct rx_msg {
     struct mac_header mac;
-	UCHAR	var[];
+    UCHAR  var[1];
 };
 
 struct tx_msg {
@@ -580,7 +578,7 @@ struct tx_msg {
     UCHAR  var[1];
 };
 
-/****** ECF Receive Control Structure (RCS) Area at Shared RAM offset 0x0800  */
+/****** ECF Receive Control Stucture (RCS) Area at Shared RAM offset 0x0800  */
 /* Structures for command specific parameters (rcs.var) */
 struct rx_packet_cmd {
     UCHAR rx_data_ptr[2];
@@ -731,4 +729,4 @@ typedef struct snaphdr_t
 #define RAY_IPX_TYPE  0x8137
 #define APPLEARP_TYPE 0x80f3
 /*****************************************************************************/
-#endif /* _RAYCTL_H_ */
+#endif /* #ifndef RAYLINK_H */

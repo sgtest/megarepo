@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Device driver for the SYMBIOS/LSILOGIC 53C8XX and 53C1010 family 
  * of PCI-SCSI IO processors.
@@ -22,6 +21,20 @@
  * Copyright (C) 1997 Richard Waltham <dormouse@farsrobt.demon.co.uk>
  *
  *-----------------------------------------------------------------------------
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
 #include "sym_glue.h"
@@ -79,32 +92,29 @@ void sym_nvram_setup_host(struct Scsi_Host *shost, struct sym_hcb *np, struct sy
  *  Get target set-up from Symbios format NVRAM.
  */
 static void
-sym_Symbios_setup_target(struct sym_tcb *tp, int target, Symbios_nvram *nvram)
+sym_Symbios_setup_target(struct sym_hcb *np, int target, Symbios_nvram *nvram)
 {
+	struct sym_tcb *tp = &np->target[target];
 	Symbios_target *tn = &nvram->target[target];
 
-	if (!(tn->flags & SYMBIOS_QUEUE_TAGS_ENABLED))
-		tp->usrtags = 0;
+	tp->usrtags =
+		(tn->flags & SYMBIOS_QUEUE_TAGS_ENABLED)? SYM_SETUP_MAX_TAG : 0;
+
 	if (!(tn->flags & SYMBIOS_DISCONNECT_ENABLE))
 		tp->usrflags &= ~SYM_DISC_ENABLED;
 	if (!(tn->flags & SYMBIOS_SCAN_AT_BOOT_TIME))
 		tp->usrflags |= SYM_SCAN_BOOT_DISABLED;
 	if (!(tn->flags & SYMBIOS_SCAN_LUNS))
 		tp->usrflags |= SYM_SCAN_LUNS_DISABLED;
-	tp->usr_period = (tn->sync_period + 3) / 4;
-	tp->usr_width = (tn->bus_width == 0x8) ? 0 : 1;
 }
-
-static const unsigned char Tekram_sync[16] = {
-	25, 31, 37, 43, 50, 62, 75, 125, 12, 15, 18, 21, 6, 7, 9, 10
-};
 
 /*
  *  Get target set-up from Tekram format NVRAM.
  */
 static void
-sym_Tekram_setup_target(struct sym_tcb *tp, int target, Tekram_nvram *nvram)
+sym_Tekram_setup_target(struct sym_hcb *np, int target, Tekram_nvram *nvram)
 {
+	struct sym_tcb *tp = &np->target[target];
 	struct Tekram_target *tn = &nvram->target[target];
 
 	if (tn->flags & TEKRAM_TAGGED_COMMANDS) {
@@ -114,22 +124,22 @@ sym_Tekram_setup_target(struct sym_tcb *tp, int target, Tekram_nvram *nvram)
 	if (tn->flags & TEKRAM_DISCONNECT_ENABLE)
 		tp->usrflags |= SYM_DISC_ENABLED;
  
-	if (tn->flags & TEKRAM_SYNC_NEGO)
-		tp->usr_period = Tekram_sync[tn->sync_index & 0xf];
-	tp->usr_width = (tn->flags & TEKRAM_WIDE_NEGO) ? 1 : 0;
+	/* If any device does not support parity, we will not use this option */
+	if (!(tn->flags & TEKRAM_PARITY_CHECK))
+		np->rv_scntl0  &= ~0x0a; /* SCSI parity checking disabled */
 }
 
 /*
  *  Get target setup from NVRAM.
  */
-void sym_nvram_setup_target(struct sym_tcb *tp, int target, struct sym_nvram *nvp)
+void sym_nvram_setup_target(struct sym_hcb *np, int target, struct sym_nvram *nvp)
 {
 	switch (nvp->type) {
 	case SYM_SYMBIOS_NVRAM:
-		sym_Symbios_setup_target(tp, target, &nvp->data.Symbios);
+		sym_Symbios_setup_target(np, target, &nvp->data.Symbios);
 		break;
 	case SYM_TEKRAM_NVRAM:
-		sym_Tekram_setup_target(tp, target, &nvp->data.Tekram);
+		sym_Tekram_setup_target(np, target, &nvp->data.Tekram);
 		break;
 	default:
 		break;
@@ -227,7 +237,7 @@ static void sym_display_Tekram_nvram(struct sym_device *np, Tekram_nvram *nvram)
 /*
  *  24C16 EEPROM reading.
  *
- *  GPIO0 - data in/data out
+ *  GPOI0 - data in/data out
  *  GPIO1 - clock
  *  Symbios NVRAM wiring now also used by Tekram.
  */
@@ -260,7 +270,6 @@ static void S24C16_set_bit(struct sym_device *np, u_char write_bit, u_char *gpre
 
 	}
 	OUTB(np, nc_gpreg, *gpreg);
-	INB(np, nc_mbox1);
 	udelay(5);
 }
 
@@ -357,7 +366,7 @@ static void S24C16_read_byte(struct sym_device *np, u_char *read_data, u_char ac
 	S24C16_write_ack(np, ack_data, gpreg, gpcntl);
 }
 
-#ifdef SYM_CONF_NVRAM_WRITE_SUPPORT
+#if SYM_CONF_NVRAM_WRITE_SUPPORT
 /*
  *  Write 'len' bytes starting at 'offset'.
  */
@@ -524,7 +533,7 @@ static int sym_read_Symbios_nvram(struct sym_device *np, Symbios_nvram *nvram)
 /*
  *  93C46 EEPROM reading.
  *
- *  GPIO0 - data in
+ *  GPOI0 - data in
  *  GPIO1 - data out
  *  GPIO2 - clock
  *  GPIO4 - chip select
@@ -538,7 +547,6 @@ static int sym_read_Symbios_nvram(struct sym_device *np, Symbios_nvram *nvram)
 static void T93C46_Clk(struct sym_device *np, u_char *gpreg)
 {
 	OUTB(np, nc_gpreg, *gpreg | 0x04);
-	INB(np, nc_mbox1);
 	udelay(2);
 	OUTB(np, nc_gpreg, *gpreg);
 }
@@ -566,7 +574,6 @@ static void T93C46_Write_Bit(struct sym_device *np, u_char write_bit, u_char *gp
 	*gpreg |= 0x10;
 		
 	OUTB(np, nc_gpreg, *gpreg);
-	INB(np, nc_mbox1);
 	udelay(2);
 
 	T93C46_Clk(np, gpreg);
@@ -579,7 +586,6 @@ static void T93C46_Stop(struct sym_device *np, u_char *gpreg)
 {
 	*gpreg &= 0xef;
 	OUTB(np, nc_gpreg, *gpreg);
-	INB(np, nc_mbox1);
 	udelay(2);
 
 	T93C46_Clk(np, gpreg);
@@ -648,7 +654,7 @@ static int sym_read_T93C46_nvram(struct sym_device *np, Tekram_nvram *nvram)
 {
 	u_char gpcntl, gpreg;
 	u_char old_gpcntl, old_gpreg;
-	int retv;
+	int retv = 1;
 
 	/* save current state of GPCNTL and GPREG */
 	old_gpreg	= INB(np, nc_gpreg);
@@ -683,7 +689,7 @@ static int sym_read_Tekram_nvram (struct sym_device *np, Tekram_nvram *nvram)
 	u_short	csum;
 	int x;
 
-	switch (np->pdev->device) {
+	switch (np->device_id) {
 	case PCI_DEVICE_ID_NCR_53C885:
 	case PCI_DEVICE_ID_NCR_53C895:
 	case PCI_DEVICE_ID_NCR_53C896:
@@ -695,7 +701,6 @@ static int sym_read_Tekram_nvram (struct sym_device *np, Tekram_nvram *nvram)
 					  data, len);
 		if (!x)
 			break;
-		fallthrough;
 	default:
 		x = sym_read_T93C46_nvram(np, nvram);
 		break;
@@ -728,8 +733,7 @@ static int sym_read_parisc_pdc(struct sym_device *np, struct pdc_initiator *pdc)
 	return SYM_PARISC_PDC;
 }
 #else
-static inline int sym_read_parisc_pdc(struct sym_device *np,
-					struct pdc_initiator *x)
+static int sym_read_parisc_pdc(struct sym_device *np, struct pdc_initiator *x)
 {
 	return 0;
 }

@@ -1,27 +1,27 @@
-# SPDX-License-Identifier: GPL-2.0
 # ===========================================================================
 # Module versions
 # ===========================================================================
 #
 # Stage one of module building created the following:
 # a) The individual .o files used for the module
-# b) A <module>.o file which is the .o files above linked together
-# c) A <module>.mod file, listing the name of the preliminary <module>.o file,
-#    plus all .o files
-# d) modules.order, which lists all the modules
+# b) A <module>.o file wich is the .o files above linked together
+# c) A <module>.mod file in $(MODVERDIR)/, listing the name of the
+#    the preliminary <module>.o file, plus all .o files
 
 # Stage 2 is handled by this file and does the following
-# 1) Find all modules listed in modules.order
+# 1) Find all modules from the files listed in $(MODVERDIR)/
 # 2) modpost is then used to
-# 3)  create one <module>.mod.c file per module
+# 3)  create one <module>.mod.c file pr. module
 # 4)  create one Module.symvers file with CRC for all exported symbols
+# 5) compile all <module>.mod.c files
+# 6) final link of the module to a <module.ko> file
 
 # Step 3 is used to place certain information in the module's ELF
 # section, including information such as:
-#   Version magic (see include/linux/vermagic.h for full details)
+#   Version magic (see include/vermagic.h for full details)
 #     - Kernel release
 #     - SMP is CONFIG_SMP
-#     - PREEMPT is CONFIG_PREEMPT[_RT]
+#     - PREEMPT is CONFIG_PREEMPT
 #     - GCC Version
 #   Module info
 #     - Module version (MODULE_VERSION)
@@ -30,117 +30,81 @@
 #     - See include/linux/module.h for more details
 
 # Step 4 is solely used to allow module versioning in external modules,
-# where the CRC of each module is retrieved from the Module.symvers file.
+# where the CRC of each module is retreived from the Module.symers file.
 
-# KBUILD_MODPOST_NOFINAL can be set to skip the final link of modules.
-# This is solely useful to speed up test compiles
+.PHONY: _modpost
+_modpost: __modpost
 
-PHONY := __modpost
-__modpost:
+include .config
+include scripts/Makefile.lib
 
-include include/config/auto.conf
-include $(srctree)/scripts/Kbuild.include
+symverfile := $(objtree)/Module.symvers
 
-MODPOST = scripts/mod/modpost								\
-	$(if $(CONFIG_MODVERSIONS),-m)							\
-	$(if $(CONFIG_MODULE_SRCVERSION_ALL),-a)					\
-	$(if $(CONFIG_SECTION_MISMATCH_WARN_ONLY),,-E)					\
-	-o $@
+# Step 1), find all modules listed in $(MODVERDIR)/
+__modules := $(sort $(shell grep -h '\.ko' /dev/null $(wildcard $(MODVERDIR)/*.mod)))
+modules   := $(patsubst %.o,%.ko, $(wildcard $(__modules:.ko=.o)))
 
-ifdef MODPOST_VMLINUX
+_modpost: $(modules)
 
-quiet_cmd_modpost = MODPOST $@
-      cmd_modpost = $(MODPOST) $<
 
-vmlinux.symvers: vmlinux.o
+# Step 2), invoke modpost
+#  Includes step 3,4
+quiet_cmd_modpost = MODPOST
+      cmd_modpost = scripts/mod/modpost            \
+        $(if $(CONFIG_MODVERSIONS),-m)             \
+	$(if $(CONFIG_MODULE_SRCVERSION_ALL),-a,)  \
+	$(if $(KBUILD_EXTMOD),-i,-o) $(symverfile) \
+	$(filter-out FORCE,$^)
+
+.PHONY: __modpost
+__modpost: $(wildcard vmlinux) $(modules:.ko=.o) FORCE
 	$(call cmd,modpost)
 
-__modpost: vmlinux.symvers
+# Declare generated files as targets for modpost
+$(symverfile):         __modpost ;
+$(modules:.ko=.mod.c): __modpost ;
 
-else
 
-ifeq ($(KBUILD_EXTMOD),)
+# Step 5), compile all *.mod.c files
 
-input-symdump := vmlinux.symvers
-output-symdump := modules-only.symvers
+# modname is set to make c_flags define KBUILD_MODNAME
+modname = $(*F)
 
-quiet_cmd_cat = GEN     $@
-      cmd_cat = cat $(real-prereqs) > $@
+quiet_cmd_cc_o_c = CC      $@
+      cmd_cc_o_c = $(CC) $(c_flags) $(CFLAGS_MODULE)	\
+		   -c -o $@ $<
 
-ifneq ($(wildcard vmlinux.symvers),)
+$(modules:.ko=.mod.o): %.mod.o: %.mod.c FORCE
+	$(call if_changed_dep,cc_o_c)
 
-__modpost: Module.symvers
-Module.symvers: vmlinux.symvers modules-only.symvers FORCE
-	$(call if_changed,cat)
+targets += $(modules:.ko=.mod.o)
 
-targets += Module.symvers
+# Step 6), final link of the modules
+quiet_cmd_ld_ko_o = LD [M]  $@
+      cmd_ld_ko_o = $(LD) $(LDFLAGS) $(LDFLAGS_MODULE) -o $@ 		\
+			  $(filter-out FORCE,$^)
 
-endif
+$(modules): %.ko :%.o %.mod.o FORCE
+	$(call if_changed,ld_ko_o)
 
-else
+targets += $(modules)
 
-# set src + obj - they may be used in the modules's Makefile
-obj := $(KBUILD_EXTMOD)
-src := $(obj)
 
-# Include the module's Makefile to find KBUILD_EXTRA_SYMBOLS
-include $(or $(wildcard $(src)/Kbuild), $(src)/Makefile)
+# Add FORCE to the prequisites of a target to force it to be always rebuilt.
+# ---------------------------------------------------------------------------
 
-# modpost option for external modules
-MODPOST += -e
+.PHONY: FORCE
 
-input-symdump := Module.symvers $(KBUILD_EXTRA_SYMBOLS)
-output-symdump := $(KBUILD_EXTMOD)/Module.symvers
-
-endif
-
-existing-input-symdump := $(wildcard $(input-symdump))
-
-# modpost options for modules (both in-kernel and external)
-MODPOST += \
-	$(addprefix -i ,$(existing-input-symdump)) \
-	$(if $(KBUILD_NSDEPS),-d $(MODULES_NSDEPS)) \
-	$(if $(CONFIG_MODULE_ALLOW_MISSING_NAMESPACE_IMPORTS)$(KBUILD_NSDEPS),-N)
-
-# 'make -i -k' ignores compile errors, and builds as many modules as possible.
-ifneq ($(findstring i,$(filter-out --%,$(MAKEFLAGS))),)
-MODPOST += -n
-endif
-
-# Clear VPATH to not search for *.symvers in $(srctree). Check only $(objtree).
-VPATH :=
-$(input-symdump):
-	@echo >&2 'WARNING: Symbol version dump "$@" is missing.'
-	@echo >&2 '         Modules may not have dependencies or modversions.'
-	@echo >&2 '         You may get many unresolved symbol warnings.'
-
-# KBUILD_MODPOST_WARN can be set to avoid error out in case of undefined symbols
-ifneq ($(KBUILD_MODPOST_WARN)$(filter-out $(existing-input-symdump), $(input-symdump)),)
-MODPOST += -w
-endif
-
-# Read out modules.order to pass in modpost.
-# Otherwise, allmodconfig would fail with "Argument list too long".
-quiet_cmd_modpost = MODPOST $@
-      cmd_modpost = sed 's/ko$$/o/' $< | $(MODPOST) -T -
-
-$(output-symdump): $(MODORDER) $(input-symdump) FORCE
-	$(call if_changed,modpost)
-
-targets += $(output-symdump)
-
-__modpost: $(output-symdump)
-ifneq ($(KBUILD_MODPOST_NOFINAL),1)
-	$(Q)$(MAKE) -f $(srctree)/scripts/Makefile.modfinal
-endif
-
-PHONY += FORCE
 FORCE:
 
-existing-targets := $(wildcard $(sort $(targets)))
+# Read all saved command lines and dependencies for the $(targets) we
+# may be building above, using $(if_changed{,_dep}). As an
+# optimization, we don't need to read them if the target does not
+# exist, we will rebuild anyway in that case.
 
--include $(foreach f,$(existing-targets),$(dir $(f)).$(notdir $(f)).cmd)
+targets := $(wildcard $(sort $(targets)))
+cmd_files := $(wildcard $(foreach f,$(targets),$(dir $(f)).$(notdir $(f)).cmd))
 
+ifneq ($(cmd_files),)
+  include $(cmd_files)
 endif
-
-.PHONY: $(PHONY)

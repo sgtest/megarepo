@@ -1,13 +1,12 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
- *  Copyright (c) 2000-2008 LSI Corporation.
+ *  Copyright (c) 2000-2003 LSI Logic Corporation.
  *
  *
  *           Name:  mpi_type.h
  *          Title:  MPI Basic type definitions
  *  Creation Date:  June 6, 2000
  *
- *    mpi_type.h Version:  01.05.02
+ *    mpi_type.h Version:  01.05.xx
  *
  *  Version History
  *  ---------------
@@ -19,8 +18,6 @@
  *  11-02-00  01.01.01  Original release for post 1.0 work
  *  02-20-01  01.01.02  Added define and ifdef for MPI_POINTER.
  *  08-08-01  01.02.01  Original release for v1.2 work.
- *  05-11-04  01.03.01  Original release for MPI v1.3.
- *  08-19-04  01.05.01  Original release for MPI v1.5.
  *  --------------------------------------------------------------------------
  */
 
@@ -52,6 +49,11 @@ typedef unsigned short  U16;
 
 typedef int32_t   S32;
 typedef u_int32_t U32;
+
+/*
+ *  The only way crap below could work on big-endian boxen would be if it
+ *  wasn't used at all.
+ */
 
 typedef struct _S64
 {

@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *	linux/arch/alpha/kernel/core_apecs.c
  *
@@ -22,7 +21,6 @@
 
 #include <asm/ptrace.h>
 #include <asm/smp.h>
-#include <asm/mce.h>
 
 #include "proto.h"
 #include "pci_impl.h"
@@ -346,8 +344,7 @@ apecs_init_arch(void)
 	 * Window 1 is direct access 1GB at 1GB
 	 * Window 2 is scatter-gather 8MB at 8MB (for isa)
 	 */
-	hose->sg_isa = iommu_arena_new(hose, 0x00800000, 0x00800000,
-				       SMP_CACHE_BYTES);
+	hose->sg_isa = iommu_arena_new(hose, 0x00800000, 0x00800000, 0);
 	hose->sg_pci = NULL;
 	__direct_map_base = 0x40000000;
 	__direct_map_size = 0x40000000;
@@ -390,7 +387,8 @@ apecs_pci_clr_err(void)
 }
 
 void
-apecs_machine_check(unsigned long vector, unsigned long la_ptr)
+apecs_machine_check(unsigned long vector, unsigned long la_ptr,
+		    struct pt_regs * regs)
 {
 	struct el_common *mchk_header;
 	struct el_apecs_procdata *mchk_procdata;
@@ -414,7 +412,7 @@ apecs_machine_check(unsigned long vector, unsigned long la_ptr)
 	wrmces(0x7);		/* reset machine check pending flag */
 	mb();
 
-	process_mcheck_info(vector, la_ptr, "APECS",
+	process_mcheck_info(vector, la_ptr, regs, "APECS",
 			    (mcheck_expected(0)
 			     && (mchk_sysdata->epic_dcsr & 0x0c00UL)));
 }

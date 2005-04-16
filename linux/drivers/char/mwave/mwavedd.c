@@ -56,10 +56,7 @@
 #include <linux/serial.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
-#include <linux/mutex.h>
 #include <linux/delay.h>
-#include <linux/serial_8250.h>
-#include <linux/nospec.h>
 #include "smapi.h"
 #include "mwavedd.h"
 #include "3780i.h"
@@ -74,22 +71,21 @@ MODULE_LICENSE("GPL");
 * checks are made against other devices (ie. superio) for conflicts.
 * We'll depend on users using the tpctl utility to do that for now
 */
-static DEFINE_MUTEX(mwave_mutex);
 int mwave_debug = 0;
 int mwave_3780i_irq = 0;
 int mwave_3780i_io = 0;
 int mwave_uart_irq = 0;
 int mwave_uart_io = 0;
 module_param(mwave_debug, int, 0);
-module_param_hw(mwave_3780i_irq, int, irq, 0);
-module_param_hw(mwave_3780i_io, int, ioport, 0);
-module_param_hw(mwave_uart_irq, int, irq, 0);
-module_param_hw(mwave_uart_io, int, ioport, 0);
+module_param(mwave_3780i_irq, int, 0);
+module_param(mwave_3780i_io, int, 0);
+module_param(mwave_uart_irq, int, 0);
+module_param(mwave_uart_io, int, 0);
 
 static int mwave_open(struct inode *inode, struct file *file);
 static int mwave_close(struct inode *inode, struct file *file);
-static long mwave_ioctl(struct file *filp, unsigned int iocmd,
-							unsigned long ioarg);
+static int mwave_ioctl(struct inode *inode, struct file *filp,
+                       unsigned int iocmd, unsigned long ioarg);
 
 MWAVE_DEVICE_DATA mwave_s_mdd;
 
@@ -120,16 +116,16 @@ static int mwave_close(struct inode *inode, struct file *file)
 	return retval;
 }
 
-static long mwave_ioctl(struct file *file, unsigned int iocmd,
-							unsigned long ioarg)
+static int mwave_ioctl(struct inode *inode, struct file *file,
+                       unsigned int iocmd, unsigned long ioarg)
 {
 	unsigned int retval = 0;
 	pMWAVE_DEVICE_DATA pDrvData = &mwave_s_mdd;
 	void __user *arg = (void __user *)ioarg;
 
-	PRINTK_4(TRACE_MWAVE,
-		"mwavedd::mwave_ioctl, entry file %p cmd %x arg %x\n",
-		file, iocmd, (int) ioarg);
+	PRINTK_5(TRACE_MWAVE,
+		"mwavedd::mwave_ioctl, entry inode %p file %p cmd %x arg %x\n",
+		 inode,  file, iocmd, (int) ioarg);
 
 	switch (iocmd) {
 
@@ -137,9 +133,7 @@ static long mwave_ioctl(struct file *file, unsigned int iocmd,
 			PRINTK_1(TRACE_MWAVE,
 				"mwavedd::mwave_ioctl, IOCTL_MW_RESET"
 				" calling tp3780I_ResetDSP\n");
-			mutex_lock(&mwave_mutex);
 			retval = tp3780I_ResetDSP(&pDrvData->rBDData);
-			mutex_unlock(&mwave_mutex);
 			PRINTK_2(TRACE_MWAVE,
 				"mwavedd::mwave_ioctl, IOCTL_MW_RESET"
 				" retval %x from tp3780I_ResetDSP\n",
@@ -150,9 +144,7 @@ static long mwave_ioctl(struct file *file, unsigned int iocmd,
 			PRINTK_1(TRACE_MWAVE,
 				"mwavedd::mwave_ioctl, IOCTL_MW_RUN"
 				" calling tp3780I_StartDSP\n");
-			mutex_lock(&mwave_mutex);
 			retval = tp3780I_StartDSP(&pDrvData->rBDData);
-			mutex_unlock(&mwave_mutex);
 			PRINTK_2(TRACE_MWAVE,
 				"mwavedd::mwave_ioctl, IOCTL_MW_RUN"
 				" retval %x from tp3780I_StartDSP\n",
@@ -166,10 +158,8 @@ static long mwave_ioctl(struct file *file, unsigned int iocmd,
 				"mwavedd::mwave_ioctl,"
 				" IOCTL_MW_DSP_ABILITIES calling"
 				" tp3780I_QueryAbilities\n");
-			mutex_lock(&mwave_mutex);
 			retval = tp3780I_QueryAbilities(&pDrvData->rBDData,
 					&rAbilities);
-			mutex_unlock(&mwave_mutex);
 			PRINTK_2(TRACE_MWAVE,
 				"mwavedd::mwave_ioctl, IOCTL_MW_DSP_ABILITIES"
 				" retval %x from tp3780I_QueryAbilities\n",
@@ -200,13 +190,11 @@ static long mwave_ioctl(struct file *file, unsigned int iocmd,
 				"mwavedd::mwave_ioctl IOCTL_MW_READ_DATA,"
 				" size %lx, ioarg %lx pusBuffer %p\n",
 				rReadData.ulDataLength, ioarg, pusBuffer);
-			mutex_lock(&mwave_mutex);
 			retval = tp3780I_ReadWriteDspDStore(&pDrvData->rBDData,
 					iocmd,
 					pusBuffer,
 					rReadData.ulDataLength,
 					rReadData.usDspAddress);
-			mutex_unlock(&mwave_mutex);
 		}
 			break;
 	
@@ -224,12 +212,10 @@ static long mwave_ioctl(struct file *file, unsigned int iocmd,
 				" size %lx, ioarg %lx pusBuffer %p\n",
 				rReadData.ulDataLength / 2, ioarg,
 				pusBuffer);
-			mutex_lock(&mwave_mutex);
 			retval = tp3780I_ReadWriteDspDStore(&pDrvData->rBDData,
 				iocmd, pusBuffer,
 				rReadData.ulDataLength / 2,
 				rReadData.usDspAddress);
-			mutex_unlock(&mwave_mutex);
 		}
 			break;
 	
@@ -247,12 +233,10 @@ static long mwave_ioctl(struct file *file, unsigned int iocmd,
 				" size %lx, ioarg %lx pusBuffer %p\n",
 				rWriteData.ulDataLength, ioarg,
 				pusBuffer);
-			mutex_lock(&mwave_mutex);
 			retval = tp3780I_ReadWriteDspDStore(&pDrvData->rBDData,
 					iocmd, pusBuffer,
 					rWriteData.ulDataLength,
 					rWriteData.usDspAddress);
-			mutex_unlock(&mwave_mutex);
 		}
 			break;
 	
@@ -270,19 +254,23 @@ static long mwave_ioctl(struct file *file, unsigned int iocmd,
 				" size %lx, ioarg %lx pusBuffer %p\n",
 				rWriteData.ulDataLength, ioarg,
 				pusBuffer);
-			mutex_lock(&mwave_mutex);
 			retval = tp3780I_ReadWriteDspIStore(&pDrvData->rBDData,
 					iocmd, pusBuffer,
 					rWriteData.ulDataLength,
 					rWriteData.usDspAddress);
-			mutex_unlock(&mwave_mutex);
 		}
 			break;
 	
 		case IOCTL_MW_REGISTER_IPC: {
 			unsigned int ipcnum = (unsigned int) ioarg;
 	
-			if (ipcnum >= ARRAY_SIZE(pDrvData->IPCs)) {
+			PRINTK_3(TRACE_MWAVE,
+				"mwavedd::mwave_ioctl IOCTL_MW_REGISTER_IPC"
+				" ipcnum %x entry usIntCount %x\n",
+				ipcnum,
+				pDrvData->IPCs[ipcnum].usIntCount);
+	
+			if (ipcnum > ARRAY_SIZE(pDrvData->IPCs)) {
 				PRINTK_ERROR(KERN_ERR_MWAVE
 						"mwavedd::mwave_ioctl:"
 						" IOCTL_MW_REGISTER_IPC:"
@@ -290,18 +278,8 @@ static long mwave_ioctl(struct file *file, unsigned int iocmd,
 						ipcnum);
 				return -EINVAL;
 			}
-			ipcnum = array_index_nospec(ipcnum,
-						    ARRAY_SIZE(pDrvData->IPCs));
-			PRINTK_3(TRACE_MWAVE,
-				"mwavedd::mwave_ioctl IOCTL_MW_REGISTER_IPC"
-				" ipcnum %x entry usIntCount %x\n",
-				ipcnum,
-				pDrvData->IPCs[ipcnum].usIntCount);
-
-			mutex_lock(&mwave_mutex);
-			pDrvData->IPCs[ipcnum].bIsHere = false;
-			pDrvData->IPCs[ipcnum].bIsEnabled = true;
-			mutex_unlock(&mwave_mutex);
+			pDrvData->IPCs[ipcnum].bIsHere = FALSE;
+			pDrvData->IPCs[ipcnum].bIsEnabled = TRUE;
 	
 			PRINTK_2(TRACE_MWAVE,
 				"mwavedd::mwave_ioctl IOCTL_MW_REGISTER_IPC"
@@ -313,23 +291,20 @@ static long mwave_ioctl(struct file *file, unsigned int iocmd,
 		case IOCTL_MW_GET_IPC: {
 			unsigned int ipcnum = (unsigned int) ioarg;
 	
-			if (ipcnum >= ARRAY_SIZE(pDrvData->IPCs)) {
+			PRINTK_3(TRACE_MWAVE,
+				"mwavedd::mwave_ioctl IOCTL_MW_GET_IPC"
+				" ipcnum %x, usIntCount %x\n",
+				ipcnum,
+				pDrvData->IPCs[ipcnum].usIntCount);
+			if (ipcnum > ARRAY_SIZE(pDrvData->IPCs)) {
 				PRINTK_ERROR(KERN_ERR_MWAVE
 						"mwavedd::mwave_ioctl:"
 						" IOCTL_MW_GET_IPC: Error:"
 						" Invalid ipcnum %x\n", ipcnum);
 				return -EINVAL;
 			}
-			ipcnum = array_index_nospec(ipcnum,
-						    ARRAY_SIZE(pDrvData->IPCs));
-			PRINTK_3(TRACE_MWAVE,
-				"mwavedd::mwave_ioctl IOCTL_MW_GET_IPC"
-				" ipcnum %x, usIntCount %x\n",
-				ipcnum,
-				pDrvData->IPCs[ipcnum].usIntCount);
 	
-			mutex_lock(&mwave_mutex);
-			if (pDrvData->IPCs[ipcnum].bIsEnabled == true) {
+			if (pDrvData->IPCs[ipcnum].bIsEnabled == TRUE) {
 				DECLARE_WAITQUEUE(wait, current);
 
 				PRINTK_2(TRACE_MWAVE,
@@ -337,7 +312,7 @@ static long mwave_ioctl(struct file *file, unsigned int iocmd,
 					" ipc %x going to sleep\n",
 					ipcnum);
 				add_wait_queue(&pDrvData->IPCs[ipcnum].ipc_wait_queue, &wait);
-				pDrvData->IPCs[ipcnum].bIsHere = true;
+				pDrvData->IPCs[ipcnum].bIsHere = TRUE;
 				set_current_state(TASK_INTERRUPTIBLE);
 				/* check whether an event was signalled by */
 				/* the interrupt handler while we were gone */
@@ -360,7 +335,7 @@ static long mwave_ioctl(struct file *file, unsigned int iocmd,
 						" application\n",
 						ipcnum);
 				}
-				pDrvData->IPCs[ipcnum].bIsHere = false;
+				pDrvData->IPCs[ipcnum].bIsHere = FALSE;
 				remove_wait_queue(&pDrvData->IPCs[ipcnum].ipc_wait_queue, &wait);
 				set_current_state(TASK_RUNNING);
 				PRINTK_2(TRACE_MWAVE,
@@ -369,7 +344,6 @@ static long mwave_ioctl(struct file *file, unsigned int iocmd,
 					" processing\n",
 					ipcnum);
 			}
-			mutex_unlock(&mwave_mutex);
 		}
 			break;
 	
@@ -380,7 +354,7 @@ static long mwave_ioctl(struct file *file, unsigned int iocmd,
 				"mwavedd::mwave_ioctl IOCTL_MW_UNREGISTER_IPC"
 				" ipcnum %x\n",
 				ipcnum);
-			if (ipcnum >= ARRAY_SIZE(pDrvData->IPCs)) {
+			if (ipcnum > ARRAY_SIZE(pDrvData->IPCs)) {
 				PRINTK_ERROR(KERN_ERR_MWAVE
 						"mwavedd::mwave_ioctl:"
 						" IOCTL_MW_UNREGISTER_IPC:"
@@ -388,21 +362,21 @@ static long mwave_ioctl(struct file *file, unsigned int iocmd,
 						ipcnum);
 				return -EINVAL;
 			}
-			ipcnum = array_index_nospec(ipcnum,
-						    ARRAY_SIZE(pDrvData->IPCs));
-			mutex_lock(&mwave_mutex);
-			if (pDrvData->IPCs[ipcnum].bIsEnabled == true) {
-				pDrvData->IPCs[ipcnum].bIsEnabled = false;
-				if (pDrvData->IPCs[ipcnum].bIsHere == true) {
+			if (pDrvData->IPCs[ipcnum].bIsEnabled == TRUE) {
+				pDrvData->IPCs[ipcnum].bIsEnabled = FALSE;
+				if (pDrvData->IPCs[ipcnum].bIsHere == TRUE) {
 					wake_up_interruptible(&pDrvData->IPCs[ipcnum].ipc_wait_queue);
 				}
 			}
-			mutex_unlock(&mwave_mutex);
 		}
 			break;
 	
 		default:
+			PRINTK_ERROR(KERN_ERR_MWAVE "mwavedd::mwave_ioctl:"
+					" Error: Unrecognized iocmd %x\n",
+					iocmd);
 			return -ENOTTY;
+			break;
 	} /* switch */
 
 	PRINTK_2(TRACE_MWAVE, "mwavedd::mwave_ioctl, exit retval %x\n", retval);
@@ -436,8 +410,8 @@ static ssize_t mwave_write(struct file *file, const char __user *buf,
 
 static int register_serial_portandirq(unsigned int port, int irq)
 {
-	struct uart_8250_port uart;
-	
+	struct serial_struct serial;
+
 	switch ( port ) {
 		case 0x3f8:
 		case 0x2f8:
@@ -468,25 +442,22 @@ static int register_serial_portandirq(unsigned int port, int irq)
 	} /* switch */
 	/* irq is okay */
 
-	memset(&uart, 0, sizeof(uart));
-	
-	uart.port.uartclk =  1843200;
-	uart.port.iobase = port;
-	uart.port.irq = irq;
-	uart.port.iotype = UPIO_PORT;
-	uart.port.flags =  UPF_SHARE_IRQ;
-	return serial8250_register_8250_port(&uart);
+	memset(&serial, 0, sizeof(serial));
+	serial.port = port;
+	serial.irq = irq;
+	serial.flags = ASYNC_SHARE_IRQ;
+
+	return register_serial(&serial);
 }
 
 
-static const struct file_operations mwave_fops = {
+static struct file_operations mwave_fops = {
 	.owner		= THIS_MODULE,
 	.read		= mwave_read,
 	.write		= mwave_write,
-	.unlocked_ioctl	= mwave_ioctl,
+	.ioctl		= mwave_ioctl,
 	.open		= mwave_open,
-	.release	= mwave_close,
-	.llseek		= default_llseek,
+	.release	= mwave_close
 };
 
 
@@ -501,7 +472,7 @@ struct device mwave_device;
 
 /* Prevent code redundancy, create a macro for mwave_show_* functions. */
 #define mwave_show_function(attr_name, format_string, field)		\
-static ssize_t mwave_show_##attr_name(struct device *dev, struct device_attribute *attr, char *buf)	\
+static ssize_t mwave_show_##attr_name(struct device *dev, char *buf)	\
 {									\
 	DSP_3780I_CONFIG_SETTINGS *pSettings =				\
 		&mwave_s_mdd.rBDData.rDspSettings;			\
@@ -547,12 +518,12 @@ static void mwave_exit(void)
 
 	if (pDrvData->device_registered) {
 		device_unregister(&mwave_device);
-		pDrvData->device_registered = false;
+		pDrvData->device_registered = FALSE;
 	}
 #endif
 
 	if ( pDrvData->sLine >= 0 ) {
-		serial8250_unregister_port(pDrvData->sLine);
+		unregister_serial(pDrvData->sLine);
 	}
 	if (pDrvData->bMwaveDevRegistered) {
 		misc_deregister(&mwave_misc_dev);
@@ -582,16 +553,16 @@ static int __init mwave_init(void)
 
 	memset(&mwave_s_mdd, 0, sizeof(MWAVE_DEVICE_DATA));
 
-	pDrvData->bBDInitialized = false;
-	pDrvData->bResourcesClaimed = false;
-	pDrvData->bDSPEnabled = false;
-	pDrvData->bDSPReset = false;
-	pDrvData->bMwaveDevRegistered = false;
+	pDrvData->bBDInitialized = FALSE;
+	pDrvData->bResourcesClaimed = FALSE;
+	pDrvData->bDSPEnabled = FALSE;
+	pDrvData->bDSPReset = FALSE;
+	pDrvData->bMwaveDevRegistered = FALSE;
 	pDrvData->sLine = -1;
 
 	for (i = 0; i < ARRAY_SIZE(pDrvData->IPCs); i++) {
-		pDrvData->IPCs[i].bIsEnabled = false;
-		pDrvData->IPCs[i].bIsHere = false;
+		pDrvData->IPCs[i].bIsEnabled = FALSE;
+		pDrvData->IPCs[i].bIsHere = FALSE;
 		pDrvData->IPCs[i].usIntCount = 0;	/* no ints received yet */
 		init_waitqueue_head(&pDrvData->IPCs[i].ipc_wait_queue);
 	}
@@ -607,7 +578,7 @@ static int __init mwave_init(void)
 				" Failed to initialize board data\n");
 		goto cleanup_error;
 	}
-	pDrvData->bBDInitialized = true;
+	pDrvData->bBDInitialized = TRUE;
 
 	retval = tp3780I_CalcResources(&pDrvData->rBDData);
 	PRINTK_2(TRACE_MWAVE,
@@ -632,7 +603,7 @@ static int __init mwave_init(void)
 				" Failed to claim resources\n");
 		goto cleanup_error;
 	}
-	pDrvData->bResourcesClaimed = true;
+	pDrvData->bResourcesClaimed = TRUE;
 
 	retval = tp3780I_EnableDSP(&pDrvData->rBDData);
 	PRINTK_2(TRACE_MWAVE,
@@ -645,7 +616,7 @@ static int __init mwave_init(void)
 				" Failed to enable DSP\n");
 		goto cleanup_error;
 	}
-	pDrvData->bDSPEnabled = true;
+	pDrvData->bDSPEnabled = TRUE;
 
 	if (misc_register(&mwave_misc_dev) < 0) {
 		PRINTK_ERROR(KERN_ERR_MWAVE
@@ -653,7 +624,7 @@ static int __init mwave_init(void)
 				" Failed to register misc device\n");
 		goto cleanup_error;
 	}
-	pDrvData->bMwaveDevRegistered = true;
+	pDrvData->bMwaveDevRegistered = TRUE;
 
 	pDrvData->sLine = register_serial_portandirq(
 		pDrvData->rBDData.rDspSettings.usUartBaseIO,
@@ -670,11 +641,11 @@ static int __init mwave_init(void)
 #if 0
 	/* sysfs */
 	memset(&mwave_device, 0, sizeof (struct device));
-	dev_set_name(&mwave_device, "mwave");
+	snprintf(mwave_device.bus_id, BUS_ID_SIZE, "mwave");
 
 	if (device_register(&mwave_device))
 		goto cleanup_error;
-	pDrvData->device_registered = true;
+	pDrvData->device_registered = TRUE;
 	for (i = 0; i < ARRAY_SIZE(mwave_dev_attrs); i++) {
 		if(device_create_file(&mwave_device, mwave_dev_attrs[i])) {
 			PRINTK_ERROR(KERN_ERR_MWAVE

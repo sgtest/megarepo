@@ -1,672 +1,652 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
-/* AFS Cache Manager Service
+/* cmservice.c: AFS Cache Manager Service
  *
  * Copyright (C) 2002 Red Hat, Inc. All Rights Reserved.
  * Written by David Howells (dhowells@redhat.com)
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version
+ * 2 of the License, or (at your option) any later version.
  */
 
 #include <linux/module.h>
 #include <linux/init.h>
-#include <linux/slab.h>
 #include <linux/sched.h>
-#include <linux/ip.h>
+#include <linux/completion.h>
+#include "server.h"
+#include "cell.h"
+#include "transport.h"
+#include <rxrpc/rxrpc.h>
+#include <rxrpc/transport.h>
+#include <rxrpc/connection.h>
+#include <rxrpc/call.h>
+#include "cmservice.h"
 #include "internal.h"
-#include "afs_cm.h"
-#include "protocol_yfs.h"
 
-static int afs_deliver_cb_init_call_back_state(struct afs_call *);
-static int afs_deliver_cb_init_call_back_state3(struct afs_call *);
-static int afs_deliver_cb_probe(struct afs_call *);
-static int afs_deliver_cb_callback(struct afs_call *);
-static int afs_deliver_cb_probe_uuid(struct afs_call *);
-static int afs_deliver_cb_tell_me_about_yourself(struct afs_call *);
-static void afs_cm_destructor(struct afs_call *);
-static void SRXAFSCB_CallBack(struct work_struct *);
-static void SRXAFSCB_InitCallBackState(struct work_struct *);
-static void SRXAFSCB_Probe(struct work_struct *);
-static void SRXAFSCB_ProbeUuid(struct work_struct *);
-static void SRXAFSCB_TellMeAboutYourself(struct work_struct *);
+static unsigned afscm_usage;		/* AFS cache manager usage count */
+static struct rw_semaphore afscm_sem;	/* AFS cache manager start/stop semaphore */
 
-static int afs_deliver_yfs_cb_callback(struct afs_call *);
+static int afscm_new_call(struct rxrpc_call *call);
+static void afscm_attention(struct rxrpc_call *call);
+static void afscm_error(struct rxrpc_call *call);
+static void afscm_aemap(struct rxrpc_call *call);
 
-/*
- * CB.CallBack operation type
- */
-static const struct afs_call_type afs_SRXCBCallBack = {
-	.name		= "CB.CallBack",
-	.deliver	= afs_deliver_cb_callback,
-	.destructor	= afs_cm_destructor,
-	.work		= SRXAFSCB_CallBack,
+static void _SRXAFSCM_CallBack(struct rxrpc_call *call);
+static void _SRXAFSCM_InitCallBackState(struct rxrpc_call *call);
+static void _SRXAFSCM_Probe(struct rxrpc_call *call);
+
+typedef void (*_SRXAFSCM_xxxx_t)(struct rxrpc_call *call);
+
+static const struct rxrpc_operation AFSCM_ops[] = {
+	{
+		.id	= 204,
+		.asize	= RXRPC_APP_MARK_EOF,
+		.name	= "CallBack",
+		.user	= _SRXAFSCM_CallBack,
+	},
+	{
+		.id	= 205,
+		.asize	= RXRPC_APP_MARK_EOF,
+		.name	= "InitCallBackState",
+		.user	= _SRXAFSCM_InitCallBackState,
+	},
+	{
+		.id	= 206,
+		.asize	= RXRPC_APP_MARK_EOF,
+		.name	= "Probe",
+		.user	= _SRXAFSCM_Probe,
+	},
+#if 0
+	{
+		.id	= 207,
+		.asize	= RXRPC_APP_MARK_EOF,
+		.name	= "GetLock",
+		.user	= _SRXAFSCM_GetLock,
+	},
+	{
+		.id	= 208,
+		.asize	= RXRPC_APP_MARK_EOF,
+		.name	= "GetCE",
+		.user	= _SRXAFSCM_GetCE,
+	},
+	{
+		.id	= 209,
+		.asize	= RXRPC_APP_MARK_EOF,
+		.name	= "GetXStatsVersion",
+		.user	= _SRXAFSCM_GetXStatsVersion,
+	},
+	{
+		.id	= 210,
+		.asize	= RXRPC_APP_MARK_EOF,
+		.name	= "GetXStats",
+		.user	= _SRXAFSCM_GetXStats,
+	}
+#endif
 };
 
-/*
- * CB.InitCallBackState operation type
- */
-static const struct afs_call_type afs_SRXCBInitCallBackState = {
-	.name		= "CB.InitCallBackState",
-	.deliver	= afs_deliver_cb_init_call_back_state,
-	.destructor	= afs_cm_destructor,
-	.work		= SRXAFSCB_InitCallBackState,
+static struct rxrpc_service AFSCM_service = {
+	.name		= "AFS/CM",
+	.owner		= THIS_MODULE,
+	.link		= LIST_HEAD_INIT(AFSCM_service.link),
+	.new_call	= afscm_new_call,
+	.service_id	= 1,
+	.attn_func	= afscm_attention,
+	.error_func	= afscm_error,
+	.aemap_func	= afscm_aemap,
+	.ops_begin	= &AFSCM_ops[0],
+	.ops_end	= &AFSCM_ops[sizeof(AFSCM_ops) / sizeof(AFSCM_ops[0])],
 };
 
-/*
- * CB.InitCallBackState3 operation type
- */
-static const struct afs_call_type afs_SRXCBInitCallBackState3 = {
-	.name		= "CB.InitCallBackState3",
-	.deliver	= afs_deliver_cb_init_call_back_state3,
-	.destructor	= afs_cm_destructor,
-	.work		= SRXAFSCB_InitCallBackState,
-};
+static DECLARE_COMPLETION(kafscmd_alive);
+static DECLARE_COMPLETION(kafscmd_dead);
+static DECLARE_WAIT_QUEUE_HEAD(kafscmd_sleepq);
+static LIST_HEAD(kafscmd_attention_list);
+static LIST_HEAD(afscm_calls);
+static DEFINE_SPINLOCK(afscm_calls_lock);
+static DEFINE_SPINLOCK(kafscmd_attention_lock);
+static int kafscmd_die;
 
+/*****************************************************************************/
 /*
- * CB.Probe operation type
+ * AFS Cache Manager kernel thread
  */
-static const struct afs_call_type afs_SRXCBProbe = {
-	.name		= "CB.Probe",
-	.deliver	= afs_deliver_cb_probe,
-	.destructor	= afs_cm_destructor,
-	.work		= SRXAFSCB_Probe,
-};
-
-/*
- * CB.ProbeUuid operation type
- */
-static const struct afs_call_type afs_SRXCBProbeUuid = {
-	.name		= "CB.ProbeUuid",
-	.deliver	= afs_deliver_cb_probe_uuid,
-	.destructor	= afs_cm_destructor,
-	.work		= SRXAFSCB_ProbeUuid,
-};
-
-/*
- * CB.TellMeAboutYourself operation type
- */
-static const struct afs_call_type afs_SRXCBTellMeAboutYourself = {
-	.name		= "CB.TellMeAboutYourself",
-	.deliver	= afs_deliver_cb_tell_me_about_yourself,
-	.destructor	= afs_cm_destructor,
-	.work		= SRXAFSCB_TellMeAboutYourself,
-};
-
-/*
- * YFS CB.CallBack operation type
- */
-static const struct afs_call_type afs_SRXYFSCB_CallBack = {
-	.name		= "YFSCB.CallBack",
-	.deliver	= afs_deliver_yfs_cb_callback,
-	.destructor	= afs_cm_destructor,
-	.work		= SRXAFSCB_CallBack,
-};
-
-/*
- * route an incoming cache manager call
- * - return T if supported, F if not
- */
-bool afs_cm_incoming_call(struct afs_call *call)
+static int kafscmd(void *arg)
 {
-	_enter("{%u, CB.OP %u}", call->service_id, call->operation_ID);
+	DECLARE_WAITQUEUE(myself, current);
 
-	switch (call->operation_ID) {
-	case CBCallBack:
-		call->type = &afs_SRXCBCallBack;
-		return true;
-	case CBInitCallBackState:
-		call->type = &afs_SRXCBInitCallBackState;
-		return true;
-	case CBInitCallBackState3:
-		call->type = &afs_SRXCBInitCallBackState3;
-		return true;
-	case CBProbe:
-		call->type = &afs_SRXCBProbe;
-		return true;
-	case CBProbeUuid:
-		call->type = &afs_SRXCBProbeUuid;
-		return true;
-	case CBTellMeAboutYourself:
-		call->type = &afs_SRXCBTellMeAboutYourself;
-		return true;
-	case YFSCBCallBack:
-		if (call->service_id != YFS_CM_SERVICE)
-			return false;
-		call->type = &afs_SRXYFSCB_CallBack;
-		return true;
+	struct rxrpc_call *call;
+	_SRXAFSCM_xxxx_t func;
+	int die;
+
+	printk("kAFS: Started kafscmd %d\n", current->pid);
+
+	daemonize("kafscmd");
+
+	complete(&kafscmd_alive);
+
+	/* loop around looking for things to attend to */
+	do {
+		if (list_empty(&kafscmd_attention_list)) {
+			set_current_state(TASK_INTERRUPTIBLE);
+			add_wait_queue(&kafscmd_sleepq, &myself);
+
+			for (;;) {
+				set_current_state(TASK_INTERRUPTIBLE);
+				if (!list_empty(&kafscmd_attention_list) ||
+				    signal_pending(current) ||
+				    kafscmd_die)
+					break;
+
+				schedule();
+			}
+
+			remove_wait_queue(&kafscmd_sleepq, &myself);
+			set_current_state(TASK_RUNNING);
+		}
+
+		die = kafscmd_die;
+
+		/* dequeue the next call requiring attention */
+		call = NULL;
+		spin_lock(&kafscmd_attention_lock);
+
+		if (!list_empty(&kafscmd_attention_list)) {
+			call = list_entry(kafscmd_attention_list.next,
+					  struct rxrpc_call,
+					  app_attn_link);
+			list_del_init(&call->app_attn_link);
+			die = 0;
+		}
+
+		spin_unlock(&kafscmd_attention_lock);
+
+		if (call) {
+			/* act upon it */
+			_debug("@@@ Begin Attend Call %p", call);
+
+			func = call->app_user;
+			if (func)
+				func(call);
+
+			rxrpc_put_call(call);
+
+			_debug("@@@ End Attend Call %p", call);
+		}
+
+	} while(!die);
+
+	/* and that's all */
+	complete_and_exit(&kafscmd_dead, 0);
+
+} /* end kafscmd() */
+
+/*****************************************************************************/
+/*
+ * handle a call coming in to the cache manager
+ * - if I want to keep the call, I must increment its usage count
+ * - the return value will be negated and passed back in an abort packet if
+ *   non-zero
+ * - serialised by virtue of there only being one krxiod
+ */
+static int afscm_new_call(struct rxrpc_call *call)
+{
+	_enter("%p{cid=%u u=%d}",
+	       call, ntohl(call->call_id), atomic_read(&call->usage));
+
+	rxrpc_get_call(call);
+
+	/* add to my current call list */
+	spin_lock(&afscm_calls_lock);
+	list_add(&call->app_link,&afscm_calls);
+	spin_unlock(&afscm_calls_lock);
+
+	_leave(" = 0");
+	return 0;
+
+} /* end afscm_new_call() */
+
+/*****************************************************************************/
+/*
+ * queue on the kafscmd queue for attention
+ */
+static void afscm_attention(struct rxrpc_call *call)
+{
+	_enter("%p{cid=%u u=%d}",
+	       call, ntohl(call->call_id), atomic_read(&call->usage));
+
+	spin_lock(&kafscmd_attention_lock);
+
+	if (list_empty(&call->app_attn_link)) {
+		list_add_tail(&call->app_attn_link, &kafscmd_attention_list);
+		rxrpc_get_call(call);
+	}
+
+	spin_unlock(&kafscmd_attention_lock);
+
+	wake_up(&kafscmd_sleepq);
+
+	_leave(" {u=%d}", atomic_read(&call->usage));
+} /* end afscm_attention() */
+
+/*****************************************************************************/
+/*
+ * handle my call being aborted
+ * - clean up, dequeue and put my ref to the call
+ */
+static void afscm_error(struct rxrpc_call *call)
+{
+	int removed;
+
+	_enter("%p{est=%s ac=%u er=%d}",
+	       call,
+	       rxrpc_call_error_states[call->app_err_state],
+	       call->app_abort_code,
+	       call->app_errno);
+
+	spin_lock(&kafscmd_attention_lock);
+
+	if (list_empty(&call->app_attn_link)) {
+		list_add_tail(&call->app_attn_link, &kafscmd_attention_list);
+		rxrpc_get_call(call);
+	}
+
+	spin_unlock(&kafscmd_attention_lock);
+
+	removed = 0;
+	spin_lock(&afscm_calls_lock);
+	if (!list_empty(&call->app_link)) {
+		list_del_init(&call->app_link);
+		removed = 1;
+	}
+	spin_unlock(&afscm_calls_lock);
+
+	if (removed)
+		rxrpc_put_call(call);
+
+	wake_up(&kafscmd_sleepq);
+
+	_leave("");
+} /* end afscm_error() */
+
+/*****************************************************************************/
+/*
+ * map afs abort codes to/from Linux error codes
+ * - called with call->lock held
+ */
+static void afscm_aemap(struct rxrpc_call *call)
+{
+	switch (call->app_err_state) {
+	case RXRPC_ESTATE_LOCAL_ABORT:
+		call->app_abort_code = -call->app_errno;
+		break;
+	case RXRPC_ESTATE_PEER_ABORT:
+		call->app_errno = -ECONNABORTED;
+		break;
 	default:
-		return false;
+		break;
 	}
-}
+} /* end afscm_aemap() */
 
+/*****************************************************************************/
 /*
- * Find the server record by peer address and record a probe to the cache
- * manager from a server.
+ * start the cache manager service if not already started
  */
-static int afs_find_cm_server_by_peer(struct afs_call *call)
+int afscm_start(void)
 {
-	struct sockaddr_rxrpc srx;
-	struct afs_server *server;
+	int ret;
 
-	rxrpc_kernel_get_peer(call->net->socket, call->rxcall, &srx);
+	down_write(&afscm_sem);
+	if (!afscm_usage) {
+		ret = kernel_thread(kafscmd, NULL, 0);
+		if (ret < 0)
+			goto out;
 
-	server = afs_find_server(call->net, &srx);
-	if (!server) {
-		trace_afs_cm_no_server(call, &srx);
-		return 0;
+		wait_for_completion(&kafscmd_alive);
+
+		ret = rxrpc_add_service(afs_transport, &AFSCM_service);
+		if (ret < 0)
+			goto kill;
+
+		afs_kafstimod_add_timer(&afs_mntpt_expiry_timer,
+					afs_mntpt_expiry_timeout * HZ);
 	}
 
-	call->server = server;
+	afscm_usage++;
+	up_write(&afscm_sem);
+
 	return 0;
-}
 
+ kill:
+	kafscmd_die = 1;
+	wake_up(&kafscmd_sleepq);
+	wait_for_completion(&kafscmd_dead);
+
+ out:
+	up_write(&afscm_sem);
+	return ret;
+
+} /* end afscm_start() */
+
+/*****************************************************************************/
 /*
- * Find the server record by server UUID and record a probe to the cache
- * manager from a server.
+ * stop the cache manager service
  */
-static int afs_find_cm_server_by_uuid(struct afs_call *call,
-				      struct afs_uuid *uuid)
+void afscm_stop(void)
+{
+	struct rxrpc_call *call;
+
+	down_write(&afscm_sem);
+
+	BUG_ON(afscm_usage == 0);
+	afscm_usage--;
+
+	if (afscm_usage == 0) {
+		/* don't want more incoming calls */
+		rxrpc_del_service(afs_transport, &AFSCM_service);
+
+		/* abort any calls I've still got open (the afscm_error() will
+		 * dequeue them) */
+		spin_lock(&afscm_calls_lock);
+		while (!list_empty(&afscm_calls)) {
+			call = list_entry(afscm_calls.next,
+					  struct rxrpc_call,
+					  app_link);
+
+			list_del_init(&call->app_link);
+			rxrpc_get_call(call);
+			spin_unlock(&afscm_calls_lock);
+
+			rxrpc_call_abort(call, -ESRCH); /* abort, dequeue and
+							 * put */
+
+			_debug("nuking active call %08x.%d",
+			       ntohl(call->conn->conn_id),
+			       ntohl(call->call_id));
+			rxrpc_put_call(call);
+			rxrpc_put_call(call);
+
+			spin_lock(&afscm_calls_lock);
+		}
+		spin_unlock(&afscm_calls_lock);
+
+		/* get rid of my daemon */
+		kafscmd_die = 1;
+		wake_up(&kafscmd_sleepq);
+		wait_for_completion(&kafscmd_dead);
+
+		/* dispose of any calls waiting for attention */
+		spin_lock(&kafscmd_attention_lock);
+		while (!list_empty(&kafscmd_attention_list)) {
+			call = list_entry(kafscmd_attention_list.next,
+					  struct rxrpc_call,
+					  app_attn_link);
+
+			list_del_init(&call->app_attn_link);
+			spin_unlock(&kafscmd_attention_lock);
+
+			rxrpc_put_call(call);
+
+			spin_lock(&kafscmd_attention_lock);
+		}
+		spin_unlock(&kafscmd_attention_lock);
+
+		afs_kafstimod_del_timer(&afs_mntpt_expiry_timer);
+	}
+
+	up_write(&afscm_sem);
+
+} /* end afscm_stop() */
+
+/*****************************************************************************/
+/*
+ * handle the fileserver breaking a set of callbacks
+ */
+static void _SRXAFSCM_CallBack(struct rxrpc_call *call)
 {
 	struct afs_server *server;
+	size_t count, qty, tmp;
+	int ret = 0, removed;
 
-	rcu_read_lock();
-	server = afs_find_server_by_uuid(call->net, call->request);
-	rcu_read_unlock();
-	if (!server) {
-		trace_afs_cm_no_server_u(call, call->request);
-		return 0;
-	}
+	_enter("%p{acs=%s}", call, rxrpc_call_states[call->app_call_state]);
 
-	call->server = server;
-	return 0;
-}
+	server = afs_server_get_from_peer(call->conn->peer);
 
-/*
- * Clean up a cache manager call.
- */
-static void afs_cm_destructor(struct afs_call *call)
-{
-	kfree(call->buffer);
-	call->buffer = NULL;
-}
+	switch (call->app_call_state) {
+		/* we've received the last packet
+		 * - drain all the data from the call and send the reply
+		 */
+	case RXRPC_CSTATE_SRVR_GOT_ARGS:
+		ret = -EBADMSG;
+		qty = call->app_ready_qty;
+		if (qty < 8 || qty > 50 * (6 * 4) + 8)
+			break;
 
-/*
- * Abort a service call from within an action function.
- */
-static void afs_abort_service_call(struct afs_call *call, u32 abort_code, int error,
-				   const char *why)
-{
-	rxrpc_kernel_abort_call(call->net->socket, call->rxcall,
-				abort_code, error, why);
-	afs_set_call_complete(call, error, 0);
-}
+		{
+			struct afs_callback *cb, *pcb;
+			int loop;
+			__be32 *fp, *bp;
 
-/*
- * The server supplied a list of callbacks that it wanted to break.
- */
-static void SRXAFSCB_CallBack(struct work_struct *work)
-{
-	struct afs_call *call = container_of(work, struct afs_call, work);
+			fp = rxrpc_call_alloc_scratch(call, qty);
 
-	_enter("");
+			/* drag the entire argument block out to the scratch
+			 * space */
+			ret = rxrpc_call_read_data(call, fp, qty, 0);
+			if (ret < 0)
+				break;
 
-	/* We need to break the callbacks before sending the reply as the
-	 * server holds up change visibility till it receives our reply so as
-	 * to maintain cache coherency.
-	 */
-	if (call->server) {
-		trace_afs_server(call->server,
-				 atomic_read(&call->server->ref),
-				 atomic_read(&call->server->active),
-				 afs_server_trace_callback);
-		afs_break_callbacks(call->server, call->count, call->request);
-	}
+			/* and unmarshall the parameter block */
+			ret = -EBADMSG;
+			count = ntohl(*fp++);
+			if (count>AFSCBMAX ||
+			    (count * (3 * 4) + 8 != qty &&
+			     count * (6 * 4) + 8 != qty))
+				break;
 
-	afs_send_empty_reply(call);
-	afs_put_call(call);
-	_leave("");
-}
+			bp = fp + count*3;
+			tmp = ntohl(*bp++);
+			if (tmp > 0 && tmp != count)
+				break;
+			if (tmp == 0)
+				bp = NULL;
 
-/*
- * deliver request data to a CB.CallBack call
- */
-static int afs_deliver_cb_callback(struct afs_call *call)
-{
-	struct afs_callback_break *cb;
-	__be32 *bp;
-	int ret, loop;
+			pcb = cb = rxrpc_call_alloc_scratch_s(
+				call, struct afs_callback);
 
-	_enter("{%u}", call->unmarshall);
+			for (loop = count - 1; loop >= 0; loop--) {
+				pcb->fid.vid	= ntohl(*fp++);
+				pcb->fid.vnode	= ntohl(*fp++);
+				pcb->fid.unique	= ntohl(*fp++);
+				if (bp) {
+					pcb->version	= ntohl(*bp++);
+					pcb->expiry	= ntohl(*bp++);
+					pcb->type	= ntohl(*bp++);
+				}
+				else {
+					pcb->version	= 0;
+					pcb->expiry	= 0;
+					pcb->type	= AFSCM_CB_UNTYPED;
+				}
+				pcb++;
+			}
 
-	switch (call->unmarshall) {
-	case 0:
-		afs_extract_to_tmp(call);
-		call->unmarshall++;
-
-		/* extract the FID array and its count in two steps */
-		fallthrough;
-	case 1:
-		_debug("extract FID count");
-		ret = afs_extract_data(call, true);
-		if (ret < 0)
-			return ret;
-
-		call->count = ntohl(call->tmp);
-		_debug("FID count: %u", call->count);
-		if (call->count > AFSCBMAX)
-			return afs_protocol_error(call, afs_eproto_cb_fid_count);
-
-		call->buffer = kmalloc(array3_size(call->count, 3, 4),
-				       GFP_KERNEL);
-		if (!call->buffer)
-			return -ENOMEM;
-		afs_extract_to_buf(call, call->count * 3 * 4);
-		call->unmarshall++;
-
-		fallthrough;
-	case 2:
-		_debug("extract FID array");
-		ret = afs_extract_data(call, true);
-		if (ret < 0)
-			return ret;
-
-		_debug("unmarshall FID array");
-		call->request = kcalloc(call->count,
-					sizeof(struct afs_callback_break),
-					GFP_KERNEL);
-		if (!call->request)
-			return -ENOMEM;
-
-		cb = call->request;
-		bp = call->buffer;
-		for (loop = call->count; loop > 0; loop--, cb++) {
-			cb->fid.vid	= ntohl(*bp++);
-			cb->fid.vnode	= ntohl(*bp++);
-			cb->fid.unique	= ntohl(*bp++);
+			/* invoke the actual service routine */
+			ret = SRXAFSCM_CallBack(server, count, cb);
+			if (ret < 0)
+				break;
 		}
 
-		afs_extract_to_tmp(call);
-		call->unmarshall++;
-
-		/* extract the callback array and its count in two steps */
-		fallthrough;
-	case 3:
-		_debug("extract CB count");
-		ret = afs_extract_data(call, true);
+		/* send the reply */
+		ret = rxrpc_call_write_data(call, 0, NULL, RXRPC_LAST_PACKET,
+					    GFP_KERNEL, 0, &count);
 		if (ret < 0)
-			return ret;
+			break;
+		break;
 
-		call->count2 = ntohl(call->tmp);
-		_debug("CB count: %u", call->count2);
-		if (call->count2 != call->count && call->count2 != 0)
-			return afs_protocol_error(call, afs_eproto_cb_count);
-		call->iter = &call->def_iter;
-		iov_iter_discard(&call->def_iter, READ, call->count2 * 3 * 4);
-		call->unmarshall++;
+		/* operation complete */
+	case RXRPC_CSTATE_COMPLETE:
+		call->app_user = NULL;
+		removed = 0;
+		spin_lock(&afscm_calls_lock);
+		if (!list_empty(&call->app_link)) {
+			list_del_init(&call->app_link);
+			removed = 1;
+		}
+		spin_unlock(&afscm_calls_lock);
 
-		fallthrough;
-	case 4:
-		_debug("extract discard %zu/%u",
-		       iov_iter_count(call->iter), call->count2 * 3 * 4);
+		if (removed)
+			rxrpc_put_call(call);
+		break;
 
-		ret = afs_extract_data(call, false);
-		if (ret < 0)
-			return ret;
+		/* operation terminated on error */
+	case RXRPC_CSTATE_ERROR:
+		call->app_user = NULL;
+		break;
 
-		call->unmarshall++;
-		fallthrough;
-
-	case 5:
+	default:
 		break;
 	}
 
-	if (!afs_check_call_state(call, AFS_CALL_SV_REPLYING))
-		return afs_io_error(call, afs_io_error_cm_reply);
-
-	/* we'll need the file server record as that tells us which set of
-	 * vnodes to operate upon */
-	return afs_find_cm_server_by_peer(call);
-}
-
-/*
- * allow the fileserver to request callback state (re-)initialisation
- */
-static void SRXAFSCB_InitCallBackState(struct work_struct *work)
-{
-	struct afs_call *call = container_of(work, struct afs_call, work);
-
-	_enter("{%p}", call->server);
-
-	if (call->server)
-		afs_init_callback_state(call->server);
-	afs_send_empty_reply(call);
-	afs_put_call(call);
-	_leave("");
-}
-
-/*
- * deliver request data to a CB.InitCallBackState call
- */
-static int afs_deliver_cb_init_call_back_state(struct afs_call *call)
-{
-	int ret;
-
-	_enter("");
-
-	afs_extract_discard(call, 0);
-	ret = afs_extract_data(call, false);
 	if (ret < 0)
-		return ret;
+		rxrpc_call_abort(call, ret);
 
-	/* we'll need the file server record as that tells us which set of
-	 * vnodes to operate upon */
-	return afs_find_cm_server_by_peer(call);
-}
+	afs_put_server(server);
 
+	_leave(" = %d", ret);
+
+} /* end _SRXAFSCM_CallBack() */
+
+/*****************************************************************************/
 /*
- * deliver request data to a CB.InitCallBackState3 call
+ * handle the fileserver asking us to initialise our callback state
  */
-static int afs_deliver_cb_init_call_back_state3(struct afs_call *call)
+static void _SRXAFSCM_InitCallBackState(struct rxrpc_call *call)
 {
-	struct afs_uuid *r;
-	unsigned loop;
-	__be32 *b;
-	int ret;
+	struct afs_server *server;
+	size_t count;
+	int ret = 0, removed;
 
-	_enter("");
+	_enter("%p{acs=%s}", call, rxrpc_call_states[call->app_call_state]);
 
-	_enter("{%u}", call->unmarshall);
+	server = afs_server_get_from_peer(call->conn->peer);
 
-	switch (call->unmarshall) {
-	case 0:
-		call->buffer = kmalloc_array(11, sizeof(__be32), GFP_KERNEL);
-		if (!call->buffer)
-			return -ENOMEM;
-		afs_extract_to_buf(call, 11 * sizeof(__be32));
-		call->unmarshall++;
-
-		fallthrough;
-	case 1:
-		_debug("extract UUID");
-		ret = afs_extract_data(call, false);
-		switch (ret) {
-		case 0:		break;
-		case -EAGAIN:	return 0;
-		default:	return ret;
-		}
-
-		_debug("unmarshall UUID");
-		call->request = kmalloc(sizeof(struct afs_uuid), GFP_KERNEL);
-		if (!call->request)
-			return -ENOMEM;
-
-		b = call->buffer;
-		r = call->request;
-		r->time_low			= b[0];
-		r->time_mid			= htons(ntohl(b[1]));
-		r->time_hi_and_version		= htons(ntohl(b[2]));
-		r->clock_seq_hi_and_reserved 	= ntohl(b[3]);
-		r->clock_seq_low		= ntohl(b[4]);
-
-		for (loop = 0; loop < 6; loop++)
-			r->node[loop] = ntohl(b[loop + 5]);
-
-		call->unmarshall++;
-		fallthrough;
-
-	case 2:
+	switch (call->app_call_state) {
+		/* we've received the last packet - drain all the data from the
+		 * call */
+	case RXRPC_CSTATE_SRVR_GOT_ARGS:
+		/* shouldn't be any args */
+		ret = -EBADMSG;
 		break;
-	}
 
-	if (!afs_check_call_state(call, AFS_CALL_SV_REPLYING))
-		return afs_io_error(call, afs_io_error_cm_reply);
-
-	/* we'll need the file server record as that tells us which set of
-	 * vnodes to operate upon */
-	return afs_find_cm_server_by_uuid(call, call->request);
-}
-
-/*
- * allow the fileserver to see if the cache manager is still alive
- */
-static void SRXAFSCB_Probe(struct work_struct *work)
-{
-	struct afs_call *call = container_of(work, struct afs_call, work);
-
-	_enter("");
-	afs_send_empty_reply(call);
-	afs_put_call(call);
-	_leave("");
-}
-
-/*
- * deliver request data to a CB.Probe call
- */
-static int afs_deliver_cb_probe(struct afs_call *call)
-{
-	int ret;
-
-	_enter("");
-
-	afs_extract_discard(call, 0);
-	ret = afs_extract_data(call, false);
-	if (ret < 0)
-		return ret;
-
-	if (!afs_check_call_state(call, AFS_CALL_SV_REPLYING))
-		return afs_io_error(call, afs_io_error_cm_reply);
-	return afs_find_cm_server_by_peer(call);
-}
-
-/*
- * Allow the fileserver to quickly find out if the cache manager has been
- * rebooted.
- */
-static void SRXAFSCB_ProbeUuid(struct work_struct *work)
-{
-	struct afs_call *call = container_of(work, struct afs_call, work);
-	struct afs_uuid *r = call->request;
-
-	_enter("");
-
-	if (memcmp(r, &call->net->uuid, sizeof(call->net->uuid)) == 0)
-		afs_send_empty_reply(call);
-	else
-		afs_abort_service_call(call, 1, 1, "K-1");
-
-	afs_put_call(call);
-	_leave("");
-}
-
-/*
- * deliver request data to a CB.ProbeUuid call
- */
-static int afs_deliver_cb_probe_uuid(struct afs_call *call)
-{
-	struct afs_uuid *r;
-	unsigned loop;
-	__be32 *b;
-	int ret;
-
-	_enter("{%u}", call->unmarshall);
-
-	switch (call->unmarshall) {
-	case 0:
-		call->buffer = kmalloc_array(11, sizeof(__be32), GFP_KERNEL);
-		if (!call->buffer)
-			return -ENOMEM;
-		afs_extract_to_buf(call, 11 * sizeof(__be32));
-		call->unmarshall++;
-
-		fallthrough;
-	case 1:
-		_debug("extract UUID");
-		ret = afs_extract_data(call, false);
-		switch (ret) {
-		case 0:		break;
-		case -EAGAIN:	return 0;
-		default:	return ret;
-		}
-
-		_debug("unmarshall UUID");
-		call->request = kmalloc(sizeof(struct afs_uuid), GFP_KERNEL);
-		if (!call->request)
-			return -ENOMEM;
-
-		b = call->buffer;
-		r = call->request;
-		r->time_low			= b[0];
-		r->time_mid			= htons(ntohl(b[1]));
-		r->time_hi_and_version		= htons(ntohl(b[2]));
-		r->clock_seq_hi_and_reserved 	= ntohl(b[3]);
-		r->clock_seq_low		= ntohl(b[4]);
-
-		for (loop = 0; loop < 6; loop++)
-			r->node[loop] = ntohl(b[loop + 5]);
-
-		call->unmarshall++;
-		fallthrough;
-
-	case 2:
-		break;
-	}
-
-	if (!afs_check_call_state(call, AFS_CALL_SV_REPLYING))
-		return afs_io_error(call, afs_io_error_cm_reply);
-	return afs_find_cm_server_by_peer(call);
-}
-
-/*
- * allow the fileserver to ask about the cache manager's capabilities
- */
-static void SRXAFSCB_TellMeAboutYourself(struct work_struct *work)
-{
-	struct afs_call *call = container_of(work, struct afs_call, work);
-	int loop;
-
-	struct {
-		struct /* InterfaceAddr */ {
-			__be32 nifs;
-			__be32 uuid[11];
-			__be32 ifaddr[32];
-			__be32 netmask[32];
-			__be32 mtu[32];
-		} ia;
-		struct /* Capabilities */ {
-			__be32 capcount;
-			__be32 caps[1];
-		} cap;
-	} reply;
-
-	_enter("");
-
-	memset(&reply, 0, sizeof(reply));
-
-	reply.ia.uuid[0] = call->net->uuid.time_low;
-	reply.ia.uuid[1] = htonl(ntohs(call->net->uuid.time_mid));
-	reply.ia.uuid[2] = htonl(ntohs(call->net->uuid.time_hi_and_version));
-	reply.ia.uuid[3] = htonl((s8) call->net->uuid.clock_seq_hi_and_reserved);
-	reply.ia.uuid[4] = htonl((s8) call->net->uuid.clock_seq_low);
-	for (loop = 0; loop < 6; loop++)
-		reply.ia.uuid[loop + 5] = htonl((s8) call->net->uuid.node[loop]);
-
-	reply.cap.capcount = htonl(1);
-	reply.cap.caps[0] = htonl(AFS_CAP_ERROR_TRANSLATION);
-	afs_send_simple_reply(call, &reply, sizeof(reply));
-	afs_put_call(call);
-	_leave("");
-}
-
-/*
- * deliver request data to a CB.TellMeAboutYourself call
- */
-static int afs_deliver_cb_tell_me_about_yourself(struct afs_call *call)
-{
-	int ret;
-
-	_enter("");
-
-	afs_extract_discard(call, 0);
-	ret = afs_extract_data(call, false);
-	if (ret < 0)
-		return ret;
-
-	if (!afs_check_call_state(call, AFS_CALL_SV_REPLYING))
-		return afs_io_error(call, afs_io_error_cm_reply);
-	return afs_find_cm_server_by_peer(call);
-}
-
-/*
- * deliver request data to a YFS CB.CallBack call
- */
-static int afs_deliver_yfs_cb_callback(struct afs_call *call)
-{
-	struct afs_callback_break *cb;
-	struct yfs_xdr_YFSFid *bp;
-	size_t size;
-	int ret, loop;
-
-	_enter("{%u}", call->unmarshall);
-
-	switch (call->unmarshall) {
-	case 0:
-		afs_extract_to_tmp(call);
-		call->unmarshall++;
-
-		/* extract the FID array and its count in two steps */
-		fallthrough;
-	case 1:
-		_debug("extract FID count");
-		ret = afs_extract_data(call, true);
+		/* send the reply when asked for it */
+	case RXRPC_CSTATE_SRVR_SND_REPLY:
+		/* invoke the actual service routine */
+		ret = SRXAFSCM_InitCallBackState(server);
 		if (ret < 0)
-			return ret;
+			break;
 
-		call->count = ntohl(call->tmp);
-		_debug("FID count: %u", call->count);
-		if (call->count > YFSCBMAX)
-			return afs_protocol_error(call, afs_eproto_cb_fid_count);
-
-		size = array_size(call->count, sizeof(struct yfs_xdr_YFSFid));
-		call->buffer = kmalloc(size, GFP_KERNEL);
-		if (!call->buffer)
-			return -ENOMEM;
-		afs_extract_to_buf(call, size);
-		call->unmarshall++;
-
-		fallthrough;
-	case 2:
-		_debug("extract FID array");
-		ret = afs_extract_data(call, false);
+		ret = rxrpc_call_write_data(call, 0, NULL, RXRPC_LAST_PACKET,
+					    GFP_KERNEL, 0, &count);
 		if (ret < 0)
-			return ret;
+			break;
+		break;
 
-		_debug("unmarshall FID array");
-		call->request = kcalloc(call->count,
-					sizeof(struct afs_callback_break),
-					GFP_KERNEL);
-		if (!call->request)
-			return -ENOMEM;
-
-		cb = call->request;
-		bp = call->buffer;
-		for (loop = call->count; loop > 0; loop--, cb++) {
-			cb->fid.vid	= xdr_to_u64(bp->volume);
-			cb->fid.vnode	= xdr_to_u64(bp->vnode.lo);
-			cb->fid.vnode_hi = ntohl(bp->vnode.hi);
-			cb->fid.unique	= ntohl(bp->vnode.unique);
-			bp++;
+		/* operation complete */
+	case RXRPC_CSTATE_COMPLETE:
+		call->app_user = NULL;
+		removed = 0;
+		spin_lock(&afscm_calls_lock);
+		if (!list_empty(&call->app_link)) {
+			list_del_init(&call->app_link);
+			removed = 1;
 		}
+		spin_unlock(&afscm_calls_lock);
 
-		afs_extract_to_tmp(call);
-		call->unmarshall++;
-		fallthrough;
+		if (removed)
+			rxrpc_put_call(call);
+		break;
 
-	case 3:
+		/* operation terminated on error */
+	case RXRPC_CSTATE_ERROR:
+		call->app_user = NULL;
+		break;
+
+	default:
 		break;
 	}
 
-	if (!afs_check_call_state(call, AFS_CALL_SV_REPLYING))
-		return afs_io_error(call, afs_io_error_cm_reply);
+	if (ret < 0)
+		rxrpc_call_abort(call, ret);
 
-	/* We'll need the file server record as that tells us which set of
-	 * vnodes to operate upon.
-	 */
-	return afs_find_cm_server_by_peer(call);
-}
+	afs_put_server(server);
+
+	_leave(" = %d", ret);
+
+} /* end _SRXAFSCM_InitCallBackState() */
+
+/*****************************************************************************/
+/*
+ * handle a probe from a fileserver
+ */
+static void _SRXAFSCM_Probe(struct rxrpc_call *call)
+{
+	struct afs_server *server;
+	size_t count;
+	int ret = 0, removed;
+
+	_enter("%p{acs=%s}", call, rxrpc_call_states[call->app_call_state]);
+
+	server = afs_server_get_from_peer(call->conn->peer);
+
+	switch (call->app_call_state) {
+		/* we've received the last packet - drain all the data from the
+		 * call */
+	case RXRPC_CSTATE_SRVR_GOT_ARGS:
+		/* shouldn't be any args */
+		ret = -EBADMSG;
+		break;
+
+		/* send the reply when asked for it */
+	case RXRPC_CSTATE_SRVR_SND_REPLY:
+		/* invoke the actual service routine */
+		ret = SRXAFSCM_Probe(server);
+		if (ret < 0)
+			break;
+
+		ret = rxrpc_call_write_data(call, 0, NULL, RXRPC_LAST_PACKET,
+					    GFP_KERNEL, 0, &count);
+		if (ret < 0)
+			break;
+		break;
+
+		/* operation complete */
+	case RXRPC_CSTATE_COMPLETE:
+		call->app_user = NULL;
+		removed = 0;
+		spin_lock(&afscm_calls_lock);
+		if (!list_empty(&call->app_link)) {
+			list_del_init(&call->app_link);
+			removed = 1;
+		}
+		spin_unlock(&afscm_calls_lock);
+
+		if (removed)
+			rxrpc_put_call(call);
+		break;
+
+		/* operation terminated on error */
+	case RXRPC_CSTATE_ERROR:
+		call->app_user = NULL;
+		break;
+
+	default:
+		break;
+	}
+
+	if (ret < 0)
+		rxrpc_call_abort(call, ret);
+
+	afs_put_server(server);
+
+	_leave(" = %d", ret);
+
+} /* end _SRXAFSCM_Probe() */

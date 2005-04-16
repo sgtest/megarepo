@@ -1,7 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * inode.c
- *
+ * 
  * Copyright (C) 2001 Will Dyson <will_dyson@pobox.com>
  */
 
@@ -9,14 +8,15 @@
 
 #include "befs.h"
 #include "inode.h"
+#include "endian.h"
 
 /*
- * Validates the correctness of the befs inode
- * Returns BEFS_OK if the inode should be used, otherwise
- * returns BEFS_BAD_INODE
- */
+	Validates the correctness of the befs inode
+	Returns BEFS_OK if the inode should be used, otherwise
+	returns BEFS_BAD_INODE
+*/
 int
-befs_check_inode(struct super_block *sb, befs_inode *raw_inode,
+befs_check_inode(struct super_block *sb, befs_inode * raw_inode,
 		 befs_blocknr_t inode)
 {
 	u32 magic1 = fs32_to_cpu(sb, raw_inode->magic1);
@@ -26,8 +26,7 @@ befs_check_inode(struct super_block *sb, befs_inode *raw_inode,
 	/* check magic header. */
 	if (magic1 != BEFS_INODE_MAGIC1) {
 		befs_error(sb,
-			   "Inode has a bad magic header - inode = %lu",
-			   (unsigned long)inode);
+			   "Inode has a bad magic header - inode = %lu", inode);
 		return BEFS_BAD_INODE;
 	}
 
@@ -36,8 +35,8 @@ befs_check_inode(struct super_block *sb, befs_inode *raw_inode,
 	 */
 	if (inode != iaddr2blockno(sb, &ino_num)) {
 		befs_error(sb, "inode blocknr field disagrees with vfs "
-			   "VFS: %lu, Inode %lu", (unsigned long)
-			   inode, (unsigned long)iaddr2blockno(sb, &ino_num));
+			   "VFS: %lu, Inode %lu",
+			   inode, iaddr2blockno(sb, &ino_num));
 		return BEFS_BAD_INODE;
 	}
 
@@ -46,8 +45,7 @@ befs_check_inode(struct super_block *sb, befs_inode *raw_inode,
 	 */
 
 	if (!(flags & BEFS_INODE_IN_USE)) {
-		befs_error(sb, "inode is not used - inode = %lu",
-			   (unsigned long)inode);
+		befs_error(sb, "inode is not used - inode = %lu", inode);
 		return BEFS_BAD_INODE;
 	}
 

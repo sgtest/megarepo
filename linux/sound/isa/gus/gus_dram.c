@@ -1,16 +1,32 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- *  Copyright (c) by Jaroslav Kysela <perex@perex.cz>
+ *  Copyright (c) by Jaroslav Kysela <perex@suse.cz>
  *  DRAM access routines
+ *
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ *
  */
 
+#include <sound/driver.h>
 #include <linux/time.h>
 #include <sound/core.h>
 #include <sound/gus.h>
 #include <sound/info.h>
 
 
-static int snd_gus_dram_poke(struct snd_gus_card *gus, char __user *_buffer,
+static int snd_gus_dram_poke(snd_gus_card_t *gus, char __user *_buffer,
 			     unsigned int address, unsigned int size)
 {
 	unsigned long flags;
@@ -41,13 +57,13 @@ static int snd_gus_dram_poke(struct snd_gus_card *gus, char __user *_buffer,
 }
 
 
-int snd_gus_dram_write(struct snd_gus_card *gus, char __user *buffer,
+int snd_gus_dram_write(snd_gus_card_t *gus, char __user *buffer,
 		       unsigned int address, unsigned int size)
 {
 	return snd_gus_dram_poke(gus, buffer, address, size);
 }
 
-static int snd_gus_dram_peek(struct snd_gus_card *gus, char __user *_buffer,
+static int snd_gus_dram_peek(snd_gus_card_t *gus, char __user *_buffer,
 			     unsigned int address, unsigned int size,
 			     int rom)
 {
@@ -79,7 +95,7 @@ static int snd_gus_dram_peek(struct snd_gus_card *gus, char __user *_buffer,
 	return 0;
 }
 
-int snd_gus_dram_read(struct snd_gus_card *gus, char __user *buffer,
+int snd_gus_dram_read(snd_gus_card_t *gus, char __user *buffer,
 		      unsigned int address, unsigned int size,
 		      int rom)
 {

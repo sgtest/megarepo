@@ -1,11 +1,10 @@
-# SPDX-License-Identifier: GPL-2.0-only
 #
 # Makefile for Linux arch/m68k/atari source directory
 #
 
 obj-y		:= config.o time.o debug.o ataints.o stdma.o \
-			atasound.o stram.o
+			atasound.o stram.o atari_ksyms.o
 
-obj-$(CONFIG_ATARI_KBD_CORE)	+= atakeyb.o
-
-obj-$(CONFIG_NVRAM:m=y)		+= nvram.o
+ifeq ($(CONFIG_PCI),y)
+obj-$(CONFIG_HADES)	+= hades-pci.o
+endif

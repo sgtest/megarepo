@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * linux/include/linux/lockd/share.h
  *
@@ -22,11 +21,10 @@ struct nlm_share {
 	u32			s_mode;		/* deny mode */
 };
 
-__be32	nlmsvc_share_file(struct nlm_host *, struct nlm_file *,
+u32	nlmsvc_share_file(struct nlm_host *, struct nlm_file *,
 					       struct nlm_args *);
-__be32	nlmsvc_unshare_file(struct nlm_host *, struct nlm_file *,
+u32	nlmsvc_unshare_file(struct nlm_host *, struct nlm_file *,
 					       struct nlm_args *);
-void	nlmsvc_traverse_shares(struct nlm_host *, struct nlm_file *,
-					       nlm_host_match_fn_t);
+int	nlmsvc_traverse_shares(struct nlm_host *, struct nlm_file *, int);
 
 #endif /* LINUX_LOCKD_SHARE_H */

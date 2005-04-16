@@ -1,13 +1,11 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __MEGARAID_H__
 #define __MEGARAID_H__
 
 #include <linux/spinlock.h>
-#include <linux/mutex.h>
-#include <scsi/scsi_cmnd.h>
+
 
 #define MEGARAID_VERSION	\
-	"v2.00.4 (Release Date: Thu Feb 9 08:51:30 EST 2006)\n"
+	"v2.00.3 (Release Date: Wed Feb 19 08:51:30 EST 2003)\n"
 
 /*
  * Driver features - change the values to enable or disable features in the
@@ -15,7 +13,7 @@
  */
 
 /*
- * Command coalescing - This feature allows the driver to be able to combine
+ * Comand coalescing - This feature allows the driver to be able to combine
  * two or more commands and issue as one command in order to boost I/O
  * performance. Useful if the nature of the I/O is sequential. It is not very
  * useful for random natured I/Os.
@@ -47,9 +45,44 @@
 
 #define MAX_DEV_TYPE	32
 
+#ifndef PCI_VENDOR_ID_LSI_LOGIC
+#define PCI_VENDOR_ID_LSI_LOGIC		0x1000
+#endif
+
+#ifndef PCI_VENDOR_ID_AMI
+#define PCI_VENDOR_ID_AMI		0x101E
+#endif
+
+#ifndef PCI_VENDOR_ID_DELL
+#define PCI_VENDOR_ID_DELL		0x1028
+#endif
+
+#ifndef PCI_VENDOR_ID_INTEL
+#define PCI_VENDOR_ID_INTEL		0x8086
+#endif
+
+#ifndef PCI_DEVICE_ID_AMI_MEGARAID
+#define PCI_DEVICE_ID_AMI_MEGARAID	0x9010
+#endif
+
+#ifndef PCI_DEVICE_ID_AMI_MEGARAID2
+#define PCI_DEVICE_ID_AMI_MEGARAID2	0x9060
+#endif
+
+#ifndef PCI_DEVICE_ID_AMI_MEGARAID3
+#define PCI_DEVICE_ID_AMI_MEGARAID3	0x1960
+#endif
+
 #define PCI_DEVICE_ID_DISCOVERY		0x000E
 #define PCI_DEVICE_ID_PERC4_DI		0x000F
 #define PCI_DEVICE_ID_PERC4_QC_VERDE	0x0407
+
+/* Sub-System Vendor IDs */
+#define	AMI_SUBSYS_VID			0x101E
+#define DELL_SUBSYS_VID			0x1028
+#define	HP_SUBSYS_VID			0x103C
+#define LSI_SUBSYS_VID			0x1000
+#define INTEL_SUBSYS_VID		0x8086
 
 #define HBA_SIGNATURE	      		0x3344
 #define HBA_SIGNATURE_471	  	0xCCCC
@@ -192,7 +225,7 @@ typedef struct {
 	u32	dma_type;
 	u32	dma_direction;
 
-	struct scsi_cmnd	*cmd;
+	Scsi_Cmnd	*cmd;
 	dma_addr_t	dma_h_bulkdata;
 	dma_addr_t	dma_h_sgdata;
 
@@ -348,7 +381,7 @@ typedef struct {
 	u8	battery_status;	/*
 				 * BIT 0: battery module missing
 				 * BIT 1: VBAD
-				 * BIT 2: temperature high
+				 * BIT 2: temprature high
 				 * BIT 3: battery pack missing
 				 * BIT 4,5:
 				 *   00 - charge complete
@@ -436,7 +469,7 @@ typedef struct {
 	u8	type;		/* Type of the device */
 	u8	cur_status;	/* current status of the device */
 	u8	tag_depth;	/* Level of tagging */
-	u8	sync_neg;	/* sync negotiation - ENABLE or DISABLE */
+	u8	sync_neg;	/* sync negotiation - ENABLE or DISBALE */
 	u32	size;		/* configurable size in terms of 512 byte
 				   blocks */
 }__attribute__ ((packed)) phys_drv;
@@ -499,9 +532,9 @@ struct uioctl_t {
 
 /*
  * struct mcontroller is used to pass information about the controllers in the
- * system. Its up to the application how to use the information. We are passing
+ * system. Its upto the application how to use the information. We are passing
  * as much info about the cards as possible and useful. Before issuing the
- * call to find information about the cards, the application needs to issue a
+ * call to find information about the cards, the applicaiton needs to issue a
  * ioctl first to find out the number of controllers in the system.
  */
 #define MAX_CONTROLLERS 32
@@ -757,28 +790,8 @@ struct private_bios_data {
 #define CACHED_IO		0
 #define DIRECT_IO		1
 
-struct megaraid_cmd_priv {
-	struct list_head entry;
-};
 
-#define SCSI_LIST(scp)							\
-	(&((struct megaraid_cmd_priv *)scsi_cmd_priv(scp))->entry)
-
-struct scsi_cmd_and_priv {
-	struct scsi_cmnd	 cmd;
-	struct megaraid_cmd_priv priv;
-};
-
-static inline struct scsi_cmnd *
-megaraid_to_scsi_cmd(struct megaraid_cmd_priv *cmd_priv)
-{
-	/* See also scsi_mq_setup_tags() */
-	BUILD_BUG_ON(sizeof(struct scsi_cmd_and_priv) !=
-		     sizeof(struct scsi_cmnd) +
-		     sizeof(struct megaraid_cmd_priv));
-
-	return &container_of(cmd_priv, struct scsi_cmd_and_priv, priv)->cmd;
-}
+#define SCSI_LIST(scp) ((struct list_head *)(&(scp)->SCp))
 
 /*
  * Each controller's soft state
@@ -788,10 +801,9 @@ typedef struct {
 				   clustering is available */
 	u32	flag;
 
-	unsigned long		base;
-	void __iomem		*mmio_base;
+	unsigned long	base;
 
-	/* mbox64 with mbox not aligned on 16-byte boundary */
+	/* mbox64 with mbox not aligned on 16-byte boundry */
 	mbox64_t	*una_mbox64;
 	dma_addr_t	una_mbox64_dma;
 
@@ -835,6 +847,18 @@ typedef struct {
 
 #ifdef CONFIG_PROC_FS
 	struct proc_dir_entry	*controller_proc_dir_entry;
+	struct proc_dir_entry	*proc_read;
+	struct proc_dir_entry	*proc_stat;
+	struct proc_dir_entry	*proc_mbox;
+
+#if MEGA_HAVE_ENH_PROC
+	struct proc_dir_entry	*proc_rr;
+	struct proc_dir_entry	*proc_battery;
+#define MAX_PROC_CHANNELS	4
+	struct proc_dir_entry	*proc_pdrvstat[MAX_PROC_CHANNELS];
+	struct proc_dir_entry	*proc_rdrvstat[MAX_PROC_CHANNELS];
+#endif
+
 #endif
 
 	int	has_64bit_addr;		/* are we using 64-bit addressing */
@@ -864,10 +888,10 @@ typedef struct {
 	u8	sglen;	/* f/w supported scatter-gather list length */
 
 	scb_t			int_scb;
-	struct mutex		int_mtx;	/* To synchronize the internal
+	Scsi_Cmnd		int_scmd;
+	struct semaphore	int_mtx;	/* To synchronize the internal
 						commands */
-	int			int_status;	/* status of internal cmd */
-	struct completion	int_waitq;	/* wait queue for internal
+	wait_queue_head_t	int_waitq;	/* wait queue for internal
 						 cmds */
 
 	int	has_cluster;	/* cluster support on this HBA */
@@ -900,6 +924,13 @@ struct mega_hbas {
 #define MEGA_DMA_TYPE_NONE		0xFFFF
 #define MEGA_BULK_DATA			0x0001
 #define MEGA_SGLIST			0x0002
+
+/*
+ * lockscope definitions, callers can specify the lock scope with this data
+ * type. LOCK_INT would mean the caller has not acquired the lock before
+ * making the call and LOCK_EXT would mean otherwise.
+ */
+typedef enum { LOCK_INT, LOCK_EXT } lockscope_t;
 
 /*
  * Parameters for the io-mapped controllers
@@ -962,21 +993,22 @@ static int mega_query_adapter(adapter_t *);
 static int issue_scb(adapter_t *, scb_t *);
 static int mega_setup_mailbox(adapter_t *);
 
-static int megaraid_queue (struct Scsi_Host *, struct scsi_cmnd *);
-static scb_t * mega_build_cmd(adapter_t *, struct scsi_cmnd *, int *);
+static int megaraid_queue (Scsi_Cmnd *, void (*)(Scsi_Cmnd *));
+static scb_t * mega_build_cmd(adapter_t *, Scsi_Cmnd *, int *);
 static void __mega_runpendq(adapter_t *);
 static int issue_scb_block(adapter_t *, u_char *);
 
-static irqreturn_t megaraid_isr_memmapped(int, void *);
-static irqreturn_t megaraid_isr_iomapped(int, void *);
+static irqreturn_t megaraid_isr_memmapped(int, void *, struct pt_regs *);
+static irqreturn_t megaraid_isr_iomapped(int, void *, struct pt_regs *);
 
 static void mega_free_scb(adapter_t *, scb_t *);
 
-static int megaraid_abort(struct scsi_cmnd *);
-static int megaraid_reset(struct scsi_cmnd *);
-static int megaraid_abort_and_reset(adapter_t *, struct scsi_cmnd *, int);
+static int megaraid_abort(Scsi_Cmnd *);
+static int megaraid_reset(Scsi_Cmnd *);
+static int megaraid_abort_and_reset(adapter_t *, Scsi_Cmnd *, int);
 static int megaraid_biosparam(struct scsi_device *, struct block_device *,
 		sector_t, int []);
+static int mega_print_inquiry(char *, char *);
 
 static int mega_build_sglist (adapter_t *adapter, scb_t *scb,
 			      u32 *buffer, u32 *length);
@@ -988,7 +1020,8 @@ static void mega_8_to_40ld (mraid_inquiry *inquiry,
 		mega_inquiry3 *enquiry3, mega_product_info *);
 
 static int megadev_open (struct inode *, struct file *);
-static int megadev_ioctl (struct file *, unsigned int, unsigned long);
+static int megadev_ioctl (struct inode *, struct file *, unsigned int,
+		unsigned long);
 static int mega_m_to_n(void __user *, nitioctl_t *);
 static int mega_n_to_m(void __user *, megacmd_t *);
 
@@ -998,22 +1031,40 @@ static int mega_is_bios_enabled (adapter_t *);
 
 #ifdef CONFIG_PROC_FS
 static void mega_create_proc_entry(int, struct proc_dir_entry *);
+static int proc_read_config(char *, char **, off_t, int, int *, void *);
+static int proc_read_stat(char *, char **, off_t, int, int *, void *);
+static int proc_read_mbox(char *, char **, off_t, int, int *, void *);
+static int proc_rebuild_rate(char *, char **, off_t, int, int *, void *);
+static int proc_battery(char *, char **, off_t, int, int *, void *);
+static int proc_pdrv_ch0(char *, char **, off_t, int, int *, void *);
+static int proc_pdrv_ch1(char *, char **, off_t, int, int *, void *);
+static int proc_pdrv_ch2(char *, char **, off_t, int, int *, void *);
+static int proc_pdrv_ch3(char *, char **, off_t, int, int *, void *);
+static int proc_pdrv(adapter_t *, char *, int);
+static int proc_rdrv_10(char *, char **, off_t, int, int *, void *);
+static int proc_rdrv_20(char *, char **, off_t, int, int *, void *);
+static int proc_rdrv_30(char *, char **, off_t, int, int *, void *);
+static int proc_rdrv_40(char *, char **, off_t, int, int *, void *);
+static int proc_rdrv(adapter_t *, char *, int, int);
+#endif
+
 static int mega_adapinq(adapter_t *, dma_addr_t);
 static int mega_internal_dev_inquiry(adapter_t *, u8, u8, dma_addr_t);
-#endif
 
 static int mega_support_ext_cdb(adapter_t *);
 static mega_passthru* mega_prepare_passthru(adapter_t *, scb_t *,
-		struct scsi_cmnd *, int, int);
+		Scsi_Cmnd *, int, int);
 static mega_ext_passthru* mega_prepare_extpassthru(adapter_t *,
-		scb_t *, struct scsi_cmnd *, int, int);
+		scb_t *, Scsi_Cmnd *, int, int);
 static void mega_enum_raid_scsi(adapter_t *);
 static void mega_get_boot_drv(adapter_t *);
 static int mega_support_random_del(adapter_t *);
 static int mega_del_logdrv(adapter_t *, int);
 static int mega_do_del_logdrv(adapter_t *, int);
 static void mega_get_max_sgl(adapter_t *);
-static int mega_internal_command(adapter_t *, megacmd_t *, mega_passthru *);
+static int mega_internal_command(adapter_t *, lockscope_t, megacmd_t *,
+		mega_passthru *);
+static void mega_internal_done(Scsi_Cmnd *);
 static int mega_support_cluster(adapter_t *);
 #endif
 

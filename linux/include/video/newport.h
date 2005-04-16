@@ -1,12 +1,11 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /* $Id: newport.h,v 1.5 1999/08/04 06:01:51 ulfc Exp $
  *
  * newport.h: Defines and register layout for NEWPORT graphics
  *            hardware.
  *
- * Copyright (C) 1996 David S. Miller (davem@davemloft.net)
+ * Copyright (C) 1996 David S. Miller (dm@engr.sgi.com)
  * 
- * Ulf Carlsson - Compatibility with the IRIX structures added
+ * Ulf Carlsson - Compability with the IRIX structures added
  */
 
 #ifndef _SGI_NEWPORT_H
@@ -383,8 +382,7 @@ typedef struct {
 #define VC2_IREG_CONTROL       0x10
 #define VC2_IREG_CONFIG        0x20
 
-static inline void newport_vc2_set(struct newport_regs *regs,
-				   unsigned char vc2ireg,
+extern __inline__ void newport_vc2_set(struct newport_regs *regs, unsigned char vc2ireg,
 				   unsigned short val)
 {
 	regs->set.dcbmode = (NPORT_DMODE_AVC2 | VC2_REGADDR_INDEX | NPORT_DMODE_W3 |
@@ -392,7 +390,7 @@ static inline void newport_vc2_set(struct newport_regs *regs,
 	regs->set.dcbdata0.byword = (vc2ireg << 24) | (val << 8);
 }
 
-static inline unsigned short newport_vc2_get(struct newport_regs *regs,
+extern __inline__ unsigned short newport_vc2_get(struct newport_regs *regs,
 					     unsigned char vc2ireg)
 {
 	regs->set.dcbmode = (NPORT_DMODE_AVC2 | VC2_REGADDR_INDEX | NPORT_DMODE_W1 |
@@ -454,7 +452,7 @@ static __inline__ int newport_wait(struct newport_regs *regs)
 {
 	int t = BUSY_TIMEOUT;
 
-	while (--t)
+	while (t--)
 		if (!(regs->cset.status & NPORT_STAT_GBUSY))
 			break;
 	return !t;
@@ -464,7 +462,7 @@ static __inline__ int newport_bfwait(struct newport_regs *regs)
 {
 	int t = BUSY_TIMEOUT;
 
-	while (--t)
+	while (t--)
 		if(!(regs->cset.status & NPORT_STAT_BBUSY))
 			break;
 	return !t;

@@ -1,5 +1,8 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  *
  * Copyright (C) Jonathan Naylor G4KLX (g4klx@g4klx.demon.co.uk)
  *
@@ -9,11 +12,11 @@
  * diagrams as the code is not obvious and probably very easy to break.
  */
 #include <linux/errno.h>
-#include <linux/filter.h>
 #include <linux/types.h>
 #include <linux/socket.h>
 #include <linux/in.h>
 #include <linux/kernel.h>
+#include <linux/sched.h>
 #include <linux/timer.h>
 #include <linux/string.h>
 #include <linux/sockios.h>
@@ -23,7 +26,9 @@
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
 #include <net/sock.h>
-#include <net/tcp_states.h>
+#include <net/ip.h>			/* For ip_rcv */
+#include <net/tcp.h>
+#include <asm/system.h>
 #include <linux/fcntl.h>
 #include <linux/mm.h>
 #include <linux/interrupt.h>
@@ -162,8 +167,7 @@ static int rose_state3_machine(struct sock *sk, struct sk_buff *skb, int framety
 		rose_frames_acked(sk, nr);
 		if (ns == rose->vr) {
 			rose_start_idletimer(sk);
-			if (sk_filter_trim_cap(sk, skb, ROSE_MIN_LEN) == 0 &&
-			    __sock_queue_rcv_skb(sk, skb) == 0) {
+			if (sock_queue_rcv_skb(sk, skb) == 0) {
 				rose->vr = (rose->vr + 1) % ROSE_MODULUS;
 				queued = 1;
 			} else {
@@ -180,7 +184,7 @@ static int rose_state3_machine(struct sock *sk, struct sk_buff *skb, int framety
 				break;
 			}
 			if (atomic_read(&sk->sk_rmem_alloc) >
-			    (sk->sk_rcvbuf >> 1))
+			    (sk->sk_rcvbuf / 2))
 				rose->condition |= ROSE_COND_OWN_RX_BUSY;
 		}
 		/*
@@ -217,7 +221,6 @@ static int rose_state4_machine(struct sock *sk, struct sk_buff *skb, int framety
 	switch (frametype) {
 	case ROSE_RESET_REQUEST:
 		rose_write_internal(sk, ROSE_RESET_CONFIRMATION);
-		fallthrough;
 	case ROSE_RESET_CONFIRMATION:
 		rose_stop_timer(sk);
 		rose_start_idletimer(sk);

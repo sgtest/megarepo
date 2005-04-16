@@ -4,7 +4,7 @@ M68000 Hi-Performance Microprocessor Division
 M68060 Software Package
 Production Release P1.00 -- October 10, 1994
 
-M68060 Software Package Copyright Â© 1993, 1994 Motorola Inc.  All rights reserved.
+M68060 Software Package Copyright © 1993, 1994 Motorola Inc.  All rights reserved.
 
 THE SOFTWARE is provided on an "AS IS" basis and without warranty.
 To the maximum extent permitted by applicable law,
@@ -776,7 +776,7 @@ muls64_zero:
 # ALGORITHM ***********************************************************	#
 #	In the interest of simplicity, all operands are converted to	#
 # longword size whether the operation is byte, word, or long. The	#
-# bounds are sign extended accordingly. If Rn is a data register, Rn is #
+# bounds are sign extended accordingly. If Rn is a data regsiter, Rn is #
 # also sign extended. If Rn is an address register, it need not be sign #
 # extended since the full register is always used.			#
 #	The condition codes are set correctly before the final "rts".	#

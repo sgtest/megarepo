@@ -1,10 +1,23 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * OSS compatible sequencer driver
  *
  * read/write/select interface to device file
  *
  * Copyright (C) 1998,99 Takashi Iwai <tiwai@suse.de>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  */
 
 #include "seq_oss_device.h"
@@ -20,7 +33,7 @@
 /*
  * protoypes
  */
-static int insert_queue(struct seq_oss_devinfo *dp, union evrec *rec, struct file *opt);
+static int insert_queue(seq_oss_devinfo_t *dp, evrec_t *rec, struct file *opt);
 
 
 /*
@@ -28,12 +41,12 @@ static int insert_queue(struct seq_oss_devinfo *dp, union evrec *rec, struct fil
  */
 
 int
-snd_seq_oss_read(struct seq_oss_devinfo *dp, char __user *buf, int count)
+snd_seq_oss_read(seq_oss_devinfo_t *dp, char __user *buf, int count)
 {
-	struct seq_oss_readq *readq = dp->readq;
+	seq_oss_readq_t *readq = dp->readq;
 	int result = 0, err = 0;
 	int ev_len;
-	union evrec rec;
+	evrec_t rec;
 	unsigned long flags;
 
 	if (readq == NULL || ! is_read_mode(dp->file_mode))
@@ -80,11 +93,11 @@ snd_seq_oss_read(struct seq_oss_devinfo *dp, char __user *buf, int count)
  */
 
 int
-snd_seq_oss_write(struct seq_oss_devinfo *dp, const char __user *buf, int count, struct file *opt)
+snd_seq_oss_write(seq_oss_devinfo_t *dp, const char __user *buf, int count, struct file *opt)
 {
 	int result = 0, err = 0;
 	int ev_size, fmt;
-	union evrec rec;
+	evrec_t rec;
 
 	if (! is_write_mode(dp->file_mode) || dp->writeq == NULL)
 		return -ENXIO;
@@ -132,8 +145,7 @@ snd_seq_oss_write(struct seq_oss_devinfo *dp, const char __user *buf, int count,
 		}
 
 		/* insert queue */
-		err = insert_queue(dp, &rec, opt);
-		if (err < 0)
+		if ((err = insert_queue(dp, &rec, opt)) < 0)
 			break;
 
 		result += ev_size;
@@ -149,10 +161,10 @@ snd_seq_oss_write(struct seq_oss_devinfo *dp, const char __user *buf, int count,
  * return: 0 = OK, non-zero = NG
  */
 static int
-insert_queue(struct seq_oss_devinfo *dp, union evrec *rec, struct file *opt)
+insert_queue(seq_oss_devinfo_t *dp, evrec_t *rec, struct file *opt)
 {
 	int rc = 0;
-	struct snd_seq_event event;
+	snd_seq_event_t event;
 
 	/* if this is a timing event, process the current time */
 	if (snd_seq_oss_process_timer_event(dp->timer, rec))
@@ -162,17 +174,20 @@ insert_queue(struct seq_oss_devinfo *dp, union evrec *rec, struct file *opt)
 	memset(&event, 0, sizeof(event));
 	/* set dummy -- to be sure */
 	event.type = SNDRV_SEQ_EVENT_NOTEOFF;
-	snd_seq_oss_fill_addr(dp, &event, dp->addr.client, dp->addr.port);
+	snd_seq_oss_fill_addr(dp, &event, dp->addr.port, dp->addr.client);
 
 	if (snd_seq_oss_process_event(dp, rec, &event))
 		return 0; /* invalid event - no need to insert queue */
 
 	event.time.tick = snd_seq_oss_timer_cur_tick(dp->timer);
-	if (dp->timer->realtime || !dp->timer->running)
+	if (dp->timer->realtime || !dp->timer->running) {
 		snd_seq_oss_dispatch(dp, &event, 0, 0);
-	else
-		rc = snd_seq_kernel_client_enqueue(dp->cseq, &event, opt,
-						   !is_nonblock_mode(dp->file_mode));
+	} else {
+		if (is_nonblock_mode(dp->file_mode))
+			rc = snd_seq_kernel_client_enqueue(dp->cseq, &event, 0, 0);
+		else
+			rc = snd_seq_kernel_client_enqueue_blocking(dp->cseq, &event, opt, 0, 0);
+	}
 	return rc;
 }
 		
@@ -181,21 +196,21 @@ insert_queue(struct seq_oss_devinfo *dp, union evrec *rec, struct file *opt)
  * select / poll
  */
   
-__poll_t
-snd_seq_oss_poll(struct seq_oss_devinfo *dp, struct file *file, poll_table * wait)
+unsigned int
+snd_seq_oss_poll(seq_oss_devinfo_t *dp, struct file *file, poll_table * wait)
 {
-	__poll_t mask = 0;
+	unsigned int mask = 0;
 
 	/* input */
 	if (dp->readq && is_read_mode(dp->file_mode)) {
 		if (snd_seq_oss_readq_poll(dp->readq, file, wait))
-			mask |= EPOLLIN | EPOLLRDNORM;
+			mask |= POLLIN | POLLRDNORM;
 	}
 
 	/* output */
 	if (dp->writeq && is_write_mode(dp->file_mode)) {
 		if (snd_seq_kernel_client_write_poll(dp->cseq, file, wait))
-			mask |= EPOLLOUT | EPOLLWRNORM;
+			mask |= POLLOUT | POLLWRNORM;
 	}
 	return mask;
 }

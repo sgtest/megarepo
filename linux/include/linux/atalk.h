@@ -1,10 +1,43 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __LINUX_ATALK_H__
 #define __LINUX_ATALK_H__
 
-
 #include <net/sock.h>
-#include <uapi/linux/atalk.h>
+
+/*
+ * AppleTalk networking structures
+ *
+ * The following are directly referenced from the University Of Michigan
+ * netatalk for compatibility reasons.
+ */
+#define ATPORT_FIRST	1
+#define ATPORT_RESERVED	128
+#define ATPORT_LAST	254		/* 254 is only legal on localtalk */ 
+#define ATADDR_ANYNET	(__u16)0
+#define ATADDR_ANYNODE	(__u8)0
+#define ATADDR_ANYPORT  (__u8)0
+#define ATADDR_BCAST	(__u8)255
+#define DDP_MAXSZ	587
+#define DDP_MAXHOPS     15		/* 4 bits of hop counter */
+
+#define SIOCATALKDIFADDR       (SIOCPROTOPRIVATE + 0)
+
+struct atalk_addr {
+	__u16	s_net;
+	__u8	s_node;
+};
+
+struct sockaddr_at {
+	sa_family_t	  sat_family;
+	__u8		  sat_port;
+	struct atalk_addr sat_addr;
+	char		  sat_zero[8];
+};
+
+struct atalk_netrange {
+	__u8	nr_phase;
+	__u16	nr_firstnet;
+	__u16	nr_lastnet;
+};
 
 struct atalk_route {
 	struct net_device  *dev;
@@ -35,8 +68,8 @@ struct atalk_iface {
 struct atalk_sock {
 	/* struct sock has to be the first member of atalk_sock */
 	struct sock	sk;
-	__be16		dest_net;
-	__be16		src_net;
+	unsigned short	dest_net;
+	unsigned short	src_net;
 	unsigned char	dest_node;
 	unsigned char	src_node;
 	unsigned char	dest_port;
@@ -48,11 +81,23 @@ static inline struct atalk_sock *at_sk(struct sock *sk)
 	return (struct atalk_sock *)sk;
 }
 
+#ifdef __KERNEL__
+
+#include <asm/byteorder.h>
+
 struct ddpehdr {
-	__be16	deh_len_hops;	/* lower 10 bits are length, next 4 - hops */
-	__be16	deh_sum;
-	__be16	deh_dnet;
-	__be16	deh_snet;
+#ifdef __LITTLE_ENDIAN_BITFIELD
+	__u16	deh_len:10,
+		deh_hops:4,
+		deh_pad:2;
+#else
+	__u16	deh_pad:2,
+		deh_hops:4,
+		deh_len:10;
+#endif
+	__u16	deh_sum;
+	__u16	deh_dnet;
+	__u16	deh_snet;
 	__u8	deh_dnode;
 	__u8	deh_snode;
 	__u8	deh_dport;
@@ -62,35 +107,65 @@ struct ddpehdr {
 
 static __inline__ struct ddpehdr *ddp_hdr(struct sk_buff *skb)
 {
-	return (struct ddpehdr *)skb_transport_header(skb);
+	return (struct ddpehdr *)skb->h.raw;
 }
+
+/*
+ *	Don't drop the struct into the struct above.  You'll get some
+ *	surprise padding.
+ */
+struct ddpebits {
+#ifdef __LITTLE_ENDIAN_BITFIELD
+	__u16	deh_len:10,
+		deh_hops:4,
+		deh_pad:2;
+#else
+	__u16	deh_pad:2,
+		deh_hops:4,
+		deh_len:10;
+#endif
+};
+
+/* Short form header */
+struct ddpshdr {
+#ifdef __LITTLE_ENDIAN_BITFIELD
+	__u16	dsh_len:10,
+		dsh_pad:6;
+#else
+	__u16	dsh_pad:6,
+		dsh_len:10;
+#endif
+	__u8	dsh_dport;
+	__u8	dsh_sport;
+	/* And netatalk apps expect to stick the type in themselves */
+};
 
 /* AppleTalk AARP headers */
 struct elapaarp {
-	__be16	hw_type;
+	__u16	hw_type;
 #define AARP_HW_TYPE_ETHERNET		1
 #define AARP_HW_TYPE_TOKENRING		2
-	__be16	pa_type;
+	__u16	pa_type;
 	__u8	hw_len;
 	__u8	pa_len;
 #define AARP_PA_ALEN			4
-	__be16	function;
+	__u16	function;
 #define AARP_REQUEST			1
 #define AARP_REPLY			2
 #define AARP_PROBE			3
-	__u8	hw_src[ETH_ALEN];
-	__u8	pa_src_zero;
-	__be16	pa_src_net;
-	__u8	pa_src_node;
-	__u8	hw_dst[ETH_ALEN];
-	__u8	pa_dst_zero;
-	__be16	pa_dst_net;
-	__u8	pa_dst_node;
-} __attribute__ ((packed));
+	__u8	hw_src[ETH_ALEN]	__attribute__ ((packed));
+	__u8	pa_src_zero		__attribute__ ((packed));
+	__u16	pa_src_net		__attribute__ ((packed));
+	__u8	pa_src_node		__attribute__ ((packed));
+	__u8	hw_dst[ETH_ALEN]	__attribute__ ((packed));
+	__u8	pa_dst_zero		__attribute__ ((packed));
+	__u16	pa_dst_net		__attribute__ ((packed));
+	__u8	pa_dst_node		__attribute__ ((packed));	
+};
 
 static __inline__ struct elapaarp *aarp_hdr(struct sk_buff *skb)
 {
-	return (struct elapaarp *)skb_transport_header(skb);
+	return (struct elapaarp *)skb->h.raw;
 }
 
 /* Not specified - how long till we drop a resolved entry */
@@ -108,17 +183,15 @@ static __inline__ struct elapaarp *aarp_hdr(struct sk_buff *skb)
 #define AARP_RESOLVE_TIME	(10 * HZ)
 
 extern struct datalink_proto *ddp_dl, *aarp_dl;
-extern int aarp_proto_init(void);
+extern void aarp_proto_init(void);
 
 /* Inter module exports */
 
 /* Give a device find its atif control structure */
-#if IS_ENABLED(CONFIG_ATALK)
 static inline struct atalk_iface *atalk_find_dev(struct net_device *dev)
 {
 	return dev->atalk_ptr;
 }
-#endif
 
 extern struct atalk_addr *atalk_find_dev_addr(struct net_device *dev);
 extern struct net_device *atrtr_get_dev(struct atalk_addr *sa);
@@ -145,12 +218,7 @@ extern rwlock_t atalk_interfaces_lock;
 
 extern struct atalk_route atrtr_default;
 
-struct aarp_iter_state {
-	int bucket;
-	struct aarp_entry **table;
-};
-
-extern const struct seq_operations aarp_seq_ops;
+extern struct file_operations atalk_seq_arp_fops;
 
 extern int sysctl_aarp_expiry_time;
 extern int sysctl_aarp_tick_time;
@@ -158,29 +226,20 @@ extern int sysctl_aarp_retransmit_limit;
 extern int sysctl_aarp_resolve_time;
 
 #ifdef CONFIG_SYSCTL
-extern int atalk_register_sysctl(void);
+extern void atalk_register_sysctl(void);
 extern void atalk_unregister_sysctl(void);
 #else
-static inline int atalk_register_sysctl(void)
-{
-	return 0;
-}
-static inline void atalk_unregister_sysctl(void)
-{
-}
+#define atalk_register_sysctl()		do { } while(0)
+#define atalk_unregister_sysctl()	do { } while(0)
 #endif
 
 #ifdef CONFIG_PROC_FS
 extern int atalk_proc_init(void);
 extern void atalk_proc_exit(void);
 #else
-static inline int atalk_proc_init(void)
-{
-	return 0;
-}
-static inline void atalk_proc_exit(void)
-{
-}
+#define atalk_proc_init()	({ 0; })
+#define atalk_proc_exit()	do { } while(0)
 #endif /* CONFIG_PROC_FS */
 
+#endif /* __KERNEL__ */
 #endif /* __LINUX_ATALK_H__ */

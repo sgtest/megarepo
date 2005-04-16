@@ -1,23 +1,36 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- *  Copyright (c) by Jaroslav Kysela <perex@perex.cz>
+ *  Copyright (c) by Jaroslav Kysela <perex@suse.cz>
  *     and (c) 1999 Steve Ratcliffe <steve@parabola.demon.co.uk>
  *  Copyright (C) 1999-2000 Takashi Iwai <tiwai@suse.de>
  *
  *  Routines for control of EMU8000 chip
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  */
 
+#include <sound/driver.h>
 #include <linux/wait.h>
-#include <linux/sched/signal.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/ioport.h>
-#include <linux/export.h>
 #include <linux/delay.h>
-#include <linux/io.h>
 #include <sound/core.h>
 #include <sound/emu8000.h>
 #include <sound/emu8000_reg.h>
-#include <linux/uaccess.h>
+#include <asm/io.h>
+#include <asm/uaccess.h>
 #include <linux/init.h>
 #include <sound/control.h>
 #include <sound/initval.h>
@@ -32,7 +45,7 @@
  * directly.  The macros handle the port number and command word.
  */
 /* Write a word */
-void snd_emu8000_poke(struct snd_emu8000 *emu, unsigned int port, unsigned int reg, unsigned int val)
+void snd_emu8000_poke(emu8000_t *emu, unsigned int port, unsigned int reg, unsigned int val)
 {
 	unsigned long flags;
 	spin_lock_irqsave(&emu->reg_lock, flags);
@@ -45,7 +58,7 @@ void snd_emu8000_poke(struct snd_emu8000 *emu, unsigned int port, unsigned int r
 }
 
 /* Read a word */
-unsigned short snd_emu8000_peek(struct snd_emu8000 *emu, unsigned int port, unsigned int reg)
+unsigned short snd_emu8000_peek(emu8000_t *emu, unsigned int port, unsigned int reg)
 {
 	unsigned short res;
 	unsigned long flags;
@@ -60,7 +73,7 @@ unsigned short snd_emu8000_peek(struct snd_emu8000 *emu, unsigned int port, unsi
 }
 
 /* Write a double word */
-void snd_emu8000_poke_dw(struct snd_emu8000 *emu, unsigned int port, unsigned int reg, unsigned int val)
+void snd_emu8000_poke_dw(emu8000_t *emu, unsigned int port, unsigned int reg, unsigned int val)
 {
 	unsigned long flags;
 	spin_lock_irqsave(&emu->reg_lock, flags);
@@ -74,7 +87,7 @@ void snd_emu8000_poke_dw(struct snd_emu8000 *emu, unsigned int port, unsigned in
 }
 
 /* Read a double word */
-unsigned int snd_emu8000_peek_dw(struct snd_emu8000 *emu, unsigned int port, unsigned int reg)
+unsigned int snd_emu8000_peek_dw(emu8000_t *emu, unsigned int port, unsigned int reg)
 {
 	unsigned short low;
 	unsigned int res;
@@ -94,7 +107,7 @@ unsigned int snd_emu8000_peek_dw(struct snd_emu8000 *emu, unsigned int port, uns
  * Set up / close a channel to be used for DMA.
  */
 /*exported*/ void
-snd_emu8000_dma_chan(struct snd_emu8000 *emu, int ch, int mode)
+snd_emu8000_dma_chan(emu8000_t *emu, int ch, int mode)
 {
 	unsigned right_bit = (mode & EMU8000_RAM_RIGHT) ? 0x01000000 : 0;
 	mode &= EMU8000_RAM_MODE_MASK;
@@ -118,11 +131,12 @@ snd_emu8000_dma_chan(struct snd_emu8000 *emu, int ch, int mode)
 
 /*
  */
-static void
-snd_emu8000_read_wait(struct snd_emu8000 *emu)
+static void __init
+snd_emu8000_read_wait(emu8000_t *emu)
 {
 	while ((EMU8000_SMALR_READ(emu) & 0x80000000) != 0) {
-		schedule_timeout_interruptible(1);
+		set_current_state(TASK_INTERRUPTIBLE);
+		schedule_timeout(1);
 		if (signal_pending(current))
 			break;
 	}
@@ -130,11 +144,12 @@ snd_emu8000_read_wait(struct snd_emu8000 *emu)
 
 /*
  */
-static void
-snd_emu8000_write_wait(struct snd_emu8000 *emu)
+static void __init
+snd_emu8000_write_wait(emu8000_t *emu)
 {
 	while ((EMU8000_SMALW_READ(emu) & 0x80000000) != 0) {
-		schedule_timeout_interruptible(1);
+		set_current_state(TASK_INTERRUPTIBLE);
+		schedule_timeout(1);
 		if (signal_pending(current))
 			break;
 	}
@@ -143,8 +158,8 @@ snd_emu8000_write_wait(struct snd_emu8000 *emu)
 /*
  * detect a card at the given port
  */
-static int
-snd_emu8000_detect(struct snd_emu8000 *emu)
+static int __init
+snd_emu8000_detect(emu8000_t *emu)
 {
 	/* Initialise */
 	EMU8000_HWCF1_WRITE(emu, 0x0059);
@@ -169,8 +184,8 @@ snd_emu8000_detect(struct snd_emu8000 *emu)
 /*
  * intiailize audio channels
  */
-static void
-init_audio(struct snd_emu8000 *emu)
+static void __init
+init_audio(emu8000_t *emu)
 {
 	int ch;
 
@@ -210,8 +225,8 @@ init_audio(struct snd_emu8000 *emu)
 /*
  * initialize DMA address
  */
-static void
-init_dma(struct snd_emu8000 *emu)
+static void __init
+init_dma(emu8000_t *emu)
 {
 	EMU8000_SMALR_WRITE(emu, 0);
 	EMU8000_SMARR_WRITE(emu, 0);
@@ -222,7 +237,7 @@ init_dma(struct snd_emu8000 *emu)
 /*
  * initialization arrays; from ADIP
  */
-static const unsigned short init1[128] = {
+static unsigned short init1[128] /*__devinitdata*/ = {
 	0x03ff, 0x0030,  0x07ff, 0x0130, 0x0bff, 0x0230,  0x0fff, 0x0330,
 	0x13ff, 0x0430,  0x17ff, 0x0530, 0x1bff, 0x0630,  0x1fff, 0x0730,
 	0x23ff, 0x0830,  0x27ff, 0x0930, 0x2bff, 0x0a30,  0x2fff, 0x0b30,
@@ -244,7 +259,7 @@ static const unsigned short init1[128] = {
 	0xf3ff, 0x0c30,  0xf7ff, 0x0d30, 0xfbff, 0x0e30,  0xffff, 0x0f30,
 };
 
-static const unsigned short init2[128] = {
+static unsigned short init2[128] /*__devinitdata*/ = {
 	0x03ff, 0x8030, 0x07ff, 0x8130, 0x0bff, 0x8230, 0x0fff, 0x8330,
 	0x13ff, 0x8430, 0x17ff, 0x8530, 0x1bff, 0x8630, 0x1fff, 0x8730,
 	0x23ff, 0x8830, 0x27ff, 0x8930, 0x2bff, 0x8a30, 0x2fff, 0x8b30,
@@ -266,7 +281,7 @@ static const unsigned short init2[128] = {
 	0xf3ff, 0x8c30, 0xf7ff, 0x8d30, 0xfbff, 0x8e30, 0xffff, 0x8f30,
 };
 
-static const unsigned short init3[128] = {
+static unsigned short init3[128] /*__devinitdata*/ = {
 	0x0C10, 0x8470, 0x14FE, 0xB488, 0x167F, 0xA470, 0x18E7, 0x84B5,
 	0x1B6E, 0x842A, 0x1F1D, 0x852A, 0x0DA3, 0x8F7C, 0x167E, 0xF254,
 	0x0000, 0x842A, 0x0001, 0x852A, 0x18E6, 0x8BAA, 0x1B6D, 0xF234,
@@ -288,7 +303,7 @@ static const unsigned short init3[128] = {
 	0x1342, 0xD36E, 0x3EC7, 0xB3FF, 0x0000, 0x8365, 0x1420, 0x9570,
 };
 
-static const unsigned short init4[128] = {
+static unsigned short init4[128] /*__devinitdata*/ = {
 	0x0C10, 0x8470, 0x14FE, 0xB488, 0x167F, 0xA470, 0x18E7, 0x84B5,
 	0x1B6E, 0x842A, 0x1F1D, 0x852A, 0x0DA3, 0x0F7C, 0x167E, 0x7254,
 	0x0000, 0x842A, 0x0001, 0x852A, 0x18E6, 0x0BAA, 0x1B6D, 0x7234,
@@ -314,11 +329,11 @@ static const unsigned short init4[128] = {
  * Taken from the oss driver, not obvious from the doc how this
  * is meant to work
  */
-static void
-send_array(struct snd_emu8000 *emu, const unsigned short *data, int size)
+static void __init
+send_array(emu8000_t *emu, unsigned short *data, int size)
 {
 	int i;
-	const unsigned short *p;
+	unsigned short *p;
 
 	p = data;
 	for (i = 0; i < size; i++, p++)
@@ -336,8 +351,8 @@ send_array(struct snd_emu8000 *emu, const unsigned short *data, int size)
  * Send initialization arrays to start up, this just follows the
  * initialisation sequence in the adip.
  */
-static void
-init_arrays(struct snd_emu8000 *emu)
+static void __init
+init_arrays(emu8000_t *emu)
 {
 	send_array(emu, init1, ARRAY_SIZE(init1)/4);
 
@@ -358,12 +373,12 @@ init_arrays(struct snd_emu8000 *emu)
 
 /*
  * Size the onboard memory.
- * This is written so as not to need arbitrary delays after the write. It
+ * This is written so as not to need arbitary delays after the write. It
  * seems that the only way to do this is to use the one channel and keep
  * reallocating between read and write.
  */
-static void
-size_dram(struct snd_emu8000 *emu)
+static void __init
+size_dram(emu8000_t *emu)
 {
 	int i, size;
 
@@ -378,19 +393,10 @@ size_dram(struct snd_emu8000 *emu)
 	EMU8000_SMALW_WRITE(emu, EMU8000_DRAM_OFFSET);
 	EMU8000_SMLD_WRITE(emu, UNIQUE_ID1);
 	snd_emu8000_init_fm(emu); /* This must really be here and not 2 lines back even */
-	snd_emu8000_write_wait(emu);
 
-	/*
-	 * Detect first 512 KiB.  If a write succeeds at the beginning of a
-	 * 512 KiB page we assume that the whole page is there.
-	 */
-	EMU8000_SMALR_WRITE(emu, EMU8000_DRAM_OFFSET);
-	EMU8000_SMLD_READ(emu); /* discard stale data  */
-	if (EMU8000_SMLD_READ(emu) != UNIQUE_ID1)
-		goto skip_detect;   /* No RAM */
-	snd_emu8000_read_wait(emu);
+	while (size < EMU8000_MAX_DRAM) {
 
-	for (size = 512 * 1024; size < EMU8000_MAX_DRAM; size += 512 * 1024) {
+		size += 512 * 1024;  /* increment 512kbytes */
 
 		/* Write a unique data on the test address.
 		 * if the address is out of range, the data is written on
@@ -411,7 +417,8 @@ size_dram(struct snd_emu8000 *emu)
 		/*snd_emu8000_read_wait(emu);*/
 		EMU8000_SMLD_READ(emu); /* discard stale data  */
 		if (EMU8000_SMLD_READ(emu) != UNIQUE_ID2)
-			break; /* no memory at this address */
+			break; /* we must have wrapped around */
+
 		snd_emu8000_read_wait(emu);
 
 		/*
@@ -424,23 +431,21 @@ size_dram(struct snd_emu8000 *emu)
 		if (EMU8000_SMLD_READ(emu) != UNIQUE_ID1)
 			break; /* we must have wrapped around */
 		snd_emu8000_read_wait(emu);
-
-		/* Otherwise, it's valid memory. */
 	}
 
-skip_detect:
 	/* wait until FULL bit in SMAxW register is false */
 	for (i = 0; i < 10000; i++) {
 		if ((EMU8000_SMALW_READ(emu) & 0x80000000) == 0)
 			break;
-		schedule_timeout_interruptible(1);
+		set_current_state(TASK_INTERRUPTIBLE);
+		schedule_timeout(1);
 		if (signal_pending(current))
 			break;
 	}
 	snd_emu8000_dma_chan(emu, 0, EMU8000_RAM_CLOSE);
 	snd_emu8000_dma_chan(emu, 1, EMU8000_RAM_CLOSE);
 
-	pr_info("EMU8000 [0x%lx]: %d KiB on-board DRAM detected\n",
+	snd_printdd("EMU8000 [0x%lx]: %d Kb on-board memory detected\n",
 		    emu->port1, size/1024);
 
 	emu->mem_size = size;
@@ -453,7 +458,7 @@ skip_detect:
  * and therefore lose 2 voices.
  */
 /*exported*/ void
-snd_emu8000_init_fm(struct snd_emu8000 *emu)
+snd_emu8000_init_fm(emu8000_t *emu)
 {
 	unsigned long flags;
 
@@ -498,8 +503,8 @@ snd_emu8000_init_fm(struct snd_emu8000 *emu)
 /*
  * The main initialization routine.
  */
-static void
-snd_emu8000_init_hw(struct snd_emu8000 *emu)
+static void __init
+snd_emu8000_init_hw(emu8000_t *emu)
 {
 	int i;
 
@@ -548,7 +553,7 @@ snd_emu8000_init_hw(struct snd_emu8000 *emu)
  * Bass/Treble Equalizer
  *----------------------------------------------------------------*/
 
-static const unsigned short bass_parm[12][3] = {
+static unsigned short bass_parm[12][3] = {
 	{0xD26A, 0xD36A, 0x0000}, /* -12 dB */
 	{0xD25B, 0xD35B, 0x0000}, /*  -8 */
 	{0xD24C, 0xD34C, 0x0000}, /*  -6 */
@@ -563,7 +568,7 @@ static const unsigned short bass_parm[12][3] = {
 	{0xC26A, 0xC36A, 0x0002}, /* +12 dB */
 };
 
-static const unsigned short treble_parm[12][9] = {
+static unsigned short treble_parm[12][9] = {
 	{0x821E, 0xC26A, 0x031E, 0xC36A, 0x021E, 0xD208, 0x831E, 0xD308, 0x0001}, /* -12 dB */
 	{0x821E, 0xC25B, 0x031E, 0xC35B, 0x021E, 0xD208, 0x831E, 0xD308, 0x0001},
 	{0x821E, 0xC24C, 0x031E, 0xC34C, 0x021E, 0xD208, 0x831E, 0xD308, 0x0001},
@@ -583,7 +588,7 @@ static const unsigned short treble_parm[12][9] = {
  * set Emu8000 digital equalizer; from 0 to 11 [-12dB - 12dB]
  */
 /*exported*/ void
-snd_emu8000_update_equalizer(struct snd_emu8000 *emu)
+snd_emu8000_update_equalizer(emu8000_t *emu)
 {
 	unsigned short w;
 	int bass = emu->bass_level;
@@ -626,17 +631,17 @@ snd_emu8000_update_equalizer(struct snd_emu8000 *emu)
 /* user can define chorus modes up to 32 */
 #define SNDRV_EMU8000_CHORUS_NUMBERS	32
 
-struct soundfont_chorus_fx {
+typedef struct soundfont_chorus_fx_t {
 	unsigned short feedback;	/* feedback level (0xE600-0xE6FF) */
 	unsigned short delay_offset;	/* delay (0-0x0DA3) [1/44100 sec] */
 	unsigned short lfo_depth;	/* LFO depth (0xBC00-0xBCFF) */
 	unsigned int delay;	/* right delay (0-0xFFFFFFFF) [1/256/44100 sec] */
 	unsigned int lfo_freq;		/* LFO freq LFO freq (0-0xFFFFFFFF) */
-};
+} soundfont_chorus_fx_t;
 
 /* 5 parameters for each chorus mode; 3 x 16bit, 2 x 32bit */
 static char chorus_defined[SNDRV_EMU8000_CHORUS_NUMBERS];
-static struct soundfont_chorus_fx chorus_parm[SNDRV_EMU8000_CHORUS_NUMBERS] = {
+static soundfont_chorus_fx_t chorus_parm[SNDRV_EMU8000_CHORUS_NUMBERS] = {
 	{0xE600, 0x03F6, 0xBC2C ,0x00000000, 0x0000006D}, /* chorus 1 */
 	{0xE608, 0x031A, 0xBC6E, 0x00000000, 0x0000017C}, /* chorus 2 */
 	{0xE610, 0x031A, 0xBC84, 0x00000000, 0x00000083}, /* chorus 3 */
@@ -648,9 +653,9 @@ static struct soundfont_chorus_fx chorus_parm[SNDRV_EMU8000_CHORUS_NUMBERS] = {
 };
 
 /*exported*/ int
-snd_emu8000_load_chorus_fx(struct snd_emu8000 *emu, int mode, const void __user *buf, long len)
+snd_emu8000_load_chorus_fx(emu8000_t *emu, int mode, const void __user *buf, long len)
 {
-	struct soundfont_chorus_fx rec;
+	soundfont_chorus_fx_t rec;
 	if (mode < SNDRV_EMU8000_CHORUS_PREDEFINED || mode >= SNDRV_EMU8000_CHORUS_NUMBERS) {
 		snd_printk(KERN_WARNING "invalid chorus mode %d for uploading\n", mode);
 		return -EINVAL;
@@ -663,7 +668,7 @@ snd_emu8000_load_chorus_fx(struct snd_emu8000 *emu, int mode, const void __user 
 }
 
 /*exported*/ void
-snd_emu8000_update_chorus_mode(struct snd_emu8000 *emu)
+snd_emu8000_update_chorus_mode(emu8000_t *emu)
 {
 	int effect = emu->chorus_mode;
 	if (effect < 0 || effect >= SNDRV_EMU8000_CHORUS_NUMBERS ||
@@ -697,15 +702,15 @@ snd_emu8000_update_chorus_mode(struct snd_emu8000 *emu)
 /* user can define reverb modes up to 32 */
 #define SNDRV_EMU8000_REVERB_NUMBERS	32
 
-struct soundfont_reverb_fx {
+typedef struct soundfont_reverb_fx_t {
 	unsigned short parms[28];
-};
+} soundfont_reverb_fx_t;
 
 /* reverb mode settings; write the following 28 data of 16 bit length
  *   on the corresponding ports in the reverb_cmds array
  */
 static char reverb_defined[SNDRV_EMU8000_CHORUS_NUMBERS];
-static struct soundfont_reverb_fx reverb_parm[SNDRV_EMU8000_REVERB_NUMBERS] = {
+static soundfont_reverb_fx_t reverb_parm[SNDRV_EMU8000_REVERB_NUMBERS] = {
 {{  /* room 1 */
 	0xB488, 0xA450, 0x9550, 0x84B5, 0x383A, 0x3EB5, 0x72F4,
 	0x72A4, 0x7254, 0x7204, 0x7204, 0x7204, 0x4416, 0x4516,
@@ -775,9 +780,9 @@ static struct reverb_cmd_pair {
 };
 
 /*exported*/ int
-snd_emu8000_load_reverb_fx(struct snd_emu8000 *emu, int mode, const void __user *buf, long len)
+snd_emu8000_load_reverb_fx(emu8000_t *emu, int mode, const void __user *buf, long len)
 {
-	struct soundfont_reverb_fx rec;
+	soundfont_reverb_fx_t rec;
 
 	if (mode < SNDRV_EMU8000_REVERB_PREDEFINED || mode >= SNDRV_EMU8000_REVERB_NUMBERS) {
 		snd_printk(KERN_WARNING "invalid reverb mode %d for uploading\n", mode);
@@ -791,7 +796,7 @@ snd_emu8000_load_reverb_fx(struct snd_emu8000 *emu, int mode, const void __user 
 }
 
 /*exported*/ void
-snd_emu8000_update_reverb_mode(struct snd_emu8000 *emu)
+snd_emu8000_update_reverb_mode(emu8000_t *emu)
 {
 	int effect = emu->reverb_mode;
 	int i;
@@ -817,7 +822,7 @@ snd_emu8000_update_reverb_mode(struct snd_emu8000 *emu)
 /*
  * bass/treble
  */
-static int mixer_bass_treble_info(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_info *uinfo)
+static int mixer_bass_treble_info(snd_kcontrol_t *kcontrol, snd_ctl_elem_info_t * uinfo)
 {
 	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
 	uinfo->count = 1;
@@ -826,17 +831,17 @@ static int mixer_bass_treble_info(struct snd_kcontrol *kcontrol, struct snd_ctl_
 	return 0;
 }
 
-static int mixer_bass_treble_get(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *ucontrol)
+static int mixer_bass_treble_get(snd_kcontrol_t * kcontrol, snd_ctl_elem_value_t * ucontrol)
 {
-	struct snd_emu8000 *emu = snd_kcontrol_chip(kcontrol);
+	emu8000_t *emu = snd_kcontrol_chip(kcontrol);
 	
 	ucontrol->value.integer.value[0] = kcontrol->private_value ? emu->treble_level : emu->bass_level;
 	return 0;
 }
 
-static int mixer_bass_treble_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *ucontrol)
+static int mixer_bass_treble_put(snd_kcontrol_t * kcontrol, snd_ctl_elem_value_t * ucontrol)
 {
-	struct snd_emu8000 *emu = snd_kcontrol_chip(kcontrol);
+	emu8000_t *emu = snd_kcontrol_chip(kcontrol);
 	unsigned long flags;
 	int change;
 	unsigned short val1;
@@ -855,7 +860,7 @@ static int mixer_bass_treble_put(struct snd_kcontrol *kcontrol, struct snd_ctl_e
 	return change;
 }
 
-static const struct snd_kcontrol_new mixer_bass_control =
+static snd_kcontrol_new_t mixer_bass_control =
 {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "Synth Tone Control - Bass",
@@ -865,7 +870,7 @@ static const struct snd_kcontrol_new mixer_bass_control =
 	.private_value = 0,
 };
 
-static const struct snd_kcontrol_new mixer_treble_control =
+static snd_kcontrol_new_t mixer_treble_control =
 {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "Synth Tone Control - Treble",
@@ -878,7 +883,7 @@ static const struct snd_kcontrol_new mixer_treble_control =
 /*
  * chorus/reverb mode
  */
-static int mixer_chorus_reverb_info(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_info *uinfo)
+static int mixer_chorus_reverb_info(snd_kcontrol_t *kcontrol, snd_ctl_elem_info_t * uinfo)
 {
 	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
 	uinfo->count = 1;
@@ -887,17 +892,17 @@ static int mixer_chorus_reverb_info(struct snd_kcontrol *kcontrol, struct snd_ct
 	return 0;
 }
 
-static int mixer_chorus_reverb_get(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *ucontrol)
+static int mixer_chorus_reverb_get(snd_kcontrol_t * kcontrol, snd_ctl_elem_value_t * ucontrol)
 {
-	struct snd_emu8000 *emu = snd_kcontrol_chip(kcontrol);
+	emu8000_t *emu = snd_kcontrol_chip(kcontrol);
 	
 	ucontrol->value.integer.value[0] = kcontrol->private_value ? emu->chorus_mode : emu->reverb_mode;
 	return 0;
 }
 
-static int mixer_chorus_reverb_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *ucontrol)
+static int mixer_chorus_reverb_put(snd_kcontrol_t * kcontrol, snd_ctl_elem_value_t * ucontrol)
 {
-	struct snd_emu8000 *emu = snd_kcontrol_chip(kcontrol);
+	emu8000_t *emu = snd_kcontrol_chip(kcontrol);
 	unsigned long flags;
 	int change;
 	unsigned short val1;
@@ -922,7 +927,7 @@ static int mixer_chorus_reverb_put(struct snd_kcontrol *kcontrol, struct snd_ctl
 	return change;
 }
 
-static const struct snd_kcontrol_new mixer_chorus_mode_control =
+static snd_kcontrol_new_t mixer_chorus_mode_control =
 {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "Chorus Mode",
@@ -932,7 +937,7 @@ static const struct snd_kcontrol_new mixer_chorus_mode_control =
 	.private_value = 1,
 };
 
-static const struct snd_kcontrol_new mixer_reverb_mode_control =
+static snd_kcontrol_new_t mixer_reverb_mode_control =
 {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "Reverb Mode",
@@ -945,7 +950,7 @@ static const struct snd_kcontrol_new mixer_reverb_mode_control =
 /*
  * FM OPL3 chorus/reverb depth
  */
-static int mixer_fm_depth_info(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_info *uinfo)
+static int mixer_fm_depth_info(snd_kcontrol_t *kcontrol, snd_ctl_elem_info_t * uinfo)
 {
 	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
 	uinfo->count = 1;
@@ -954,17 +959,17 @@ static int mixer_fm_depth_info(struct snd_kcontrol *kcontrol, struct snd_ctl_ele
 	return 0;
 }
 
-static int mixer_fm_depth_get(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *ucontrol)
+static int mixer_fm_depth_get(snd_kcontrol_t * kcontrol, snd_ctl_elem_value_t * ucontrol)
 {
-	struct snd_emu8000 *emu = snd_kcontrol_chip(kcontrol);
+	emu8000_t *emu = snd_kcontrol_chip(kcontrol);
 	
 	ucontrol->value.integer.value[0] = kcontrol->private_value ? emu->fm_chorus_depth : emu->fm_reverb_depth;
 	return 0;
 }
 
-static int mixer_fm_depth_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *ucontrol)
+static int mixer_fm_depth_put(snd_kcontrol_t * kcontrol, snd_ctl_elem_value_t * ucontrol)
 {
-	struct snd_emu8000 *emu = snd_kcontrol_chip(kcontrol);
+	emu8000_t *emu = snd_kcontrol_chip(kcontrol);
 	unsigned long flags;
 	int change;
 	unsigned short val1;
@@ -984,7 +989,7 @@ static int mixer_fm_depth_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem
 	return change;
 }
 
-static const struct snd_kcontrol_new mixer_fm_chorus_depth_control =
+static snd_kcontrol_new_t mixer_fm_chorus_depth_control =
 {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "FM Chorus Depth",
@@ -994,7 +999,7 @@ static const struct snd_kcontrol_new mixer_fm_chorus_depth_control =
 	.private_value = 1,
 };
 
-static const struct snd_kcontrol_new mixer_fm_reverb_depth_control =
+static snd_kcontrol_new_t mixer_fm_reverb_depth_control =
 {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "FM Reverb Depth",
@@ -1005,7 +1010,7 @@ static const struct snd_kcontrol_new mixer_fm_reverb_depth_control =
 };
 
 
-static const struct snd_kcontrol_new *mixer_defs[EMU8000_NUM_CONTROLS] = {
+static snd_kcontrol_new_t *mixer_defs[EMU8000_NUM_CONTROLS] = {
 	&mixer_bass_control,
 	&mixer_treble_control,
 	&mixer_chorus_mode_control,
@@ -1017,24 +1022,19 @@ static const struct snd_kcontrol_new *mixer_defs[EMU8000_NUM_CONTROLS] = {
 /*
  * create and attach mixer elements for WaveTable treble/bass controls
  */
-static int
-snd_emu8000_create_mixer(struct snd_card *card, struct snd_emu8000 *emu)
+static int __init
+snd_emu8000_create_mixer(snd_card_t *card, emu8000_t *emu)
 {
-	struct snd_kcontrol *kctl;
 	int i, err = 0;
 
-	if (snd_BUG_ON(!emu || !card))
-		return -EINVAL;
+	snd_assert(emu != NULL && card != NULL, return -EINVAL);
 
 	spin_lock_init(&emu->control_lock);
 
 	memset(emu->controls, 0, sizeof(emu->controls));
 	for (i = 0; i < EMU8000_NUM_CONTROLS; i++) {
-		kctl = snd_ctl_new1(mixer_defs[i], emu);
-		err = snd_ctl_add(card, kctl);
-		if (err < 0)
+		if ((err = snd_ctl_add(card, emu->controls[i] = snd_ctl_new1(mixer_defs[i], emu))) < 0)
 			goto __error;
-		emu->controls[i] = kctl;
 	}
 	return 0;
 
@@ -1048,16 +1048,48 @@ __error:
 	return err;
 }
 
+
+/*
+ * free resources
+ */
+static int snd_emu8000_free(emu8000_t *hw)
+{
+	if (hw->res_port1) {
+		release_resource(hw->res_port1);
+		kfree_nocheck(hw->res_port1);
+	}
+	if (hw->res_port2) {
+		release_resource(hw->res_port2);
+		kfree_nocheck(hw->res_port2);
+	}
+	if (hw->res_port3) {
+		release_resource(hw->res_port3);
+		kfree_nocheck(hw->res_port3);
+	}
+	kfree(hw);
+	return 0;
+}
+
+/*
+ */
+static int snd_emu8000_dev_free(snd_device_t *device)
+{
+	emu8000_t *hw = device->device_data;
+	return snd_emu8000_free(hw);
+}
+
 /*
  * initialize and register emu8000 synth device.
  */
-int
-snd_emu8000_new(struct snd_card *card, int index, long port, int seq_ports,
-		struct snd_seq_device **awe_ret)
+int __init
+snd_emu8000_new(snd_card_t *card, int index, long port, int seq_ports, snd_seq_device_t **awe_ret)
 {
-	struct snd_seq_device *awe;
-	struct snd_emu8000 *hw;
+	snd_seq_device_t *awe;
+	emu8000_t *hw;
 	int err;
+	static snd_device_ops_t ops = {
+		.dev_free = snd_emu8000_dev_free,
+	};
 
 	if (awe_ret)
 		*awe_ret = NULL;
@@ -1065,7 +1097,7 @@ snd_emu8000_new(struct snd_card *card, int index, long port, int seq_ports,
 	if (seq_ports <= 0)
 		return 0;
 
-	hw = devm_kzalloc(card->dev, sizeof(*hw), GFP_KERNEL);
+	hw = kcalloc(1, sizeof(*hw), GFP_KERNEL);
 	if (hw == NULL)
 		return -ENOMEM;
 	spin_lock_init(&hw->reg_lock);
@@ -1073,10 +1105,11 @@ snd_emu8000_new(struct snd_card *card, int index, long port, int seq_ports,
 	hw->port1 = port;
 	hw->port2 = port + 0x400;
 	hw->port3 = port + 0x800;
-	if (!devm_request_region(card->dev, hw->port1, 4, "Emu8000-1") ||
-	    !devm_request_region(card->dev, hw->port2, 4, "Emu8000-2") ||
-	    !devm_request_region(card->dev, hw->port3, 4, "Emu8000-3")) {
+	if (!(hw->res_port1 = request_region(hw->port1, 4, "Emu8000-1")) ||
+	    !(hw->res_port2 = request_region(hw->port2, 4, "Emu8000-2")) ||
+	    !(hw->res_port3 = request_region(hw->port3, 4, "Emu8000-3"))) {
 		snd_printk(KERN_ERR "sbawe: can't grab ports 0x%lx, 0x%lx, 0x%lx\n", hw->port1, hw->port2, hw->port3);
+		snd_emu8000_free(hw);
 		return -EBUSY;
 	}
 	hw->mem_size = 0;
@@ -1089,18 +1122,26 @@ snd_emu8000_new(struct snd_card *card, int index, long port, int seq_ports,
 	hw->fm_chorus_depth = 0;
 	hw->fm_reverb_depth = 0;
 
-	if (snd_emu8000_detect(hw) < 0)
+	if (snd_emu8000_detect(hw) < 0) {
+		snd_emu8000_free(hw);
 		return -ENODEV;
+	}
 
 	snd_emu8000_init_hw(hw);
-	err = snd_emu8000_create_mixer(card, hw);
-	if (err < 0)
+	if ((err = snd_emu8000_create_mixer(card, hw)) < 0) {
+		snd_emu8000_free(hw);
 		return err;
-#if IS_ENABLED(CONFIG_SND_SEQUENCER)
+	}
+	
+	if ((err = snd_device_new(card, SNDRV_DEV_CODEC, hw, &ops)) < 0) {
+		snd_emu8000_free(hw);
+		return err;
+	}
+#if defined(CONFIG_SND_SEQUENCER) || (defined(MODULE) && defined(CONFIG_SND_SEQUENCER_MODULE))
 	if (snd_seq_device_new(card, index, SNDRV_SEQ_DEV_ID_EMU8000,
-			       sizeof(struct snd_emu8000*), &awe) >= 0) {
+			       sizeof(emu8000_t*), &awe) >= 0) {
 		strcpy(awe->name, "EMU-8000");
-		*(struct snd_emu8000 **)SNDRV_SEQ_DEVICE_ARGPTR(awe) = hw;
+		*(emu8000_t**)SNDRV_SEQ_DEVICE_ARGPTR(awe) = hw;
 	}
 #else
 	awe = NULL;

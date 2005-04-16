@@ -1,8 +1,11 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (C) by Paul Barton-Davis 1998-1999
  *
  * Some portions of this file are taken from work that is
  * copyright (C) by Hannu Savolainen 1993-1996
+ *
+ * This program is distributed under the GNU GENERAL PUBLIC LICENSE (GPL)
+ * Version 2 (June 1991). See the "COPYING" file distributed with this software
+ * for more info.  
  */
 
 /*  
@@ -17,17 +20,14 @@
  *
  */
 
-#include <linux/io.h>
+#include <sound/driver.h>
+#include <asm/io.h>
 #include <linux/interrupt.h>
 #include <linux/init.h>
 #include <linux/delay.h>
 #include <linux/time.h>
 #include <linux/wait.h>
-#include <linux/sched/signal.h>
-#include <linux/firmware.h>
 #include <linux/moduleparam.h>
-#include <linux/slab.h>
-#include <linux/module.h>
 #include <sound/core.h>
 #include <sound/snd_wavefront.h>
 #include <sound/initval.h>
@@ -53,8 +53,9 @@ static int debug_default = 0;  /* you can set this to control debugging
 
 /* XXX this needs to be made firmware and hardware version dependent */
 
-#define DEFAULT_OSPATH	"wavefront.os"
-static char *ospath = DEFAULT_OSPATH; /* the firmware file name */
+static char *ospath = "/etc/sound/wavefront.os"; /* where to find a processed
+						    version of the WaveFront OS
+						 */
 
 static int wait_usecs = 150; /* This magic number seems to give pretty optimal
 				throughput based on my limited experimentation.
@@ -96,7 +97,7 @@ MODULE_PARM_DESC(sleep_interval, "how long to sleep when waiting for reply");
 module_param(sleep_tries, int, 0444);
 MODULE_PARM_DESC(sleep_tries, "how many times to try sleeping during a wait");
 module_param(ospath, charp, 0444);
-MODULE_PARM_DESC(ospath, "pathname to processed ICS2115 OS firmware");
+MODULE_PARM_DESC(ospath, "full pathname to processed ICS2115 OS firmware");
 module_param(reset_time, int, 0444);
 MODULE_PARM_DESC(reset_time, "how long to wait for a reset to take effect");
 module_param(ramcheck_time, int, 0444);
@@ -114,10 +115,17 @@ MODULE_PARM_DESC(osrun_time, "how many seconds to wait for the ICS2115 OS");
 
 #ifdef WF_DEBUG
 
+#if defined(NEW_MACRO_VARARGS) || __GNUC__ >= 3
 #define DPRINT(cond, ...) \
        if ((dev->debug & (cond)) == (cond)) { \
 	     snd_printk (__VA_ARGS__); \
        }
+#else
+#define DPRINT(cond, args...) \
+       if ((dev->debug & (cond)) == (cond)) { \
+	     snd_printk (args); \
+       }
+#endif
 #else
 #define DPRINT(cond, args...)
 #endif /* WF_DEBUG */
@@ -136,13 +144,13 @@ MODULE_PARM_DESC(osrun_time, "how many seconds to wait for the ICS2115 OS");
 static int wavefront_delete_sample (snd_wavefront_t *, int sampnum);
 static int wavefront_find_free_sample (snd_wavefront_t *);
 
-struct wavefront_command {
+typedef struct {
 	int cmd;
 	char *action;
 	unsigned int read_cnt;
 	unsigned int write_cnt;
 	int need_ack;
-};
+} wavefront_command;
 
 static struct {
 	int errno;
@@ -162,7 +170,7 @@ static struct {
 
 #define NEEDS_ACK 1
 
-static struct wavefront_command wavefront_commands[] = {
+static wavefront_command wavefront_commands[] = {
 	{ WFC_SET_SYNTHVOL, "set synthesizer volume", 0, 1, NEEDS_ACK },
 	{ WFC_GET_SYNTHVOL, "get synthesizer volume", 1, 0, 0},
 	{ WFC_SET_NVOICES, "set number of voices", 0, 1, NEEDS_ACK },
@@ -241,7 +249,7 @@ wavefront_errorstr (int errnum)
 	return "Unknown WaveFront error";
 }
 
-static struct wavefront_command *
+static wavefront_command *
 wavefront_get_command (int cmd) 
 
 {
@@ -253,7 +261,7 @@ wavefront_get_command (int cmd)
 		}
 	}
 
-	return NULL;
+	return (wavefront_command *) 0;
 }
 
 static inline int
@@ -267,7 +275,8 @@ static int
 wavefront_sleep (int limit)
 
 {
-	schedule_timeout_interruptible(limit);
+	set_current_state(TASK_INTERRUPTIBLE);
+	schedule_timeout(limit);
 
 	return signal_pending(current);
 }
@@ -337,10 +346,9 @@ snd_wavefront_cmd (snd_wavefront_t *dev,
 	int ack;
 	unsigned int i;
 	int c;
-	struct wavefront_command *wfcmd;
+	wavefront_command *wfcmd;
 
-	wfcmd = wavefront_get_command(cmd);
-	if (!wfcmd) {
+	if ((wfcmd = wavefront_get_command (cmd)) == (wavefront_command *) 0) {
 		snd_printk ("command 0x%x not supported.\n",
 			cmd);
 		return 1;
@@ -392,8 +400,7 @@ snd_wavefront_cmd (snd_wavefront_t *dev,
 
 		for (i = 0; i < wfcmd->read_cnt; i++) {
 
-			c = wavefront_read(dev);
-			if (c == -1) {
+			if ((c = wavefront_read (dev)) == -1) {
 				DPRINT (WF_DEBUG_IO, "bad read for byte "
 						      "%d of 0x%x [%s].\n",
 						      i, cmd, wfcmd->action);
@@ -403,8 +410,7 @@ snd_wavefront_cmd (snd_wavefront_t *dev,
 			/* Now handle errors. Lots of special cases here */
 	    
 			if (c == 0xff) { 
-				c = wavefront_read(dev);
-				if (c == -1) {
+				if ((c = wavefront_read (dev)) == -1) {
 					DPRINT (WF_DEBUG_IO, "bad read for "
 							      "error byte at "
 							      "read byte %d "
@@ -462,9 +468,9 @@ snd_wavefront_cmd (snd_wavefront_t *dev,
 		   of the standard value.
 		*/
 	    
-		ack = wavefront_read(dev);
-		if (ack == 0)
+		if ((ack = wavefront_read (dev)) == 0) {
 			ack = WF_ACK;
+		}
 	
 		if (ack != WF_ACK) {
 			if (ack == -1) {
@@ -478,8 +484,7 @@ snd_wavefront_cmd (snd_wavefront_t *dev,
 
 				if (ack == 0xff) { /* explicit error */
 		    
-					err = wavefront_read(dev);
-					if (err == -1) {
+					if ((err = wavefront_read (dev)) == -1) {
 						DPRINT (WF_DEBUG_DATA,
 							"cannot read err "
 							"for 0x%x [%s].\n",
@@ -540,7 +545,7 @@ munge_int32 (unsigned int src,
 	                            /* Note: we leave the upper bits in place */ 
 
 		dst++;
-	}
+ 	};
 	return dst;
 };
 
@@ -581,6 +586,8 @@ demunge_buf (unsigned char *src, unsigned char *dst, unsigned int src_bytes)
 	int i;
 	unsigned char *end = src + src_bytes;
     
+	end = src + src_bytes;
+
 	/* NOTE: src and dst *CAN* point to the same address */
 
 	for (i = 0; src != end; i++) {
@@ -605,9 +612,9 @@ wavefront_delete_sample (snd_wavefront_t *dev, int sample_num)
 	wbuf[0] = sample_num & 0x7f;
 	wbuf[1] = sample_num >> 7;
 
-	x = snd_wavefront_cmd(dev, WFC_DELETE_SAMPLE, NULL, wbuf);
-	if (!x)
+	if ((x = snd_wavefront_cmd (dev, WFC_DELETE_SAMPLE, NULL, wbuf)) == 0) {
 		dev->sample_status[sample_num] = WF_ST_EMPTY;
+	}
 
 	return x;
 }
@@ -635,7 +642,7 @@ wavefront_get_sample_status (snd_wavefront_t *dev, int assume_rom)
 		wbuf[1] = i >> 7;
 
 		if (snd_wavefront_cmd (dev, WFC_IDENTIFY_SAMPLE_TYPE, rbuf, wbuf)) {
-			snd_printk(KERN_WARNING "cannot identify sample "
+			snd_printk("cannot identify sample "
 				   "type of slot %d\n", i);
 			dev->sample_status[i] = WF_ST_EMPTY;
 			continue;
@@ -693,9 +700,8 @@ wavefront_get_patch_status (snd_wavefront_t *dev)
 		patchnum[0] = i & 0x7f;
 		patchnum[1] = i >> 7;
 
-		x = snd_wavefront_cmd(dev, WFC_UPLOAD_PATCH, patchbuf,
-				      patchnum);
-		if (x == 0) {
+		if ((x = snd_wavefront_cmd (dev, WFC_UPLOAD_PATCH, patchbuf,
+					patchnum)) == 0) {
 
 			dev->patch_status[i] |= WF_SLOT_FILLED;
 			p = (wavefront_patch *) patchbuf;
@@ -741,9 +747,8 @@ wavefront_get_program_status (snd_wavefront_t *dev)
 	for (i = 0; i < WF_MAX_PROGRAM; i++) {
 		prognum = i;
 
-		x = snd_wavefront_cmd(dev, WFC_UPLOAD_PROGRAM, progbuf,
-				      &prognum);
-		if (x == 0) {
+		if ((x = snd_wavefront_cmd (dev, WFC_UPLOAD_PROGRAM, progbuf,
+					&prognum)) == 0) {
 
 			dev->prog_status[i] |= WF_SLOT_USED;
 
@@ -787,17 +792,15 @@ wavefront_send_patch (snd_wavefront_t *dev, wavefront_patch_info *header)
 	DPRINT (WF_DEBUG_LOAD_PATCH, "downloading patch %d\n",
 				      header->number);
 
-	if (header->number >= ARRAY_SIZE(dev->patch_status))
-		return -EINVAL;
-
 	dev->patch_status[header->number] |= WF_SLOT_FILLED;
 
+	bptr = buf;
 	bptr = munge_int32 (header->number, buf, 2);
 	munge_buf ((unsigned char *)&header->hdr.p, bptr, WF_PATCH_BYTES);
     
 	if (snd_wavefront_cmd (dev, WFC_DOWNLOAD_PATCH, NULL, buf)) {
 		snd_printk ("download patch failed\n");
-		return -EIO;
+		return -(EIO);
 	}
 
 	return (0);
@@ -812,9 +815,6 @@ wavefront_send_program (snd_wavefront_t *dev, wavefront_patch_info *header)
 
 	DPRINT (WF_DEBUG_LOAD_PATCH, "downloading program %d\n",
 		header->number);
-
-	if (header->number >= ARRAY_SIZE(dev->prog_status))
-		return -EINVAL;
 
 	dev->prog_status[header->number] = WF_SLOT_USED;
 
@@ -838,7 +838,7 @@ wavefront_send_program (snd_wavefront_t *dev, wavefront_patch_info *header)
     
 	if (snd_wavefront_cmd (dev, WFC_DOWNLOAD_PROGRAM, NULL, buf)) {
 		snd_printk ("download patch failed\n");	
-		return -EIO;
+		return -(EIO);
 	}
 
 	return (0);
@@ -874,7 +874,7 @@ wavefront_send_sample (snd_wavefront_t *dev,
 	   divided by 2.
         */
 
-	u16 sample_short = 0;
+	u16 sample_short;
 	u32 length;
 	u16 __user *data_end = NULL;
 	unsigned int i;
@@ -898,15 +898,12 @@ wavefront_send_sample (snd_wavefront_t *dev,
 	if (header->number == WAVEFRONT_FIND_FREE_SAMPLE_SLOT) {
 		int x;
 
-		x = wavefront_find_free_sample(dev);
-		if (x < 0)
+		if ((x = wavefront_find_free_sample (dev)) < 0) {
 			return -ENOMEM;
+		}
 		snd_printk ("unspecified sample => %d\n", x);
 		header->number = x;
 	}
-
-	if (header->number >= WF_MAX_SAMPLE)
-		return -EINVAL;
 
 	if (header->size) {
 
@@ -962,7 +959,7 @@ wavefront_send_sample (snd_wavefront_t *dev,
 	if (skip > 0 && header->hdr.s.SampleResolution != LINEAR_16BIT) {
 		snd_printk ("channel selection only "
 			    "possible on 16-bit samples");
-		return -EINVAL;
+		return -(EINVAL);
 	}
 
 	switch (skip) {
@@ -1059,7 +1056,7 @@ wavefront_send_sample (snd_wavefront_t *dev,
 			   NULL, sample_hdr)) {
 		snd_printk ("sample %sdownload refused.\n",
 			    header->size ? "" : "header ");
-		return -EIO;
+		return -(EIO);
 	}
 
 	if (header->size == 0) {
@@ -1079,21 +1076,20 @@ wavefront_send_sample (snd_wavefront_t *dev,
 			blocksize = max_blksize;
 		} else {
 			/* round to nearest 16-byte value */
-			blocksize = ALIGN(length - written, 8);
+			blocksize = ((length-written+7)&~0x7);
 		}
 
 		if (snd_wavefront_cmd (dev, WFC_DOWNLOAD_BLOCK, NULL, NULL)) {
 			snd_printk ("download block "
 				    "request refused.\n");
-			return -EIO;
+			return -(EIO);
 		}
 
 		for (i = 0; i < blocksize; i++) {
 
 			if (dataptr < data_end) {
 		
-				if (get_user(sample_short, dataptr))
-					return -EFAULT;
+				__get_user (sample_short, dataptr);
 				dataptr += skip;
 		
 				if (data_is_unsigned) { /* GUS ? */
@@ -1142,17 +1138,16 @@ wavefront_send_sample (snd_wavefront_t *dev,
 		   nothing to do with DMA at all.
 		*/
 	
-		dma_ack = wavefront_read(dev);
-		if (dma_ack != WF_DMA_ACK) {
+		if ((dma_ack = wavefront_read (dev)) != WF_DMA_ACK) {
 			if (dma_ack == -1) {
 				snd_printk ("upload sample "
 					    "DMA ack timeout\n");
-				return -EIO;
+				return -(EIO);
 			} else {
 				snd_printk ("upload sample "
 					    "DMA ack error 0x%x\n",
 					    dma_ack);
-				return -EIO;
+				return -(EIO);
 			}
 		}
 	}
@@ -1177,10 +1172,7 @@ wavefront_send_alias (snd_wavefront_t *dev, wavefront_patch_info *header)
 				      "alias for %d\n",
 				      header->number,
 				      header->hdr.a.OriginalSample);
-
-	if (header->number >= WF_MAX_SAMPLE)
-		return -EINVAL;
-
+    
 	munge_int32 (header->number, &alias_hdr[0], 2);
 	munge_int32 (header->hdr.a.OriginalSample, &alias_hdr[2], 2);
 	munge_int32 (*((unsigned int *)&header->hdr.a.sampleStartOffset),
@@ -1196,7 +1188,7 @@ wavefront_send_alias (snd_wavefront_t *dev, wavefront_patch_info *header)
 
 	if (snd_wavefront_cmd (dev, WFC_DOWNLOAD_SAMPLE_ALIAS, NULL, alias_hdr)) {
 		snd_printk ("download alias failed.\n");
-		return -EIO;
+		return -(EIO);
 	}
 
 	dev->sample_status[header->number] = (WF_SLOT_FILLED|WF_ST_ALIAS);
@@ -1211,10 +1203,7 @@ wavefront_send_multisample (snd_wavefront_t *dev, wavefront_patch_info *header)
 	int num_samples;
 	unsigned char *msample_hdr;
 
-	if (header->number >= WF_MAX_SAMPLE)
-		return -EINVAL;
-
-	msample_hdr = kmalloc(WF_MSAMPLE_BYTES, GFP_KERNEL);
+	msample_hdr = kmalloc(sizeof(WF_MSAMPLE_BYTES), GFP_KERNEL);
 	if (! msample_hdr)
 		return -ENOMEM;
 
@@ -1250,7 +1239,7 @@ wavefront_send_multisample (snd_wavefront_t *dev, wavefront_patch_info *header)
 			   msample_hdr)) {
 		snd_printk ("download of multisample failed.\n");
 		kfree(msample_hdr);
-		return -EIO;
+		return -(EIO);
 	}
 
 	dev->sample_status[header->number] = (WF_SLOT_FILLED|WF_ST_MULTISAMPLE);
@@ -1272,7 +1261,7 @@ wavefront_fetch_multisample (snd_wavefront_t *dev,
     
 	if (snd_wavefront_cmd (dev, WFC_UPLOAD_MULTISAMPLE, log_ns, number)) {
 		snd_printk ("upload multisample failed.\n");
-		return -EIO;
+		return -(EIO);
 	}
     
 	DPRINT (WF_DEBUG_DATA, "msample %d has %d samples\n",
@@ -1288,19 +1277,17 @@ wavefront_fetch_multisample (snd_wavefront_t *dev,
 		char d[2];
 		int val;
 	
-		val = wavefront_read(dev);
-		if (val == -1) {
+		if ((val = wavefront_read (dev)) == -1) {
 			snd_printk ("upload multisample failed "
 				    "during sample loop.\n");
-			return -EIO;
+			return -(EIO);
 		}
 		d[0] = val;
 
-		val = wavefront_read(dev);
-		if (val == -1) {
+		if ((val = wavefront_read (dev)) == -1) {
 			snd_printk ("upload multisample failed "
 				    "during sample loop.\n");
-			return -EIO;
+			return -(EIO);
 		}
 		d[1] = val;
 	
@@ -1335,7 +1322,7 @@ wavefront_send_drum (snd_wavefront_t *dev, wavefront_patch_info *header)
 
 	if (snd_wavefront_cmd (dev, WFC_DOWNLOAD_EDRUM_PROGRAM, NULL, drumbuf)) {
 		snd_printk ("download drum failed.\n");
-		return -EIO;
+		return -(EIO);
 	}
 
 	return (0);
@@ -1639,7 +1626,7 @@ wavefront_synth_control (snd_wavefront_card_t *acard,
 }
 
 int 
-snd_wavefront_synth_open (struct snd_hwdep *hw, struct file *file)
+snd_wavefront_synth_open (snd_hwdep_t *hw, struct file *file)
 
 {
 	if (!try_module_get(hw->card->module))
@@ -1649,7 +1636,7 @@ snd_wavefront_synth_open (struct snd_hwdep *hw, struct file *file)
 }
 
 int 
-snd_wavefront_synth_release (struct snd_hwdep *hw, struct file *file)
+snd_wavefront_synth_release (snd_hwdep_t *hw, struct file *file)
 
 {
 	module_put(hw->card->module);
@@ -1657,23 +1644,22 @@ snd_wavefront_synth_release (struct snd_hwdep *hw, struct file *file)
 }
 
 int
-snd_wavefront_synth_ioctl (struct snd_hwdep *hw, struct file *file,
+snd_wavefront_synth_ioctl (snd_hwdep_t *hw, struct file *file,
 			   unsigned int cmd, unsigned long arg)
 
 {
-	struct snd_card *card;
+	snd_card_t *card;
 	snd_wavefront_t *dev;
 	snd_wavefront_card_t *acard;
 	wavefront_control *wc;
 	void __user *argp = (void __user *)arg;
 	int err;
 
-	card = (struct snd_card *) hw->card;
+	card = (snd_card_t *) hw->card;
 
-	if (snd_BUG_ON(!card))
-		return -ENODEV;
-	if (snd_BUG_ON(!card->private_data))
-		return -ENODEV;
+	snd_assert(card != NULL, return -ENODEV);
+
+	snd_assert(card->private_data != NULL, return -ENODEV);
 
 	acard = card->private_data;
 	dev = &acard->wavefront;
@@ -1686,11 +1672,12 @@ snd_wavefront_synth_ioctl (struct snd_hwdep *hw, struct file *file,
 		break;
 
 	case WFCTL_WFCMD:
-		wc = memdup_user(argp, sizeof(*wc));
-		if (IS_ERR(wc))
-			return PTR_ERR(wc);
-
-		if (wavefront_synth_control (acard, wc) < 0)
+		wc = kmalloc(sizeof(*wc), GFP_KERNEL);
+		if (! wc)
+			return -ENOMEM;
+		if (copy_from_user (wc, argp, sizeof (*wc)))
+			err = -EFAULT;
+		else if (wavefront_synth_control (acard, wc) < 0)
 			err = -EIO;
 		else if (copy_to_user (argp, wc, sizeof (*wc)))
 			err = -EFAULT;
@@ -1759,7 +1746,7 @@ snd_wavefront_internal_interrupt (snd_wavefront_card_t *card)
 7 Unused
 */
 
-static int
+static int __init
 snd_wavefront_interrupt_bits (int irq)
 
 {
@@ -1787,12 +1774,12 @@ snd_wavefront_interrupt_bits (int irq)
 	return bits;
 }
 
-static void
+static void __init
 wavefront_should_cause_interrupt (snd_wavefront_t *dev, 
-				  int val, int port, unsigned long timeout)
+				  int val, int port, int timeout)
 
 {
-	wait_queue_entry_t wait;
+	wait_queue_t wait;
 
 	init_waitqueue_entry(&wait, current);
 	spin_lock_irq(&dev->irq_lock);
@@ -1800,13 +1787,16 @@ wavefront_should_cause_interrupt (snd_wavefront_t *dev,
 	dev->irq_ok = 0;
 	outb (val,port);
 	spin_unlock_irq(&dev->irq_lock);
-	while (!dev->irq_ok && time_before(jiffies, timeout)) {
-		schedule_timeout_uninterruptible(1);
-		barrier();
+	while (1) {
+		set_current_state(TASK_INTERRUPTIBLE);
+		if ((timeout = schedule_timeout(timeout)) == 0)
+			return;
+		if (dev->irq_ok)
+			return;
 	}
 }
 
-static int
+static int __init
 wavefront_reset_to_cleanliness (snd_wavefront_t *dev)
 
 {
@@ -1918,8 +1908,7 @@ wavefront_reset_to_cleanliness (snd_wavefront_t *dev)
 		goto gone_bad;
 	}
 	
-	hwv[0] = wavefront_read(dev);
-	if (hwv[0] == -1) {
+	if ((hwv[0] = wavefront_read (dev)) == -1) {
 		snd_printk ("board not responding correctly.\n");
 		goto gone_bad;
 	}
@@ -1930,8 +1919,7 @@ wavefront_reset_to_cleanliness (snd_wavefront_t *dev)
 		   and tell us about it either way.
 		*/
 		
-		hwv[0] = wavefront_read(dev);
-		if (hwv[0] == -1) {
+		if ((hwv[0] = wavefront_read (dev)) == -1) {
 			snd_printk ("on-board RAM test failed "
 				    "(bad error code).\n");
 		} else {
@@ -1944,8 +1932,7 @@ wavefront_reset_to_cleanliness (snd_wavefront_t *dev)
 
 	/* We're OK, just get the next byte of the HW version response */
 
-	hwv[1] = wavefront_read(dev);
-	if (hwv[1] == -1) {
+	if ((hwv[1] = wavefront_read (dev)) == -1) {
 		snd_printk ("incorrect h/w response.\n");
 		goto gone_bad;
 	}
@@ -1960,80 +1947,116 @@ wavefront_reset_to_cleanliness (snd_wavefront_t *dev)
 	return (1);
 }
 
-static int
+#include <linux/fs.h>
+#include <linux/mm.h>
+#include <linux/slab.h>
+#include <linux/unistd.h>
+#include <linux/syscalls.h>
+#include <asm/uaccess.h>
+
+
+static int __init
 wavefront_download_firmware (snd_wavefront_t *dev, char *path)
 
 {
-	const unsigned char *buf;
-	int len, err;
+	unsigned char section[WF_SECTION_MAX];
+	signed char section_length; /* yes, just a char; max value is WF_SECTION_MAX */
 	int section_cnt_downloaded = 0;
-	const struct firmware *firmware;
+	int fd;
+	int c;
+	int i;
+	mm_segment_t fs;
 
-	err = request_firmware(&firmware, path, dev->card->dev);
-	if (err < 0) {
-		snd_printk(KERN_ERR "firmware (%s) download failed!!!\n", path);
+	/* This tries to be a bit cleverer than the stuff Alan Cox did for
+	   the generic sound firmware, in that it actually knows
+	   something about the structure of the Motorola firmware. In
+	   particular, it uses a version that has been stripped of the
+	   20K of useless header information, and had section lengths
+	   added, making it possible to load the entire OS without any
+	   [kv]malloc() activity, since the longest entity we ever read is
+	   42 bytes (well, WF_SECTION_MAX) long.
+	*/
+
+	fs = get_fs();
+	set_fs (get_ds());
+
+	if ((fd = sys_open ((char __user *) path, 0, 0)) < 0) {
+		snd_printk ("Unable to load \"%s\".\n",
+			path);
 		return 1;
 	}
 
-	len = 0;
-	buf = firmware->data;
-	for (;;) {
-		int section_length = *(signed char *)buf;
-		if (section_length == 0)
-			break;
-		if (section_length < 0 || section_length > WF_SECTION_MAX) {
-			snd_printk(KERN_ERR
-				   "invalid firmware section length %d\n",
-				   section_length);
+	while (1) {
+		int x;
+
+		if ((x = sys_read (fd, (char __user *) &section_length, sizeof (section_length))) !=
+		    sizeof (section_length)) {
+			snd_printk ("firmware read error.\n");
 			goto failure;
 		}
-		buf++;
-		len++;
 
-		if (firmware->size < len + section_length) {
-			snd_printk(KERN_ERR "firmware section read error.\n");
+		if (section_length == 0) {
+			break;
+		}
+
+		if (section_length < 0 || section_length > WF_SECTION_MAX) {
+			snd_printk ("invalid firmware section length %d\n",
+				    section_length);
+			goto failure;
+		}
+
+		if (sys_read (fd, (char __user *) section, section_length) != section_length) {
+			snd_printk ("firmware section "
+				"read error.\n");
 			goto failure;
 		}
 
 		/* Send command */
-		if (wavefront_write(dev, WFC_DOWNLOAD_OS))
-			goto failure;
 	
-		for (; section_length; section_length--) {
-			if (wavefront_write(dev, *buf))
+		if (wavefront_write (dev, WFC_DOWNLOAD_OS)) {
+			goto failure;
+		}
+	
+		for (i = 0; i < section_length; i++) {
+			if (wavefront_write (dev, section[i])) {
 				goto failure;
-			buf++;
-			len++;
+			}
 		}
 	
 		/* get ACK */
-		if (!wavefront_wait(dev, STAT_CAN_READ)) {
-			snd_printk(KERN_ERR "time out for firmware ACK.\n");
-			goto failure;
-		}
-		err = inb(dev->data_port);
-		if (err != WF_ACK) {
-			snd_printk(KERN_ERR
-				   "download of section #%d not "
-				   "acknowledged, ack = 0x%x\n",
-				   section_cnt_downloaded + 1, err);
+	
+		if (wavefront_wait (dev, STAT_CAN_READ)) {
+
+			if ((c = inb (dev->data_port)) != WF_ACK) {
+
+				snd_printk ("download "
+					    "of section #%d not "
+					    "acknowledged, ack = 0x%x\n",
+					    section_cnt_downloaded + 1, c);
+				goto failure;
+		
+			}
+
+		} else {
+			snd_printk ("time out for firmware ACK.\n");
 			goto failure;
 		}
 
-		section_cnt_downloaded++;
 	}
 
-	release_firmware(firmware);
+	sys_close (fd);
+	set_fs (fs);
 	return 0;
 
  failure:
-	release_firmware(firmware);
-	snd_printk(KERN_ERR "firmware download failed!!!\n");
+	sys_close (fd);
+	set_fs (fs);
+	snd_printk ("firmware download failed!!!\n");
 	return 1;
 }
 
 
-static int
+static int __init
 wavefront_do_reset (snd_wavefront_t *dev)
 
 {
@@ -2090,9 +2113,9 @@ wavefront_do_reset (snd_wavefront_t *dev)
 	   about it.
 	*/
 	
-	dev->freemem = wavefront_freemem(dev);
-	if (dev->freemem < 0)
+	if ((dev->freemem = wavefront_freemem (dev)) < 0) {
 		goto gone_bad;
+	}
 		
 	snd_printk ("available DRAM %dk\n", dev->freemem / 1024);
 
@@ -2122,7 +2145,7 @@ wavefront_do_reset (snd_wavefront_t *dev)
 	return 1;
 }
 
-int
+int __init
 snd_wavefront_start (snd_wavefront_t *dev)
 
 {
@@ -2164,7 +2187,7 @@ snd_wavefront_start (snd_wavefront_t *dev)
 	return (0);
 }
 
-int
+int __init
 snd_wavefront_detect (snd_wavefront_card_t *card)
 
 {
@@ -2218,5 +2241,3 @@ snd_wavefront_detect (snd_wavefront_card_t *card)
 
 	return 0;
 }
-
-MODULE_FIRMWARE(DEFAULT_OSPATH);

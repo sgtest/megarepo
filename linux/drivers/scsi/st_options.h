@@ -1,10 +1,9 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
    The compile-time configurable defaults for the Linux SCSI tape driver.
 
    Copyright 1995-2003 Kai Makisara.
 
-   Last modified: Thu Feb 21 21:47:07 2008 by kai.makisara
+   Last modified: Mon Apr  7 22:49:18 2003 by makisara
 */
 
 #ifndef _ST_OPTIONS_H
@@ -94,10 +93,6 @@
 /* If ST_SYSV is non-zero, the tape behaves according to the SYS V semantics.
    The default is BSD semantics. */
 #define ST_SYSV 0
-
-/* If ST_SILI is non-zero, the SILI bit is set when reading in variable block
-   mode and the block size is determined using the residual returned by the HBA. */
-#define ST_SILI 0
 
 /* Time to wait for the drive to become ready if blocking open */
 #define ST_BLOCK_SECONDS     120

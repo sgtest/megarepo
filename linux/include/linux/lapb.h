@@ -1,15 +1,9 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * These are the public elements of the Linux LAPB module.
  */
 
 #ifndef	LAPB_KERNEL_H
 #define	LAPB_KERNEL_H
-
-#include <linux/skbuff.h>
-#include <linux/timer.h>
-
-struct net_device;
 
 #define	LAPB_OK			0
 #define	LAPB_BADTOKEN		1
@@ -50,8 +44,7 @@ struct lapb_parms_struct {
 	unsigned int mode;
 };
 
-extern int lapb_register(struct net_device *dev,
-			 const struct lapb_register_struct *callbacks);
+extern int lapb_register(struct net_device *dev, struct lapb_register_struct *callbacks);
 extern int lapb_unregister(struct net_device *dev);
 extern int lapb_getparms(struct net_device *dev, struct lapb_parms_struct *parms);
 extern int lapb_setparms(struct net_device *dev, struct lapb_parms_struct *parms);

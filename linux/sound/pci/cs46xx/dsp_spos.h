@@ -1,7 +1,22 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  *  The driver for the Cirrus Logic's Sound Fusion CS46XX based soundcards
- *  Copyright (c) by Jaroslav Kysela <perex@perex.cz>
+ *  Copyright (c) by Jaroslav Kysela <perex@suse.cz>
+ *
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ *
  */
 
 /*
@@ -28,7 +43,7 @@
 /* this instruction types
    needs to be reallocated when load
    code into DSP */
-enum wide_opcode {
+typedef enum  {
 	WIDE_FOR_BEGIN_LOOP = 0x20,
 	WIDE_FOR_BEGIN_LOOP2,
 
@@ -43,7 +58,7 @@ enum wide_opcode {
 	WIDE_TBEQ_COND_CALL1_ADDR,
 	WIDE_TBEQ_NCOND_GOTOI_ADDR,
 	WIDE_TBEQ_NCOND_CALL1_ADDR,
-};
+} wide_opcode_t;
 
 /* SAMPLE segment */
 #define VARI_DECIMATE_BUF1       0x0000
@@ -171,8 +186,7 @@ enum wide_opcode {
 #define SP_SPDOUT_CONTROL 0x804D
 #define SP_SPDOUT_CSUV    0x808E
 
-static inline u8 _wrap_all_bits (u8 val)
-{
+static inline u8 _wrap_all_bits (u8 val) {
 	u8 wrapped;
 	
 	/* wrap all 8 bits */
@@ -187,30 +201,25 @@ static inline u8 _wrap_all_bits (u8 val)
 		((val & 0x80) >> 7);
 
 	return wrapped;
+
 }
 
-static inline void cs46xx_dsp_spos_update_scb (struct snd_cs46xx * chip,
-					       struct dsp_scb_descriptor * scb) 
+
+static inline void cs46xx_dsp_spos_update_scb (cs46xx_t * chip,dsp_scb_descriptor_t * scb) 
 {
 	/* update nextSCB and subListPtr in SCB */
 	snd_cs46xx_poke(chip,
 			(scb->address + SCBsubListPtr) << 2,
 			(scb->sub_list_ptr->address << 0x10) |
 			(scb->next_scb_ptr->address));	
-	scb->updated = 1;
 }
 
-static inline void cs46xx_dsp_scb_set_volume (struct snd_cs46xx * chip,
-					      struct dsp_scb_descriptor * scb,
-					      u16 left, u16 right)
-{
+static inline void cs46xx_dsp_scb_set_volume (cs46xx_t * chip,dsp_scb_descriptor_t * scb,
+					      u16 left,u16 right) {
 	unsigned int val = ((0xffff - left) << 16 | (0xffff - right));
 
 	snd_cs46xx_poke(chip, (scb->address + SCBVolumeCtrl) << 2, val);
 	snd_cs46xx_poke(chip, (scb->address + SCBVolumeCtrl + 1) << 2, val);
-	scb->volume_set = 1;
-	scb->volume[0] = left;
-	scb->volume[1] = right;
 }
 #endif /* __DSP_SPOS_H__ */
 #endif /* CONFIG_SND_CS46XX_NEW_DSP  */

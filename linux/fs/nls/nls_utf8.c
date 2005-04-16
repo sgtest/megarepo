@@ -15,11 +15,7 @@ static int uni2char(wchar_t uni, unsigned char *out, int boundlen)
 {
 	int n;
 
-	if (boundlen <= 0)
-		return -ENAMETOOLONG;
-
-	n = utf32_to_utf8(uni, out, boundlen);
-	if (n < 0) {
+	if ( (n = utf8_wctomb(out, uni, boundlen)) == -1) {
 		*out = '?';
 		return -EINVAL;
 	}
@@ -29,14 +25,11 @@ static int uni2char(wchar_t uni, unsigned char *out, int boundlen)
 static int char2uni(const unsigned char *rawstring, int boundlen, wchar_t *uni)
 {
 	int n;
-	unicode_t u;
 
-	n = utf8_to_utf32(rawstring, boundlen, &u);
-	if (n < 0 || u > MAX_WCHAR_T) {
+	if ( (n = utf8_mbtowc(uni, rawstring, boundlen)) == -1) {
 		*uni = 0x003f;	/* ? */
-		return -EINVAL;
+		n = -EINVAL;
 	}
-	*uni = (wchar_t) u;
 	return n;
 }
 
@@ -46,6 +39,7 @@ static struct nls_table table = {
 	.char2uni	= char2uni,
 	.charset2lower	= identity,	/* no conversion */
 	.charset2upper	= identity,
+	.owner		= THIS_MODULE,
 };
 
 static int __init init_nls_utf8(void)

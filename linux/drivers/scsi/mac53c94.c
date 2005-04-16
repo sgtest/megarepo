@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * SCSI low-level driver for the 53c94 SCSI bus adaptor found
  * on Power Macintosh computers, controlling the external SCSI chain.
@@ -18,12 +17,12 @@
 #include <linux/stat.h>
 #include <linux/spinlock.h>
 #include <linux/interrupt.h>
-#include <linux/module.h>
-#include <linux/pci.h>
-#include <linux/pgtable.h>
 #include <asm/dbdma.h>
 #include <asm/io.h>
+#include <asm/pgtable.h>
 #include <asm/prom.h>
+#include <asm/system.h>
+#include <asm/pci-bridge.h>
 #include <asm/macio.h>
 
 #include <scsi/scsi.h>
@@ -61,12 +60,13 @@ struct fsc_state {
 
 static void mac53c94_init(struct fsc_state *);
 static void mac53c94_start(struct fsc_state *);
-static void mac53c94_interrupt(int, void *);
-static irqreturn_t do_mac53c94_interrupt(int, void *);
+static void mac53c94_interrupt(int, void *, struct pt_regs *);
+static irqreturn_t do_mac53c94_interrupt(int, void *, struct pt_regs *);
 static void cmd_done(struct fsc_state *, int result);
 static void set_dma_cmds(struct fsc_state *, struct scsi_cmnd *);
 
-static int mac53c94_queue_lck(struct scsi_cmnd *cmd)
+
+static int mac53c94_queue(struct scsi_cmnd *cmd, void (*done)(struct scsi_cmnd *))
 {
 	struct fsc_state *state;
 
@@ -75,13 +75,13 @@ static int mac53c94_queue_lck(struct scsi_cmnd *cmd)
 		int i;
 		printk(KERN_DEBUG "mac53c94_queue %p: command is", cmd);
 		for (i = 0; i < cmd->cmd_len; ++i)
-			printk(KERN_CONT " %.2x", cmd->cmnd[i]);
-		printk(KERN_CONT "\n");
-		printk(KERN_DEBUG "use_sg=%d request_bufflen=%d request_buffer=%p\n",
-		       scsi_sg_count(cmd), scsi_bufflen(cmd), scsi_sglist(cmd));
+			printk(" %.2x", cmd->cmnd[i]);
+		printk("\n" KERN_DEBUG "use_sg=%d request_bufflen=%d request_buffer=%p\n",
+		       cmd->use_sg, cmd->request_bufflen, cmd->request_buffer);
 	}
 #endif
 
+	cmd->scsi_done = done;
 	cmd->host_scribble = NULL;
 
 	state = (struct fsc_state *) cmd->device->host->hostdata;
@@ -98,16 +98,16 @@ static int mac53c94_queue_lck(struct scsi_cmnd *cmd)
 	return 0;
 }
 
-static DEF_SCSI_QCMD(mac53c94_queue)
+static int mac53c94_abort(struct scsi_cmnd *cmd)
+{
+	return FAILED;
+}
 
 static int mac53c94_host_reset(struct scsi_cmnd *cmd)
 {
 	struct fsc_state *state = (struct fsc_state *) cmd->device->host->hostdata;
 	struct mac53c94_regs __iomem *regs = state->regs;
 	struct dbdma_regs __iomem *dma = state->dma;
-	unsigned long flags;
-
-	spin_lock_irqsave(cmd->device->host->host_lock, flags);
 
 	writel((RUN|PAUSE|FLUSH|WAKE) << 16, &dma->control);
 	writeb(CMD_SCSI_RESET, &regs->command);	/* assert RST */
@@ -116,8 +116,6 @@ static int mac53c94_host_reset(struct scsi_cmnd *cmd)
 	udelay(20);
 	mac53c94_init(state);
 	writeb(CMD_NOP, &regs->command);
-
-	spin_unlock_irqrestore(cmd->device->host->host_lock, flags);
 	return SUCCESS;
 }
 
@@ -125,6 +123,7 @@ static void mac53c94_init(struct fsc_state *state)
 {
 	struct mac53c94_regs __iomem *regs = state->regs;
 	struct dbdma_regs __iomem *dma = state->dma;
+	int x;
 
 	writeb(state->host->this_id | CF1_PAR_ENABLE, &regs->config1);
 	writeb(TIMO_VAL(250), &regs->sel_timeout);	/* 250ms */
@@ -133,7 +132,7 @@ static void mac53c94_init(struct fsc_state *state)
 	writeb(0, &regs->config3);
 	writeb(0, &regs->sync_period);
 	writeb(0, &regs->sync_offset);
-	(void)readb(&regs->interrupt);
+	x = readb(&regs->interrupt);
 	writel((RUN|PAUSE|FLUSH|WAKE) << 16, &dma->control);
 }
 
@@ -174,27 +173,27 @@ static void mac53c94_start(struct fsc_state *state)
 	writeb(CMD_SELECT, &regs->command);
 	state->phase = selecting;
 
-	set_dma_cmds(state, cmd);
+	if (cmd->use_sg > 0 || cmd->request_bufflen != 0)
+		set_dma_cmds(state, cmd);
 }
 
-static irqreturn_t do_mac53c94_interrupt(int irq, void *dev_id)
+static irqreturn_t do_mac53c94_interrupt(int irq, void *dev_id, struct pt_regs *ptregs)
 {
 	unsigned long flags;
 	struct Scsi_Host *dev = ((struct fsc_state *) dev_id)->current_req->device->host;
 	
 	spin_lock_irqsave(dev->host_lock, flags);
-	mac53c94_interrupt(irq, dev_id);
+	mac53c94_interrupt(irq, dev_id, ptregs);
 	spin_unlock_irqrestore(dev->host_lock, flags);
 	return IRQ_HANDLED;
 }
 
-static void mac53c94_interrupt(int irq, void *dev_id)
+static void mac53c94_interrupt(int irq, void *dev_id, struct pt_regs *ptregs)
 {
 	struct fsc_state *state = (struct fsc_state *) dev_id;
 	struct mac53c94_regs __iomem *regs = state->regs;
 	struct dbdma_regs __iomem *dma = state->dma;
-	struct scsi_cmnd *const cmd = state->current_req;
-	struct mac53c94_cmd_priv *const mcmd = mac53c94_priv(cmd);
+	struct scsi_cmnd *cmd = state->current_req;
 	int nb, stat, seq, intr;
 	static int mac53c94_errors;
 
@@ -234,7 +233,7 @@ static void mac53c94_interrupt(int irq, void *dev_id)
 		++mac53c94_errors;
 		writeb(CMD_NOP + CMD_DMA_MODE, &regs->command);
 	}
-	if (!cmd) {
+	if (cmd == 0) {
 		printk(KERN_DEBUG "53c94: interrupt with no command active?\n");
 		return;
 	}
@@ -263,11 +262,11 @@ static void mac53c94_interrupt(int irq, void *dev_id)
 		writeb(CMD_NOP, &regs->command);
 		/* set DMA controller going if any data to transfer */
 		if ((stat & (STAT_MSG|STAT_CD)) == 0
-		    && (scsi_sg_count(cmd) > 0 || scsi_bufflen(cmd))) {
-			nb = mcmd->this_residual;
+		    && (cmd->use_sg > 0 || cmd->request_bufflen != 0)) {
+			nb = cmd->SCp.this_residual;
 			if (nb > 0xfff0)
 				nb = 0xfff0;
-			mcmd->this_residual -= nb;
+			cmd->SCp.this_residual -= nb;
 			writeb(nb, &regs->count_lo);
 			writeb(nb >> 8, &regs->count_mid);
 			writeb(CMD_DMA_MODE + CMD_NOP, &regs->command);
@@ -294,13 +293,13 @@ static void mac53c94_interrupt(int irq, void *dev_id)
 			cmd_done(state, DID_ERROR << 16);
 			return;
 		}
-		if (mcmd->this_residual != 0
+		if (cmd->SCp.this_residual != 0
 		    && (stat & (STAT_MSG|STAT_CD)) == 0) {
 			/* Set up the count regs to transfer more */
-			nb = mcmd->this_residual;
+			nb = cmd->SCp.this_residual;
 			if (nb > 0xfff0)
 				nb = 0xfff0;
-			mcmd->this_residual -= nb;
+			cmd->SCp.this_residual -= nb;
 			writeb(nb, &regs->count_lo);
 			writeb(nb >> 8, &regs->count_mid);
 			writeb(CMD_DMA_MODE + CMD_NOP, &regs->command);
@@ -311,7 +310,14 @@ static void mac53c94_interrupt(int irq, void *dev_id)
 			printk(KERN_DEBUG "intr %x before data xfer complete\n", intr);
 		}
 		writel(RUN << 16, &dma->control);	/* stop dma */
-		scsi_dma_unmap(cmd);
+		if (cmd->use_sg != 0) {
+			pci_unmap_sg(state->pdev,
+				(struct scatterlist *)cmd->request_buffer,
+				cmd->use_sg, cmd->sc_data_direction);
+		} else {
+			pci_unmap_single(state->pdev, state->dma_addr,
+				cmd->request_bufflen, cmd->sc_data_direction);
+		}
 		/* should check dma status */
 		writeb(CMD_I_COMPLETE, &regs->command);
 		state->phase = completing;
@@ -322,8 +328,9 @@ static void mac53c94_interrupt(int irq, void *dev_id)
 			cmd_done(state, DID_ERROR << 16);
 			return;
 		}
-		mcmd->status = readb(&regs->fifo);
-		mcmd->message = readb(&regs->fifo);
+		cmd->SCp.Status = readb(&regs->fifo);
+		cmd->SCp.Message = readb(&regs->fifo);
+		cmd->result = CMD_ACCEPT_MSG;
 		writeb(CMD_ACCEPT_MSG, &regs->command);
 		state->phase = busfreeing;
 		break;
@@ -331,7 +338,8 @@ static void mac53c94_interrupt(int irq, void *dev_id)
 		if (intr != INTR_DISCONNECT) {
 			printk(KERN_DEBUG "got intr %x when expected disconnect\n", intr);
 		}
-		cmd_done(state, (DID_OK << 16) + (mcmd->message << 8) + mcmd->status);
+		cmd_done(state, (DID_OK << 16) + (cmd->SCp.Message << 8)
+			 + cmd->SCp.Status);
 		break;
 	default:
 		printk(KERN_DEBUG "don't know about phase %d\n", state->phase);
@@ -343,9 +351,9 @@ static void cmd_done(struct fsc_state *state, int result)
 	struct scsi_cmnd *cmd;
 
 	cmd = state->current_req;
-	if (cmd) {
+	if (cmd != 0) {
 		cmd->result = result;
-		scsi_done(cmd);
+		(*cmd->scsi_done)(cmd);
 		state->current_req = NULL;
 	}
 	state->phase = idle;
@@ -357,67 +365,79 @@ static void cmd_done(struct fsc_state *state, int result)
  */
 static void set_dma_cmds(struct fsc_state *state, struct scsi_cmnd *cmd)
 {
-	int i, dma_cmd, total, nseg;
+	int i, dma_cmd, total;
 	struct scatterlist *scl;
 	struct dbdma_cmd *dcmds;
 	dma_addr_t dma_addr;
 	u32 dma_len;
 
-	nseg = scsi_dma_map(cmd);
-	BUG_ON(nseg < 0);
-	if (!nseg)
-		return;
-
 	dma_cmd = cmd->sc_data_direction == DMA_TO_DEVICE ?
 			OUTPUT_MORE : INPUT_MORE;
 	dcmds = state->dma_cmds;
-	total = 0;
+	if (cmd->use_sg > 0) {
+		int nseg;
 
-	scsi_for_each_sg(cmd, scl, nseg, i) {
-		dma_addr = sg_dma_address(scl);
-		dma_len = sg_dma_len(scl);
-		if (dma_len > 0xffff)
-			panic("mac53c94: scatterlist element >= 64k");
-		total += dma_len;
-		dcmds->req_count = cpu_to_le16(dma_len);
-		dcmds->command = cpu_to_le16(dma_cmd);
-		dcmds->phy_addr = cpu_to_le32(dma_addr);
+		total = 0;
+		scl = (struct scatterlist *) cmd->buffer;
+		nseg = pci_map_sg(state->pdev, scl, cmd->use_sg,
+				cmd->sc_data_direction);
+		for (i = 0; i < nseg; ++i) {
+			dma_addr = sg_dma_address(scl);
+			dma_len = sg_dma_len(scl);
+			if (dma_len > 0xffff)
+				panic("mac53c94: scatterlist element >= 64k");
+			total += dma_len;
+			st_le16(&dcmds->req_count, dma_len);
+			st_le16(&dcmds->command, dma_cmd);
+			st_le32(&dcmds->phy_addr, dma_addr);
+			dcmds->xfer_status = 0;
+			++scl;
+			++dcmds;
+		}
+	} else {
+		total = cmd->request_bufflen;
+		if (total > 0xffff)
+			panic("mac53c94: transfer size >= 64k");
+		dma_addr = pci_map_single(state->pdev, cmd->request_buffer,
+					  total, cmd->sc_data_direction);
+		state->dma_addr = dma_addr;
+		st_le16(&dcmds->req_count, total);
+		st_le32(&dcmds->phy_addr, dma_addr);
 		dcmds->xfer_status = 0;
 		++dcmds;
 	}
-
 	dma_cmd += OUTPUT_LAST - OUTPUT_MORE;
-	dcmds[-1].command = cpu_to_le16(dma_cmd);
-	dcmds->command = cpu_to_le16(DBDMA_STOP);
-	mac53c94_priv(cmd)->this_residual = total;
+	st_le16(&dcmds[-1].command, dma_cmd);
+	st_le16(&dcmds->command, DBDMA_STOP);
+	cmd->SCp.this_residual = total;
 }
 
 static struct scsi_host_template mac53c94_template = {
 	.proc_name	= "53c94",
 	.name		= "53C94",
 	.queuecommand	= mac53c94_queue,
+	.eh_abort_handler = mac53c94_abort,
 	.eh_host_reset_handler = mac53c94_host_reset,
 	.can_queue	= 1,
 	.this_id	= 7,
 	.sg_tablesize	= SG_ALL,
-	.max_segment_size = 65535,
-	.cmd_size	= sizeof(struct mac53c94_cmd_priv),
+	.cmd_per_lun	= 1,
+	.use_clustering	= DISABLE_CLUSTERING,
 };
 
-static int mac53c94_probe(struct macio_dev *mdev, const struct of_device_id *match)
+static int mac53c94_probe(struct macio_dev *mdev, const struct of_match *match)
 {
 	struct device_node *node = macio_get_of_node(mdev);
 	struct pci_dev *pdev = macio_get_pci_dev(mdev);
 	struct fsc_state *state;
 	struct Scsi_Host *host;
 	void *dma_cmd_space;
-	const unsigned char *clkprop;
-	int proplen, rc = -ENODEV;
+	unsigned char *clkprop;
+	int proplen;
 
 	if (macio_resource_count(mdev) != 2 || macio_irq_count(mdev) != 2) {
-		printk(KERN_ERR "mac53c94: expected 2 addrs and intrs"
-		       " (got %d/%d)\n",
-		       macio_resource_count(mdev), macio_irq_count(mdev));
+		printk(KERN_ERR "mac53c94: expected 2 addrs and intrs (got %d/%d)\n",
+		       node->n_addrs, node->n_intrs);
 		return -ENODEV;
 	}
 
@@ -429,7 +449,6 @@ static int mac53c94_probe(struct macio_dev *mdev, const struct of_device_id *mat
        	host = scsi_host_alloc(&mac53c94_template, sizeof(struct fsc_state));
 	if (host == NULL) {
 		printk(KERN_ERR "mac53c94: couldn't register host");
-		rc = -ENOMEM;
 		goto out_release;
 	}
 
@@ -446,14 +465,15 @@ static int mac53c94_probe(struct macio_dev *mdev, const struct of_device_id *mat
 		ioremap(macio_resource_start(mdev, 1), 0x1000);
 	state->dmaintr = macio_irq(mdev, 1);
 	if (state->regs == NULL || state->dma == NULL) {
-		printk(KERN_ERR "mac53c94: ioremap failed for %pOF\n", node);
+		printk(KERN_ERR "mac53c94: ioremap failed for %s\n",
+		       node->full_name);
 		goto out_free;
 	}
 
-	clkprop = of_get_property(node, "clock-frequency", &proplen);
+       	clkprop = get_property(node, "clock-frequency", &proplen);
        	if (clkprop == NULL || proplen != sizeof(int)) {
-       		printk(KERN_ERR "%pOF: can't get clock frequency, "
-       		       "assuming 25MHz\n", node);
+       		printk(KERN_ERR "%s: can't get clock frequency, "
+       		       "assuming 25MHz\n", node->full_name);
        		state->clk_freq = 25000000;
        	} else
        		state->clk_freq = *(int *)clkprop;
@@ -462,16 +482,13 @@ static int mac53c94_probe(struct macio_dev *mdev, const struct of_device_id *mat
        	 * +1 to allow for aligning.
 	 * XXX FIXME: Use DMA consistent routines
 	 */
-       	dma_cmd_space = kmalloc_array(host->sg_tablesize + 2,
-					     sizeof(struct dbdma_cmd),
-					     GFP_KERNEL);
-	if (!dma_cmd_space) {
-		printk(KERN_ERR "mac53c94: couldn't allocate dma "
-		       "command space for %pOF\n", node);
-		rc = -ENOMEM;
-		goto out_free;
-	}
-
+       	dma_cmd_space = kmalloc((host->sg_tablesize + 2) *
+       				sizeof(struct dbdma_cmd), GFP_KERNEL);
+       	if (dma_cmd_space == 0) {
+       		printk(KERN_ERR "mac53c94: couldn't allocate dma "
+       		       "command space for %s\n", node->full_name);
+       		goto out_free;
+       	}
 	state->dma_cmds = (struct dbdma_cmd *)DBDMA_ALIGN(dma_cmd_space);
 	memset(state->dma_cmds, 0, (host->sg_tablesize + 1)
 	       * sizeof(struct dbdma_cmd));
@@ -479,21 +496,18 @@ static int mac53c94_probe(struct macio_dev *mdev, const struct of_device_id *mat
 
 	mac53c94_init(state);
 
-	if (request_irq(state->intr, do_mac53c94_interrupt, 0, "53C94",state)) {
-		printk(KERN_ERR "mac53C94: can't get irq %d for %pOF\n",
-		       state->intr, node);
+	if (request_irq(state->intr, do_mac53c94_interrupt, 0, "53C94", state)) {
+		printk(KERN_ERR "mac53C94: can't get irq %d for %s\n",
+		       state->intr, node->full_name);
 		goto out_free_dma;
 	}
 
-	rc = scsi_add_host(host, &mdev->ofdev.dev);
-	if (rc != 0)
-		goto out_release_irq;
-
+	/* XXX FIXME: handle failure */
+	scsi_add_host(host, &mdev->ofdev.dev);
 	scsi_scan_host(host);
+
 	return 0;
 
- out_release_irq:
-	free_irq(state->intr, state);
  out_free_dma:
 	kfree(state->dma_cmd_space);
  out_free:
@@ -505,7 +519,7 @@ static int mac53c94_probe(struct macio_dev *mdev, const struct of_device_id *mat
  out_release:
 	macio_release_resources(mdev);
 
-	return rc;
+	return  -ENODEV;
 }
 
 static int mac53c94_remove(struct macio_dev *mdev)
@@ -518,9 +532,9 @@ static int mac53c94_remove(struct macio_dev *mdev)
 	free_irq(fp->intr, fp);
 
 	if (fp->regs)
-		iounmap(fp->regs);
+		iounmap((void *) fp->regs);
 	if (fp->dma)
-		iounmap(fp->dma);
+		iounmap((void *) fp->dma);
 	kfree(fp->dma_cmd_space);
 
 	scsi_host_put(host);
@@ -531,22 +545,20 @@ static int mac53c94_remove(struct macio_dev *mdev)
 }
 
 
-static struct of_device_id mac53c94_match[] = 
+static struct of_match mac53c94_match[] = 
 {
 	{
 	.name 		= "53c94",
+	.type		= OF_ANY_MATCH,
+	.compatible	= OF_ANY_MATCH
 	},
 	{},
 };
-MODULE_DEVICE_TABLE (of, mac53c94_match);
 
 static struct macio_driver mac53c94_driver = 
 {
-	.driver = {
-		.name 		= "mac53c94",
-		.owner		= THIS_MODULE,
-		.of_match_table	= mac53c94_match,
-	},
+	.name 		= "mac53c94",
+	.match_table	= mac53c94_match,
 	.probe		= mac53c94_probe,
 	.remove		= mac53c94_remove,
 };

@@ -1,47 +1,49 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
- * SCLP line mode console driver
+ *  drivers/s390/char/sclp_con.c
+ *    SCLP line mode console driver
  *
- * Copyright IBM Corp. 1999, 2009
- * Author(s): Martin Peschke <mpeschke@de.ibm.com>
- *	      Martin Schwidefsky <schwidefsky@de.ibm.com>
+ *  S390 version
+ *    Copyright (C) 1999 IBM Deutschland Entwicklung GmbH, IBM Corporation
+ *    Author(s): Martin Peschke <mpeschke@de.ibm.com>
+ *		 Martin Schwidefsky <schwidefsky@de.ibm.com>
  */
 
+#include <linux/config.h>
 #include <linux/kmod.h>
 #include <linux/console.h>
 #include <linux/init.h>
-#include <linux/panic_notifier.h>
 #include <linux/timer.h>
 #include <linux/jiffies.h>
-#include <linux/termios.h>
+#include <linux/bootmem.h>
 #include <linux/err.h>
-#include <linux/reboot.h>
-#include <linux/gfp.h>
 
 #include "sclp.h"
 #include "sclp_rw.h"
 #include "sclp_tty.h"
+
+#define SCLP_CON_PRINT_HEADER "sclp console driver: "
 
 #define sclp_console_major 4		/* TTYAUX_MAJOR */
 #define sclp_console_minor 64
 #define sclp_console_name  "ttyS"
 
 /* Lock to guard over changes to global variables */
-static DEFINE_SPINLOCK(sclp_con_lock);
+static spinlock_t sclp_con_lock;
 /* List of free pages that can be used for console output buffering */
-static LIST_HEAD(sclp_con_pages);
+static struct list_head sclp_con_pages;
 /* List of full struct sclp_buffer structures ready for output */
-static LIST_HEAD(sclp_con_outqueue);
+static struct list_head sclp_con_outqueue;
+/* Counter how many buffers are emitted (max 1) and how many */
+/* are on the output queue. */
+static int sclp_con_buffer_count;
 /* Pointer to current console buffer */
 static struct sclp_buffer *sclp_conbuf;
 /* Timer for delayed output of console messages */
 static struct timer_list sclp_con_timer;
-/* Flag that output queue is currently running */
-static int sclp_con_queue_running;
 
 /* Output format for console messages */
-#define SCLP_CON_COLUMNS	320
-#define SPACES_PER_TAB		8
+static unsigned short sclp_con_columns;
+static unsigned short sclp_con_width_htab;
 
 static void
 sclp_conbuf_callback(struct sclp_buffer *buffer, int rc)
@@ -52,70 +54,42 @@ sclp_conbuf_callback(struct sclp_buffer *buffer, int rc)
 	do {
 		page = sclp_unmake_buffer(buffer);
 		spin_lock_irqsave(&sclp_con_lock, flags);
-
 		/* Remove buffer from outqueue */
 		list_del(&buffer->list);
+		sclp_con_buffer_count--;
 		list_add_tail((struct list_head *) page, &sclp_con_pages);
-
 		/* Check if there is a pending buffer on the out queue. */
 		buffer = NULL;
 		if (!list_empty(&sclp_con_outqueue))
-			buffer = list_first_entry(&sclp_con_outqueue,
-						  struct sclp_buffer, list);
-		if (!buffer) {
-			sclp_con_queue_running = 0;
-			spin_unlock_irqrestore(&sclp_con_lock, flags);
-			break;
-		}
+			buffer = list_entry(sclp_con_outqueue.next,
+					    struct sclp_buffer, list);
 		spin_unlock_irqrestore(&sclp_con_lock, flags);
-	} while (sclp_emit_buffer(buffer, sclp_conbuf_callback));
+	} while (buffer && sclp_emit_buffer(buffer, sclp_conbuf_callback));
 }
 
-/*
- * Finalize and emit first pending buffer.
- */
-static void sclp_conbuf_emit(void)
+static inline void
+sclp_conbuf_emit(void)
 {
 	struct sclp_buffer* buffer;
 	unsigned long flags;
+	int count;
 	int rc;
 
 	spin_lock_irqsave(&sclp_con_lock, flags);
-	if (sclp_conbuf)
-		list_add_tail(&sclp_conbuf->list, &sclp_con_outqueue);
+	buffer = sclp_conbuf;
 	sclp_conbuf = NULL;
-	if (sclp_con_queue_running)
-		goto out_unlock;
-	if (list_empty(&sclp_con_outqueue))
-		goto out_unlock;
-	buffer = list_first_entry(&sclp_con_outqueue, struct sclp_buffer,
-				  list);
-	sclp_con_queue_running = 1;
+	if (buffer == NULL) {
+		spin_unlock_irqrestore(&sclp_con_lock, flags);
+		return;
+	}
+	list_add_tail(&buffer->list, &sclp_con_outqueue);
+	count = sclp_con_buffer_count++;
 	spin_unlock_irqrestore(&sclp_con_lock, flags);
-
+	if (count)
+		return;
 	rc = sclp_emit_buffer(buffer, sclp_conbuf_callback);
 	if (rc)
 		sclp_conbuf_callback(buffer, rc);
-	return;
-out_unlock:
-	spin_unlock_irqrestore(&sclp_con_lock, flags);
-}
-
-/*
- * Wait until out queue is empty
- */
-static void sclp_console_sync_queue(void)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&sclp_con_lock, flags);
-	del_timer(&sclp_con_timer);
-	while (sclp_con_queue_running) {
-		spin_unlock_irqrestore(&sclp_con_lock, flags);
-		sclp_sync_wait();
-		spin_lock_irqsave(&sclp_con_lock, flags);
-	}
-	spin_unlock_irqrestore(&sclp_con_lock, flags);
 }
 
 /*
@@ -123,34 +97,9 @@ static void sclp_console_sync_queue(void)
  * temporary write buffer without further waiting on a final new line.
  */
 static void
-sclp_console_timeout(struct timer_list *unused)
+sclp_console_timeout(unsigned long data)
 {
 	sclp_conbuf_emit();
-}
-
-/*
- * Drop oldest console buffer if sclp_con_drop is set
- */
-static int
-sclp_console_drop_buffer(void)
-{
-	struct list_head *list;
-	struct sclp_buffer *buffer;
-	void *page;
-
-	if (!sclp_console_drop)
-		return 0;
-	list = sclp_con_outqueue.next;
-	if (sclp_con_queue_running)
-		/* The first element is in I/O */
-		list = list->next;
-	if (list == &sclp_con_outqueue)
-		return 0;
-	list_del(list);
-	buffer = list_entry(list, struct sclp_buffer, list);
-	page = sclp_unmake_buffer(buffer);
-	list_add_tail((struct list_head *) page, &sclp_con_pages);
-	return 1;
 }
 
 /*
@@ -174,19 +123,15 @@ sclp_console_write(struct console *console, const char *message,
 	do {
 		/* make sure we have a console output buffer */
 		if (sclp_conbuf == NULL) {
-			if (list_empty(&sclp_con_pages))
-				sclp_console_full++;
 			while (list_empty(&sclp_con_pages)) {
-				if (sclp_console_drop_buffer())
-					break;
 				spin_unlock_irqrestore(&sclp_con_lock, flags);
 				sclp_sync_wait();
 				spin_lock_irqsave(&sclp_con_lock, flags);
 			}
 			page = sclp_con_pages.next;
 			list_del((struct list_head *) page);
-			sclp_conbuf = sclp_make_buffer(page, SCLP_CON_COLUMNS,
-						       SPACES_PER_TAB);
+			sclp_conbuf = sclp_make_buffer(page, sclp_con_columns,
+						       sclp_con_width_htab);
 		}
 		/* try to write the string to the current output buffer */
 		written = sclp_write(sclp_conbuf, (const unsigned char *)
@@ -207,7 +152,11 @@ sclp_console_write(struct console *console, const char *message,
 	/* Setup timer to output current console buffer after 1/10 second */
 	if (sclp_conbuf != NULL && sclp_chars_in_buffer(sclp_conbuf) != 0 &&
 	    !timer_pending(&sclp_con_timer)) {
-		mod_timer(&sclp_con_timer, jiffies + HZ / 10);
+		init_timer(&sclp_con_timer);
+		sclp_con_timer.function = sclp_console_timeout;
+		sclp_con_timer.data = 0UL;
+		sclp_con_timer.expires = jiffies + HZ/10;
+		add_timer(&sclp_con_timer);
 	}
 	spin_unlock_irqrestore(&sclp_con_lock, flags);
 }
@@ -220,35 +169,26 @@ sclp_console_device(struct console *c, int *index)
 }
 
 /*
- * This panic/reboot notifier makes sure that all buffers
+ * This routine is called from panic when the kernel
+ * is going to give up. We have to make sure that all buffers
  * will be flushed to the SCLP.
  */
-static int sclp_console_notify(struct notifier_block *self,
-			       unsigned long event, void *data)
+static void
+sclp_console_unblank(void)
 {
-	/*
-	 * Perform the lock check before effectively getting the
-	 * lock on sclp_conbuf_emit() / sclp_console_sync_queue()
-	 * to prevent potential lockups in atomic context.
-	 */
-	if (spin_is_locked(&sclp_con_lock))
-		return NOTIFY_DONE;
+	unsigned long flags;
 
 	sclp_conbuf_emit();
-	sclp_console_sync_queue();
-
-	return NOTIFY_DONE;
+	spin_lock_irqsave(&sclp_con_lock, flags);
+	if (timer_pending(&sclp_con_timer))
+		del_timer(&sclp_con_timer);
+	while (sclp_con_buffer_count > 0) {
+		spin_unlock_irqrestore(&sclp_con_lock, flags);
+		sclp_sync_wait();
+		spin_lock_irqsave(&sclp_con_lock, flags);
+	}
+	spin_unlock_irqrestore(&sclp_con_lock, flags);
 }
-
-static struct notifier_block on_panic_nb = {
-	.notifier_call = sclp_console_notify,
-	.priority = INT_MIN + 1, /* run the callback late */
-};
-
-static struct notifier_block on_reboot_nb = {
-	.notifier_call = sclp_console_notify,
-	.priority = INT_MIN + 1, /* run the callback late */
-};
 
 /*
  * used to register the SCLP console to the kernel and to
@@ -259,6 +199,7 @@ static struct console sclp_console =
 	.name = sclp_console_name,
 	.write = sclp_console_write,
 	.device = sclp_console_device,
+	.unblank = sclp_console_unblank,
 	.flags = CON_PRINTBUFFER,
 	.index = 0 /* ttyS0 */
 };
@@ -273,23 +214,37 @@ sclp_console_init(void)
 	int i;
 	int rc;
 
-	/* SCLP consoles are handled together */
-	if (!(CONSOLE_IS_SCLP || CONSOLE_IS_VT220))
+	if (!CONSOLE_IS_SCLP)
 		return 0;
 	rc = sclp_rw_init();
 	if (rc)
 		return rc;
 	/* Allocate pages for output buffering */
-	for (i = 0; i < sclp_console_pages; i++) {
-		page = (void *) get_zeroed_page(GFP_KERNEL | GFP_DMA);
-		list_add_tail(page, &sclp_con_pages);
+	INIT_LIST_HEAD(&sclp_con_pages);
+	for (i = 0; i < MAX_CONSOLE_PAGES; i++) {
+		page = alloc_bootmem_low_pages(PAGE_SIZE);
+		if (page == NULL)
+			return -ENOMEM;
+		list_add_tail((struct list_head *) page, &sclp_con_pages);
 	}
+	INIT_LIST_HEAD(&sclp_con_outqueue);
+	spin_lock_init(&sclp_con_lock);
+	sclp_con_buffer_count = 0;
 	sclp_conbuf = NULL;
-	timer_setup(&sclp_con_timer, sclp_console_timeout, 0);
+	init_timer(&sclp_con_timer);
+
+	/* Set output format */
+	if (MACHINE_IS_VM)
+		/*
+		 * save 4 characters for the CPU number
+		 * written at start of each line by VM/CP
+		 */
+		sclp_con_columns = 76;
+	else
+		sclp_con_columns = 80;
+	sclp_con_width_htab = 8;
 
 	/* enable printk-access to this driver */
-	atomic_notifier_chain_register(&panic_notifier_list, &on_panic_nb);
-	register_reboot_notifier(&on_reboot_nb);
 	register_console(&sclp_console);
 	return 0;
 }

@@ -1,101 +1,100 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
- * (c) Copyright 2003, 2006 Hewlett-Packard Development Company, L.P.
- *	Alex Williamson <alex.williamson@hp.com>
- *	Bjorn Helgaas <bjorn.helgaas@hp.com>
+ * arch/ia64/kernel/acpi-ext.c
+ *
+ * Copyright (C) 2003 Hewlett-Packard
+ * Copyright (C) Alex Williamson
+ * Copyright (C) Bjorn Helgaas
+ *
+ * Vendor specific extensions to ACPI.
  */
 
+#include <linux/config.h>
 #include <linux/module.h>
 #include <linux/types.h>
-#include <linux/slab.h>
 #include <linux/acpi.h>
+#include <linux/efi.h>
 
 #include <asm/acpi-ext.h>
 
-/*
- * Device CSRs that do not appear in PCI config space should be described
- * via ACPI.  This would normally be done with Address Space Descriptors
- * marked as "consumer-only," but old versions of Windows and Linux ignore
- * the producer/consumer flag, so HP invented a vendor-defined resource to
- * describe the location and size of CSR space.
- */
-
-struct acpi_vendor_uuid hp_ccsr_uuid = {
-	.subtype = 2,
-	.data = { 0xf9, 0xad, 0xe9, 0x69, 0x4f, 0x92, 0x5f, 0xab, 0xf6, 0x4a,
-	    0x24, 0xd2, 0x01, 0x37, 0x0e, 0xad },
+struct acpi_vendor_descriptor {
+	u8				guid_id;
+	efi_guid_t			guid;
 };
 
-static acpi_status hp_ccsr_locate(acpi_handle obj, u64 *base, u64 *length)
-{
-	acpi_status status;
-	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
-	struct acpi_resource *resource;
-	struct acpi_resource_vendor_typed *vendor;
-
-	status = acpi_get_vendor_resource(obj, METHOD_NAME__CRS, &hp_ccsr_uuid,
-		&buffer);
-
-	resource = buffer.pointer;
-	vendor = &resource->data.vendor_typed;
-
-	if (ACPI_FAILURE(status) || vendor->byte_length < 16) {
-		status = AE_NOT_FOUND;
-		goto exit;
-	}
-
-	memcpy(base, vendor->byte_data, sizeof(*base));
-	memcpy(length, vendor->byte_data + 8, sizeof(*length));
-
-  exit:
-	kfree(buffer.pointer);
-	return status;
-}
-
-struct csr_space {
-	u64	base;
-	u64	length;
+struct acpi_vendor_info {
+	struct acpi_vendor_descriptor	*descriptor;
+	u8				*data;
+	u32				length;
 };
 
-static acpi_status find_csr_space(struct acpi_resource *resource, void *data)
+acpi_status
+acpi_vendor_resource_match(struct acpi_resource *resource, void *context)
 {
-	struct csr_space *space = data;
-	struct acpi_resource_address64 addr;
-	acpi_status status;
+	struct acpi_vendor_info *info = (struct acpi_vendor_info *) context;
+	struct acpi_resource_vendor *vendor;
+	struct acpi_vendor_descriptor *descriptor;
+	u32 length;
 
-	status = acpi_resource_to_address64(resource, &addr);
-	if (ACPI_SUCCESS(status) &&
-	    addr.resource_type == ACPI_MEMORY_RANGE &&
-	    addr.address.address_length &&
-	    addr.producer_consumer == ACPI_CONSUMER) {
-		space->base = addr.address.minimum;
-		space->length = addr.address.address_length;
-		return AE_CTRL_TERMINATE;
-	}
-	return AE_OK;		/* keep looking */
+	if (resource->id != ACPI_RSTYPE_VENDOR)
+		return AE_OK;
+
+	vendor = (struct acpi_resource_vendor *) &resource->data;
+	descriptor = (struct acpi_vendor_descriptor *) vendor->reserved;
+	if (vendor->length <= sizeof(*info->descriptor) ||
+	    descriptor->guid_id != info->descriptor->guid_id ||
+	    efi_guidcmp(descriptor->guid, info->descriptor->guid))
+		return AE_OK;
+
+	length = vendor->length - sizeof(struct acpi_vendor_descriptor);
+	info->data = acpi_os_allocate(length);
+	if (!info->data)
+		return AE_NO_MEMORY;
+
+	memcpy(info->data, vendor->reserved + sizeof(struct acpi_vendor_descriptor), length);
+	info->length = length;
+	return AE_CTRL_TERMINATE;
 }
 
-static acpi_status hp_crs_locate(acpi_handle obj, u64 *base, u64 *length)
+acpi_status
+acpi_find_vendor_resource(acpi_handle obj, struct acpi_vendor_descriptor *id,
+		u8 **data, u32 *length)
 {
-	struct csr_space space = { 0, 0 };
+	struct acpi_vendor_info info;
 
-	acpi_walk_resources(obj, METHOD_NAME__CRS, find_csr_space, &space);
-	if (!space.length)
+	info.descriptor = id;
+	info.data = NULL;
+
+	acpi_walk_resources(obj, METHOD_NAME__CRS, acpi_vendor_resource_match, &info);
+	if (!info.data)
 		return AE_NOT_FOUND;
 
-	*base = space.base;
-	*length = space.length;
+	*data = info.data;
+	*length = info.length;
 	return AE_OK;
 }
 
-acpi_status hp_acpi_csr_space(acpi_handle obj, u64 *csr_base, u64 *csr_length)
+struct acpi_vendor_descriptor hp_ccsr_descriptor = {
+	.guid_id = 2,
+	.guid    = EFI_GUID(0x69e9adf9, 0x924f, 0xab5f, 0xf6, 0x4a, 0x24, 0xd2, 0x01, 0x37, 0x0e, 0xad)
+};
+
+acpi_status
+hp_acpi_csr_space(acpi_handle obj, u64 *csr_base, u64 *csr_length)
 {
 	acpi_status status;
+	u8 *data;
+	u32 length;
 
-	status = hp_ccsr_locate(obj, csr_base, csr_length);
-	if (ACPI_SUCCESS(status))
-		return status;
+	status = acpi_find_vendor_resource(obj, &hp_ccsr_descriptor, &data, &length);
 
-	return hp_crs_locate(obj, csr_base, csr_length);
+	if (ACPI_FAILURE(status) || length != 16)
+		return AE_NOT_FOUND;
+
+	memcpy(csr_base, data, sizeof(*csr_base));
+	memcpy(csr_length, data + 8, sizeof(*csr_length));
+	acpi_os_free(data);
+
+	return AE_OK;
 }
+
 EXPORT_SYMBOL(hp_acpi_csr_space);

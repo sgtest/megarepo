@@ -1,284 +1,363 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
+ *  drivers/s390/cio/chsc.c
  *   S/390 common I/O routines -- channel subsystem call
+ *   $Revision: 1.119 $
  *
- *    Copyright IBM Corp. 1999,2012
+ *    Copyright (C) 1999-2002 IBM Deutschland Entwicklung GmbH,
+ *			      IBM Corporation
  *    Author(s): Ingo Adlung (adlung@de.ibm.com)
- *		 Cornelia Huck (cornelia.huck@de.ibm.com)
+ *		 Cornelia Huck (cohuck@de.ibm.com)
  *		 Arnd Bergmann (arndb@de.ibm.com)
  */
 
-#define KMSG_COMPONENT "cio"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
-
 #include <linux/module.h>
+#include <linux/config.h>
 #include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/device.h>
-#include <linux/mutex.h>
-#include <linux/pci.h>
 
 #include <asm/cio.h>
-#include <asm/chpid.h>
-#include <asm/chsc.h>
-#include <asm/crw.h>
-#include <asm/isc.h>
-#include <asm/ebcdic.h>
-#include <asm/ap.h>
 
 #include "css.h"
 #include "cio.h"
 #include "cio_debug.h"
 #include "ioasm.h"
-#include "chp.h"
 #include "chsc.h"
 
+static struct channel_path *chps[NR_CHPIDS];
+
 static void *sei_page;
-static void *chsc_page;
-static DEFINE_SPINLOCK(chsc_page_lock);
 
-#define SEI_VF_FLA	0xc0 /* VF flag for Full Link Address */
-#define SEI_RS_CHPID	0x4  /* 4 in RS field indicates CHPID */
+static int new_channel_path(int chpid);
 
-/**
- * chsc_error_from_response() - convert a chsc response to an error
- * @response: chsc response code
- *
- * Returns an appropriate Linux error code for @response.
- */
-int chsc_error_from_response(int response)
+static inline void
+set_chp_logically_online(int chp, int onoff)
 {
-	switch (response) {
-	case 0x0001:
-		return 0;
-	case 0x0002:
-	case 0x0003:
-	case 0x0006:
-	case 0x0007:
-	case 0x0008:
-	case 0x000a:
-	case 0x0104:
-		return -EINVAL;
-	case 0x0004:
-	case 0x0106:		/* "Wrong Channel Parm" for the op 0x003d */
-		return -EOPNOTSUPP;
-	case 0x000b:
-	case 0x0107:		/* "Channel busy" for the op 0x003d */
-		return -EBUSY;
-	case 0x0100:
-	case 0x0102:
-		return -ENOMEM;
-	case 0x0108:		/* "HW limit exceeded" for the op 0x003d */
-		return -EUSERS;
-	default:
-		return -EIO;
+	chps[chp]->state = onoff;
+}
+
+static int
+get_chp_status(int chp)
+{
+	return (chps[chp] ? chps[chp]->state : -ENODEV);
+}
+
+void
+chsc_validate_chpids(struct subchannel *sch)
+{
+	int mask, chp;
+
+	for (chp = 0; chp <= 7; chp++) {
+		mask = 0x80 >> chp;
+		if (!get_chp_status(sch->schib.pmcw.chpid[chp]))
+			/* disable using this path */
+			sch->opm &= ~mask;
 	}
 }
-EXPORT_SYMBOL_GPL(chsc_error_from_response);
 
-struct chsc_ssd_area {
-	struct chsc_header request;
-	u16 :10;
-	u16 ssid:2;
-	u16 :4;
-	u16 f_sch;	  /* first subchannel */
-	u16 :16;
-	u16 l_sch;	  /* last subchannel */
-	u32 :32;
-	struct chsc_header response;
-	u32 :32;
-	u8 sch_valid : 1;
-	u8 dev_valid : 1;
-	u8 st	     : 3; /* subchannel type */
-	u8 zeroes    : 3;
-	u8  unit_addr;	  /* unit address */
-	u16 devno;	  /* device number */
-	u8 path_mask;
-	u8 fla_valid_mask;
-	u16 sch;	  /* subchannel */
-	u8 chpid[8];	  /* chpids 0-7 */
-	u16 fla[8];	  /* full link addresses 0-7 */
-} __packed __aligned(PAGE_SIZE);
-
-int chsc_get_ssd_info(struct subchannel_id schid, struct chsc_ssd_info *ssd)
+void
+chpid_is_actually_online(int chp)
 {
-	struct chsc_ssd_area *ssd_area;
-	unsigned long flags;
-	int ccode;
-	int ret;
-	int i;
-	int mask;
+	int state;
 
-	spin_lock_irqsave(&chsc_page_lock, flags);
-	memset(chsc_page, 0, PAGE_SIZE);
-	ssd_area = chsc_page;
-	ssd_area->request.length = 0x0010;
-	ssd_area->request.code = 0x0004;
-	ssd_area->ssid = schid.ssid;
-	ssd_area->f_sch = schid.sch_no;
-	ssd_area->l_sch = schid.sch_no;
+	state = get_chp_status(chp);
+	if (state < 0) {
+		need_rescan = 1;
+		queue_work(slow_path_wq, &slow_path_work);
+	} else
+		WARN_ON(!state);
+}
+
+/* FIXME: this is _always_ called for every subchannel. shouldn't we
+ *	  process more than one at a time? */
+static int
+chsc_get_sch_desc_irq(struct subchannel *sch, void *page)
+{
+	int ccode, j;
+
+	struct {
+		struct chsc_header request;
+		u16 reserved1;
+		u16 f_sch;	  /* first subchannel */
+		u16 reserved2;
+		u16 l_sch;	  /* last subchannel */
+		u32 reserved3;
+		struct chsc_header response;
+		u32 reserved4;
+		u8 sch_valid : 1;
+		u8 dev_valid : 1;
+		u8 st	     : 3; /* subchannel type */
+		u8 zeroes    : 3;
+		u8  unit_addr;	  /* unit address */
+		u16 devno;	  /* device number */
+		u8 path_mask;
+		u8 fla_valid_mask;
+		u16 sch;	  /* subchannel */
+		u8 chpid[8];	  /* chpids 0-7 */
+		u16 fla[8];	  /* full link addresses 0-7 */
+	} *ssd_area;
+
+	ssd_area = page;
+
+	ssd_area->request = (struct chsc_header) {
+		.length = 0x0010,
+		.code   = 0x0004,
+	};
+
+	ssd_area->f_sch = sch->irq;
+	ssd_area->l_sch = sch->irq;
 
 	ccode = chsc(ssd_area);
-	/* Check response. */
 	if (ccode > 0) {
-		ret = (ccode == 3) ? -ENODEV : -EBUSY;
-		goto out;
+		pr_debug("chsc returned with ccode = %d\n", ccode);
+		return (ccode == 3) ? -ENODEV : -EBUSY;
 	}
-	ret = chsc_error_from_response(ssd_area->response.code);
-	if (ret != 0) {
-		CIO_MSG_EVENT(2, "chsc: ssd failed for 0.%x.%04x (rc=%04x)\n",
-			      schid.ssid, schid.sch_no,
+
+	switch (ssd_area->response.code) {
+	case 0x0001: /* everything ok */
+		break;
+	case 0x0002:
+		CIO_CRW_EVENT(2, "Invalid command!\n");
+		return -EINVAL;
+	case 0x0003:
+		CIO_CRW_EVENT(2, "Error in chsc request block!\n");
+		return -EINVAL;
+	case 0x0004:
+		CIO_CRW_EVENT(2, "Model does not provide ssd\n");
+		return -EOPNOTSUPP;
+	default:
+		CIO_CRW_EVENT(2, "Unknown CHSC response %d\n",
 			      ssd_area->response.code);
-		goto out;
+		return -EIO;
 	}
-	if (!ssd_area->sch_valid) {
-		ret = -ENODEV;
-		goto out;
+
+	/*
+	 * ssd_area->st stores the type of the detected
+	 * subchannel, with the following definitions:
+	 *
+	 * 0: I/O subchannel:	  All fields have meaning
+	 * 1: CHSC subchannel:	  Only sch_val, st and sch
+	 *			  have meaning
+	 * 2: Message subchannel: All fields except unit_addr
+	 *			  have meaning
+	 * 3: ADM subchannel:	  Only sch_val, st and sch
+	 *			  have meaning
+	 *
+	 * Other types are currently undefined.
+	 */
+	if (ssd_area->st > 3) { /* uhm, that looks strange... */
+		CIO_CRW_EVENT(0, "Strange subchannel type %d"
+			      " for sch %04x\n", ssd_area->st, sch->irq);
+		/*
+		 * There may have been a new subchannel type defined in the
+		 * time since this code was written; since we don't know which
+		 * fields have meaning and what to do with it we just jump out
+		 */
+		return 0;
+	} else {
+		const char *type[4] = {"I/O", "chsc", "message", "ADM"};
+		CIO_CRW_EVENT(6, "ssd: sch %04x is %s subchannel\n",
+			      sch->irq, type[ssd_area->st]);
+
+		sch->ssd_info.valid = 1;
+		sch->ssd_info.type = ssd_area->st;
 	}
-	/* Copy data */
-	ret = 0;
-	memset(ssd, 0, sizeof(struct chsc_ssd_info));
-	if ((ssd_area->st != SUBCHANNEL_TYPE_IO) &&
-	    (ssd_area->st != SUBCHANNEL_TYPE_MSG))
-		goto out;
-	ssd->path_mask = ssd_area->path_mask;
-	ssd->fla_valid_mask = ssd_area->fla_valid_mask;
-	for (i = 0; i < 8; i++) {
-		mask = 0x80 >> i;
-		if (ssd_area->path_mask & mask) {
-			chp_id_init(&ssd->chpid[i]);
-			ssd->chpid[i].id = ssd_area->chpid[i];
+
+	if (ssd_area->st == 0 || ssd_area->st == 2) {
+		for (j = 0; j < 8; j++) {
+			if (!((0x80 >> j) & ssd_area->path_mask &
+			      ssd_area->fla_valid_mask))
+				continue;
+			sch->ssd_info.chpid[j] = ssd_area->chpid[j];
+			sch->ssd_info.fla[j]   = ssd_area->fla[j];
 		}
-		if (ssd_area->fla_valid_mask & mask)
-			ssd->fla[i] = ssd_area->fla[i];
 	}
-out:
-	spin_unlock_irqrestore(&chsc_page_lock, flags);
+	return 0;
+}
+
+int
+css_get_ssd_info(struct subchannel *sch)
+{
+	int ret;
+	void *page;
+
+	page = (void *)get_zeroed_page(GFP_KERNEL | GFP_DMA);
+	if (!page)
+		return -ENOMEM;
+	spin_lock_irq(&sch->lock);
+	ret = chsc_get_sch_desc_irq(sch, page);
+	if (ret) {
+		static int cio_chsc_err_msg;
+		
+		if (!cio_chsc_err_msg) {
+			printk(KERN_ERR
+			       "chsc_get_sch_descriptions:"
+			       " Error %d while doing chsc; "
+			       "processing some machine checks may "
+			       "not work\n", ret);
+			cio_chsc_err_msg = 1;
+		}
+	}
+	spin_unlock_irq(&sch->lock);
+	free_page((unsigned long)page);
+	if (!ret) {
+		int j, chpid;
+		/* Allocate channel path structures, if needed. */
+		for (j = 0; j < 8; j++) {
+			chpid = sch->ssd_info.chpid[j];
+			if (chpid && (get_chp_status(chpid) < 0))
+			    new_channel_path(chpid);
+		}
+	}
 	return ret;
 }
 
-/**
- * chsc_ssqd() - store subchannel QDIO data (SSQD)
- * @schid: id of the subchannel on which SSQD is performed
- * @ssqd: request and response block for SSQD
- *
- * Returns 0 on success.
- */
-int chsc_ssqd(struct subchannel_id schid, struct chsc_ssqd_area *ssqd)
+static int
+s390_subchannel_remove_chpid(struct device *dev, void *data)
 {
-	memset(ssqd, 0, sizeof(*ssqd));
-	ssqd->request.length = 0x0010;
-	ssqd->request.code = 0x0024;
-	ssqd->first_sch = schid.sch_no;
-	ssqd->last_sch = schid.sch_no;
-	ssqd->ssid = schid.ssid;
+	int j;
+	int mask;
+	struct subchannel *sch;
+	__u8 *chpid;
+	struct schib schib;
 
-	if (chsc(ssqd))
-		return -EIO;
+	sch = to_subchannel(dev);
+	chpid = data;
+	for (j = 0; j < 8; j++)
+		if (sch->schib.pmcw.chpid[j] == *chpid)
+			break;
+	if (j >= 8)
+		return 0;
 
-	return chsc_error_from_response(ssqd->response.code);
-}
-EXPORT_SYMBOL_GPL(chsc_ssqd);
+	mask = 0x80 >> j;
+	spin_lock(&sch->lock);
 
-/**
- * chsc_sadc() - set adapter device controls (SADC)
- * @schid: id of the subchannel on which SADC is performed
- * @scssc: request and response block for SADC
- * @summary_indicator_addr: summary indicator address
- * @subchannel_indicator_addr: subchannel indicator address
- * @isc: Interruption Subclass for this subchannel
- *
- * Returns 0 on success.
- */
-int chsc_sadc(struct subchannel_id schid, struct chsc_scssc_area *scssc,
-	      u64 summary_indicator_addr, u64 subchannel_indicator_addr, u8 isc)
-{
-	memset(scssc, 0, sizeof(*scssc));
-	scssc->request.length = 0x0fe0;
-	scssc->request.code = 0x0021;
-	scssc->operation_code = 0;
+	stsch(sch->irq, &schib);
+	if (!schib.pmcw.dnv)
+		goto out_unreg;
+	memcpy(&sch->schib, &schib, sizeof(struct schib));
+	/* Check for single path devices. */
+	if (sch->schib.pmcw.pim == 0x80)
+		goto out_unreg;
+	if (sch->vpm == mask)
+		goto out_unreg;
 
-	scssc->summary_indicator_addr = summary_indicator_addr;
-	scssc->subchannel_indicator_addr = subchannel_indicator_addr;
-
-	scssc->ks = PAGE_DEFAULT_KEY >> 4;
-	scssc->kc = PAGE_DEFAULT_KEY >> 4;
-	scssc->isc = isc;
-	scssc->schid = schid;
-
-	/* enable the time delay disablement facility */
-	if (css_general_characteristics.aif_tdd)
-		scssc->word_with_d_bit = 0x10000000;
-
-	if (chsc(scssc))
-		return -EIO;
-
-	return chsc_error_from_response(scssc->response.code);
-}
-EXPORT_SYMBOL_GPL(chsc_sadc);
-
-static int s390_subchannel_remove_chpid(struct subchannel *sch, void *data)
-{
-	spin_lock_irq(sch->lock);
-	if (sch->driver && sch->driver->chp_event)
-		if (sch->driver->chp_event(sch, data, CHP_OFFLINE) != 0)
+	if ((sch->schib.scsw.actl & (SCSW_ACTL_CLEAR_PEND |
+				     SCSW_ACTL_HALT_PEND |
+				     SCSW_ACTL_START_PEND |
+				     SCSW_ACTL_RESUME_PEND)) &&
+	    (sch->schib.pmcw.lpum == mask)) {
+		int cc = cio_cancel(sch);
+		
+		if (cc == -ENODEV)
 			goto out_unreg;
-	spin_unlock_irq(sch->lock);
-	return 0;
 
+		if (cc == -EINVAL) {
+			cc = cio_clear(sch);
+			if (cc == -ENODEV)
+				goto out_unreg;
+			/* Call handler. */
+			if (sch->driver && sch->driver->termination)
+				sch->driver->termination(&sch->dev);
+			goto out_unlock;
+		}
+	} else if ((sch->schib.scsw.actl & SCSW_ACTL_DEVACT) &&
+		   (sch->schib.scsw.actl & SCSW_ACTL_SCHACT) &&
+		   (sch->schib.pmcw.lpum == mask)) {
+		int cc;
+
+		cc = cio_clear(sch);
+		if (cc == -ENODEV)
+			goto out_unreg;
+		/* Call handler. */
+		if (sch->driver && sch->driver->termination)
+			sch->driver->termination(&sch->dev);
+		goto out_unlock;
+	}
+
+	/* trigger path verification. */
+	if (sch->driver && sch->driver->verify)
+		sch->driver->verify(&sch->dev);
+out_unlock:
+	spin_unlock(&sch->lock);
+	return 0;
 out_unreg:
+	spin_unlock(&sch->lock);
 	sch->lpm = 0;
-	spin_unlock_irq(sch->lock);
-	css_schedule_eval(sch->schid);
+	if (css_enqueue_subchannel_slow(sch->irq)) {
+		css_clear_subchannel_slow_list();
+		need_rescan = 1;
+	}
 	return 0;
 }
 
-void chsc_chp_offline(struct chp_id chpid)
+static inline void
+s390_set_chpid_offline( __u8 chpid)
 {
-	struct channel_path *chp = chpid_to_chp(chpid);
-	struct chp_link link;
 	char dbf_txt[15];
 
-	sprintf(dbf_txt, "chpr%x.%02x", chpid.cssid, chpid.id);
+	sprintf(dbf_txt, "chpr%x", chpid);
 	CIO_TRACE_EVENT(2, dbf_txt);
 
-	if (chp_get_status(chpid) <= 0)
+	if (get_chp_status(chpid) <= 0)
 		return;
-	memset(&link, 0, sizeof(struct chp_link));
-	link.chpid = chpid;
-	/* Wait until previous actions have settled. */
-	css_wait_for_slow_path();
 
-	mutex_lock(&chp->lock);
-	chp_update_desc(chp);
-	mutex_unlock(&chp->lock);
+	bus_for_each_dev(&css_bus_type, NULL, &chpid,
+			 s390_subchannel_remove_chpid);
 
-	for_each_subchannel_staged(s390_subchannel_remove_chpid, NULL, &link);
+	if (need_rescan || css_slow_subchannels_exist())
+		queue_work(slow_path_wq, &slow_path_work);
 }
 
-static int __s390_process_res_acc(struct subchannel *sch, void *data)
+static int
+s390_process_res_acc_sch(u8 chpid, __u16 fla, u32 fla_mask,
+			 struct subchannel *sch)
 {
-	spin_lock_irq(sch->lock);
-	if (sch->driver && sch->driver->chp_event)
-		sch->driver->chp_event(sch, data, CHP_ONLINE);
-	spin_unlock_irq(sch->lock);
+	int found;
+	int chp;
+	int ccode;
+	
+	found = 0;
+	for (chp = 0; chp <= 7; chp++)
+		/*
+		 * check if chpid is in information updated by ssd
+		 */
+		if (sch->ssd_info.valid &&
+		    sch->ssd_info.chpid[chp] == chpid &&
+		    (sch->ssd_info.fla[chp] & fla_mask) == fla) {
+			found = 1;
+			break;
+		}
+	
+	if (found == 0)
+		return 0;
 
-	return 0;
+	/*
+	 * Do a stsch to update our subchannel structure with the
+	 * new path information and eventually check for logically
+	 * offline chpids.
+	 */
+	ccode = stsch(sch->irq, &sch->schib);
+	if (ccode > 0)
+		return 0;
+
+	return 0x80 >> chp;
 }
 
-static void s390_process_res_acc(struct chp_link *link)
+static int
+s390_process_res_acc (u8 chpid, __u16 fla, u32 fla_mask)
 {
+	struct subchannel *sch;
+	int irq, rc;
 	char dbf_txt[15];
 
-	sprintf(dbf_txt, "accpr%x.%02x", link->chpid.cssid,
-		link->chpid.id);
+	sprintf(dbf_txt, "accpr%x", chpid);
 	CIO_TRACE_EVENT( 2, dbf_txt);
-	if (link->fla != 0) {
-		sprintf(dbf_txt, "fla%x", link->fla);
+	if (fla != 0) {
+		sprintf(dbf_txt, "fla%x", fla);
 		CIO_TRACE_EVENT( 2, dbf_txt);
 	}
-	/* Wait until previous actions have settled. */
-	css_wait_for_slow_path();
+
 	/*
 	 * I/O resources may have become accessible.
 	 * Scan through all subchannels that may be concerned and
@@ -286,742 +365,563 @@ static void s390_process_res_acc(struct chp_link *link)
 	 * The more information we have (info), the less scanning
 	 * will we have to do.
 	 */
-	for_each_subchannel_staged(__s390_process_res_acc, NULL, link);
-	css_schedule_reprobe();
+
+	if (!get_chp_status(chpid))
+		return 0; /* no need to do the rest */
+
+	rc = 0;
+	for (irq = 0; irq < __MAX_SUBCHANNELS; irq++) {
+		int chp_mask, old_lpm;
+
+		sch = get_subchannel_by_schid(irq);
+		if (!sch) {
+			struct schib schib;
+			int ret;
+			/*
+			 * We don't know the device yet, but since a path
+			 * may be available now to the device we'll have
+			 * to do recognition again.
+			 * Since we don't have any idea about which chpid
+			 * that beast may be on we'll have to do a stsch
+			 * on all devices, grr...
+			 */
+			if (stsch(irq, &schib)) {
+				/* We're through */
+				if (need_rescan)
+					rc = -EAGAIN;
+				break;
+			}
+			if (need_rescan) {
+				rc = -EAGAIN;
+				continue;
+			}
+			/* Put it on the slow path. */
+			ret = css_enqueue_subchannel_slow(irq);
+			if (ret) {
+				css_clear_subchannel_slow_list();
+				need_rescan = 1;
+			}
+			rc = -EAGAIN;
+			continue;
+		}
+	
+		spin_lock_irq(&sch->lock);
+
+		chp_mask = s390_process_res_acc_sch(chpid, fla, fla_mask, sch);
+
+		if (chp_mask == 0) {
+
+			spin_unlock_irq(&sch->lock);
+
+			if (fla_mask != 0)
+				break;
+			else
+				continue;
+		}
+		old_lpm = sch->lpm;
+		sch->lpm = ((sch->schib.pmcw.pim &
+			     sch->schib.pmcw.pam &
+			     sch->schib.pmcw.pom)
+			    | chp_mask) & sch->opm;
+		if (!old_lpm && sch->lpm)
+			device_trigger_reprobe(sch);
+		else if (sch->driver && sch->driver->verify)
+			sch->driver->verify(&sch->dev);
+
+		spin_unlock_irq(&sch->lock);
+		put_device(&sch->dev);
+		if (fla_mask != 0)
+			break;
+	}
+	return rc;
 }
 
-static int process_fces_event(struct subchannel *sch, void *data)
+static int
+__get_chpid_from_lir(void *data)
 {
-	spin_lock_irq(sch->lock);
-	if (sch->driver && sch->driver->chp_event)
-		sch->driver->chp_event(sch, data, CHP_FCES_EVENT);
-	spin_unlock_irq(sch->lock);
+	struct lir {
+		u8  iq;
+		u8  ic;
+		u16 sci;
+		/* incident-node descriptor */
+		u32 indesc[28];
+		/* attached-node descriptor */
+		u32 andesc[28];
+		/* incident-specific information */
+		u32 isinfo[28];
+	} *lir;
+
+	lir = (struct lir*) data;
+	if (!(lir->iq&0x80))
+		/* NULL link incident record */
+		return -EINVAL;
+	if (!(lir->indesc[0]&0xc0000000))
+		/* node descriptor not valid */
+		return -EINVAL;
+	if (!(lir->indesc[0]&0x10000000))
+		/* don't handle device-type nodes - FIXME */
+		return -EINVAL;
+	/* Byte 3 contains the chpid. Could also be CTCA, but we don't care */
+
+	return (u16) (lir->indesc[0]&0x000000ff);
+}
+
+int
+chsc_process_crw(void)
+{
+	int chpid, ret;
+	struct {
+		struct chsc_header request;
+		u32 reserved1;
+		u32 reserved2;
+		u32 reserved3;
+		struct chsc_header response;
+		u32 reserved4;
+		u8  flags;
+		u8  vf;		/* validity flags */
+		u8  rs;		/* reporting source */
+		u8  cc;		/* content code */
+		u16 fla;	/* full link address */
+		u16 rsid;	/* reporting source id */
+		u32 reserved5;
+		u32 reserved6;
+		u32 ccdf[96];	/* content-code dependent field */
+		/* ccdf has to be big enough for a link-incident record */
+	} *sei_area;
+
+	if (!sei_page)
+		return 0;
+	/*
+	 * build the chsc request block for store event information
+	 * and do the call
+	 * This function is only called by the machine check handler thread,
+	 * so we don't need locking for the sei_page.
+	 */
+	sei_area = sei_page;
+
+	CIO_TRACE_EVENT( 2, "prcss");
+	ret = 0;
+	do {
+		int ccode, status;
+		memset(sei_area, 0, sizeof(*sei_area));
+
+		sei_area->request = (struct chsc_header) {
+			.length = 0x0010,
+			.code   = 0x000e,
+		};
+
+		ccode = chsc(sei_area);
+		if (ccode > 0)
+			return 0;
+
+		switch (sei_area->response.code) {
+			/* for debug purposes, check for problems */
+		case 0x0001:
+			CIO_CRW_EVENT(4, "chsc_process_crw: event information "
+					"successfully stored\n");
+			break; /* everything ok */
+		case 0x0002:
+			CIO_CRW_EVENT(2,
+				      "chsc_process_crw: invalid command!\n");
+			return 0;
+		case 0x0003:
+			CIO_CRW_EVENT(2, "chsc_process_crw: error in chsc "
+				      "request block!\n");
+			return 0;
+		case 0x0005:
+			CIO_CRW_EVENT(2, "chsc_process_crw: no event "
+				      "information stored\n");
+			return 0;
+		default:
+			CIO_CRW_EVENT(2, "chsc_process_crw: chsc response %d\n",
+				      sei_area->response.code);
+			return 0;
+		}
+
+		/* Check if we might have lost some information. */
+		if (sei_area->flags & 0x40)
+			CIO_CRW_EVENT(2, "chsc_process_crw: Event information "
+				       "has been lost due to overflow!\n");
+
+		if (sei_area->rs != 4) {
+			CIO_CRW_EVENT(2, "chsc_process_crw: reporting source "
+				      "(%04X) isn't a chpid!\n",
+				      sei_area->rsid);
+			continue;
+		}
+
+		/* which kind of information was stored? */
+		switch (sei_area->cc) {
+		case 1: /* link incident*/
+			CIO_CRW_EVENT(4, "chsc_process_crw: "
+				      "channel subsystem reports link incident,"
+				      " reporting source is chpid %x\n",
+				      sei_area->rsid);
+			chpid = __get_chpid_from_lir(sei_area->ccdf);
+			if (chpid < 0)
+				CIO_CRW_EVENT(4, "%s: Invalid LIR, skipping\n",
+					      __FUNCTION__);
+			else
+				s390_set_chpid_offline(chpid);
+			break;
+			
+		case 2: /* i/o resource accessibiliy */
+			CIO_CRW_EVENT(4, "chsc_process_crw: "
+				      "channel subsystem reports some I/O "
+				      "devices may have become accessible\n");
+			pr_debug("Data received after sei: \n");
+			pr_debug("Validity flags: %x\n", sei_area->vf);
+			
+			/* allocate a new channel path structure, if needed */
+			status = get_chp_status(sei_area->rsid);
+			if (status < 0)
+				new_channel_path(sei_area->rsid);
+			else if (!status)
+				return 0;
+			if ((sei_area->vf & 0x80) == 0) {
+				pr_debug("chpid: %x\n", sei_area->rsid);
+				ret = s390_process_res_acc(sei_area->rsid,
+							   0, 0);
+			} else if ((sei_area->vf & 0xc0) == 0x80) {
+				pr_debug("chpid: %x link addr: %x\n",
+					 sei_area->rsid, sei_area->fla);
+				ret = s390_process_res_acc(sei_area->rsid,
+							   sei_area->fla,
+							   0xff00);
+			} else if ((sei_area->vf & 0xc0) == 0xc0) {
+				pr_debug("chpid: %x full link addr: %x\n",
+					 sei_area->rsid, sei_area->fla);
+				ret = s390_process_res_acc(sei_area->rsid,
+							   sei_area->fla,
+							   0xffff);
+			}
+			pr_debug("\n");
+			
+			break;
+			
+		default: /* other stuff */
+			CIO_CRW_EVENT(4, "chsc_process_crw: event %d\n",
+				      sei_area->cc);
+			break;
+		}
+	} while (sei_area->flags & 0x80);
+	return ret;
+}
+
+static int
+chp_add(int chpid)
+{
+	struct subchannel *sch;
+	int irq, ret, rc;
+	char dbf_txt[15];
+
+	if (!get_chp_status(chpid))
+		return 0; /* no need to do the rest */
+	
+	sprintf(dbf_txt, "cadd%x", chpid);
+	CIO_TRACE_EVENT(2, dbf_txt);
+
+	rc = 0;
+	for (irq = 0; irq < __MAX_SUBCHANNELS; irq++) {
+		int i;
+
+		sch = get_subchannel_by_schid(irq);
+		if (!sch) {
+			struct schib schib;
+
+			if (stsch(irq, &schib)) {
+				/* We're through */
+				if (need_rescan)
+					rc = -EAGAIN;
+				break;
+			}
+			if (need_rescan) {
+				rc = -EAGAIN;
+				continue;
+			}
+			/* Put it on the slow path. */
+			ret = css_enqueue_subchannel_slow(irq);
+			if (ret) {
+				css_clear_subchannel_slow_list();
+				need_rescan = 1;
+			}
+			rc = -EAGAIN;
+			continue;
+		}
+	
+		spin_lock(&sch->lock);
+		for (i=0; i<8; i++)
+			if (sch->schib.pmcw.chpid[i] == chpid) {
+				if (stsch(sch->irq, &sch->schib) != 0) {
+					/* Endgame. */
+					spin_unlock(&sch->lock);
+					return rc;
+				}
+				break;
+			}
+		if (i==8) {
+			spin_unlock(&sch->lock);
+			return rc;
+		}
+		sch->lpm = ((sch->schib.pmcw.pim &
+			     sch->schib.pmcw.pam &
+			     sch->schib.pmcw.pom)
+			    | 0x80 >> i) & sch->opm;
+
+		if (sch->driver && sch->driver->verify)
+			sch->driver->verify(&sch->dev);
+
+		spin_unlock(&sch->lock);
+		put_device(&sch->dev);
+	}
+	return rc;
+}
+
+/* 
+ * Handling of crw machine checks with channel path source.
+ */
+int
+chp_process_crw(int chpid, int on)
+{
+	if (on == 0) {
+		/* Path has gone. We use the link incident routine.*/
+		s390_set_chpid_offline(chpid);
+		return 0; /* De-register is async anyway. */
+	}
+	/*
+	 * Path has come. Allocate a new channel path structure,
+	 * if needed.
+	 */
+	if (get_chp_status(chpid) < 0)
+		new_channel_path(chpid);
+	/* Avoid the extra overhead in process_rec_acc. */
+	return chp_add(chpid);
+}
+
+static inline int
+__check_for_io_and_kill(struct subchannel *sch, int index)
+{
+	int cc;
+
+	if (!device_is_online(sch))
+		/* cio could be doing I/O. */
+		return 0;
+	cc = stsch(sch->irq, &sch->schib);
+	if (cc)
+		return 0;
+	if (sch->schib.scsw.actl && sch->schib.pmcw.lpum == (0x80 >> index)) {
+		device_set_waiting(sch);
+		return 1;
+	}
 	return 0;
 }
 
-struct chsc_sei_nt0_area {
-	u8  flags;
-	u8  vf;				/* validity flags */
-	u8  rs;				/* reporting source */
-	u8  cc;				/* content code */
-	u16 fla;			/* full link address */
-	u16 rsid;			/* reporting source id */
-	u32 reserved1;
-	u32 reserved2;
-	/* ccdf has to be big enough for a link-incident record */
-	u8  ccdf[PAGE_SIZE - 24 - 16];	/* content-code dependent field */
-} __packed;
-
-struct chsc_sei_nt2_area {
-	u8  flags;			/* p and v bit */
-	u8  reserved1;
-	u8  reserved2;
-	u8  cc;				/* content code */
-	u32 reserved3[13];
-	u8  ccdf[PAGE_SIZE - 24 - 56];	/* content-code dependent field */
-} __packed;
-
-#define CHSC_SEI_NT0	(1ULL << 63)
-#define CHSC_SEI_NT2	(1ULL << 61)
-
-struct chsc_sei {
-	struct chsc_header request;
-	u32 reserved1;
-	u64 ntsm;			/* notification type mask */
-	struct chsc_header response;
-	u32 :24;
-	u8 nt;
-	union {
-		struct chsc_sei_nt0_area nt0_area;
-		struct chsc_sei_nt2_area nt2_area;
-		u8 nt_area[PAGE_SIZE - 24];
-	} u;
-} __packed __aligned(PAGE_SIZE);
-
-/*
- * Link Incident Record as defined in SA22-7202, "ESCON I/O Interface"
- */
-
-#define LIR_IQ_CLASS_INFO		0
-#define LIR_IQ_CLASS_DEGRADED		1
-#define LIR_IQ_CLASS_NOT_OPERATIONAL	2
-
-struct lir {
-	struct {
-		u32 null:1;
-		u32 reserved:3;
-		u32 class:2;
-		u32 reserved2:2;
-	} __packed iq;
-	u32 ic:8;
-	u32 reserved:16;
-	struct node_descriptor incident_node;
-	struct node_descriptor attached_node;
-	u8 reserved2[32];
-} __packed;
-
-#define PARAMS_LEN	10	/* PARAMS=xx,xxxxxx */
-#define NODEID_LEN	35	/* NODEID=tttttt/mdl,mmm.ppssssssssssss,xxxx */
-
-/* Copy EBCIDC text, convert to ASCII and optionally add delimiter. */
-static char *store_ebcdic(char *dest, const char *src, unsigned long len,
-			  char delim)
+static inline void
+__s390_subchannel_vary_chpid(struct subchannel *sch, __u8 chpid, int on)
 {
-	memcpy(dest, src, len);
-	EBCASC(dest, len);
-
-	if (delim)
-		dest[len++] = delim;
-
-	return dest + len;
-}
-
-static void chsc_link_from_sei(struct chp_link *link,
-				struct chsc_sei_nt0_area *sei_area)
-{
-	if ((sei_area->vf & SEI_VF_FLA) != 0) {
-		link->fla	= sei_area->fla;
-		link->fla_mask	= ((sei_area->vf & SEI_VF_FLA) == SEI_VF_FLA) ?
-							0xffff : 0xff00;
-	}
-}
-
-/* Format node ID and parameters for output in LIR log message. */
-static void format_node_data(char *params, char *id, struct node_descriptor *nd)
-{
-	memset(params, 0, PARAMS_LEN);
-	memset(id, 0, NODEID_LEN);
-
-	if (nd->validity != ND_VALIDITY_VALID) {
-		strncpy(params, "n/a", PARAMS_LEN - 1);
-		strncpy(id, "n/a", NODEID_LEN - 1);
-		return;
-	}
-
-	/* PARAMS=xx,xxxxxx */
-	snprintf(params, PARAMS_LEN, "%02x,%06x", nd->byte0, nd->params);
-	/* NODEID=tttttt/mdl,mmm.ppssssssssssss,xxxx */
-	id = store_ebcdic(id, nd->type, sizeof(nd->type), '/');
-	id = store_ebcdic(id, nd->model, sizeof(nd->model), ',');
-	id = store_ebcdic(id, nd->manufacturer, sizeof(nd->manufacturer), '.');
-	id = store_ebcdic(id, nd->plant, sizeof(nd->plant), 0);
-	id = store_ebcdic(id, nd->seq, sizeof(nd->seq), ',');
-	sprintf(id, "%04X", nd->tag);
-}
-
-static void chsc_process_sei_link_incident(struct chsc_sei_nt0_area *sei_area)
-{
-	struct lir *lir = (struct lir *) &sei_area->ccdf;
-	char iuparams[PARAMS_LEN], iunodeid[NODEID_LEN], auparams[PARAMS_LEN],
-	     aunodeid[NODEID_LEN];
-
-	CIO_CRW_EVENT(4, "chsc: link incident (rs=%02x, rs_id=%04x, iq=%02x)\n",
-		      sei_area->rs, sei_area->rsid, sei_area->ccdf[0]);
-
-	/* Ignore NULL Link Incident Records. */
-	if (lir->iq.null)
-		return;
-
-	/* Inform user that a link requires maintenance actions because it has
-	 * become degraded or not operational. Note that this log message is
-	 * the primary intention behind a Link Incident Record. */
-
-	format_node_data(iuparams, iunodeid, &lir->incident_node);
-	format_node_data(auparams, aunodeid, &lir->attached_node);
-
-	switch (lir->iq.class) {
-	case LIR_IQ_CLASS_DEGRADED:
-		pr_warn("Link degraded: RS=%02x RSID=%04x IC=%02x "
-			"IUPARAMS=%s IUNODEID=%s AUPARAMS=%s AUNODEID=%s\n",
-			sei_area->rs, sei_area->rsid, lir->ic, iuparams,
-			iunodeid, auparams, aunodeid);
-		break;
-	case LIR_IQ_CLASS_NOT_OPERATIONAL:
-		pr_err("Link stopped: RS=%02x RSID=%04x IC=%02x "
-		       "IUPARAMS=%s IUNODEID=%s AUPARAMS=%s AUNODEID=%s\n",
-		       sei_area->rs, sei_area->rsid, lir->ic, iuparams,
-		       iunodeid, auparams, aunodeid);
-		break;
-	default:
-		break;
-	}
-}
-
-static void chsc_process_sei_res_acc(struct chsc_sei_nt0_area *sei_area)
-{
-	struct channel_path *chp;
-	struct chp_link link;
-	struct chp_id chpid;
-	int status;
-
-	CIO_CRW_EVENT(4, "chsc: resource accessibility event (rs=%02x, "
-		      "rs_id=%04x)\n", sei_area->rs, sei_area->rsid);
-	if (sei_area->rs != 4)
-		return;
-	chp_id_init(&chpid);
-	chpid.id = sei_area->rsid;
-	/* allocate a new channel path structure, if needed */
-	status = chp_get_status(chpid);
-	if (!status)
-		return;
-
-	if (status < 0) {
-		chp_new(chpid);
-	} else {
-		chp = chpid_to_chp(chpid);
-		mutex_lock(&chp->lock);
-		chp_update_desc(chp);
-		mutex_unlock(&chp->lock);
-	}
-	memset(&link, 0, sizeof(struct chp_link));
-	link.chpid = chpid;
-	chsc_link_from_sei(&link, sei_area);
-	s390_process_res_acc(&link);
-}
-
-static void chsc_process_sei_chp_avail(struct chsc_sei_nt0_area *sei_area)
-{
-	struct channel_path *chp;
-	struct chp_id chpid;
-	u8 *data;
-	int num;
-
-	CIO_CRW_EVENT(4, "chsc: channel path availability information\n");
-	if (sei_area->rs != 0)
-		return;
-	data = sei_area->ccdf;
-	chp_id_init(&chpid);
-	for (num = 0; num <= __MAX_CHPID; num++) {
-		if (!chp_test_bit(data, num))
-			continue;
-		chpid.id = num;
-
-		CIO_CRW_EVENT(4, "Update information for channel path "
-			      "%x.%02x\n", chpid.cssid, chpid.id);
-		chp = chpid_to_chp(chpid);
-		if (!chp) {
-			chp_new(chpid);
-			continue;
-		}
-		mutex_lock(&chp->lock);
-		chp_update_desc(chp);
-		mutex_unlock(&chp->lock);
-	}
-}
-
-struct chp_config_data {
-	u8 map[32];
-	u8 op;
-	u8 pc;
-};
-
-static void chsc_process_sei_chp_config(struct chsc_sei_nt0_area *sei_area)
-{
-	struct chp_config_data *data;
-	struct chp_id chpid;
-	int num;
-	char *events[3] = {"configure", "deconfigure", "cancel deconfigure"};
-
-	CIO_CRW_EVENT(4, "chsc: channel-path-configuration notification\n");
-	if (sei_area->rs != 0)
-		return;
-	data = (struct chp_config_data *) &(sei_area->ccdf);
-	chp_id_init(&chpid);
-	for (num = 0; num <= __MAX_CHPID; num++) {
-		if (!chp_test_bit(data->map, num))
-			continue;
-		chpid.id = num;
-		pr_notice("Processing %s for channel path %x.%02x\n",
-			  events[data->op], chpid.cssid, chpid.id);
-		switch (data->op) {
-		case 0:
-			chp_cfg_schedule(chpid, 1);
-			break;
-		case 1:
-			chp_cfg_schedule(chpid, 0);
-			break;
-		case 2:
-			chp_cfg_cancel_deconfigure(chpid);
-			break;
-		}
-	}
-}
-
-static void chsc_process_sei_scm_change(struct chsc_sei_nt0_area *sei_area)
-{
-	int ret;
-
-	CIO_CRW_EVENT(4, "chsc: scm change notification\n");
-	if (sei_area->rs != 7)
-		return;
-
-	ret = scm_update_information();
-	if (ret)
-		CIO_CRW_EVENT(0, "chsc: updating change notification"
-			      " failed (rc=%d).\n", ret);
-}
-
-static void chsc_process_sei_scm_avail(struct chsc_sei_nt0_area *sei_area)
-{
-	int ret;
-
-	CIO_CRW_EVENT(4, "chsc: scm available information\n");
-	if (sei_area->rs != 7)
-		return;
-
-	ret = scm_process_availability_information();
-	if (ret)
-		CIO_CRW_EVENT(0, "chsc: process availability information"
-			      " failed (rc=%d).\n", ret);
-}
-
-static void chsc_process_sei_ap_cfg_chg(struct chsc_sei_nt0_area *sei_area)
-{
-	CIO_CRW_EVENT(3, "chsc: ap config changed\n");
-	if (sei_area->rs != 5)
-		return;
-
-	ap_bus_cfg_chg();
-}
-
-static void chsc_process_sei_fces_event(struct chsc_sei_nt0_area *sei_area)
-{
-	struct chp_link link;
-	struct chp_id chpid;
-	struct channel_path *chp;
-
-	CIO_CRW_EVENT(4,
-	"chsc: FCES status notification (rs=%02x, rs_id=%04x, FCES-status=%x)\n",
-		sei_area->rs, sei_area->rsid, sei_area->ccdf[0]);
-
-	if (sei_area->rs != SEI_RS_CHPID)
-		return;
-	chp_id_init(&chpid);
-	chpid.id = sei_area->rsid;
-
-	/* Ignore the event on unknown/invalid chp */
-	chp = chpid_to_chp(chpid);
-	if (!chp)
-		return;
-
-	memset(&link, 0, sizeof(struct chp_link));
-	link.chpid = chpid;
-	chsc_link_from_sei(&link, sei_area);
-
-	for_each_subchannel_staged(process_fces_event, NULL, &link);
-}
-
-static void chsc_process_sei_nt2(struct chsc_sei_nt2_area *sei_area)
-{
-	switch (sei_area->cc) {
-	case 1:
-		zpci_event_error(sei_area->ccdf);
-		break;
-	case 2:
-		zpci_event_availability(sei_area->ccdf);
-		break;
-	default:
-		CIO_CRW_EVENT(2, "chsc: sei nt2 unhandled cc=%d\n",
-			      sei_area->cc);
-		break;
-	}
-}
-
-static void chsc_process_sei_nt0(struct chsc_sei_nt0_area *sei_area)
-{
-	/* which kind of information was stored? */
-	switch (sei_area->cc) {
-	case 1: /* link incident*/
-		chsc_process_sei_link_incident(sei_area);
-		break;
-	case 2: /* i/o resource accessibility */
-		chsc_process_sei_res_acc(sei_area);
-		break;
-	case 3: /* ap config changed */
-		chsc_process_sei_ap_cfg_chg(sei_area);
-		break;
-	case 7: /* channel-path-availability information */
-		chsc_process_sei_chp_avail(sei_area);
-		break;
-	case 8: /* channel-path-configuration notification */
-		chsc_process_sei_chp_config(sei_area);
-		break;
-	case 12: /* scm change notification */
-		chsc_process_sei_scm_change(sei_area);
-		break;
-	case 14: /* scm available notification */
-		chsc_process_sei_scm_avail(sei_area);
-		break;
-	case 15: /* FCES event notification */
-		chsc_process_sei_fces_event(sei_area);
-		break;
-	default: /* other stuff */
-		CIO_CRW_EVENT(2, "chsc: sei nt0 unhandled cc=%d\n",
-			      sei_area->cc);
-		break;
-	}
-
-	/* Check if we might have lost some information. */
-	if (sei_area->flags & 0x40) {
-		CIO_CRW_EVENT(2, "chsc: event overflow\n");
-		css_schedule_eval_all();
-	}
-}
-
-static void chsc_process_event_information(struct chsc_sei *sei, u64 ntsm)
-{
-	static int ntsm_unsupported;
-
-	while (true) {
-		memset(sei, 0, sizeof(*sei));
-		sei->request.length = 0x0010;
-		sei->request.code = 0x000e;
-		if (!ntsm_unsupported)
-			sei->ntsm = ntsm;
-
-		if (chsc(sei))
-			break;
-
-		if (sei->response.code != 0x0001) {
-			CIO_CRW_EVENT(2, "chsc: sei failed (rc=%04x, ntsm=%llx)\n",
-				      sei->response.code, sei->ntsm);
-
-			if (sei->response.code == 3 && sei->ntsm) {
-				/* Fallback for old firmware. */
-				ntsm_unsupported = 1;
-				continue;
-			}
-			break;
-		}
-
-		CIO_CRW_EVENT(2, "chsc: sei successful (nt=%d)\n", sei->nt);
-		switch (sei->nt) {
-		case 0:
-			chsc_process_sei_nt0(&sei->u.nt0_area);
-			break;
-		case 2:
-			chsc_process_sei_nt2(&sei->u.nt2_area);
-			break;
-		default:
-			CIO_CRW_EVENT(2, "chsc: unhandled nt: %d\n", sei->nt);
-			break;
-		}
-
-		if (!(sei->u.nt0_area.flags & 0x80))
-			break;
-	}
-}
-
-/*
- * Handle channel subsystem related CRWs.
- * Use store event information to find out what's going on.
- *
- * Note: Access to sei_page is serialized through machine check handler
- * thread, so no need for locking.
- */
-static void chsc_process_crw(struct crw *crw0, struct crw *crw1, int overflow)
-{
-	struct chsc_sei *sei = sei_page;
-
-	if (overflow) {
-		css_schedule_eval_all();
-		return;
-	}
-	CIO_CRW_EVENT(2, "CRW reports slct=%d, oflw=%d, "
-		      "chn=%d, rsc=%X, anc=%d, erc=%X, rsid=%X\n",
-		      crw0->slct, crw0->oflw, crw0->chn, crw0->rsc, crw0->anc,
-		      crw0->erc, crw0->rsid);
-
-	CIO_TRACE_EVENT(2, "prcss");
-	chsc_process_event_information(sei, CHSC_SEI_NT0 | CHSC_SEI_NT2);
-}
-
-void chsc_chp_online(struct chp_id chpid)
-{
-	struct channel_path *chp = chpid_to_chp(chpid);
-	struct chp_link link;
-	char dbf_txt[15];
-
-	sprintf(dbf_txt, "cadd%x.%02x", chpid.cssid, chpid.id);
-	CIO_TRACE_EVENT(2, dbf_txt);
-
-	if (chp_get_status(chpid) != 0) {
-		memset(&link, 0, sizeof(struct chp_link));
-		link.chpid = chpid;
-		/* Wait until previous actions have settled. */
-		css_wait_for_slow_path();
-
-		mutex_lock(&chp->lock);
-		chp_update_desc(chp);
-		mutex_unlock(&chp->lock);
-
-		for_each_subchannel_staged(__s390_process_res_acc, NULL,
-					   &link);
-		css_schedule_reprobe();
-	}
-}
-
-static void __s390_subchannel_vary_chpid(struct subchannel *sch,
-					 struct chp_id chpid, int on)
-{
+	int chp, old_lpm;
 	unsigned long flags;
-	struct chp_link link;
 
-	memset(&link, 0, sizeof(struct chp_link));
-	link.chpid = chpid;
-	spin_lock_irqsave(sch->lock, flags);
-	if (sch->driver && sch->driver->chp_event)
-		sch->driver->chp_event(sch, &link,
-				       on ? CHP_VARY_ON : CHP_VARY_OFF);
-	spin_unlock_irqrestore(sch->lock, flags);
+	if (!sch->ssd_info.valid)
+		return;
+	
+	spin_lock_irqsave(&sch->lock, flags);
+	old_lpm = sch->lpm;
+	for (chp = 0; chp < 8; chp++) {
+		if (sch->ssd_info.chpid[chp] != chpid)
+			continue;
+
+		if (on) {
+			sch->opm |= (0x80 >> chp);
+			sch->lpm |= (0x80 >> chp);
+			if (!old_lpm)
+				device_trigger_reprobe(sch);
+			else if (sch->driver && sch->driver->verify)
+				sch->driver->verify(&sch->dev);
+		} else {
+			sch->opm &= ~(0x80 >> chp);
+			sch->lpm &= ~(0x80 >> chp);
+			/*
+			 * Give running I/O a grace period in which it
+			 * can successfully terminate, even using the
+			 * just varied off path. Then kill it.
+			 */
+			if (!__check_for_io_and_kill(sch, chp) && !sch->lpm) {
+				if (css_enqueue_subchannel_slow(sch->irq)) {
+					css_clear_subchannel_slow_list();
+					need_rescan = 1;
+				}
+			} else if (sch->driver && sch->driver->verify)
+				sch->driver->verify(&sch->dev);
+		}
+		break;
+	}
+	spin_unlock_irqrestore(&sch->lock, flags);
 }
 
-static int s390_subchannel_vary_chpid_off(struct subchannel *sch, void *data)
+static int
+s390_subchannel_vary_chpid_off(struct device *dev, void *data)
 {
-	struct chp_id *chpid = data;
+	struct subchannel *sch;
+	__u8 *chpid;
+
+	sch = to_subchannel(dev);
+	chpid = data;
 
 	__s390_subchannel_vary_chpid(sch, *chpid, 0);
 	return 0;
 }
 
-static int s390_subchannel_vary_chpid_on(struct subchannel *sch, void *data)
+static int
+s390_subchannel_vary_chpid_on(struct device *dev, void *data)
 {
-	struct chp_id *chpid = data;
+	struct subchannel *sch;
+	__u8 *chpid;
+
+	sch = to_subchannel(dev);
+	chpid = data;
 
 	__s390_subchannel_vary_chpid(sch, *chpid, 1);
 	return 0;
 }
 
-/**
- * chsc_chp_vary - propagate channel-path vary operation to subchannels
- * @chpid: channl-path ID
- * @on: non-zero for vary online, zero for vary offline
+/*
+ * Function: s390_vary_chpid
+ * Varies the specified chpid online or offline
  */
-int chsc_chp_vary(struct chp_id chpid, int on)
+static int
+s390_vary_chpid( __u8 chpid, int on)
 {
-	struct channel_path *chp = chpid_to_chp(chpid);
+	char dbf_text[15];
+	int status, irq, ret;
+	struct subchannel *sch;
+
+	sprintf(dbf_text, on?"varyon%x":"varyoff%x", chpid);
+	CIO_TRACE_EVENT( 2, dbf_text);
+
+	status = get_chp_status(chpid);
+	if (status < 0) {
+		printk(KERN_ERR "Can't vary unknown chpid %02X\n", chpid);
+		return -EINVAL;
+	}
+
+	if (!on && !status) {
+		printk(KERN_ERR "chpid %x is already offline\n", chpid);
+		return -EINVAL;
+	}
+
+	set_chp_logically_online(chpid, on);
 
 	/*
 	 * Redo PathVerification on the devices the chpid connects to
 	 */
-	if (on) {
-		/* Try to update the channel path description. */
-		chp_update_desc(chp);
-		for_each_subchannel_staged(s390_subchannel_vary_chpid_on,
-					   NULL, &chpid);
-		css_schedule_reprobe();
-	} else
-		for_each_subchannel_staged(s390_subchannel_vary_chpid_off,
-					   NULL, &chpid);
 
+	bus_for_each_dev(&css_bus_type, NULL, &chpid, on ?
+			 s390_subchannel_vary_chpid_on :
+			 s390_subchannel_vary_chpid_off);
+	if (!on)
+		goto out;
+	/* Scan for new devices on varied on path. */
+	for (irq = 0; irq < __MAX_SUBCHANNELS; irq++) {
+		struct schib schib;
+
+		if (need_rescan)
+			break;
+		sch = get_subchannel_by_schid(irq);
+		if (sch) {
+			put_device(&sch->dev);
+			continue;
+		}
+		if (stsch(irq, &schib))
+			/* We're through */
+			break;
+		/* Put it on the slow path. */
+		ret = css_enqueue_subchannel_slow(irq);
+		if (ret) {
+			css_clear_subchannel_slow_list();
+			need_rescan = 1;
+		}
+	}
+out:
+	if (need_rescan || css_slow_subchannels_exist())
+		queue_work(slow_path_wq, &slow_path_work);
 	return 0;
 }
 
-static void
-chsc_remove_cmg_attr(struct channel_subsystem *css)
+/*
+ * Files for the channel path entries.
+ */
+static ssize_t
+chp_status_show(struct device *dev, char *buf)
 {
-	int i;
+	struct channel_path *chp = container_of(dev, struct channel_path, dev);
 
-	for (i = 0; i <= __MAX_CHPID; i++) {
-		if (!css->chps[i])
-			continue;
-		chp_remove_cmg_attr(css->chps[i]);
-	}
+	if (!chp)
+		return 0;
+	return (get_chp_status(chp->id) ? sprintf(buf, "online\n") :
+		sprintf(buf, "offline\n"));
+}
+
+static ssize_t
+chp_status_write(struct device *dev, const char *buf, size_t count)
+{
+	struct channel_path *cp = container_of(dev, struct channel_path, dev);
+	char cmd[10];
+	int num_args;
+	int error;
+
+	num_args = sscanf(buf, "%5s", cmd);
+	if (!num_args)
+		return count;
+
+	if (!strnicmp(cmd, "on", 2))
+		error = s390_vary_chpid(cp->id, 1);
+	else if (!strnicmp(cmd, "off", 3))
+		error = s390_vary_chpid(cp->id, 0);
+	else
+		error = -EINVAL;
+
+	return error < 0 ? error : count;
+
+}
+
+static DEVICE_ATTR(status, 0644, chp_status_show, chp_status_write);
+
+static ssize_t
+chp_type_show(struct device *dev, char *buf)
+{
+	struct channel_path *chp = container_of(dev, struct channel_path, dev);
+
+	if (!chp)
+		return 0;
+	return sprintf(buf, "%x\n", chp->desc.desc);
+}
+
+static DEVICE_ATTR(type, 0444, chp_type_show, NULL);
+
+static struct attribute * chp_attrs[] = {
+	&dev_attr_status.attr,
+	&dev_attr_type.attr,
+	NULL,
+};
+
+static struct attribute_group chp_attr_group = {
+	.attrs = chp_attrs,
+};
+
+static void
+chp_release(struct device *dev)
+{
+	struct channel_path *cp;
+	
+	cp = container_of(dev, struct channel_path, dev);
+	kfree(cp);
 }
 
 static int
-chsc_add_cmg_attr(struct channel_subsystem *css)
+chsc_determine_channel_path_description(int chpid,
+					struct channel_path_desc *desc)
 {
-	int i, ret;
-
-	ret = 0;
-	for (i = 0; i <= __MAX_CHPID; i++) {
-		if (!css->chps[i])
-			continue;
-		ret = chp_add_cmg_attr(css->chps[i]);
-		if (ret)
-			goto cleanup;
-	}
-	return ret;
-cleanup:
-	for (--i; i >= 0; i--) {
-		if (!css->chps[i])
-			continue;
-		chp_remove_cmg_attr(css->chps[i]);
-	}
-	return ret;
-}
-
-int __chsc_do_secm(struct channel_subsystem *css, int enable)
-{
-	struct {
-		struct chsc_header request;
-		u32 operation_code : 2;
-		u32 : 30;
-		u32 key : 4;
-		u32 : 28;
-		u32 zeroes1;
-		u32 cub_addr1;
-		u32 zeroes2;
-		u32 cub_addr2;
-		u32 reserved[13];
-		struct chsc_header response;
-		u32 status : 8;
-		u32 : 4;
-		u32 fmt : 4;
-		u32 : 16;
-	} *secm_area;
-	unsigned long flags;
-	int ret, ccode;
-
-	spin_lock_irqsave(&chsc_page_lock, flags);
-	memset(chsc_page, 0, PAGE_SIZE);
-	secm_area = chsc_page;
-	secm_area->request.length = 0x0050;
-	secm_area->request.code = 0x0016;
-
-	secm_area->key = PAGE_DEFAULT_KEY >> 4;
-	secm_area->cub_addr1 = (u64)(unsigned long)css->cub_addr1;
-	secm_area->cub_addr2 = (u64)(unsigned long)css->cub_addr2;
-
-	secm_area->operation_code = enable ? 0 : 1;
-
-	ccode = chsc(secm_area);
-	if (ccode > 0) {
-		ret = (ccode == 3) ? -ENODEV : -EBUSY;
-		goto out;
-	}
-
-	switch (secm_area->response.code) {
-	case 0x0102:
-	case 0x0103:
-		ret = -EINVAL;
-		break;
-	default:
-		ret = chsc_error_from_response(secm_area->response.code);
-	}
-	if (ret != 0)
-		CIO_CRW_EVENT(2, "chsc: secm failed (rc=%04x)\n",
-			      secm_area->response.code);
-out:
-	spin_unlock_irqrestore(&chsc_page_lock, flags);
-	return ret;
-}
-
-int
-chsc_secm(struct channel_subsystem *css, int enable)
-{
-	int ret;
-
-	if (enable && !css->cm_enabled) {
-		css->cub_addr1 = (void *)get_zeroed_page(GFP_KERNEL | GFP_DMA);
-		css->cub_addr2 = (void *)get_zeroed_page(GFP_KERNEL | GFP_DMA);
-		if (!css->cub_addr1 || !css->cub_addr2) {
-			free_page((unsigned long)css->cub_addr1);
-			free_page((unsigned long)css->cub_addr2);
-			return -ENOMEM;
-		}
-	}
-	ret = __chsc_do_secm(css, enable);
-	if (!ret) {
-		css->cm_enabled = enable;
-		if (css->cm_enabled) {
-			ret = chsc_add_cmg_attr(css);
-			if (ret) {
-				__chsc_do_secm(css, 0);
-				css->cm_enabled = 0;
-			}
-		} else
-			chsc_remove_cmg_attr(css);
-	}
-	if (!css->cm_enabled) {
-		free_page((unsigned long)css->cub_addr1);
-		free_page((unsigned long)css->cub_addr2);
-	}
-	return ret;
-}
-
-int chsc_determine_channel_path_desc(struct chp_id chpid, int fmt, int rfmt,
-				     int c, int m, void *page)
-{
-	struct chsc_scpd *scpd_area;
-	int ccode, ret;
-
-	if ((rfmt == 1 || rfmt == 0) && c == 1 &&
-	    !css_general_characteristics.fcs)
-		return -EINVAL;
-	if ((rfmt == 2) && !css_general_characteristics.cib)
-		return -EINVAL;
-	if ((rfmt == 3) && !css_general_characteristics.util_str)
-		return -EINVAL;
-
-	memset(page, 0, PAGE_SIZE);
-	scpd_area = page;
-	scpd_area->request.length = 0x0010;
-	scpd_area->request.code = 0x0002;
-	scpd_area->cssid = chpid.cssid;
-	scpd_area->first_chpid = chpid.id;
-	scpd_area->last_chpid = chpid.id;
-	scpd_area->m = m;
-	scpd_area->c = c;
-	scpd_area->fmt = fmt;
-	scpd_area->rfmt = rfmt;
-
-	ccode = chsc(scpd_area);
-	if (ccode > 0)
-		return (ccode == 3) ? -ENODEV : -EBUSY;
-
-	ret = chsc_error_from_response(scpd_area->response.code);
-	if (ret)
-		CIO_CRW_EVENT(2, "chsc: scpd failed (rc=%04x)\n",
-			      scpd_area->response.code);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(chsc_determine_channel_path_desc);
-
-#define chsc_det_chp_desc(FMT, c)					\
-int chsc_determine_fmt##FMT##_channel_path_desc(			\
-	struct chp_id chpid, struct channel_path_desc_fmt##FMT *desc)	\
-{									\
-	struct chsc_scpd *scpd_area;					\
-	unsigned long flags;						\
-	int ret;							\
-									\
-	spin_lock_irqsave(&chsc_page_lock, flags);			\
-	scpd_area = chsc_page;						\
-	ret = chsc_determine_channel_path_desc(chpid, 0, FMT, c, 0,	\
-					       scpd_area);		\
-	if (ret)							\
-		goto out;						\
-									\
-	memcpy(desc, scpd_area->data, sizeof(*desc));			\
-out:									\
-	spin_unlock_irqrestore(&chsc_page_lock, flags);			\
-	return ret;							\
-}
-
-chsc_det_chp_desc(0, 0)
-chsc_det_chp_desc(1, 1)
-chsc_det_chp_desc(3, 0)
-
-static void
-chsc_initialize_cmg_chars(struct channel_path *chp, u8 cmcv,
-			  struct cmg_chars *chars)
-{
-	int i, mask;
-
-	for (i = 0; i < NR_MEASUREMENT_CHARS; i++) {
-		mask = 0x80 >> (i + 3);
-		if (cmcv & mask)
-			chp->cmg_chars.values[i] = chars->values[i];
-		else
-			chp->cmg_chars.values[i] = 0;
-	}
-}
-
-int chsc_get_channel_measurement_chars(struct channel_path *chp)
-{
-	unsigned long flags;
 	int ccode, ret;
 
 	struct {
@@ -1033,179 +933,129 @@ int chsc_get_channel_measurement_chars(struct channel_path *chp)
 		u32 zeroes1;
 		struct chsc_header response;
 		u32 zeroes2;
-		u32 not_valid : 1;
-		u32 shared : 1;
-		u32 : 22;
-		u32 chpid : 8;
-		u32 cmcv : 5;
-		u32 : 11;
-		u32 cmgq : 8;
-		u32 cmg : 8;
-		u32 zeroes3;
-		u32 data[NR_MEASUREMENT_CHARS];
-	} *scmc_area;
+		struct channel_path_desc desc;
+	} *scpd_area;
 
-	chp->shared = -1;
-	chp->cmg = -1;
+	scpd_area = (void *)get_zeroed_page(GFP_KERNEL | GFP_DMA);
+	if (!scpd_area)
+		return -ENOMEM;
 
-	if (!css_chsc_characteristics.scmc || !css_chsc_characteristics.secm)
-		return -EINVAL;
+	scpd_area->request = (struct chsc_header) {
+		.length = 0x0010,
+		.code   = 0x0002,
+	};
 
-	spin_lock_irqsave(&chsc_page_lock, flags);
-	memset(chsc_page, 0, PAGE_SIZE);
-	scmc_area = chsc_page;
-	scmc_area->request.length = 0x0010;
-	scmc_area->request.code = 0x0022;
-	scmc_area->first_chpid = chp->chpid.id;
-	scmc_area->last_chpid = chp->chpid.id;
+	scpd_area->first_chpid = chpid;
+	scpd_area->last_chpid = chpid;
 
-	ccode = chsc(scmc_area);
+	ccode = chsc(scpd_area);
 	if (ccode > 0) {
 		ret = (ccode == 3) ? -ENODEV : -EBUSY;
 		goto out;
 	}
 
-	ret = chsc_error_from_response(scmc_area->response.code);
-	if (ret) {
-		CIO_CRW_EVENT(2, "chsc: scmc failed (rc=%04x)\n",
-			      scmc_area->response.code);
-		goto out;
-	}
-	if (scmc_area->not_valid)
-		goto out;
-
-	chp->cmg = scmc_area->cmg;
-	chp->shared = scmc_area->shared;
-	if (chp->cmg != 2 && chp->cmg != 3) {
-		/* No cmg-dependent data. */
-		goto out;
-	}
-	chsc_initialize_cmg_chars(chp, scmc_area->cmcv,
-				  (struct cmg_chars *) &scmc_area->data);
-out:
-	spin_unlock_irqrestore(&chsc_page_lock, flags);
-	return ret;
-}
-
-int __init chsc_init(void)
-{
-	int ret;
-
-	sei_page = (void *)get_zeroed_page(GFP_KERNEL | GFP_DMA);
-	chsc_page = (void *)get_zeroed_page(GFP_KERNEL | GFP_DMA);
-	if (!sei_page || !chsc_page) {
-		ret = -ENOMEM;
-		goto out_err;
-	}
-	ret = crw_register_handler(CRW_RSC_CSS, chsc_process_crw);
-	if (ret)
-		goto out_err;
-	return ret;
-out_err:
-	free_page((unsigned long)chsc_page);
-	free_page((unsigned long)sei_page);
-	return ret;
-}
-
-void __init chsc_init_cleanup(void)
-{
-	crw_unregister_handler(CRW_RSC_CSS);
-	free_page((unsigned long)chsc_page);
-	free_page((unsigned long)sei_page);
-}
-
-int __chsc_enable_facility(struct chsc_sda_area *sda_area, int operation_code)
-{
-	int ret;
-
-	sda_area->request.length = 0x0400;
-	sda_area->request.code = 0x0031;
-	sda_area->operation_code = operation_code;
-
-	ret = chsc(sda_area);
-	if (ret > 0) {
-		ret = (ret == 3) ? -ENODEV : -EBUSY;
-		goto out;
-	}
-
-	switch (sda_area->response.code) {
-	case 0x0101:
+	switch (scpd_area->response.code) {
+	case 0x0001: /* Success. */
+		memcpy(desc, &scpd_area->desc,
+		       sizeof(struct channel_path_desc));
+		ret = 0;
+		break;
+	case 0x0003: /* Invalid block. */
+	case 0x0007: /* Invalid format. */
+	case 0x0008: /* Other invalid block. */
+		CIO_CRW_EVENT(2, "Error in chsc request block!\n");
+		ret = -EINVAL;
+		break;
+	case 0x0004: /* Command not provided in model. */
+		CIO_CRW_EVENT(2, "Model does not provide scpd\n");
 		ret = -EOPNOTSUPP;
 		break;
 	default:
-		ret = chsc_error_from_response(sda_area->response.code);
+		CIO_CRW_EVENT(2, "Unknown CHSC response %d\n",
+			      scpd_area->response.code);
+		ret = -EIO;
 	}
 out:
+	free_page((unsigned long)scpd_area);
 	return ret;
 }
 
-int chsc_enable_facility(int operation_code)
+/*
+ * Entries for chpids on the system bus.
+ * This replaces /proc/chpids.
+ */
+static int
+new_channel_path(int chpid)
 {
-	struct chsc_sda_area *sda_area;
-	unsigned long flags;
+	struct channel_path *chp;
 	int ret;
 
-	spin_lock_irqsave(&chsc_page_lock, flags);
-	memset(chsc_page, 0, PAGE_SIZE);
-	sda_area = chsc_page;
+	chp = kmalloc(sizeof(struct channel_path), GFP_KERNEL);
+	if (!chp)
+		return -ENOMEM;
+	memset(chp, 0, sizeof(struct channel_path));
 
-	ret = __chsc_enable_facility(sda_area, operation_code);
-	if (ret != 0)
-		CIO_CRW_EVENT(2, "chsc: sda (oc=%x) failed (rc=%04x)\n",
-			      operation_code, sda_area->response.code);
+	/* fill in status, etc. */
+	chp->id = chpid;
+	chp->state = 1;
+	chp->dev = (struct device) {
+		.parent  = &css_bus_device,
+		.release = chp_release,
+	};
+	snprintf(chp->dev.bus_id, BUS_ID_SIZE, "chp0.%x", chpid);
 
-	spin_unlock_irqrestore(&chsc_page_lock, flags);
+	/* Obtain channel path description and fill it in. */
+	ret = chsc_determine_channel_path_description(chpid, &chp->desc);
+	if (ret)
+		goto out_free;
+
+	/* make it known to the system */
+	ret = device_register(&chp->dev);
+	if (ret) {
+		printk(KERN_WARNING "%s: could not register %02x\n",
+		       __func__, chpid);
+		goto out_free;
+	}
+	ret = sysfs_create_group(&chp->dev.kobj, &chp_attr_group);
+	if (ret) {
+		device_unregister(&chp->dev);
+		goto out_free;
+	} else
+		chps[chpid] = chp;
+	return ret;
+out_free:
+	kfree(chp);
 	return ret;
 }
 
-int __init chsc_get_cssid_iid(int idx, u8 *cssid, u8 *iid)
+void *
+chsc_get_chp_desc(struct subchannel *sch, int chp_no)
 {
-	struct {
-		struct chsc_header request;
-		u8 atype;
-		u32 : 24;
-		u32 reserved1[6];
-		struct chsc_header response;
-		u32 reserved2[3];
-		struct {
-			u8 cssid;
-			u8 iid;
-			u32 : 16;
-		} list[0];
-	} *sdcal_area;
-	int ret;
+	struct channel_path *chp;
+	struct channel_path_desc *desc;
 
-	spin_lock_irq(&chsc_page_lock);
-	memset(chsc_page, 0, PAGE_SIZE);
-	sdcal_area = chsc_page;
-	sdcal_area->request.length = 0x0020;
-	sdcal_area->request.code = 0x0034;
-	sdcal_area->atype = 4;
-
-	ret = chsc(sdcal_area);
-	if (ret) {
-		ret = (ret == 3) ? -ENODEV : -EBUSY;
-		goto exit;
-	}
-
-	ret = chsc_error_from_response(sdcal_area->response.code);
-	if (ret) {
-		CIO_CRW_EVENT(2, "chsc: sdcal failed (rc=%04x)\n",
-			      sdcal_area->response.code);
-		goto exit;
-	}
-
-	if ((addr_t) &sdcal_area->list[idx] <
-	    (addr_t) &sdcal_area->response + sdcal_area->response.length) {
-		*cssid = sdcal_area->list[idx].cssid;
-		*iid = sdcal_area->list[idx].iid;
-	}
-	else
-		ret = -ENODEV;
-exit:
-	spin_unlock_irq(&chsc_page_lock);
-	return ret;
+	chp = chps[sch->schib.pmcw.chpid[chp_no]];
+	if (!chp)
+		return NULL;
+	desc = kmalloc(sizeof(struct channel_path_desc), GFP_KERNEL);
+	if (!desc)
+		return NULL;
+	memcpy(desc, &chp->desc, sizeof(struct channel_path_desc));
+	return desc;
 }
+
+
+static int __init
+chsc_alloc_sei_area(void)
+{
+	sei_page = (void *)get_zeroed_page(GFP_KERNEL | GFP_DMA);
+	if (!sei_page)
+		printk(KERN_WARNING"Can't allocate page for processing of " \
+		       "chsc machine checks!\n");
+	return (sei_page ? 0 : -ENOMEM);
+}
+
+subsys_initcall(chsc_alloc_sei_area);
 
 struct css_general_char css_general_characteristics;
 struct css_chsc_char css_chsc_characteristics;
@@ -1213,7 +1063,6 @@ struct css_chsc_char css_chsc_characteristics;
 int __init
 chsc_determine_css_characteristics(void)
 {
-	unsigned long flags;
 	int result;
 	struct {
 		struct chsc_header request;
@@ -1223,333 +1072,43 @@ chsc_determine_css_characteristics(void)
 		struct chsc_header response;
 		u32 reserved4;
 		u32 general_char[510];
-		u32 chsc_char[508];
+		u32 chsc_char[518];
 	} *scsc_area;
 
-	spin_lock_irqsave(&chsc_page_lock, flags);
-	memset(chsc_page, 0, PAGE_SIZE);
-	scsc_area = chsc_page;
-	scsc_area->request.length = 0x0010;
-	scsc_area->request.code = 0x0010;
+	scsc_area = (void *)get_zeroed_page(GFP_KERNEL | GFP_DMA);
+	if (!scsc_area) {
+	        printk(KERN_WARNING"cio: Was not able to determine available" \
+		       "CHSCs due to no memory.\n");
+		return -ENOMEM;
+	}
+
+	scsc_area->request = (struct chsc_header) {
+		.length = 0x0010,
+		.code   = 0x0010,
+	};
 
 	result = chsc(scsc_area);
 	if (result) {
-		result = (result == 3) ? -ENODEV : -EBUSY;
+		printk(KERN_WARNING"cio: Was not able to determine " \
+		       "available CHSCs, cc=%i.\n", result);
+		result = -EIO;
 		goto exit;
 	}
 
-	result = chsc_error_from_response(scsc_area->response.code);
-	if (result == 0) {
-		memcpy(&css_general_characteristics, scsc_area->general_char,
-		       sizeof(css_general_characteristics));
-		memcpy(&css_chsc_characteristics, scsc_area->chsc_char,
-		       sizeof(css_chsc_characteristics));
-	} else
-		CIO_CRW_EVENT(2, "chsc: scsc failed (rc=%04x)\n",
-			      scsc_area->response.code);
+	if (scsc_area->response.code != 1) {
+		printk(KERN_WARNING"cio: Was not able to determine " \
+		       "available CHSCs.\n");
+		result = -EIO;
+		goto exit;
+	}
+	memcpy(&css_general_characteristics, scsc_area->general_char,
+	       sizeof(css_general_characteristics));
+	memcpy(&css_chsc_characteristics, scsc_area->chsc_char,
+	       sizeof(css_chsc_characteristics));
 exit:
-	spin_unlock_irqrestore(&chsc_page_lock, flags);
+	free_page ((unsigned long) scsc_area);
 	return result;
 }
 
 EXPORT_SYMBOL_GPL(css_general_characteristics);
 EXPORT_SYMBOL_GPL(css_chsc_characteristics);
-
-int chsc_sstpc(void *page, unsigned int op, u16 ctrl, long *clock_delta)
-{
-	struct {
-		struct chsc_header request;
-		unsigned int rsvd0;
-		unsigned int op : 8;
-		unsigned int rsvd1 : 8;
-		unsigned int ctrl : 16;
-		unsigned int rsvd2[5];
-		struct chsc_header response;
-		unsigned int rsvd3[3];
-		s64 clock_delta;
-		unsigned int rsvd4[2];
-	} *rr;
-	int rc;
-
-	memset(page, 0, PAGE_SIZE);
-	rr = page;
-	rr->request.length = 0x0020;
-	rr->request.code = 0x0033;
-	rr->op = op;
-	rr->ctrl = ctrl;
-	rc = chsc(rr);
-	if (rc)
-		return -EIO;
-	rc = (rr->response.code == 0x0001) ? 0 : -EIO;
-	if (clock_delta)
-		*clock_delta = rr->clock_delta;
-	return rc;
-}
-
-int chsc_sstpi(void *page, void *result, size_t size)
-{
-	struct {
-		struct chsc_header request;
-		unsigned int rsvd0[3];
-		struct chsc_header response;
-		char data[];
-	} *rr;
-	int rc;
-
-	memset(page, 0, PAGE_SIZE);
-	rr = page;
-	rr->request.length = 0x0010;
-	rr->request.code = 0x0038;
-	rc = chsc(rr);
-	if (rc)
-		return -EIO;
-	memcpy(result, &rr->data, size);
-	return (rr->response.code == 0x0001) ? 0 : -EIO;
-}
-
-int chsc_stzi(void *page, void *result, size_t size)
-{
-	struct {
-		struct chsc_header request;
-		unsigned int rsvd0[3];
-		struct chsc_header response;
-		char data[];
-	} *rr;
-	int rc;
-
-	memset(page, 0, PAGE_SIZE);
-	rr = page;
-	rr->request.length = 0x0010;
-	rr->request.code = 0x003e;
-	rc = chsc(rr);
-	if (rc)
-		return -EIO;
-	memcpy(result, &rr->data, size);
-	return (rr->response.code == 0x0001) ? 0 : -EIO;
-}
-
-int chsc_siosl(struct subchannel_id schid)
-{
-	struct {
-		struct chsc_header request;
-		u32 word1;
-		struct subchannel_id sid;
-		u32 word3;
-		struct chsc_header response;
-		u32 word[11];
-	} *siosl_area;
-	unsigned long flags;
-	int ccode;
-	int rc;
-
-	spin_lock_irqsave(&chsc_page_lock, flags);
-	memset(chsc_page, 0, PAGE_SIZE);
-	siosl_area = chsc_page;
-	siosl_area->request.length = 0x0010;
-	siosl_area->request.code = 0x0046;
-	siosl_area->word1 = 0x80000000;
-	siosl_area->sid = schid;
-
-	ccode = chsc(siosl_area);
-	if (ccode > 0) {
-		if (ccode == 3)
-			rc = -ENODEV;
-		else
-			rc = -EBUSY;
-		CIO_MSG_EVENT(2, "chsc: chsc failed for 0.%x.%04x (ccode=%d)\n",
-			      schid.ssid, schid.sch_no, ccode);
-		goto out;
-	}
-	rc = chsc_error_from_response(siosl_area->response.code);
-	if (rc)
-		CIO_MSG_EVENT(2, "chsc: siosl failed for 0.%x.%04x (rc=%04x)\n",
-			      schid.ssid, schid.sch_no,
-			      siosl_area->response.code);
-	else
-		CIO_MSG_EVENT(4, "chsc: siosl succeeded for 0.%x.%04x\n",
-			      schid.ssid, schid.sch_no);
-out:
-	spin_unlock_irqrestore(&chsc_page_lock, flags);
-	return rc;
-}
-EXPORT_SYMBOL_GPL(chsc_siosl);
-
-/**
- * chsc_scm_info() - store SCM information (SSI)
- * @scm_area: request and response block for SSI
- * @token: continuation token
- *
- * Returns 0 on success.
- */
-int chsc_scm_info(struct chsc_scm_info *scm_area, u64 token)
-{
-	int ccode, ret;
-
-	memset(scm_area, 0, sizeof(*scm_area));
-	scm_area->request.length = 0x0020;
-	scm_area->request.code = 0x004C;
-	scm_area->reqtok = token;
-
-	ccode = chsc(scm_area);
-	if (ccode > 0) {
-		ret = (ccode == 3) ? -ENODEV : -EBUSY;
-		goto out;
-	}
-	ret = chsc_error_from_response(scm_area->response.code);
-	if (ret != 0)
-		CIO_MSG_EVENT(2, "chsc: scm info failed (rc=%04x)\n",
-			      scm_area->response.code);
-out:
-	return ret;
-}
-EXPORT_SYMBOL_GPL(chsc_scm_info);
-
-/**
- * chsc_pnso() - Perform Network-Subchannel Operation
- * @schid:		id of the subchannel on which PNSO is performed
- * @pnso_area:		request and response block for the operation
- * @oc:			Operation Code
- * @resume_token:	resume token for multiblock response
- * @cnc:		Boolean change-notification control
- *
- * pnso_area must be allocated by the caller with get_zeroed_page(GFP_KERNEL)
- *
- * Returns 0 on success.
- */
-int chsc_pnso(struct subchannel_id schid, struct chsc_pnso_area *pnso_area,
-	      u8 oc, struct chsc_pnso_resume_token resume_token, int cnc)
-{
-	memset(pnso_area, 0, sizeof(*pnso_area));
-	pnso_area->request.length = 0x0030;
-	pnso_area->request.code = 0x003d; /* network-subchannel operation */
-	pnso_area->m	   = schid.m;
-	pnso_area->ssid  = schid.ssid;
-	pnso_area->sch	 = schid.sch_no;
-	pnso_area->cssid = schid.cssid;
-	pnso_area->oc	 = oc;
-	pnso_area->resume_token = resume_token;
-	pnso_area->n	   = (cnc != 0);
-	if (chsc(pnso_area))
-		return -EIO;
-	return chsc_error_from_response(pnso_area->response.code);
-}
-
-int chsc_sgib(u32 origin)
-{
-	struct {
-		struct chsc_header request;
-		u16 op;
-		u8  reserved01[2];
-		u8  reserved02:4;
-		u8  fmt:4;
-		u8  reserved03[7];
-		/* operation data area begin */
-		u8  reserved04[4];
-		u32 gib_origin;
-		u8  reserved05[10];
-		u8  aix;
-		u8  reserved06[4029];
-		struct chsc_header response;
-		u8  reserved07[4];
-	} *sgib_area;
-	int ret;
-
-	spin_lock_irq(&chsc_page_lock);
-	memset(chsc_page, 0, PAGE_SIZE);
-	sgib_area = chsc_page;
-	sgib_area->request.length = 0x0fe0;
-	sgib_area->request.code = 0x0021;
-	sgib_area->op = 0x1;
-	sgib_area->gib_origin = origin;
-
-	ret = chsc(sgib_area);
-	if (ret == 0)
-		ret = chsc_error_from_response(sgib_area->response.code);
-	spin_unlock_irq(&chsc_page_lock);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(chsc_sgib);
-
-#define SCUD_REQ_LEN	0x10 /* SCUD request block length */
-#define SCUD_REQ_CMD	0x4b /* SCUD Command Code */
-
-struct chse_cudb {
-	u16 flags:8;
-	u16 chp_valid:8;
-	u16 cu;
-	u32 esm_valid:8;
-	u32:24;
-	u8 chpid[8];
-	u32:32;
-	u32:32;
-	u8 esm[8];
-	u32 efla[8];
-} __packed;
-
-struct chsc_scud {
-	struct chsc_header request;
-	u16:4;
-	u16 fmt:4;
-	u16 cssid:8;
-	u16 first_cu;
-	u16:16;
-	u16 last_cu;
-	u32:32;
-	struct chsc_header response;
-	u16:4;
-	u16 fmt_resp:4;
-	u32:24;
-	struct chse_cudb cudb[];
-} __packed;
-
-/**
- * chsc_scud() - Store control-unit description.
- * @cu:		number of the control-unit
- * @esm:	8 1-byte endpoint security mode values
- * @esm_valid:	validity mask for @esm
- *
- * Interface to retrieve information about the endpoint security
- * modes for up to 8 paths of a control unit.
- *
- * Returns 0 on success.
- */
-int chsc_scud(u16 cu, u64 *esm, u8 *esm_valid)
-{
-	struct chsc_scud *scud = chsc_page;
-	int ret;
-
-	spin_lock_irq(&chsc_page_lock);
-	memset(chsc_page, 0, PAGE_SIZE);
-	scud->request.length = SCUD_REQ_LEN;
-	scud->request.code = SCUD_REQ_CMD;
-	scud->fmt = 0;
-	scud->cssid = 0;
-	scud->first_cu = cu;
-	scud->last_cu = cu;
-
-	ret = chsc(scud);
-	if (!ret)
-		ret = chsc_error_from_response(scud->response.code);
-
-	if (!ret && (scud->response.length <= 8 || scud->fmt_resp != 0
-			|| !(scud->cudb[0].flags & 0x80)
-			|| scud->cudb[0].cu != cu)) {
-
-		CIO_MSG_EVENT(2, "chsc: scud failed rc=%04x, L2=%04x "
-			"FMT=%04x, cudb.flags=%02x, cudb.cu=%04x",
-			scud->response.code, scud->response.length,
-			scud->fmt_resp, scud->cudb[0].flags, scud->cudb[0].cu);
-		ret = -EINVAL;
-	}
-
-	if (ret)
-		goto out;
-
-	memcpy(esm, scud->cudb[0].esm, sizeof(*esm));
-	*esm_valid = scud->cudb[0].esm_valid;
-out:
-	spin_unlock_irq(&chsc_page_lock);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(chsc_scud);

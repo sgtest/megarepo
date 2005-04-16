@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /****************************************************************************/
 
 /*
@@ -6,6 +5,8 @@
  *
  *      (C) Copyright 2000-2001, Greg Ungerer (gerg@snapgear.com)
  *      (C) Copyright 2001-2002, SnapGear (www.snapgear.com)
+ *
+ *	$Id: nettel.c,v 1.10 2005/01/05 17:11:29 dwmw2 Exp $
  */
 
 /****************************************************************************/
@@ -19,9 +20,6 @@
 #include <linux/mtd/partitions.h>
 #include <linux/mtd/cfi.h>
 #include <linux/reboot.h>
-#include <linux/err.h>
-#include <linux/kdev_t.h>
-#include <linux/root_dev.h>
 #include <asm/io.h>
 
 /****************************************************************************/
@@ -108,7 +106,7 @@ static struct map_info nettel_amd_map = {
 	.bankwidth = AMD_BUSWIDTH,
 };
 
-static const struct mtd_partition nettel_amd_partitions[] = {
+static struct mtd_partition nettel_amd_partitions[] = {
 	{
 		.name = "SnapGear BIOS config",
 		.offset = 0x000e0000,
@@ -130,7 +128,8 @@ static const struct mtd_partition nettel_amd_partitions[] = {
 	}
 };
 
-#define NUM_AMD_PARTITIONS ARRAY_SIZE(nettel_amd_partitions)
+#define NUM_AMD_PARTITIONS \
+	(sizeof(nettel_amd_partitions)/sizeof(nettel_amd_partitions[0]))
 
 /****************************************************************************/
 
@@ -144,7 +143,7 @@ static int nettel_reboot_notifier(struct notifier_block *nb, unsigned long val, 
 {
 	struct cfi_private *cfi = nettel_intel_map.fldrv_priv;
 	unsigned long b;
-
+	
 	/* Make sure all FLASH chips are put back into read mode */
 	for (b = 0; (b < nettel_intel_partitions[3].size); b += 0x100000) {
 		cfi_send_gen_cmd(0xff, 0x55, b, &nettel_intel_map, cfi,
@@ -157,11 +156,68 @@ static struct notifier_block nettel_notifier_block = {
 	nettel_reboot_notifier, NULL, 0
 };
 
+/*
+ *	Erase the configuration file system.
+ *	Used to support the software reset button.
+ */
+static void nettel_erasecallback(struct erase_info *done)
+{
+	wait_queue_head_t *wait_q = (wait_queue_head_t *)done->priv;
+	wake_up(wait_q);
+}
+
+static struct erase_info nettel_erase;
+
+int nettel_eraseconfig(void)
+{
+	struct mtd_info *mtd;
+	DECLARE_WAITQUEUE(wait, current);
+	wait_queue_head_t wait_q;
+	int ret;
+
+	init_waitqueue_head(&wait_q);
+	mtd = get_mtd_device(NULL, 2);
+	if (mtd) {
+		nettel_erase.mtd = mtd;
+		nettel_erase.callback = nettel_erasecallback;
+		nettel_erase.callback = NULL;
+		nettel_erase.addr = 0;
+		nettel_erase.len = mtd->size;
+		nettel_erase.priv = (u_long) &wait_q;
+		nettel_erase.priv = 0;
+
+		set_current_state(TASK_INTERRUPTIBLE);
+		add_wait_queue(&wait_q, &wait);
+
+		ret = MTD_ERASE(mtd, &nettel_erase);
+		if (ret) {
+			set_current_state(TASK_RUNNING);
+			remove_wait_queue(&wait_q, &wait);
+			put_mtd_device(mtd);
+			return(ret);
+		}
+
+		schedule();  /* Wait for erase to finish. */
+		remove_wait_queue(&wait_q, &wait);
+		
+		put_mtd_device(mtd);
+	}
+
+	return(0);
+}
+
+#else
+
+int nettel_eraseconfig(void)
+{
+	return(0);
+}
+
 #endif
 
 /****************************************************************************/
 
-static int __init nettel_init(void)
+int __init nettel_init(void)
 {
 	volatile unsigned long *amdpar;
 	unsigned long amdaddr, maxsize;
@@ -176,7 +232,7 @@ static int __init nettel_init(void)
 #endif
 	int rc = 0;
 
-	nettel_mmcrp = (void *) ioremap(0xfffef000, 4096);
+	nettel_mmcrp = (void *) ioremap_nocache(0xfffef000, 4096);
 	if (nettel_mmcrp == NULL) {
 		printk("SNAPGEAR: failed to disable MMCR cache??\n");
 		return(-EIO);
@@ -217,17 +273,16 @@ static int __init nettel_init(void)
 	__asm__ ("wbinvd");
 
 	nettel_amd_map.phys = amdaddr;
-	nettel_amd_map.virt = ioremap(amdaddr, maxsize);
+	nettel_amd_map.virt = ioremap_nocache(amdaddr, maxsize);
 	if (!nettel_amd_map.virt) {
 		printk("SNAPGEAR: failed to ioremap() BOOTCS\n");
-		iounmap(nettel_mmcrp);
 		return(-EIO);
 	}
 	simple_map_init(&nettel_amd_map);
 
 	if ((amd_mtd = do_map_probe("jedec_probe", &nettel_amd_map))) {
 		printk(KERN_NOTICE "SNAPGEAR: AMD flash device size = %dK\n",
-			(int)(amd_mtd->size>>10));
+			amd_mtd->size>>10);
 
 		amd_mtd->owner = THIS_MODULE;
 
@@ -281,8 +336,7 @@ static int __init nettel_init(void)
 		nettel_amd_map.virt = NULL;
 #else
 		/* Only AMD flash supported */
-		rc = -ENXIO;
-		goto out_unmap2;
+		return(-ENXIO);
 #endif
 	}
 
@@ -300,21 +354,20 @@ static int __init nettel_init(void)
 	/* Turn other PAR off so the first probe doesn't find it */
 	*intel1par = 0;
 
-	/* Probe for the size of the first Intel flash */
+	/* Probe for the the size of the first Intel flash */
 	nettel_intel_map.size = maxsize;
 	nettel_intel_map.phys = intel0addr;
-	nettel_intel_map.virt = ioremap(intel0addr, maxsize);
+	nettel_intel_map.virt = ioremap_nocache(intel0addr, maxsize);
 	if (!nettel_intel_map.virt) {
 		printk("SNAPGEAR: failed to ioremap() ROMCS1\n");
-		rc = -EIO;
-		goto out_unmap2;
+		return(-EIO);
 	}
 	simple_map_init(&nettel_intel_map);
 
 	intel_mtd = do_map_probe("cfi_probe", &nettel_intel_map);
 	if (!intel_mtd) {
-		rc = -ENXIO;
-		goto out_unmap1;
+		iounmap(nettel_intel_map.virt);
+		return(-ENXIO);
 	}
 
 	/* Set PAR to the detected size */
@@ -337,17 +390,16 @@ static int __init nettel_init(void)
 	iounmap(nettel_intel_map.virt);
 
 	nettel_intel_map.size = maxsize;
-	nettel_intel_map.virt = ioremap(intel0addr, maxsize);
+	nettel_intel_map.virt = ioremap_nocache(intel0addr, maxsize);
 	if (!nettel_intel_map.virt) {
 		printk("SNAPGEAR: failed to ioremap() ROMCS1/2\n");
-		rc = -EIO;
-		goto out_unmap2;
+		return(-EIO);
 	}
 
 	intel_mtd = do_map_probe("cfi_probe", &nettel_intel_map);
 	if (! intel_mtd) {
-		rc = -ENXIO;
-		goto out_unmap1;
+		iounmap((void *) nettel_intel_map.virt);
+		return(-ENXIO);
 	}
 
 	intel1size = intel_mtd->size - intel0size;
@@ -358,12 +410,17 @@ static int __init nettel_init(void)
 		*intel1par = 0;
 	}
 
-	printk(KERN_NOTICE "SNAPGEAR: Intel flash device size = %lldKiB\n",
-	       (unsigned long long)(intel_mtd->size >> 10));
+	printk(KERN_NOTICE "SNAPGEAR: Intel flash device size = %dK\n",
+		(intel_mtd->size >> 10));
 
 	intel_mtd->owner = THIS_MODULE;
 
-	num_intel_partitions = ARRAY_SIZE(nettel_intel_partitions);
+#ifndef CONFIG_BLK_DEV_INITRD
+	ROOT_DEV = MKDEV(MTD_BLOCK_MAJOR, 1);
+#endif
+
+	num_intel_partitions = sizeof(nettel_intel_partitions) /
+		sizeof(nettel_intel_partitions[0]);
 
 	if (intelboot) {
 		/*
@@ -373,7 +430,7 @@ static int __init nettel_init(void)
 		nettel_intel_partitions[1].size = (intel0size + intel1size) -
 			(1024*1024 + intel_mtd->erasesize);
 		nettel_intel_partitions[3].size = intel0size + intel1size;
-		nettel_intel_partitions[4].offset =
+		nettel_intel_partitions[4].offset = 
 			(intel0size + intel1size) - intel_mtd->erasesize;
 		nettel_intel_partitions[4].size = intel_mtd->erasesize;
 		nettel_intel_partitions[5].offset =
@@ -384,55 +441,32 @@ static int __init nettel_init(void)
 		/* No BIOS regions when AMD boot */
 		num_intel_partitions -= 2;
 	}
-	rc = mtd_device_register(intel_mtd, nettel_intel_partitions,
-				 num_intel_partitions);
-	if (rc)
-		goto out_map_destroy;
+	rc = add_mtd_partitions(intel_mtd, nettel_intel_partitions,
+		num_intel_partitions);
 #endif
 
 	if (amd_mtd) {
-		rc = mtd_device_register(amd_mtd, nettel_amd_partitions,
-					 num_amd_partitions);
-		if (rc)
-			goto out_mtd_unreg;
+		rc = add_mtd_partitions(amd_mtd, nettel_amd_partitions,
+			num_amd_partitions);
 	}
 
 #ifdef CONFIG_MTD_CFI_INTELEXT
 	register_reboot_notifier(&nettel_notifier_block);
 #endif
 
-	return rc;
-
-out_mtd_unreg:
-#ifdef CONFIG_MTD_CFI_INTELEXT
-	mtd_device_unregister(intel_mtd);
-out_map_destroy:
-	map_destroy(intel_mtd);
-out_unmap1:
-	iounmap(nettel_intel_map.virt);
-#endif
-
-out_unmap2:
-	iounmap(nettel_mmcrp);
-	iounmap(nettel_amd_map.virt);
-
-	return rc;
+	return(rc);
 }
 
 /****************************************************************************/
 
-static void __exit nettel_cleanup(void)
+void __exit nettel_cleanup(void)
 {
 #ifdef CONFIG_MTD_CFI_INTELEXT
 	unregister_reboot_notifier(&nettel_notifier_block);
 #endif
 	if (amd_mtd) {
-		mtd_device_unregister(amd_mtd);
+		del_mtd_partitions(amd_mtd);
 		map_destroy(amd_mtd);
-	}
-	if (nettel_mmcrp) {
-		iounmap(nettel_mmcrp);
-		nettel_mmcrp = NULL;
 	}
 	if (nettel_amd_map.virt) {
 		iounmap(nettel_amd_map.virt);
@@ -440,12 +474,12 @@ static void __exit nettel_cleanup(void)
 	}
 #ifdef CONFIG_MTD_CFI_INTELEXT
 	if (intel_mtd) {
-		mtd_device_unregister(intel_mtd);
+		del_mtd_partitions(intel_mtd);
 		map_destroy(intel_mtd);
 	}
 	if (nettel_intel_map.virt) {
 		iounmap(nettel_intel_map.virt);
-		nettel_intel_map.virt = NULL;
+		nettel_intel_map.virt = 0;
 	}
 #endif
 }

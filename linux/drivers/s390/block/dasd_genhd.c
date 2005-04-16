@@ -1,56 +1,51 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
+ * File...........: linux/drivers/s390/block/dasd_genhd.c
  * Author(s)......: Holger Smolinski <Holger.Smolinski@de.ibm.com>
  *		    Horst Hummel <Horst.Hummel@de.ibm.com>
  *		    Carsten Otte <Cotte@de.ibm.com>
  *		    Martin Schwidefsky <schwidefsky@de.ibm.com>
  * Bugreports.to..: <Linux390@de.ibm.com>
- * Copyright IBM Corp. 1999, 2001
+ * (C) IBM Corporation, IBM Deutschland Entwicklung GmbH, 1999-2001
  *
  * gendisk related functions for the dasd driver.
  *
+ * $Revision: 1.48 $
  */
 
-#define KMSG_COMPONENT "dasd"
-
+#include <linux/config.h>
 #include <linux/interrupt.h>
-#include <linux/major.h>
 #include <linux/fs.h>
 #include <linux/blkpg.h>
 
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
 
 /* This is ugly... */
 #define PRINTK_HEADER "dasd_gendisk:"
 
 #include "dasd_int.h"
 
-static struct lock_class_key dasd_bio_compl_lkclass;
-
 /*
  * Allocate and register gendisk structure for device.
  */
-int dasd_gendisk_alloc(struct dasd_block *block)
+int
+dasd_gendisk_alloc(struct dasd_device *device)
 {
 	struct gendisk *gdp;
-	struct dasd_device *base;
-	int len, rc;
+	int len;
 
 	/* Make sure the minor for this device exists. */
-	base = block->base;
-	if (base->devindex >= DASD_PER_MAJOR)
+	if (device->devindex >= DASD_PER_MAJOR)
 		return -EBUSY;
 
-	gdp = blk_mq_alloc_disk_for_queue(block->request_queue,
-					  &dasd_bio_compl_lkclass);
+	gdp = alloc_disk(1 << DASD_PARTN_BITS);
 	if (!gdp)
 		return -ENOMEM;
 
 	/* Initialize gendisk structure. */
 	gdp->major = DASD_MAJOR;
-	gdp->first_minor = base->devindex << DASD_PARTN_BITS;
-	gdp->minors = 1 << DASD_PARTN_BITS;
+	gdp->first_minor = device->devindex << DASD_PARTN_BITS;
 	gdp->fops = &dasd_device_operations;
+	gdp->driverfs_dev = &device->cdev->dev;
 
 	/*
 	 * Set device name.
@@ -60,72 +55,62 @@ int dasd_gendisk_alloc(struct dasd_block *block)
 	 *   dasdaaaa - dasdzzzz : 456976 devices, added up = 475252
 	 */
 	len = sprintf(gdp->disk_name, "dasd");
-	if (base->devindex > 25) {
-		if (base->devindex > 701) {
-			if (base->devindex > 18277)
+	if (device->devindex > 25) {
+	        if (device->devindex > 701) {
+		        if (device->devindex > 18277)
 			        len += sprintf(gdp->disk_name + len, "%c",
-					       'a'+(((base->devindex-18278)
+					       'a'+(((device->devindex-18278)
 						     /17576)%26));
 			len += sprintf(gdp->disk_name + len, "%c",
-				       'a'+(((base->devindex-702)/676)%26));
+				       'a'+(((device->devindex-702)/676)%26));
 		}
 		len += sprintf(gdp->disk_name + len, "%c",
-			       'a'+(((base->devindex-26)/26)%26));
+			       'a'+(((device->devindex-26)/26)%26));
 	}
-	len += sprintf(gdp->disk_name + len, "%c", 'a'+(base->devindex%26));
+	len += sprintf(gdp->disk_name + len, "%c", 'a'+(device->devindex%26));
 
-	if (base->features & DASD_FEATURE_READONLY ||
-	    test_bit(DASD_FLAG_DEVICE_RO, &base->flags))
+ 	sprintf(gdp->devfs_name, "dasd/%s", device->cdev->dev.bus_id);
+
+	if (test_bit(DASD_FLAG_RO, &device->flags))
 		set_disk_ro(gdp, 1);
-	dasd_add_link_to_gendisk(gdp, base);
-	block->gdp = gdp;
-	set_capacity(block->gdp, 0);
-
-	rc = device_add_disk(&base->cdev->dev, block->gdp, NULL);
-	if (rc) {
-		dasd_gendisk_free(block);
-		return rc;
-	}
-
+	gdp->private_data = device;
+	gdp->queue = device->request_queue;
+	device->gdp = gdp;
+	set_capacity(device->gdp, 0);
+	add_disk(device->gdp);
 	return 0;
 }
 
 /*
  * Unregister and free gendisk structure for device.
  */
-void dasd_gendisk_free(struct dasd_block *block)
+void
+dasd_gendisk_free(struct dasd_device *device)
 {
-	if (block->gdp) {
-		del_gendisk(block->gdp);
-		block->gdp->private_data = NULL;
-		put_disk(block->gdp);
-		block->gdp = NULL;
-	}
+	del_gendisk(device->gdp);
+	device->gdp->queue = 0;
+	put_disk(device->gdp);
+	device->gdp = 0;
 }
 
 /*
  * Trigger a partition detection.
  */
-int dasd_scan_partitions(struct dasd_block *block)
+int
+dasd_scan_partitions(struct dasd_device * device)
 {
 	struct block_device *bdev;
-	int rc;
 
-	bdev = blkdev_get_by_dev(disk_devt(block->gdp), FMODE_READ, NULL);
-	if (IS_ERR(bdev)) {
-		DBF_DEV_EVENT(DBF_ERR, block->base,
-			      "scan partitions error, blkdev_get returned %ld",
-			      PTR_ERR(bdev));
+	/* Make the disk known. */
+	set_capacity(device->gdp, device->blocks << device->s2b_shift);
+	bdev = bdget_disk(device->gdp, 0);
+	if (!bdev || blkdev_get(bdev, FMODE_READ, 1) < 0)
 		return -ENODEV;
-	}
-
-	mutex_lock(&block->gdp->open_mutex);
-	rc = bdev_disk_changed(block->gdp, false);
-	mutex_unlock(&block->gdp->open_mutex);
-	if (rc)
-		DBF_DEV_EVENT(DBF_ERR, block->base,
-				"scan partitions error, rc %d", rc);
-
+	/*
+	 * See fs/partition/check.c:register_disk,rescan_partitions
+	 * Can't call rescan_partitions directly. Use ioctl.
+	 */
+	ioctl_by_bdev(bdev, BLKRRPART, 0);
 	/*
 	 * Since the matching blkdev_put call to the blkdev_get in
 	 * this function is not called before dasd_destroy_partitions
@@ -136,7 +121,7 @@ int dasd_scan_partitions(struct dasd_block *block)
 	 * is why the assignment to device->bdev is done AFTER
 	 * the BLKRRPART ioctl.
 	 */
-	block->bdev = bdev;
+	device->bdev = bdev;
 	return 0;
 }
 
@@ -144,40 +129,57 @@ int dasd_scan_partitions(struct dasd_block *block)
  * Remove all inodes in the system for a device, delete the
  * partitions and make device unusable by setting its size to zero.
  */
-void dasd_destroy_partitions(struct dasd_block *block)
+void
+dasd_destroy_partitions(struct dasd_device * device)
 {
+	/* The two structs have 168/176 byte on 31/64 bit. */
+	struct blkpg_partition bpart;
+	struct blkpg_ioctl_arg barg;
 	struct block_device *bdev;
 
 	/*
 	 * Get the bdev pointer from the device structure and clear
 	 * device->bdev to lower the offline open_count limit again.
 	 */
-	bdev = block->bdev;
-	block->bdev = NULL;
+	bdev = device->bdev;
+	device->bdev = 0;
 
-	mutex_lock(&bdev->bd_disk->open_mutex);
-	bdev_disk_changed(bdev->bd_disk, true);
-	mutex_unlock(&bdev->bd_disk->open_mutex);
+	/*
+	 * See fs/partition/check.c:delete_partition
+	 * Can't call delete_partitions directly. Use ioctl.
+	 * The ioctl also does locking and invalidation.
+	 */
+	memset(&bpart, 0, sizeof(struct blkpg_partition));
+	memset(&barg, 0, sizeof(struct blkpg_ioctl_arg));
+	barg.data = &bpart;
+	barg.op = BLKPG_DEL_PARTITION;
+	for (bpart.pno = device->gdp->minors - 1; bpart.pno > 0; bpart.pno--)
+		ioctl_by_bdev(bdev, BLKPG, (unsigned long) &barg);
 
+	invalidate_partition(device->gdp, 0);
 	/* Matching blkdev_put to the blkdev_get in dasd_scan_partitions. */
-	blkdev_put(bdev, FMODE_READ);
+	blkdev_put(bdev);
+	set_capacity(device->gdp, 0);
 }
 
-int dasd_gendisk_init(void)
+int
+dasd_gendisk_init(void)
 {
 	int rc;
 
 	/* Register to static dasd major 94 */
 	rc = register_blkdev(DASD_MAJOR, "dasd");
 	if (rc != 0) {
-		pr_warn("Registering the device driver with major number %d failed\n",
-			DASD_MAJOR);
+		MESSAGE(KERN_WARNING,
+			"Couldn't register successfully to "
+			"major no %d", DASD_MAJOR);
 		return rc;
 	}
 	return 0;
 }
 
-void dasd_gendisk_exit(void)
+void
+dasd_gendisk_exit(void)
 {
 	unregister_blkdev(DASD_MAJOR, "dasd");
 }

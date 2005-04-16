@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /* drivers/nubus/proc.c: Proc FS interface for NuBus.
 
    By David Huggins-Daines <dhd@debian.org>
@@ -11,176 +10,165 @@
    structure in /proc analogous to the structure of the NuBus ROM
    resources.
 
-   Therefore each board function gets a directory, which may in turn
-   contain subdirectories.  Each slot resource is a file.  Unrecognized
-   resources are empty files, since every resource ID requires a special
-   case (e.g. if the resource ID implies a directory or block, then its
-   value has to be interpreted as a slot ROM pointer etc.).
- */
+   Therefore each NuBus device is in fact a directory, which may in
+   turn contain subdirectories.  The "files" correspond to NuBus
+   resource records.  For those types of records which we know how to
+   convert to formats that are meaningful to userspace (mostly just
+   icons) these files will provide "cooked" data.  Otherwise they will
+   simply provide raw access (read-only of course) to the ROM.  */
 
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/nubus.h>
 #include <linux/proc_fs.h>
-#include <linux/seq_file.h>
-#include <linux/slab.h>
 #include <linux/init.h>
-#include <linux/module.h>
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
 #include <asm/byteorder.h>
 
-/*
- * /proc/bus/nubus/devices stuff
- */
-
 static int
-nubus_devices_proc_show(struct seq_file *m, void *v)
+get_nubus_dev_info(char *buf, char **start, off_t pos, int count)
 {
-	struct nubus_rsrc *fres;
+	struct nubus_dev *dev = nubus_devices;
+	off_t at = 0;
+	int len, cnt;
 
-	for_each_func_rsrc(fres)
-		seq_printf(m, "%x\t%04x %04x %04x %04x\t%08lx\n",
-			   fres->board->slot, fres->category, fres->type,
-			   fres->dr_sw, fres->dr_hw, fres->board->slot_addr);
-	return 0;
+	cnt = 0;
+	while (dev && count > cnt) {
+		len = sprintf(buf, "%x\t%04x %04x %04x %04x",
+			      dev->board->slot,
+			      dev->category,
+			      dev->type,
+			      dev->dr_sw,
+			      dev->dr_hw);
+		len += sprintf(buf+len,
+			       "\t%08lx",
+			       dev->board->slot_addr);
+		buf[len++] = '\n';
+		at += len;
+		if (at >= pos) {
+			if (!*start) {
+				*start = buf + (pos - (at - len));
+				cnt = at - pos;
+			} else
+				cnt += len;
+			buf += len;
+		}
+		dev = dev->next;
+	}
+	return (count > cnt) ? cnt : count;
 }
 
 static struct proc_dir_entry *proc_bus_nubus_dir;
 
-/*
- * /proc/bus/nubus/x/ stuff
- */
-
-struct proc_dir_entry *nubus_proc_add_board(struct nubus_board *board)
+static void nubus_proc_subdir(struct nubus_dev* dev,
+			      struct proc_dir_entry* parent,
+			      struct nubus_dir* dir)
 {
-	char name[2];
+	struct nubus_dirent ent;
 
-	if (!proc_bus_nubus_dir)
-		return NULL;
-	snprintf(name, sizeof(name), "%x", board->slot);
-	return proc_mkdir(name, proc_bus_nubus_dir);
+	/* Some of these are directories, others aren't */
+	while (nubus_readdir(dir, &ent) != -1) {
+		char name[8];
+		struct proc_dir_entry* e;
+		
+		sprintf(name, "%x", ent.type);
+		e = create_proc_entry(name, S_IFREG | S_IRUGO |
+				      S_IWUSR, parent);
+		if (!e) return;
+	}
 }
 
-/* The PDE private data for any directory under /proc/bus/nubus/x/
- * is the bytelanes value for the board in slot x.
- */
-
-struct proc_dir_entry *nubus_proc_add_rsrc_dir(struct proc_dir_entry *procdir,
-					       const struct nubus_dirent *ent,
-					       struct nubus_board *board)
+/* Can't do this recursively since the root directory is structured
+   somewhat differently from the subdirectories */
+static void nubus_proc_populate(struct nubus_dev* dev,
+				struct proc_dir_entry* parent,
+				struct nubus_dir* root)
 {
-	char name[9];
-	int lanes = board->lanes;
+	struct nubus_dirent ent;
 
-	if (!procdir)
-		return NULL;
-	snprintf(name, sizeof(name), "%x", ent->type);
-	return proc_mkdir_data(name, 0555, procdir, (void *)lanes);
+	/* We know these are all directories (board resource + one or
+	   more functional resources) */
+	while (nubus_readdir(root, &ent) != -1) {
+		char name[8];
+		struct proc_dir_entry* e;
+		struct nubus_dir dir;
+		
+		sprintf(name, "%x", ent.type);
+		e = proc_mkdir(name, parent);
+		if (!e) return;
+
+		/* And descend */
+		if (nubus_get_subdir(&ent, &dir) == -1) {
+			/* This shouldn't happen */
+			printk(KERN_ERR "NuBus root directory node %x:%x has no subdir!\n",
+			       dev->board->slot, ent.type);
+			continue;
+		} else {
+			nubus_proc_subdir(dev, e, &dir);
+		}
+	}
 }
 
-/* The PDE private data for a file under /proc/bus/nubus/x/ is a pointer to
- * an instance of the following structure, which gives the location and size
- * of the resource data in the slot ROM. For slot resources which hold only a
- * small integer, this integer value is stored directly and size is set to 0.
- * A NULL private data pointer indicates an unrecognized resource.
- */
-
-struct nubus_proc_pde_data {
-	unsigned char *res_ptr;
-	unsigned int res_size;
-};
-
-static struct nubus_proc_pde_data *
-nubus_proc_alloc_pde_data(unsigned char *ptr, unsigned int size)
+int nubus_proc_attach_device(struct nubus_dev *dev)
 {
-	struct nubus_proc_pde_data *pded;
+	struct proc_dir_entry *e;
+	struct nubus_dir root;
+	char name[8];
 
-	pded = kmalloc(sizeof(*pded), GFP_KERNEL);
-	if (!pded)
-		return NULL;
+	if (dev == NULL) {
+		printk(KERN_ERR
+		       "NULL pointer in nubus_proc_attach_device, shoot the programmer!\n");
+		return -1;
+	}
+		
+	if (dev->board == NULL) {
+		printk(KERN_ERR
+		       "NULL pointer in nubus_proc_attach_device, shoot the programmer!\n");
+		printk("dev = %p, dev->board = %p\n", dev, dev->board);
+		return -1;
+	}
+		
+	/* Create a directory */
+	sprintf(name, "%x", dev->board->slot);
+	e = dev->procdir = proc_mkdir(name, proc_bus_nubus_dir);
+	if (!e)
+		return -ENOMEM;
 
-	pded->res_ptr = ptr;
-	pded->res_size = size;
-	return pded;
+	/* Now recursively populate it with files */
+	nubus_get_root_dir(dev->board, &root);
+	nubus_proc_populate(dev, e, &root);
+
+	return 0;
 }
 
-static int nubus_proc_rsrc_show(struct seq_file *m, void *v)
+/* FIXME: this is certainly broken! */
+int nubus_proc_detach_device(struct nubus_dev *dev)
 {
-	struct inode *inode = m->private;
-	struct nubus_proc_pde_data *pded;
+	struct proc_dir_entry *e;
 
-	pded = pde_data(inode);
-	if (!pded)
-		return 0;
-
-	if (pded->res_size > m->size)
-		return -EFBIG;
-
-	if (pded->res_size) {
-		int lanes = (int)proc_get_parent_data(inode);
-		struct nubus_dirent ent;
-
-		if (!lanes)
-			return 0;
-
-		ent.mask = lanes;
-		ent.base = pded->res_ptr;
-		ent.data = 0;
-		nubus_seq_write_rsrc_mem(m, &ent, pded->res_size);
-	} else {
-		unsigned int data = (unsigned int)pded->res_ptr;
-
-		seq_putc(m, data >> 16);
-		seq_putc(m, data >> 8);
-		seq_putc(m, data >> 0);
+	if ((e = dev->procdir)) {
+		if (atomic_read(&e->count))
+			return -EBUSY;
+		remove_proc_entry(e->name, proc_bus_nubus_dir);
+		dev->procdir = NULL;
 	}
 	return 0;
 }
 
-void nubus_proc_add_rsrc_mem(struct proc_dir_entry *procdir,
-			     const struct nubus_dirent *ent,
-			     unsigned int size)
+void __init proc_bus_nubus_add_devices(void)
 {
-	char name[9];
-	struct nubus_proc_pde_data *pded;
-
-	if (!procdir)
-		return;
-
-	snprintf(name, sizeof(name), "%x", ent->type);
-	if (size)
-		pded = nubus_proc_alloc_pde_data(nubus_dirptr(ent), size);
-	else
-		pded = NULL;
-	proc_create_single_data(name, S_IFREG | 0444, procdir,
-			nubus_proc_rsrc_show, pded);
+	struct nubus_dev *dev;
+	
+	for(dev = nubus_devices; dev; dev = dev->next)
+		nubus_proc_attach_device(dev);
 }
-
-void nubus_proc_add_rsrc(struct proc_dir_entry *procdir,
-			 const struct nubus_dirent *ent)
-{
-	char name[9];
-	unsigned char *data = (unsigned char *)ent->data;
-
-	if (!procdir)
-		return;
-
-	snprintf(name, sizeof(name), "%x", ent->type);
-	proc_create_single_data(name, S_IFREG | 0444, procdir,
-			nubus_proc_rsrc_show,
-			nubus_proc_alloc_pde_data(data, 0));
-}
-
-/*
- * /proc/nubus stuff
- */
 
 void __init nubus_proc_init(void)
 {
-	proc_create_single("nubus", 0, NULL, nubus_proc_show);
-	proc_bus_nubus_dir = proc_mkdir("bus/nubus", NULL);
-	if (!proc_bus_nubus_dir)
+	if (!MACH_IS_MAC)
 		return;
-	proc_create_single("devices", 0, proc_bus_nubus_dir,
-			nubus_devices_proc_show);
+	proc_bus_nubus_dir = proc_mkdir("nubus", proc_bus);
+	create_proc_info_entry("devices", 0, proc_bus_nubus_dir,
+				get_nubus_dev_info);
+	proc_bus_nubus_add_devices();
 }

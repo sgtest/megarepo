@@ -1,9 +1,13 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
 #ifndef _I8042_JAZZ_H
 #define _I8042_JAZZ_H
 
 #include <asm/jazz.h>
 
+/*
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 as published by
+ * the Free Software Foundation.
+ */
 
 /*
  * Names.
@@ -49,7 +53,7 @@ static inline int i8042_platform_init(void)
 #if 0
 	/* XXX JAZZ_KEYBOARD_ADDRESS is a virtual address */
 	if (!request_mem_region(JAZZ_KEYBOARD_ADDRESS, 2, "i8042"))
-		return -EBUSY;
+		return 1;
 #endif
 
 	return 0;

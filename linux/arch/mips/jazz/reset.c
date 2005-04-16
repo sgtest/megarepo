@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Reset a Jazz machine.
  *
@@ -7,6 +6,10 @@
  */
 #include <linux/jiffies.h>
 #include <asm/jazz.h>
+#include <asm/io.h>
+#include <asm/system.h>
+#include <asm/reboot.h>
+#include <asm/delay.h>
 
 #define KBD_STAT_IBF		0x02	/* Keyboard input buffer full */
 
@@ -50,8 +53,17 @@ void jazz_machine_restart(char *command)
 {
 	while(1) {
 		kb_wait();
-		jazz_write_command(0xd1);
+		jazz_write_command (0xd1);
 		kb_wait();
-		jazz_write_output(0x00);
+		jazz_write_output (0x00);
 	}
+}
+
+void jazz_machine_halt(void)
+{
+}
+
+void jazz_machine_power_off(void)
+{
+	/* Jazz machines don't have a software power switch */
 }

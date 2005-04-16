@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /* toshiba.c -- Linux driver for accessing the SMM on Toshiba laptops
  *
  * Copyright (c) 1996-2001  Jonathan A. Buzzard (jonathan@buzzard.org.uk)
@@ -36,11 +35,22 @@
  *       *any* time. It is up to any program to be aware of this eventuality
  *       and take appropriate steps.
  *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation; either version 2, or (at your option) any
+ * later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
  * The information used to write this driver has been obtained by reverse
  * engineering the software supplied by Toshiba for their portable computers in
  * strict accordance with the European Council Directive 92/250/EEC on the legal
  * protection of computer programs, and it's implementation into English Law by
  * the Copyright (Computer Programs) Regulations 1992 (S.I. 1992 No.3233).
+ *
  */
 
 #define TOSH_VERSION "1.11 26/9/2001"
@@ -48,42 +58,39 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/sched.h>
 #include <linux/types.h>
 #include <linux/fcntl.h>
 #include <linux/miscdevice.h>
 #include <linux/ioport.h>
 #include <asm/io.h>
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
 #include <linux/init.h>
 #include <linux/stat.h>
 #include <linux/proc_fs.h>
-#include <linux/seq_file.h>
-#include <linux/mutex.h>
+
 #include <linux/toshiba.h>
 
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Jonathan Buzzard <jonathan@buzzard.org.uk>");
-MODULE_DESCRIPTION("Toshiba laptop SMM driver");
+#define TOSH_MINOR_DEV 181
 
-static DEFINE_MUTEX(tosh_mutex);
-static int tosh_fn;
-module_param_named(fn, tosh_fn, int, 0);
-MODULE_PARM_DESC(fn, "User specified Fn key detection port");
+static int tosh_id = 0x0000;
+static int tosh_bios = 0x0000;
+static int tosh_date = 0x0000;
+static int tosh_sci = 0x0000;
+static int tosh_fan = 0;
 
-static int tosh_id;
-static int tosh_bios;
-static int tosh_date;
-static int tosh_sci;
-static int tosh_fan;
+static int tosh_fn = 0;
 
-static long tosh_ioctl(struct file *, unsigned int,
+module_param(tosh_fn, int, 0);
+
+
+static int tosh_ioctl(struct inode *, struct file *, unsigned int,
 	unsigned long);
 
 
-static const struct file_operations tosh_fops = {
+static struct file_operations tosh_fops = {
 	.owner		= THIS_MODULE,
-	.unlocked_ioctl	= tosh_ioctl,
-	.llseek		= noop_llseek,
+	.ioctl		= tosh_ioctl,
 };
 
 static struct miscdevice tosh_device = {
@@ -238,10 +245,10 @@ int tosh_smm(SMMRegisters *regs)
 
 	return eax;
 }
-EXPORT_SYMBOL(tosh_smm);
 
 
-static long tosh_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
+static int tosh_ioctl(struct inode *ip, struct file *fp, unsigned int cmd,
+	unsigned long arg)
 {
 	SMMRegisters regs;
 	SMMRegisters __user *argp = (SMMRegisters __user *)arg;
@@ -263,16 +270,13 @@ static long tosh_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
 				return -EINVAL;
 
 			/* do we need to emulate the fan ? */
-			mutex_lock(&tosh_mutex);
 			if (tosh_fan==1) {
 				if (((ax==0xf300) || (ax==0xf400)) && (bx==0x0004)) {
 					err = tosh_emulate_fan(&regs);
-					mutex_unlock(&tosh_mutex);
 					break;
 				}
 			}
 			err = tosh_smm(&regs);
-			mutex_unlock(&tosh_mutex);
 			break;
 		default:
 			return -EINVAL;
@@ -289,10 +293,12 @@ static long tosh_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
  * Print the information for /proc/toshiba
  */
 #ifdef CONFIG_PROC_FS
-static int proc_toshiba_show(struct seq_file *m, void *v)
+static int tosh_get_info(char *buffer, char **start, off_t fpos, int length)
 {
+	char *temp;
 	int key;
 
+	temp = buffer;
 	key = tosh_fn_status();
 
 	/* Arguments
@@ -303,7 +309,8 @@ static int proc_toshiba_show(struct seq_file *m, void *v)
 	     4) BIOS date (in SCI date format)
 	     5) Fn Key status
 	*/
-	seq_printf(m, "1.1 0x%04x %d.%d %d.%d 0x%04x 0x%02x\n",
+
+	temp += sprintf(temp, "1.1 0x%04x %d.%d %d.%d 0x%04x 0x%02x\n",
 		tosh_id,
 		(tosh_sci & 0xff00)>>8,
 		tosh_sci & 0xff,
@@ -311,7 +318,8 @@ static int proc_toshiba_show(struct seq_file *m, void *v)
 		tosh_bios & 0xff,
 		tosh_date,
 		key);
-	return 0;
+
+	return temp-buffer;
 }
 #endif
 
@@ -343,15 +351,15 @@ static void tosh_set_fn_port(void)
 /*
  * Get the machine identification number of the current model
  */
-static int tosh_get_machine_id(void __iomem *bios)
+static int tosh_get_machine_id(void)
 {
 	int id;
 	SMMRegisters regs;
 	unsigned short bx,cx;
 	unsigned long address;
 
-	id = (0x100*(int) readb(bios+0xfffe))+((int) readb(bios+0xfffa));
-
+	id = (0x100*(int) isa_readb(0xffffe))+((int) isa_readb(0xffffa));
+	
 	/* do we have a SCTTable machine identication number on our hands */
 
 	if (id==0xfc2f) {
@@ -370,18 +378,18 @@ static int tosh_get_machine_id(void __iomem *bios)
 		   value. This has been verified on a Satellite Pro 430CDT,
 		   Tecra 750CDT, Tecra 780DVD and Satellite 310CDT. */
 #if TOSH_DEBUG
-		pr_debug("toshiba: debugging ID ebx=0x%04x\n", regs.ebx);
+		printk("toshiba: debugging ID ebx=0x%04x\n", regs.ebx);
 #endif
 		bx = 0xe6f5;
 
 		/* now twiddle with our pointer a bit */
 
-		address = bx;
-		cx = readw(bios + address);
-		address = 9+bx+cx;
-		cx = readw(bios + address);
-		address = 0xa+cx;
-		cx = readw(bios + address);
+		address = 0x000f0000+bx;
+		cx = isa_readw(address);
+		address = 0x000f0009+bx+cx;
+		cx = isa_readw(address);
+		address = 0x000f000a+cx;
+		cx = isa_readw(address);
 
 		/* now construct our machine identification number */
 
@@ -404,24 +412,19 @@ static int tosh_probe(void)
 	int i,major,minor,day,year,month,flag;
 	unsigned char signature[7] = { 0x54,0x4f,0x53,0x48,0x49,0x42,0x41 };
 	SMMRegisters regs;
-	void __iomem *bios = ioremap(0xf0000, 0x10000);
-
-	if (!bios)
-		return -ENOMEM;
 
 	/* extra sanity check for the string "TOSHIBA" in the BIOS because
 	   some machines that are not Toshiba's pass the next test */
 
 	for (i=0;i<7;i++) {
-		if (readb(bios+0xe010+i)!=signature[i]) {
-			pr_err("toshiba: not a supported Toshiba laptop\n");
-			iounmap(bios);
+		if (isa_readb(0xfe010+i)!=signature[i]) {
+			printk("toshiba: not a supported Toshiba laptop\n");
 			return -ENODEV;
 		}
 	}
 
 	/* call the Toshiba SCI support check routine */
-
+	
 	regs.eax = 0xf0f0;
 	regs.ebx = 0x0000;
 	regs.ecx = 0x0000;
@@ -430,30 +433,29 @@ static int tosh_probe(void)
 	/* if this is not a Toshiba laptop carry flag is set and ah=0x86 */
 
 	if ((flag==1) || ((regs.eax & 0xff00)==0x8600)) {
-		pr_err("toshiba: not a supported Toshiba laptop\n");
-		iounmap(bios);
+		printk("toshiba: not a supported Toshiba laptop\n");
 		return -ENODEV;
 	}
 
 	/* if we get this far then we are running on a Toshiba (probably)! */
 
 	tosh_sci = regs.edx & 0xffff;
-
+	
 	/* next get the machine ID of the current laptop */
 
-	tosh_id = tosh_get_machine_id(bios);
+	tosh_id = tosh_get_machine_id();
 
 	/* get the BIOS version */
 
-	major = readb(bios+0xe009)-'0';
-	minor = ((readb(bios+0xe00b)-'0')*10)+(readb(bios+0xe00c)-'0');
+	major = isa_readb(0xfe009)-'0';
+	minor = ((isa_readb(0xfe00b)-'0')*10)+(isa_readb(0xfe00c)-'0');
 	tosh_bios = (major*0x100)+minor;
 
 	/* get the BIOS date */
 
-	day = ((readb(bios+0xfff5)-'0')*10)+(readb(bios+0xfff6)-'0');
-	month = ((readb(bios+0xfff8)-'0')*10)+(readb(bios+0xfff9)-'0');
-	year = ((readb(bios+0xfffb)-'0')*10)+(readb(bios+0xfffc)-'0');
+	day = ((isa_readb(0xffff5)-'0')*10)+(isa_readb(0xffff6)-'0');
+	month = ((isa_readb(0xffff8)-'0')*10)+(isa_readb(0xffff9)-'0');
+	year = ((isa_readb(0xffffb)-'0')*10)+(isa_readb(0xffffc)-'0');
 	tosh_date = (((year-90) & 0x1f)<<10) | ((month & 0xf)<<6)
 		| ((day & 0x1f)<<1);
 
@@ -470,20 +472,19 @@ static int tosh_probe(void)
 	if ((tosh_id==0xfccb) || (tosh_id==0xfccc))
 		tosh_fan = 1;
 
-	iounmap(bios);
-
 	return 0;
 }
 
-static int __init toshiba_init(void)
+int __init tosh_init(void)
 {
 	int retval;
 	/* are we running on a Toshiba laptop */
 
-	if (tosh_probe())
-		return -ENODEV;
+	if (tosh_probe()!=0)
+		return -EIO;
 
-	pr_info("Toshiba System Management Mode driver v" TOSH_VERSION "\n");
+	printk(KERN_INFO "Toshiba System Managment Mode driver v"
+		TOSH_VERSION"\n");
 
 	/* set the port to use for Fn status if not specified as a parameter */
 	if (tosh_fn==0x00)
@@ -491,30 +492,41 @@ static int __init toshiba_init(void)
 
 	/* register the device file */
 	retval = misc_register(&tosh_device);
-	if (retval < 0)
+	if(retval < 0)
 		return retval;
 
 #ifdef CONFIG_PROC_FS
-	{
-		struct proc_dir_entry *pde;
-
-		pde = proc_create_single("toshiba", 0, NULL, proc_toshiba_show);
-		if (!pde) {
-			misc_deregister(&tosh_device);
-			return -ENOMEM;
-		}
+	/* register the proc entry */
+	if(create_proc_info_entry("toshiba", 0, NULL, tosh_get_info) == NULL){
+		misc_deregister(&tosh_device);
+		return -ENOMEM;
 	}
 #endif
 
 	return 0;
 }
 
-static void __exit toshiba_exit(void)
+#ifdef MODULE
+int init_module(void)
 {
-	remove_proc_entry("toshiba", NULL);
-	misc_deregister(&tosh_device);
+	return tosh_init();
 }
 
-module_init(toshiba_init);
-module_exit(toshiba_exit);
+void cleanup_module(void)
+{
+	/* remove the proc entry */
+
+	remove_proc_entry("toshiba", NULL);
+
+	/* unregister the device file */
+
+	misc_deregister(&tosh_device);
+}
+#endif
+
+MODULE_LICENSE("GPL");
+MODULE_PARM_DESC(tosh_fn, "User specified Fn key detection port");
+MODULE_AUTHOR("Jonathan Buzzard <jonathan@buzzard.org.uk>");
+MODULE_DESCRIPTION("Toshiba laptop SMM driver");
+MODULE_SUPPORTED_DEVICE("toshiba");
 

@@ -1,6 +1,19 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *   Copyright (C) International Business Machines Corp., 2000-2004
+ *
+ *   This program is free software;  you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or 
+ *   (at your option) any later version.
+ * 
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY;  without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See
+ *   the GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program;  if not, write to the Free Software 
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
  */
 
 /*
@@ -32,10 +45,8 @@
 #include <linux/buffer_head.h>
 #include <linux/pagemap.h>
 #include <linux/quotaops.h>
-#include <linux/slab.h>
 
 #include "jfs_incore.h"
-#include "jfs_inode.h"
 #include "jfs_filsys.h"
 #include "jfs_dinode.h"
 #include "jfs_dmap.h"
@@ -48,20 +59,25 @@
  * imap locks
  */
 /* iag free list lock */
-#define IAGFREE_LOCK_INIT(imap)		mutex_init(&imap->im_freelock)
-#define IAGFREE_LOCK(imap)		mutex_lock(&imap->im_freelock)
-#define IAGFREE_UNLOCK(imap)		mutex_unlock(&imap->im_freelock)
+#define IAGFREE_LOCK_INIT(imap)		init_MUTEX(&imap->im_freelock)
+#define IAGFREE_LOCK(imap)		down(&imap->im_freelock)
+#define IAGFREE_UNLOCK(imap)		up(&imap->im_freelock)
 
 /* per ag iag list locks */
-#define AG_LOCK_INIT(imap,index)	mutex_init(&(imap->im_aglock[index]))
-#define AG_LOCK(imap,agno)		mutex_lock(&imap->im_aglock[agno])
-#define AG_UNLOCK(imap,agno)		mutex_unlock(&imap->im_aglock[agno])
+#define AG_LOCK_INIT(imap,index)	init_MUTEX(&(imap->im_aglock[index]))
+#define AG_LOCK(imap,agno)		down(&imap->im_aglock[agno])
+#define AG_UNLOCK(imap,agno)		up(&imap->im_aglock[agno])
+
+/*
+ * external references
+ */
+extern struct address_space_operations jfs_aops;
 
 /*
  * forward references
  */
-static int diAllocAG(struct inomap *, int, bool, struct inode *);
-static int diAllocAny(struct inomap *, int, bool, struct inode *);
+static int diAllocAG(struct inomap *, int, boolean_t, struct inode *);
+static int diAllocAny(struct inomap *, int, boolean_t, struct inode *);
 static int diAllocBit(struct inomap *, struct iag *, int);
 static int diAllocExt(struct inomap *, int, struct inode *);
 static int diAllocIno(struct inomap *, int, struct inode *);
@@ -75,21 +91,40 @@ static int copy_from_dinode(struct dinode *, struct inode *);
 static void copy_to_dinode(struct dinode *, struct inode *);
 
 /*
- * NAME:	diMount()
+ *	debug code for double-checking inode map
+ */
+/* #define	_JFS_DEBUG_IMAP	1 */
+
+#ifdef	_JFS_DEBUG_IMAP
+#define DBG_DIINIT(imap)	DBGdiInit(imap)
+#define DBG_DIALLOC(imap, ino)	DBGdiAlloc(imap, ino)
+#define DBG_DIFREE(imap, ino)	DBGdiFree(imap, ino)
+
+static void *DBGdiInit(struct inomap * imap);
+static void DBGdiAlloc(struct inomap * imap, ino_t ino);
+static void DBGdiFree(struct inomap * imap, ino_t ino);
+#else
+#define DBG_DIINIT(imap)
+#define DBG_DIALLOC(imap, ino)
+#define DBG_DIFREE(imap, ino)
+#endif				/* _JFS_DEBUG_IMAP */
+
+/*
+ * NAME:        diMount()
  *
- * FUNCTION:	initialize the incore inode map control structures for
+ * FUNCTION:    initialize the incore inode map control structures for
  *		a fileset or aggregate init time.
  *
- *		the inode map's control structure (dinomap) is
- *		brought in from disk and placed in virtual memory.
+ *              the inode map's control structure (dinomap) is 
+ *              brought in from disk and placed in virtual memory.
  *
  * PARAMETERS:
- *	ipimap	- pointer to inode map inode for the aggregate or fileset.
+ *      ipimap  - pointer to inode map inode for the aggregate or fileset.
  *
  * RETURN VALUES:
- *	0	- success
- *	-ENOMEM	- insufficient free virtual memory.
- *	-EIO	- i/o error.
+ *      0       - success
+ *      -ENOMEM  - insufficient free virtual memory.
+ *      -EIO  	- i/o error.
  */
 int diMount(struct inode *ipimap)
 {
@@ -102,9 +137,11 @@ int diMount(struct inode *ipimap)
 	 * allocate/initialize the in-memory inode map control structure
 	 */
 	/* allocate the in-memory inode map control structure. */
-	imap = kmalloc(sizeof(struct inomap), GFP_KERNEL);
-	if (imap == NULL)
+	imap = (struct inomap *) kmalloc(sizeof(struct inomap), GFP_KERNEL);
+	if (imap == NULL) {
+		jfs_err("diMount: kmalloc returned NULL!");
 		return -ENOMEM;
+	}
 
 	/* read the on-disk inode map control structure. */
 
@@ -155,23 +192,25 @@ int diMount(struct inode *ipimap)
 	imap->im_ipimap = ipimap;
 	JFS_IP(ipimap)->i_imap = imap;
 
+//      DBG_DIINIT(imap);
+
 	return (0);
 }
 
 
 /*
- * NAME:	diUnmount()
+ * NAME:        diUnmount()
  *
- * FUNCTION:	write to disk the incore inode map control structures for
+ * FUNCTION:    write to disk the incore inode map control structures for
  *		a fileset or aggregate at unmount time.
  *
  * PARAMETERS:
- *	ipimap	- pointer to inode map inode for the aggregate or fileset.
+ *      ipimap  - pointer to inode map inode for the aggregate or fileset.
  *
  * RETURN VALUES:
- *	0	- success
- *	-ENOMEM	- insufficient free virtual memory.
- *	-EIO	- i/o error.
+ *      0       - success
+ *      -ENOMEM  - insufficient free virtual memory.
+ *      -EIO  	- i/o error.
  */
 int diUnmount(struct inode *ipimap, int mounterror)
 {
@@ -245,7 +284,8 @@ int diSync(struct inode *ipimap)
 	/*
 	 * write out dirty pages of imap
 	 */
-	filemap_write_and_wait(ipimap->i_mapping);
+	filemap_fdatawrite(ipimap->i_mapping);
+	filemap_fdatawait(ipimap->i_mapping);
 
 	diWriteSpecial(ipimap, 0);
 
@@ -254,22 +294,22 @@ int diSync(struct inode *ipimap)
 
 
 /*
- * NAME:	diRead()
+ * NAME:        diRead()
  *
- * FUNCTION:	initialize an incore inode from disk.
+ * FUNCTION:    initialize an incore inode from disk.
  *
  *		on entry, the specifed incore inode should itself
  *		specify the disk inode number corresponding to the
  *		incore inode (i.e. i_number should be initialized).
- *
+ *		
  *		this routine handles incore inode initialization for
  *		both "special" and "regular" inodes.  special inodes
  *		are those required early in the mount process and
- *		require special handling since much of the file system
+ *	        require special handling since much of the file system
  *		is not yet initialized.  these "special" inodes are
  *		identified by a NULL inode map inode pointer and are
  *		actually initialized by a call to diReadSpecial().
- *
+ *		
  *		for regular inodes, the iag describing the disk inode
  *		is read from disk to determine the inode extent address
  *		for the disk inode.  with the inode extent address in
@@ -278,13 +318,13 @@ int diSync(struct inode *ipimap)
  *		incore inode.
  *
  * PARAMETERS:
- *	ip	-  pointer to incore inode to be initialized from disk.
+ *      ip  -  pointer to incore inode to be initialized from disk.
  *
  * RETURN VALUES:
- *	0	- success
- *	-EIO	- i/o error.
- *	-ENOMEM	- insufficient memory
- *
+ *      0       - success
+ *      -EIO  	- i/o error.
+ *      -ENOMEM	- insufficient memory
+ *      
  */
 int diRead(struct inode *ip)
 {
@@ -298,7 +338,7 @@ int diRead(struct inode *ip)
 	struct inomap *imap;
 	int block_offset;
 	int inodes_left;
-	unsigned long pageno;
+	uint pageno;
 	int rel_inode;
 
 	jfs_info("diRead: ino = %ld", ip->i_ino);
@@ -311,7 +351,7 @@ int diRead(struct inode *ip)
 
 	/* read the iag */
 	imap = JFS_IP(ipimap)->i_imap;
-	IREAD_LOCK(ipimap, RDWRLOCK_IMAP);
+	IREAD_LOCK(ipimap);
 	rc = diIAGRead(imap, iagno, &mp);
 	IREAD_UNLOCK(ipimap);
 	if (rc) {
@@ -361,17 +401,17 @@ int diRead(struct inode *ip)
 
 	/* read the page of disk inode */
 	mp = read_metapage(ipimap, pageno << sbi->l2nbperpage, PSIZE, 1);
-	if (!mp) {
+	if (mp == 0) {
 		jfs_err("diRead: read_metapage failed");
 		return -EIO;
 	}
 
-	/* locate the disk inode requested */
+	/* locate the the disk inode requested */
 	dp = (struct dinode *) mp->data;
 	dp += rel_inode;
 
 	if (ip->i_ino != le32_to_cpu(dp->di_number)) {
-		jfs_error(ip->i_sb, "i_ino != di_number\n");
+		jfs_error(ip->i_sb, "diRead: i_ino != di_number");
 		rc = -EIO;
 	} else if (le32_to_cpu(dp->di_nlink) == 0)
 		rc = -ESTALE;
@@ -382,7 +422,7 @@ int diRead(struct inode *ip)
 	release_metapage(mp);
 
 	/* set the ag for the inode */
-	JFS_IP(ip)->agstart = agstart;
+	JFS_IP(ip)->agno = BLKTOAG(agstart, sbi);
 	JFS_IP(ip)->active_ag = -1;
 
 	return (rc);
@@ -390,26 +430,26 @@ int diRead(struct inode *ip)
 
 
 /*
- * NAME:	diReadSpecial()
+ * NAME:        diReadSpecial()
  *
- * FUNCTION:	initialize a 'special' inode from disk.
+ * FUNCTION:    initialize a 'special' inode from disk.
  *
  *		this routines handles aggregate level inodes.  The
  *		inode cache cannot differentiate between the
  *		aggregate inodes and the filesystem inodes, so we
  *		handle these here.  We don't actually use the aggregate
- *		inode map, since these inodes are at a fixed location
+ *	        inode map, since these inodes are at a fixed location
  *		and in some cases the aggregate inode map isn't initialized
  *		yet.
  *
  * PARAMETERS:
- *	sb - filesystem superblock
+ *      sb - filesystem superblock
  *	inum - aggregate inode number
  *	secondary - 1 if secondary aggregate inode table
  *
  * RETURN VALUES:
- *	new inode	- success
- *	NULL		- i/o error.
+ *      new inode	- success
+ *      NULL		- i/o error.
  */
 struct inode *diReadSpecial(struct super_block *sb, ino_t inum, int secondary)
 {
@@ -442,7 +482,7 @@ struct inode *diReadSpecial(struct super_block *sb, ino_t inum, int secondary)
 	/* read the page of fixed disk inode (AIT) in raw mode */
 	mp = read_metapage(ip, address << sbi->l2nbperpage, PSIZE, 1);
 	if (mp == NULL) {
-		set_nlink(ip, 1);	/* Don't want iput() deleting it */
+		ip->i_nlink = 1;	/* Don't want iput() deleting it */
 		iput(ip);
 		return (NULL);
 	}
@@ -454,7 +494,7 @@ struct inode *diReadSpecial(struct super_block *sb, ino_t inum, int secondary)
 	/* copy on-disk inode to in-memory inode */
 	if ((copy_from_dinode(dp, ip)) != 0) {
 		/* handle bad return by returning NULL for ip */
-		set_nlink(ip, 1);	/* Don't want iput() deleting it */
+		ip->i_nlink = 1;	/* Don't want iput() deleting it */
 		iput(ip);
 		/* release the page */
 		release_metapage(mp);
@@ -462,7 +502,7 @@ struct inode *diReadSpecial(struct super_block *sb, ino_t inum, int secondary)
 
 	}
 
-	ip->i_mapping->a_ops = &jfs_metapage_aops;
+	ip->i_mapping->a_ops = &jfs_aops;
 	mapping_set_gfp_mask(ip->i_mapping, GFP_NOFS);
 
 	/* Allocations to metadata inodes should not affect quotas */
@@ -476,18 +516,16 @@ struct inode *diReadSpecial(struct super_block *sb, ino_t inum, int secondary)
 	/* release the page */
 	release_metapage(mp);
 
-	inode_fake_hash(ip);
-
 	return (ip);
 }
 
 /*
- * NAME:	diWriteSpecial()
+ * NAME:        diWriteSpecial()
  *
- * FUNCTION:	Write the special inode to disk
+ * FUNCTION:    Write the special inode to disk
  *
  * PARAMETERS:
- *	ip - special inode
+ *      ip - special inode
  *	secondary - 1 if secondary aggregate inode table
  *
  * RETURN VALUES: none
@@ -501,6 +539,8 @@ void diWriteSpecial(struct inode *ip, int secondary)
 	ino_t inum = ip->i_ino;
 	struct metapage *mp;
 
+	ip->i_state &= ~I_DIRTY;
+
 	if (secondary)
 		address = addressPXD(&sbi->ait2) >> sbi->l2nbperpage;
 	else
@@ -513,7 +553,8 @@ void diWriteSpecial(struct inode *ip, int secondary)
 	/* read the page of fixed disk inode (AIT) in raw mode */
 	mp = read_metapage(ip, address << sbi->l2nbperpage, PSIZE, 1);
 	if (mp == NULL) {
-		jfs_err("diWriteSpecial: failed to read aggregate inode extent!");
+		jfs_err("diWriteSpecial: failed to read aggregate inode "
+			"extent!");
 		return;
 	}
 
@@ -533,9 +574,9 @@ void diWriteSpecial(struct inode *ip, int secondary)
 }
 
 /*
- * NAME:	diFreeSpecial()
+ * NAME:        diFreeSpecial()
  *
- * FUNCTION:	Free allocated space for special inode
+ * FUNCTION:    Free allocated space for special inode
  */
 void diFreeSpecial(struct inode *ip)
 {
@@ -543,7 +584,8 @@ void diFreeSpecial(struct inode *ip)
 		jfs_err("diFreeSpecial called with NULL ip!");
 		return;
 	}
-	filemap_write_and_wait(ip->i_mapping);
+	filemap_fdatawrite(ip->i_mapping);
+	filemap_fdatawait(ip->i_mapping);
 	truncate_inode_pages(ip->i_mapping, 0);
 	iput(ip);
 }
@@ -551,9 +593,9 @@ void diFreeSpecial(struct inode *ip)
 
 
 /*
- * NAME:	diWrite()
+ * NAME:        diWrite()
  *
- * FUNCTION:	write the on-disk inode portion of the in-memory inode
+ * FUNCTION:    write the on-disk inode portion of the in-memory inode
  *		to its corresponding on-disk inode.
  *
  *		on entry, the specifed incore inode should itself
@@ -565,14 +607,14 @@ void diFreeSpecial(struct inode *ip)
  *		page of the extent that contains the disk inode is
  *		read and the disk inode portion of the incore inode
  *		is copied to the disk inode.
- *
+ *		
  * PARAMETERS:
  *	tid -  transacation id
- *	ip  -  pointer to incore inode to be written to the inode extent.
+ *      ip  -  pointer to incore inode to be written to the inode extent.
  *
  * RETURN VALUES:
- *	0	- success
- *	-EIO	- i/o error.
+ *      0       - success
+ *      -EIO  	- i/o error.
  */
 int diWrite(tid_t tid, struct inode *ip)
 {
@@ -585,7 +627,7 @@ int diWrite(tid_t tid, struct inode *ip)
 	int block_offset;
 	int inodes_left;
 	struct metapage *mp;
-	unsigned long pageno;
+	uint pageno;
 	int rel_inode;
 	int dioffset;
 	struct inode *ipimap;
@@ -603,7 +645,7 @@ int diWrite(tid_t tid, struct inode *ip)
 	if (!addressPXD(&(jfs_ip->ixpxd)) ||
 	    (lengthPXD(&(jfs_ip->ixpxd)) !=
 	     JFS_IP(ipimap)->i_imap->im_nbperiext)) {
-		jfs_error(ip->i_sb, "ixpxd invalid\n");
+		jfs_error(ip->i_sb, "diWrite: ixpxd invalid");
 		return -EIO;
 	}
 
@@ -633,7 +675,7 @@ int diWrite(tid_t tid, struct inode *ip)
 	/* read the page of disk inode */
       retry:
 	mp = read_metapage(ipimap, pageno << sbi->l2nbperpage, PSIZE, 1);
-	if (!mp)
+	if (mp == 0)
 		return -EIO;
 
 	/* get the pointer to the disk inode */
@@ -655,11 +697,11 @@ int diWrite(tid_t tid, struct inode *ip)
 	 * copy btree root from in-memory inode to on-disk inode
 	 *
 	 * (tlock is taken from inline B+-tree root in in-memory
-	 * inode when the B+-tree root is updated, which is pointed
+	 * inode when the B+-tree root is updated, which is pointed 
 	 * by jfs_ip->blid as well as being on tx tlock list)
 	 *
-	 * further processing of btree root is based on the copy
-	 * in in-memory inode, where txLog() will log from, and,
+	 * further processing of btree root is based on the copy 
+	 * in in-memory inode, where txLog() will log from, and, 
 	 * for xtree root, txUpdateMap() will update map and reset
 	 * XAD_NEW bit;
 	 */
@@ -709,7 +751,7 @@ int diWrite(tid_t tid, struct inode *ip)
 	ilinelock = (struct linelock *) & tlck->lock;
 
 	/*
-	 *	regular file: 16 byte (XAD slot) granularity
+	 *      regular file: 16 byte (XAD slot) granularity
 	 */
 	if (type & tlckXTREE) {
 		xtpage_t *p, *xp;
@@ -734,7 +776,7 @@ int diWrite(tid_t tid, struct inode *ip)
 				xad->flag &= ~(XAD_NEW | XAD_EXTENDED);
 	}
 	/*
-	 *	directory: 32 byte (directory entry slot) granularity
+	 *      directory: 32 byte (directory entry slot) granularity
 	 */
 	else if (type & tlckDTREE) {
 		dtpage_t *p, *xp;
@@ -761,7 +803,7 @@ int diWrite(tid_t tid, struct inode *ip)
 		lv = & dilinelock->lv[dilinelock->index];
 		lv->offset = (dioffset + 2 * 128) >> L2INODESLOTSIZE;
 		lv->length = 2;
-		memcpy(&dp->di_inline_all, jfs_ip->i_inline_all, IDATASIZE);
+		memcpy(&dp->di_fastsymlink, jfs_ip->i_inline, IDATASIZE);
 		dilinelock->index++;
 	}
 	/*
@@ -779,8 +821,9 @@ int diWrite(tid_t tid, struct inode *ip)
 	}
 
 	/*
-	 *	lock/copy inode base: 128 byte slot granularity
+	 *      lock/copy inode base: 128 byte slot granularity
 	 */
+// baseDinode:
 	lv = & dilinelock->lv[dilinelock->index];
 	lv->offset = dioffset >> L2INODESLOTSIZE;
 	copy_to_dinode(dp, ip);
@@ -791,7 +834,18 @@ int diWrite(tid_t tid, struct inode *ip)
 		lv->length = 1;
 	dilinelock->index++;
 
-	/* release the buffer holding the updated on-disk inode.
+#ifdef _JFS_FASTDASD
+	/*
+	 * We aren't logging changes to the DASD used in directory inodes,
+	 * but we need to write them to disk.  If we don't unmount cleanly,
+	 * mount will recalculate the DASD used.
+	 */
+	if (S_ISDIR(ip->i_mode)
+	    && (ip->i_ipmnt->i_mntflag & JFS_DASD_ENABLED))
+		memcpy(&dp->di_DASD, &ip->i_DASD, sizeof(struct dasd));
+#endif				/*  _JFS_FASTDASD */
+
+	/* release the buffer holding the updated on-disk inode. 
 	 * the buffer will be later written by commit processing.
 	 */
 	write_metapage(mp);
@@ -801,15 +855,15 @@ int diWrite(tid_t tid, struct inode *ip)
 
 
 /*
- * NAME:	diFree(ip)
+ * NAME:        diFree(ip)
  *
- * FUNCTION:	free a specified inode from the inode working map
+ * FUNCTION:    free a specified inode from the inode working map
  *		for a fileset or aggregate.
  *
  *		if the inode to be freed represents the first (only)
  *		free inode within the iag, the iag will be placed on
  *		the ag free inode list.
- *
+ *	
  *		freeing the inode will cause the inode extent to be
  *		freed if the inode is the only allocated inode within
  *		the extent.  in this case all the disk resource backing
@@ -832,11 +886,11 @@ int diWrite(tid_t tid, struct inode *ip)
  *		any updates and are held until all updates are complete.
  *
  * PARAMETERS:
- *	ip	- inode to be freed.
+ *      ip  	- inode to be freed.
  *
  * RETURN VALUES:
- *	0	- success
- *	-EIO	- i/o error.
+ *      0       - success
+ *      -EIO  	- i/o error.
  */
 int diFree(struct inode *ip)
 {
@@ -865,20 +919,20 @@ int diFree(struct inode *ip)
 	 */
 	iagno = INOTOIAG(inum);
 
-	/* make sure that the iag is contained within
+	/* make sure that the iag is contained within 
 	 * the map.
 	 */
 	if (iagno >= imap->im_nextiag) {
-		print_hex_dump(KERN_ERR, "imap: ", DUMP_PREFIX_ADDRESS, 16, 4,
-			       imap, 32, 0);
-		jfs_error(ip->i_sb, "inum = %d, iagno = %d, nextiag = %d\n",
+		dump_mem("imap", imap, 32);
+		jfs_error(ip->i_sb,
+			  "diFree: inum = %d, iagno = %d, nextiag = %d",
 			  (uint) inum, iagno, imap->im_nextiag);
 		return -EIO;
 	}
 
 	/* get the allocation group for this ino.
 	 */
-	agno = BLKTOAG(JFS_IP(ip)->agstart, JFS_SBI(ip->i_sb));
+	agno = JFS_IP(ip)->agno;
 
 	/* Lock the AG specific inode map information
 	 */
@@ -887,7 +941,7 @@ int diFree(struct inode *ip)
 	/* Obtain read lock in imap inode.  Don't release it until we have
 	 * read all of the IAG's that we are going to.
 	 */
-	IREAD_LOCK(ipimap, RDWRLOCK_IMAP);
+	IREAD_LOCK(ipimap);
 
 	/* read the iag.
 	 */
@@ -907,14 +961,15 @@ int diFree(struct inode *ip)
 	mask = HIGHORDER >> bitno;
 
 	if (!(le32_to_cpu(iagp->wmap[extno]) & mask)) {
-		jfs_error(ip->i_sb, "wmap shows inode already free\n");
+		jfs_error(ip->i_sb,
+			  "diFree: wmap shows inode already free");
 	}
 
 	if (!addressPXD(&iagp->inoext[extno])) {
 		release_metapage(mp);
 		IREAD_UNLOCK(ipimap);
 		AG_UNLOCK(imap, agno);
-		jfs_error(ip->i_sb, "invalid inoext\n");
+		jfs_error(ip->i_sb, "diFree: invalid inoext");
 		return -EIO;
 	}
 
@@ -926,12 +981,12 @@ int diFree(struct inode *ip)
 		release_metapage(mp);
 		IREAD_UNLOCK(ipimap);
 		AG_UNLOCK(imap, agno);
-		jfs_error(ip->i_sb, "numfree > numinos\n");
+		jfs_error(ip->i_sb, "diFree: numfree > numinos");
 		return -EIO;
 	}
 	/*
-	 *	inode extent still has some inodes or below low water mark:
-	 *	keep the inode extent;
+	 *      inode extent still has some inodes or below low water mark:
+	 *      keep the inode extent;
 	 */
 	if (bitmap ||
 	    imap->im_agctl[agno].numfree < 96 ||
@@ -979,7 +1034,7 @@ int diFree(struct inode *ip)
 
 		/* update the free inode summary map for the extent if
 		 * freeing the inode means the extent will now have free
-		 * inodes (i.e., the inode being freed is the first free
+		 * inodes (i.e., the inode being freed is the first free 
 		 * inode of extent),
 		 */
 		if (iagp->wmap[extno] == cpu_to_le32(ONES)) {
@@ -992,11 +1047,13 @@ int diFree(struct inode *ip)
 		/* update the bitmap.
 		 */
 		iagp->wmap[extno] = cpu_to_le32(bitmap);
+		DBG_DIFREE(imap, inum);
 
 		/* update the free inode counts at the iag, ag and
 		 * map level.
 		 */
-		le32_add_cpu(&iagp->nfreeinos, 1);
+		iagp->nfreeinos =
+		    cpu_to_le32(le32_to_cpu(iagp->nfreeinos) + 1);
 		imap->im_agctl[agno].numfree += 1;
 		atomic_inc(&imap->im_numfree);
 
@@ -1012,12 +1069,12 @@ int diFree(struct inode *ip)
 
 
 	/*
-	 *	inode extent has become free and above low water mark:
-	 *	free the inode extent;
+	 *      inode extent has become free and above low water mark:
+	 *      free the inode extent;
 	 */
 
 	/*
-	 *	prepare to update iag list(s) (careful update step 1)
+	 *      prepare to update iag list(s) (careful update step 1)
 	 */
 	amp = bmp = cmp = dmp = NULL;
 	fwd = back = -1;
@@ -1045,7 +1102,7 @@ int diFree(struct inode *ip)
 		 */
 		if (iagp->nfreeexts == cpu_to_le32(EXTSPERIAG - 1)) {
 			/* in preparation for removing the iag from the
-			 * ag extent free list, read the iags preceding
+			 * ag extent free list, read the iags preceeding
 			 * and following the iag on the ag extent free
 			 * list.
 			 */
@@ -1071,7 +1128,7 @@ int diFree(struct inode *ip)
 		int inofreefwd = le32_to_cpu(iagp->inofreefwd);
 
 		/* in preparation for removing the iag from the
-		 * ag inode free list, read the iags preceding
+		 * ag inode free list, read the iags preceeding
 		 * and following the iag on the ag inode free
 		 * list.  before reading these iags, we must make
 		 * sure that we already don't have them in hand
@@ -1117,7 +1174,7 @@ int diFree(struct inode *ip)
 	invalidate_pxd_metapages(ip, freepxd);
 
 	/*
-	 *	update iag list(s) (careful update step 2)
+	 *      update iag list(s) (careful update step 2)
 	 */
 	/* add the iag to the ag extent free list if this is the
 	 * first free extent for the iag.
@@ -1169,21 +1226,22 @@ int diFree(struct inode *ip)
 		iagp->inofreefwd = iagp->inofreeback = cpu_to_le32(-1);
 	}
 
-	/* update the inode extent address and working map
+	/* update the inode extent address and working map 
 	 * to reflect the free extent.
-	 * the permanent map should have been updated already
+	 * the permanent map should have been updated already 
 	 * for the inode being freed.
 	 */
 	if (iagp->pmap[extno] != 0) {
-		jfs_error(ip->i_sb, "the pmap does not show inode free\n");
+		jfs_error(ip->i_sb, "diFree: the pmap does not show inode free");
 	}
 	iagp->wmap[extno] = 0;
+	DBG_DIFREE(imap, inum);
 	PXDlength(&iagp->inoext[extno], 0);
 	PXDaddress(&iagp->inoext[extno], 0);
 
 	/* update the free extent and free inode summary maps
 	 * to reflect the freed extent.
-	 * the inode summary map is marked to indicate no inodes
+	 * the inode summary map is marked to indicate no inodes 
 	 * available for the freed extent.
 	 */
 	sword = extno >> L2EXTSPERSUM;
@@ -1195,8 +1253,9 @@ int diFree(struct inode *ip)
 	/* update the number of free inodes and number of free extents
 	 * for the iag.
 	 */
-	le32_add_cpu(&iagp->nfreeinos, -(INOSPEREXT - 1));
-	le32_add_cpu(&iagp->nfreeexts, 1);
+	iagp->nfreeinos = cpu_to_le32(le32_to_cpu(iagp->nfreeinos) -
+				      (INOSPEREXT - 1));
+	iagp->nfreeexts = cpu_to_le32(le32_to_cpu(iagp->nfreeexts) + 1);
 
 	/* update the number of free inodes and backed inodes
 	 * at the ag and inode map level.
@@ -1219,17 +1278,17 @@ int diFree(struct inode *ip)
 	 * start transaction to update block allocation map
 	 * for the inode extent freed;
 	 *
-	 * N.B. AG_LOCK is released and iag will be released below, and
+	 * N.B. AG_LOCK is released and iag will be released below, and 
 	 * other thread may allocate inode from/reusing the ixad freed
-	 * BUT with new/different backing inode extent from the extent
-	 * to be freed by the transaction;
+	 * BUT with new/different backing inode extent from the extent 
+	 * to be freed by the transaction;  
 	 */
 	tid = txBegin(ipimap->i_sb, COMMIT_FORCE);
-	mutex_lock(&JFS_IP(ipimap)->commit_mutex);
+	down(&JFS_IP(ipimap)->commit_sem);
 
-	/* acquire tlock of the iag page of the freed ixad
+	/* acquire tlock of the iag page of the freed ixad 
 	 * to force the page NOHOMEOK (even though no data is
-	 * logged from the iag page) until NOREDOPAGE|FREEXTENT log
+	 * logged from the iag page) until NOREDOPAGE|FREEXTENT log 
 	 * for the free of the extent is committed;
 	 * write FREEXTENT|NOREDOPAGE log record
 	 * N.B. linelock is overlaid as freed extent descriptor;
@@ -1248,8 +1307,8 @@ int diFree(struct inode *ip)
 	 * logredo needs the IAG number and IAG extent index in order
 	 * to ensure that the IMap is consistent.  The least disruptive
 	 * way to pass these values through  to the transaction manager
-	 * is in the iplist array.
-	 *
+	 * is in the iplist array.  
+	 * 
 	 * It's not pretty, but it works.
 	 */
 	iplist[1] = (struct inode *) (size_t)iagno;
@@ -1258,7 +1317,7 @@ int diFree(struct inode *ip)
 	rc = txCommit(tid, 1, &iplist[0], COMMIT_FORCE);
 
 	txEnd(tid);
-	mutex_unlock(&JFS_IP(ipimap)->commit_mutex);
+	up(&JFS_IP(ipimap)->commit_sem);
 
 	/* unlock the AG inode map information */
 	AG_UNLOCK(imap, agno);
@@ -1291,32 +1350,34 @@ int diFree(struct inode *ip)
 static inline void
 diInitInode(struct inode *ip, int iagno, int ino, int extno, struct iag * iagp)
 {
+	struct jfs_sb_info *sbi = JFS_SBI(ip->i_sb);
 	struct jfs_inode_info *jfs_ip = JFS_IP(ip);
 
 	ip->i_ino = (iagno << L2INOSPERIAG) + ino;
+	DBG_DIALLOC(JFS_IP(ipimap)->i_imap, ip->i_ino);
 	jfs_ip->ixpxd = iagp->inoext[extno];
-	jfs_ip->agstart = le64_to_cpu(iagp->agstart);
+	jfs_ip->agno = BLKTOAG(le64_to_cpu(iagp->agstart), sbi);
 	jfs_ip->active_ag = -1;
 }
 
 
 /*
- * NAME:	diAlloc(pip,dir,ip)
+ * NAME:        diAlloc(pip,dir,ip)
  *
- * FUNCTION:	allocate a disk inode from the inode working map
+ * FUNCTION:    allocate a disk inode from the inode working map 
  *		for a fileset or aggregate.
  *
  * PARAMETERS:
- *	pip	- pointer to incore inode for the parent inode.
- *	dir	- 'true' if the new disk inode is for a directory.
- *	ip	- pointer to a new inode
+ *      pip  	- pointer to incore inode for the parent inode.
+ *      dir  	- TRUE if the new disk inode is for a directory.
+ *      ip  	- pointer to a new inode
  *
  * RETURN VALUES:
- *	0	- success.
- *	-ENOSPC	- insufficient disk resources.
- *	-EIO	- i/o error.
+ *      0       - success.
+ *      -ENOSPC	- insufficient disk resources.
+ *      -EIO  	- i/o error.
  */
-int diAlloc(struct inode *pip, bool dir, struct inode *ip)
+int diAlloc(struct inode *pip, boolean_t dir, struct inode *ip)
 {
 	int rc, ino, iagno, addext, extno, bitno, sword;
 	int nwords, rem, i, agno;
@@ -1335,10 +1396,10 @@ int diAlloc(struct inode *pip, bool dir, struct inode *ip)
 	JFS_IP(ip)->ipimap = ipimap;
 	JFS_IP(ip)->fileset = FILESYSTEM_I;
 
-	/* for a directory, the allocation policy is to start
+	/* for a directory, the allocation policy is to start 
 	 * at the ag level using the preferred ag.
 	 */
-	if (dir) {
+	if (dir == TRUE) {
 		agno = dbNextAG(JFS_SBI(pip->i_sb)->ipbmap);
 		AG_LOCK(imap, agno);
 		goto tryag;
@@ -1354,7 +1415,7 @@ int diAlloc(struct inode *pip, bool dir, struct inode *ip)
 	 */
 
 	/* get the ag number of this iag */
-	agno = BLKTOAG(JFS_IP(pip)->agstart, JFS_SBI(pip->i_sb));
+	agno = JFS_IP(pip)->agno;
 
 	if (atomic_read(&JFS_SBI(pip->i_sb)->bmap->db_active[agno])) {
 		/*
@@ -1370,7 +1431,7 @@ int diAlloc(struct inode *pip, bool dir, struct inode *ip)
 	inum = pip->i_ino + 1;
 	ino = inum & (INOSPERIAG - 1);
 
-	/* back off the hint if it is outside of the iag */
+	/* back off the the hint if it is outside of the iag */
 	if (ino == 0)
 		inum = pip->i_ino;
 
@@ -1378,7 +1439,7 @@ int diAlloc(struct inode *pip, bool dir, struct inode *ip)
 	AG_LOCK(imap, agno);
 
 	/* Get read lock on imap inode */
-	IREAD_LOCK(ipimap, RDWRLOCK_IMAP);
+	IREAD_LOCK(ipimap);
 
 	/* get the iag number and read the iag */
 	iagno = INOTOIAG(inum);
@@ -1396,9 +1457,9 @@ int diAlloc(struct inode *pip, bool dir, struct inode *ip)
 	addext = (imap->im_agctl[agno].numfree < 32 && iagp->nfreeexts);
 
 	/*
-	 *	try to allocate from the IAG
+	 *      try to allocate from the IAG
 	 */
-	/* check if the inode may be allocated from the iag
+	/* check if the inode may be allocated from the iag 
 	 * (i.e. the inode has free inodes or new extent can be added).
 	 */
 	if (iagp->nfreeinos || addext) {
@@ -1453,7 +1514,7 @@ int diAlloc(struct inode *pip, bool dir, struct inode *ip)
 		 * hint or, if appropriate (i.e. addext is true), allocate
 		 * an extent of free inodes at or following the extent
 		 * containing the hint.
-		 *
+		 * 
 		 * the free inode and free extent summary maps are used
 		 * here, so determine the starting summary map position
 		 * and the number of words we'll have to examine.  again,
@@ -1469,7 +1530,7 @@ int diAlloc(struct inode *pip, bool dir, struct inode *ip)
 		/* mask any prior bits for the starting words of the
 		 * summary map.
 		 */
-		mask = (bitno == 0) ? 0 : (ONES << (EXTSPERSUM - bitno));
+		mask = ONES << (EXTSPERSUM - bitno);
 		inosmap = le32_to_cpu(iagp->inosmap[sword]) | mask;
 		extsmap = le32_to_cpu(iagp->extsmap[sword]) | mask;
 
@@ -1494,8 +1555,9 @@ int diAlloc(struct inode *pip, bool dir, struct inode *ip)
 					release_metapage(mp);
 					AG_UNLOCK(imap, agno);
 					jfs_error(ip->i_sb,
-						  "can't find free bit in wmap\n");
-					return -EIO;
+						  "diAlloc: can't find free bit "
+						  "in wmap");
+					return EIO;
 				}
 
 				/* determine the inode number within the
@@ -1595,15 +1657,15 @@ int diAlloc(struct inode *pip, bool dir, struct inode *ip)
 
 
 /*
- * NAME:	diAllocAG(imap,agno,dir,ip)
+ * NAME:        diAllocAG(imap,agno,dir,ip)
  *
- * FUNCTION:	allocate a disk inode from the allocation group.
+ * FUNCTION:    allocate a disk inode from the allocation group.
  *
  *		this routine first determines if a new extent of free
  *		inodes should be added for the allocation group, with
  *		the current request satisfied from this extent. if this
  *		is the case, an attempt will be made to do just that.  if
- *		this attempt fails or it has been determined that a new
+ *		this attempt fails or it has been determined that a new 
  *		extent should not be added, an attempt is made to satisfy
  *		the request by allocating an existing (backed) free inode
  *		from the allocation group.
@@ -1611,31 +1673,31 @@ int diAlloc(struct inode *pip, bool dir, struct inode *ip)
  * PRE CONDITION: Already have the AG lock for this AG.
  *
  * PARAMETERS:
- *	imap	- pointer to inode map control structure.
- *	agno	- allocation group to allocate from.
- *	dir	- 'true' if the new disk inode is for a directory.
- *	ip	- pointer to the new inode to be filled in on successful return
+ *      imap  	- pointer to inode map control structure.
+ *      agno  	- allocation group to allocate from.
+ *      dir  	- TRUE if the new disk inode is for a directory.
+ *      ip  	- pointer to the new inode to be filled in on successful return
  *		  with the disk inode number allocated, its extent address
  *		  and the start of the ag.
  *
  * RETURN VALUES:
- *	0	- success.
- *	-ENOSPC	- insufficient disk resources.
- *	-EIO	- i/o error.
+ *      0       - success.
+ *      -ENOSPC	- insufficient disk resources.
+ *      -EIO  	- i/o error.
  */
 static int
-diAllocAG(struct inomap * imap, int agno, bool dir, struct inode *ip)
+diAllocAG(struct inomap * imap, int agno, boolean_t dir, struct inode *ip)
 {
 	int rc, addext, numfree, numinos;
 
-	/* get the number of free and the number of backed disk
+	/* get the number of free and the number of backed disk 
 	 * inodes currently within the ag.
 	 */
 	numfree = imap->im_agctl[agno].numfree;
 	numinos = imap->im_agctl[agno].numinos;
 
 	if (numfree > numinos) {
-		jfs_error(ip->i_sb, "numfree > numinos\n");
+		jfs_error(ip->i_sb, "diAllocAG: numfree > numinos");
 		return -EIO;
 	}
 
@@ -1644,7 +1706,7 @@ diAllocAG(struct inomap * imap, int agno, bool dir, struct inode *ip)
 	 * if there are a small number of free inodes or number of free
 	 * inodes is a small percentage of the number of backed inodes.
 	 */
-	if (dir)
+	if (dir == TRUE)
 		addext = (numfree < 64 ||
 			  (numfree < 256
 			   && ((numfree * 100) / numinos) <= 20));
@@ -1655,7 +1717,7 @@ diAllocAG(struct inomap * imap, int agno, bool dir, struct inode *ip)
 	 * try to allocate a new extent of free inodes.
 	 */
 	if (addext) {
-		/* if free space is not available for this new extent, try
+		/* if free space is not avaliable for this new extent, try
 		 * below to allocate a free and existing (already backed)
 		 * inode from the ag.
 		 */
@@ -1671,9 +1733,9 @@ diAllocAG(struct inomap * imap, int agno, bool dir, struct inode *ip)
 
 
 /*
- * NAME:	diAllocAny(imap,agno,dir,iap)
+ * NAME:        diAllocAny(imap,agno,dir,iap)
  *
- * FUNCTION:	allocate a disk inode from any other allocation group.
+ * FUNCTION:    allocate a disk inode from any other allocation group.
  *
  *		this routine is called when an allocation attempt within
  *		the primary allocation group has failed. if attempts to
@@ -1681,26 +1743,26 @@ diAllocAG(struct inomap * imap, int agno, bool dir, struct inode *ip)
  *		specified primary group.
  *
  * PARAMETERS:
- *	imap	- pointer to inode map control structure.
- *	agno	- primary allocation group (to avoid).
- *	dir	- 'true' if the new disk inode is for a directory.
- *	ip	- pointer to a new inode to be filled in on successful return
+ *      imap  	- pointer to inode map control structure.
+ *      agno  	- primary allocation group (to avoid).
+ *      dir  	- TRUE if the new disk inode is for a directory.
+ *      ip  	- pointer to a new inode to be filled in on successful return
  *		  with the disk inode number allocated, its extent address
  *		  and the start of the ag.
  *
  * RETURN VALUES:
- *	0	- success.
- *	-ENOSPC	- insufficient disk resources.
- *	-EIO	- i/o error.
+ *      0       - success.
+ *      -ENOSPC	- insufficient disk resources.
+ *      -EIO  	- i/o error.
  */
 static int
-diAllocAny(struct inomap * imap, int agno, bool dir, struct inode *ip)
+diAllocAny(struct inomap * imap, int agno, boolean_t dir, struct inode *ip)
 {
 	int ag, rc;
 	int maxag = JFS_SBI(imap->im_ipimap->i_sb)->bmap->db_maxag;
 
 
-	/* try to allocate from the ags following agno up to
+	/* try to allocate from the ags following agno up to 
 	 * the maximum ag number.
 	 */
 	for (ag = agno + 1; ag <= maxag; ag++) {
@@ -1734,29 +1796,29 @@ diAllocAny(struct inomap * imap, int agno, bool dir, struct inode *ip)
 
 
 /*
- * NAME:	diAllocIno(imap,agno,ip)
+ * NAME:        diAllocIno(imap,agno,ip)
  *
- * FUNCTION:	allocate a disk inode from the allocation group's free
+ * FUNCTION:    allocate a disk inode from the allocation group's free
  *		inode list, returning an error if this free list is
  *		empty (i.e. no iags on the list).
  *
  *		allocation occurs from the first iag on the list using
  *		the iag's free inode summary map to find the leftmost
- *		free inode in the iag.
- *
+ *		free inode in the iag. 
+ *		
  * PRE CONDITION: Already have AG lock for this AG.
- *
+ *		
  * PARAMETERS:
- *	imap	- pointer to inode map control structure.
- *	agno	- allocation group.
- *	ip	- pointer to new inode to be filled in on successful return
+ *      imap  	- pointer to inode map control structure.
+ *      agno  	- allocation group.
+ *      ip  	- pointer to new inode to be filled in on successful return
  *		  with the disk inode number allocated, its extent address
  *		  and the start of the ag.
  *
  * RETURN VALUES:
- *	0	- success.
- *	-ENOSPC	- insufficient disk resources.
- *	-EIO	- i/o error.
+ *      0       - success.
+ *      -ENOSPC	- insufficient disk resources.
+ *      -EIO  	- i/o error.
  */
 static int diAllocIno(struct inomap * imap, int agno, struct inode *ip)
 {
@@ -1770,7 +1832,7 @@ static int diAllocIno(struct inomap * imap, int agno, struct inode *ip)
 		return -ENOSPC;
 
 	/* obtain read lock on imap inode */
-	IREAD_LOCK(imap->im_ipimap, RDWRLOCK_IMAP);
+	IREAD_LOCK(imap->im_ipimap);
 
 	/* read the iag at the head of the list.
 	 */
@@ -1786,7 +1848,8 @@ static int diAllocIno(struct inomap * imap, int agno, struct inode *ip)
 	if (!iagp->nfreeinos) {
 		IREAD_UNLOCK(imap->im_ipimap);
 		release_metapage(mp);
-		jfs_error(ip->i_sb, "nfreeinos = 0, but iag on freelist\n");
+		jfs_error(ip->i_sb,
+			  "diAllocIno: nfreeinos = 0, but iag on freelist");
 		return -EIO;
 	}
 
@@ -1798,7 +1861,7 @@ static int diAllocIno(struct inomap * imap, int agno, struct inode *ip)
 			IREAD_UNLOCK(imap->im_ipimap);
 			release_metapage(mp);
 			jfs_error(ip->i_sb,
-				  "free inode not found in summary map\n");
+				  "diAllocIno: free inode not found in summary map");
 			return -EIO;
 		}
 
@@ -1813,7 +1876,7 @@ static int diAllocIno(struct inomap * imap, int agno, struct inode *ip)
 	if (rem >= EXTSPERSUM) {
 		IREAD_UNLOCK(imap->im_ipimap);
 		release_metapage(mp);
-		jfs_error(ip->i_sb, "no free extent found\n");
+		jfs_error(ip->i_sb, "diAllocIno: no free extent found");
 		return -EIO;
 	}
 	extno = (sword << L2EXTSPERSUM) + rem;
@@ -1824,11 +1887,11 @@ static int diAllocIno(struct inomap * imap, int agno, struct inode *ip)
 	if (rem >= INOSPEREXT) {
 		IREAD_UNLOCK(imap->im_ipimap);
 		release_metapage(mp);
-		jfs_error(ip->i_sb, "free inode not found\n");
+		jfs_error(ip->i_sb, "diAllocIno: free inode not found");
 		return -EIO;
 	}
 
-	/* compute the inode number within the iag.
+	/* compute the inode number within the iag. 
 	 */
 	ino = (extno << L2INOSPEREXT) + rem;
 
@@ -1851,19 +1914,19 @@ static int diAllocIno(struct inomap * imap, int agno, struct inode *ip)
 
 
 /*
- * NAME:	diAllocExt(imap,agno,ip)
+ * NAME:        diAllocExt(imap,agno,ip)
  *
- * FUNCTION:	add a new extent of free inodes to an iag, allocating
- *		an inode from this extent to satisfy the current allocation
- *		request.
- *
+ * FUNCTION:   	add a new extent of free inodes to an iag, allocating
+ *	       	an inode from this extent to satisfy the current allocation
+ *	       	request.
+ *		
  *		this routine first tries to find an existing iag with free
  *		extents through the ag free extent list.  if list is not
  *		empty, the head of the list will be selected as the home
  *		of the new extent of free inodes.  otherwise (the list is
  *		empty), a new iag will be allocated for the ag to contain
  *		the extent.
- *
+ *		
  *		once an iag has been selected, the free extent summary map
  *		is used to locate a free extent within the iag and diNewExt()
  *		is called to initialize the extent, with initialization
@@ -1871,16 +1934,16 @@ static int diAllocIno(struct inomap * imap, int agno, struct inode *ip)
  *		for the purpose of satisfying this request.
  *
  * PARAMETERS:
- *	imap	- pointer to inode map control structure.
- *	agno	- allocation group number.
- *	ip	- pointer to new inode to be filled in on successful return
+ *      imap  	- pointer to inode map control structure.
+ *      agno  	- allocation group number.
+ *      ip  	- pointer to new inode to be filled in on successful return
  *		  with the disk inode number allocated, its extent address
  *		  and the start of the ag.
  *
  * RETURN VALUES:
- *	0	- success.
- *	-ENOSPC	- insufficient disk resources.
- *	-EIO	- i/o error.
+ *      0       - success.
+ *      -ENOSPC	- insufficient disk resources.
+ *      -EIO  	- i/o error.
  */
 static int diAllocExt(struct inomap * imap, int agno, struct inode *ip)
 {
@@ -1907,10 +1970,10 @@ static int diAllocExt(struct inomap * imap, int agno, struct inode *ip)
 	} else {
 		/* read the iag.
 		 */
-		IREAD_LOCK(imap->im_ipimap, RDWRLOCK_IMAP);
+		IREAD_LOCK(imap->im_ipimap);
 		if ((rc = diIAGRead(imap, iagno, &mp))) {
 			IREAD_UNLOCK(imap->im_ipimap);
-			jfs_error(ip->i_sb, "error reading iag\n");
+			jfs_error(ip->i_sb, "diAllocExt: error reading iag");
 			return rc;
 		}
 		iagp = (struct iag *) mp->data;
@@ -1922,7 +1985,8 @@ static int diAllocExt(struct inomap * imap, int agno, struct inode *ip)
 		if (sword >= SMAPSZ) {
 			release_metapage(mp);
 			IREAD_UNLOCK(imap->im_ipimap);
-			jfs_error(ip->i_sb, "free ext summary map not found\n");
+			jfs_error(ip->i_sb,
+				  "diAllocExt: free ext summary map not found");
 			return -EIO;
 		}
 		if (~iagp->extsmap[sword])
@@ -1935,7 +1999,7 @@ static int diAllocExt(struct inomap * imap, int agno, struct inode *ip)
 	if (rem >= EXTSPERSUM) {
 		release_metapage(mp);
 		IREAD_UNLOCK(imap->im_ipimap);
-		jfs_error(ip->i_sb, "free extent not found\n");
+		jfs_error(ip->i_sb, "diAllocExt: free extent not found");
 		return -EIO;
 	}
 	extno = (sword << L2EXTSPERSUM) + rem;
@@ -1970,9 +2034,9 @@ static int diAllocExt(struct inomap * imap, int agno, struct inode *ip)
 
 
 /*
- * NAME:	diAllocBit(imap,iagp,ino)
+ * NAME:        diAllocBit(imap,iagp,ino)
  *
- * FUNCTION:	allocate a backed inode from an iag.
+ * FUNCTION:   	allocate a backed inode from an iag.
  *
  *		this routine performs the mechanics of allocating a
  *		specified inode from a backed extent.
@@ -1985,19 +2049,19 @@ static int diAllocExt(struct inomap * imap, int agno, struct inode *ip)
  *		in the face of updates to multiple buffers.  under this
  *		approach, all required buffers are obtained before making
  *		any updates and are held all are updates are complete.
- *
+ *		
  * PRE CONDITION: Already have buffer lock on iagp.  Already have AG lock on
  *	this AG.  Must have read lock on imap inode.
  *
  * PARAMETERS:
- *	imap	- pointer to inode map control structure.
- *	iagp	- pointer to iag.
- *	ino	- inode number to be allocated within the iag.
+ *      imap  	- pointer to inode map control structure.
+ *      iagp  	- pointer to iag. 
+ *      ino   	- inode number to be allocated within the iag.
  *
  * RETURN VALUES:
- *	0	- success.
- *	-ENOSPC	- insufficient disk resources.
- *	-EIO	- i/o error.
+ *      0       - success.
+ *      -ENOSPC	- insufficient disk resources.
+ *      -EIO  	- i/o error.
  */
 static int diAllocBit(struct inomap * imap, struct iag * iagp, int ino)
 {
@@ -2008,7 +2072,7 @@ static int diAllocBit(struct inomap * imap, struct iag * iagp, int ino)
 
 	/* check if this is the last free inode within the iag.
 	 * if so, it will have to be removed from the ag free
-	 * inode list, so get the iags preceding and following
+	 * inode list, so get the iags preceeding and following
 	 * it on the list.
 	 */
 	if (iagp->nfreeinos == cpu_to_le32(1)) {
@@ -2054,7 +2118,8 @@ static int diAllocBit(struct inomap * imap, struct iag * iagp, int ino)
 		if (bmp)
 			release_metapage(bmp);
 
-		jfs_error(imap->im_ipimap->i_sb, "iag inconsistent\n");
+		jfs_error(imap->im_ipimap->i_sb,
+			  "diAllocBit: iag inconsistent");
 		return -EIO;
 	}
 
@@ -2094,7 +2159,7 @@ static int diAllocBit(struct inomap * imap, struct iag * iagp, int ino)
 	/* update the free inode count at the iag, ag, inode
 	 * map levels.
 	 */
-	le32_add_cpu(&iagp->nfreeinos, -1);
+	iagp->nfreeinos = cpu_to_le32(le32_to_cpu(iagp->nfreeinos) - 1);
 	imap->im_agctl[agno].numfree -= 1;
 	atomic_dec(&imap->im_numfree);
 
@@ -2103,11 +2168,11 @@ static int diAllocBit(struct inomap * imap, struct iag * iagp, int ino)
 
 
 /*
- * NAME:	diNewExt(imap,iagp,extno)
+ * NAME:        diNewExt(imap,iagp,extno)
  *
- * FUNCTION:	initialize a new extent of inodes for an iag, allocating
- *		the first inode of the extent for use for the current
- *		allocation request.
+ * FUNCTION:    initialize a new extent of inodes for an iag, allocating
+ *	        the first inode of the extent for use for the current
+ *	        allocation request.
  *
  *		disk resources are allocated for the new extent of inodes
  *		and the inodes themselves are initialized to reflect their
@@ -2131,19 +2196,19 @@ static int diAllocBit(struct inomap * imap, struct iag * iagp, int ino)
  *		buffers.  under this approach, all required buffers are
  *		obtained before making any updates and are held until all
  *		updates are complete.
- *
+ *		
  * PRE CONDITION: Already have buffer lock on iagp.  Already have AG lock on
  *	this AG.  Must have read lock on imap inode.
  *
  * PARAMETERS:
- *	imap	- pointer to inode map control structure.
- *	iagp	- pointer to iag.
- *	extno	- extent number.
+ *      imap  	- pointer to inode map control structure.
+ *      iagp  	- pointer to iag. 
+ *      extno  	- extent number.
  *
  * RETURN VALUES:
- *	0	- success.
- *	-ENOSPC	- insufficient disk resources.
- *	-EIO	- i/o error.
+ *      0       - success.
+ *      -ENOSPC	- insufficient disk resources.
+ *      -EIO  	- i/o error.
  */
 static int diNewExt(struct inomap * imap, struct iag * iagp, int extno)
 {
@@ -2161,7 +2226,7 @@ static int diNewExt(struct inomap * imap, struct iag * iagp, int extno)
 	/* better have free extents.
 	 */
 	if (!iagp->nfreeexts) {
-		jfs_error(imap->im_ipimap->i_sb, "no free extents\n");
+		jfs_error(imap->im_ipimap->i_sb, "diNewExt: no free extents");
 		return -EIO;
 	}
 
@@ -2179,7 +2244,7 @@ static int diNewExt(struct inomap * imap, struct iag * iagp, int extno)
 
 	/* check if this is the last free extent within the
 	 * iag.  if so, the iag must be removed from the ag
-	 * free extent list, so get the iags preceding and
+	 * free extent list, so get the iags preceeding and
 	 * following the iag on this list.
 	 */
 	if (iagp->nfreeexts == cpu_to_le32(1)) {
@@ -2233,7 +2298,7 @@ static int diNewExt(struct inomap * imap, struct iag * iagp, int extno)
 			}
 			if (ciagp == NULL) {
 				jfs_error(imap->im_ipimap->i_sb,
-					  "ciagp == NULL\n");
+					  "diNewExt: ciagp == NULL");
 				rc = -EIO;
 				goto error_out;
 			}
@@ -2348,8 +2413,9 @@ static int diNewExt(struct inomap * imap, struct iag * iagp, int extno)
 	/* update the free inode and free extent counts for the
 	 * iag.
 	 */
-	le32_add_cpu(&iagp->nfreeinos, (INOSPEREXT - 1));
-	le32_add_cpu(&iagp->nfreeexts, -1);
+	iagp->nfreeinos = cpu_to_le32(le32_to_cpu(iagp->nfreeinos) +
+				      (INOSPEREXT - 1));
+	iagp->nfreeexts = cpu_to_le32(le32_to_cpu(iagp->nfreeexts) - 1);
 
 	/* update the free and backed inode counts for the ag.
 	 */
@@ -2388,38 +2454,38 @@ static int diNewExt(struct inomap * imap, struct iag * iagp, int extno)
 
 
 /*
- * NAME:	diNewIAG(imap,iagnop,agno)
+ * NAME:        diNewIAG(imap,iagnop,agno)
  *
- * FUNCTION:	allocate a new iag for an allocation group.
- *
- *		first tries to allocate the iag from the inode map
- *		iagfree list:
- *		if the list has free iags, the head of the list is removed
+ * FUNCTION:   	allocate a new iag for an allocation group.
+ *		
+ *		first tries to allocate the iag from the inode map 
+ *		iagfree list:  
+ *		if the list has free iags, the head of the list is removed 
  *		and returned to satisfy the request.
  *		if the inode map's iag free list is empty, the inode map
  *		is extended to hold a new iag. this new iag is initialized
  *		and returned to satisfy the request.
  *
  * PARAMETERS:
- *	imap	- pointer to inode map control structure.
- *	iagnop	- pointer to an iag number set with the number of the
+ *      imap  	- pointer to inode map control structure.
+ *      iagnop 	- pointer to an iag number set with the number of the
  *		  newly allocated iag upon successful return.
- *	agno	- allocation group number.
+ *      agno  	- allocation group number.
  *	bpp	- Buffer pointer to be filled in with new IAG's buffer
  *
  * RETURN VALUES:
- *	0	- success.
- *	-ENOSPC	- insufficient disk resources.
- *	-EIO	- i/o error.
+ *      0       - success.
+ *      -ENOSPC	- insufficient disk resources.
+ *      -EIO  	- i/o error.
  *
- * serialization:
+ * serialization: 
  *	AG lock held on entry/exit;
  *	write lock on the map is held inside;
  *	read lock on the map is held on successful completion;
  *
- * note: new iag transaction:
+ * note: new iag transaction: 
  * . synchronously write iag;
- * . write log of xtree and inode of imap;
+ * . write log of xtree and inode  of imap;
  * . commit;
  * . synchronous write of xtree (right to left, bottom to top);
  * . at start of logredo(): init in-memory imap with one additional iag page;
@@ -2439,6 +2505,9 @@ diNewIAG(struct inomap * imap, int *iagnop, int agno, struct metapage ** mpp)
 	s64 xaddr = 0;
 	s64 blkno;
 	tid_t tid;
+#ifdef _STILL_TO_PORT
+	xad_t xad;
+#endif				/*  _STILL_TO_PORT */
 	struct inode *iplist[1];
 
 	/* pick up pointers to the inode map and mount inodes */
@@ -2449,7 +2518,7 @@ diNewIAG(struct inomap * imap, int *iagnop, int agno, struct metapage ** mpp)
 	/* acquire the free iag lock */
 	IAGFREE_LOCK(imap);
 
-	/* if there are any iags on the inode map free iag list,
+	/* if there are any iags on the inode map free iag list, 
 	 * allocate the iag from the head of the list.
 	 */
 	if (imap->im_freeiag >= 0) {
@@ -2464,18 +2533,18 @@ diNewIAG(struct inomap * imap, int *iagnop, int agno, struct metapage ** mpp)
 		 */
 
 		/* acquire inode map lock */
-		IWRITE_LOCK(ipimap, RDWRLOCK_IMAP);
+		IWRITE_LOCK(ipimap);
 
 		if (ipimap->i_size >> L2PSIZE != imap->im_nextiag + 1) {
 			IWRITE_UNLOCK(ipimap);
 			IAGFREE_UNLOCK(imap);
 			jfs_error(imap->im_ipimap->i_sb,
-				  "ipimap->i_size is wrong\n");
+				  "diNewIAG: ipimap->i_size is wrong");
 			return -EIO;
 		}
 
 
-		/* get the next available iag number */
+		/* get the next avaliable iag number */
 		iagno = imap->im_nextiag;
 
 		/* make sure that we have not exceeded the maximum inode
@@ -2504,46 +2573,13 @@ diNewIAG(struct inomap * imap, int *iagnop, int agno, struct metapage ** mpp)
 			goto out;
 		}
 
-		/*
-		 * start transaction of update of the inode map
-		 * addressing structure pointing to the new iag page;
-		 */
-		tid = txBegin(sb, COMMIT_FORCE);
-		mutex_lock(&JFS_IP(ipimap)->commit_mutex);
-
-		/* update the inode map addressing structure to point to it */
-		if ((rc =
-		     xtInsert(tid, ipimap, 0, blkno, xlen, &xaddr, 0))) {
-			txEnd(tid);
-			mutex_unlock(&JFS_IP(ipimap)->commit_mutex);
+		/* assign a buffer for the page */
+		mp = get_metapage(ipimap, xaddr, PSIZE, 1);
+		if (!mp) {
 			/* Free the blocks allocated for the iag since it was
 			 * not successfully added to the inode map
 			 */
 			dbFree(ipimap, xaddr, (s64) xlen);
-
-			/* release the inode map lock */
-			IWRITE_UNLOCK(ipimap);
-
-			goto out;
-		}
-
-		/* update the inode map's inode to reflect the extension */
-		ipimap->i_size += PSIZE;
-		inode_add_bytes(ipimap, PSIZE);
-
-		/* assign a buffer for the page */
-		mp = get_metapage(ipimap, blkno, PSIZE, 0);
-		if (!mp) {
-			/*
-			 * This is very unlikely since we just created the
-			 * extent, but let's try to handle it correctly
-			 */
-			xtTruncate(tid, ipimap, ipimap->i_size - PSIZE,
-				   COMMIT_PWMAP);
-
-			txAbort(tid, 0);
-			txEnd(tid);
-			mutex_unlock(&JFS_IP(ipimap)->commit_mutex);
 
 			/* release the inode map lock */
 			IWRITE_UNLOCK(ipimap);
@@ -2569,24 +2605,54 @@ diNewIAG(struct inomap * imap, int *iagnop, int agno, struct metapage ** mpp)
 			iagp->inosmap[i] = cpu_to_le32(ONES);
 
 		/*
-		 * Write and sync the metapage
+		 * Invalidate the page after writing and syncing it.
+		 * After it's initialized, we access it in a different
+		 * address space
 		 */
+		set_bit(META_discard, &mp->flag);
 		flush_metapage(mp);
 
 		/*
-		 * txCommit(COMMIT_FORCE) will synchronously write address
-		 * index pages and inode after commit in careful update order
+		 * start tyransaction of update of the inode map
+		 * addressing structure pointing to the new iag page;
+		 */
+		tid = txBegin(sb, COMMIT_FORCE);
+		down(&JFS_IP(ipimap)->commit_sem);
+
+		/* update the inode map addressing structure to point to it */
+		if ((rc =
+		     xtInsert(tid, ipimap, 0, blkno, xlen, &xaddr, 0))) {
+			txEnd(tid);
+			up(&JFS_IP(ipimap)->commit_sem);
+			/* Free the blocks allocated for the iag since it was
+			 * not successfully added to the inode map
+			 */
+			dbFree(ipimap, xaddr, (s64) xlen);
+
+			/* release the inode map lock */
+			IWRITE_UNLOCK(ipimap);
+
+			goto out;
+		}
+
+		/* update the inode map's inode to reflect the extension */
+		ipimap->i_size += PSIZE;
+		inode_add_bytes(ipimap, PSIZE);
+
+		/*
+		 * txCommit(COMMIT_FORCE) will synchronously write address 
+		 * index pages and inode after commit in careful update order 
 		 * of address index pages (right to left, bottom up);
 		 */
 		iplist[0] = ipimap;
 		rc = txCommit(tid, 1, &iplist[0], COMMIT_FORCE);
 
 		txEnd(tid);
-		mutex_unlock(&JFS_IP(ipimap)->commit_mutex);
+		up(&JFS_IP(ipimap)->commit_sem);
 
 		duplicateIXtree(sb, blkno, xlen, &xaddr);
 
-		/* update the next available iag number */
+		/* update the next avaliable iag number */
 		imap->im_nextiag += 1;
 
 		/* Add the iag to the iag free list so we don't lose the iag
@@ -2604,7 +2670,7 @@ diNewIAG(struct inomap * imap, int *iagnop, int agno, struct metapage ** mpp)
 	}
 
 	/* obtain read lock on map */
-	IREAD_LOCK(ipimap, RDWRLOCK_IMAP);
+	IREAD_LOCK(ipimap);
 
 	/* read the iag */
 	if ((rc = diIAGRead(imap, iagno, &mp))) {
@@ -2630,15 +2696,15 @@ diNewIAG(struct inomap * imap, int *iagnop, int agno, struct metapage ** mpp)
 }
 
 /*
- * NAME:	diIAGRead()
+ * NAME:        diIAGRead()
  *
- * FUNCTION:	get the buffer for the specified iag within a fileset
+ * FUNCTION:    get the buffer for the specified iag within a fileset
  *		or aggregate inode map.
- *
+ *		
  * PARAMETERS:
- *	imap	- pointer to inode map control structure.
- *	iagno	- iag number.
- *	bpp	- point to buffer pointer to be filled in on successful
+ *      imap  	- pointer to inode map control structure.
+ *      iagno  	- iag number.
+ *      bpp  	- point to buffer pointer to be filled in on successful
  *		  exit.
  *
  * SERIALIZATION:
@@ -2647,8 +2713,8 @@ diNewIAG(struct inomap * imap, int *iagnop, int agno, struct metapage ** mpp)
  *	 the read lock is unnecessary.)
  *
  * RETURN VALUES:
- *	0	- success.
- *	-EIO	- i/o error.
+ *      0       - success.
+ *      -EIO  	- i/o error.
  */
 static int diIAGRead(struct inomap * imap, int iagno, struct metapage ** mpp)
 {
@@ -2668,17 +2734,17 @@ static int diIAGRead(struct inomap * imap, int iagno, struct metapage ** mpp)
 }
 
 /*
- * NAME:	diFindFree()
+ * NAME:        diFindFree()
  *
- * FUNCTION:	find the first free bit in a word starting at
+ * FUNCTION:    find the first free bit in a word starting at
  *		the specified bit position.
  *
  * PARAMETERS:
- *	word	- word to be examined.
- *	start	- starting bit position.
+ *      word  	- word to be examined.
+ *      start  	- starting bit position.
  *
  * RETURN VALUES:
- *	bit position of first free bit in the word or 32 if
+ *      bit position of first free bit in the word or 32 if
  *	no free bits were found.
  */
 static int diFindFree(u32 word, int start)
@@ -2696,24 +2762,24 @@ static int diFindFree(u32 word, int start)
 
 /*
  * NAME:	diUpdatePMap()
- *
- * FUNCTION: Update the persistent map in an IAG for the allocation or
+ *                                                                    
+ * FUNCTION: Update the persistent map in an IAG for the allocation or 
  *	freeing of the specified inode.
- *
+ *                                                                    
  * PRE CONDITIONS: Working map has already been updated for allocate.
  *
  * PARAMETERS:
  *	ipimap	- Incore inode map inode
  *	inum	- Number of inode to mark in permanent map
- *	is_free	- If 'true' indicates inode should be marked freed, otherwise
+ *	is_free	- If TRUE indicates inode should be marked freed, otherwise
  *		  indicates inode should be marked allocated.
  *
- * RETURN VALUES:
+ * RETURN VALUES: 
  *		0 for success
  */
 int
 diUpdatePMap(struct inode *ipimap,
-	     unsigned long inum, bool is_free, struct tblock * tblk)
+	     unsigned long inum, boolean_t is_free, struct tblock * tblk)
 {
 	int rc;
 	struct iag *iagp;
@@ -2723,23 +2789,22 @@ diUpdatePMap(struct inode *ipimap,
 	u32 mask;
 	struct jfs_log *log;
 	int lsn, difft, diffp;
-	unsigned long flags;
 
 	imap = JFS_IP(ipimap)->i_imap;
 	/* get the iag number containing the inode */
 	iagno = INOTOIAG(inum);
 	/* make sure that the iag is contained within the map */
 	if (iagno >= imap->im_nextiag) {
-		jfs_error(ipimap->i_sb, "the iag is outside the map\n");
+		jfs_error(ipimap->i_sb,
+			  "diUpdatePMap: the iag is outside the map");
 		return -EIO;
 	}
 	/* read the iag */
-	IREAD_LOCK(ipimap, RDWRLOCK_IMAP);
+	IREAD_LOCK(ipimap);
 	rc = diIAGRead(imap, iagno, &mp);
 	IREAD_UNLOCK(ipimap);
 	if (rc)
 		return (rc);
-	metapage_wait_for_io(mp);
 	iagp = (struct iag *) mp->data;
 	/* get the inode number and extent number of the inode within
 	 * the iag and the inode number within the extent.
@@ -2748,24 +2813,24 @@ diUpdatePMap(struct inode *ipimap,
 	extno = ino >> L2INOSPEREXT;
 	bitno = ino & (INOSPEREXT - 1);
 	mask = HIGHORDER >> bitno;
-	/*
+	/* 
 	 * mark the inode free in persistent map:
 	 */
-	if (is_free) {
+	if (is_free == TRUE) {
 		/* The inode should have been allocated both in working
 		 * map and in persistent map;
 		 * the inode will be freed from working map at the release
 		 * of last reference release;
 		 */
 		if (!(le32_to_cpu(iagp->wmap[extno]) & mask)) {
-			jfs_error(ipimap->i_sb,
-				  "inode %ld not marked as allocated in wmap!\n",
-				  inum);
+			jfs_error(ipimap->i_sb, 
+				  "diUpdatePMap: inode %ld not marked as "
+				  "allocated in wmap!", inum);
 		}
 		if (!(le32_to_cpu(iagp->pmap[extno]) & mask)) {
 			jfs_error(ipimap->i_sb,
-				  "inode %ld not marked as allocated in pmap!\n",
-				  inum);
+				  "diUpdatePMap: inode %ld not marked as "
+				  "allocated in pmap!", inum);
 		}
 		/* update the bitmap for the extent of the freed inode */
 		iagp->pmap[extno] &= cpu_to_le32(~mask);
@@ -2780,13 +2845,15 @@ diUpdatePMap(struct inode *ipimap,
 		if (!(le32_to_cpu(iagp->wmap[extno]) & mask)) {
 			release_metapage(mp);
 			jfs_error(ipimap->i_sb,
-				  "the inode is not allocated in the working map\n");
+				  "diUpdatePMap: the inode is not allocated in "
+				  "the working map");
 			return -EIO;
 		}
 		if ((le32_to_cpu(iagp->pmap[extno]) & mask) != 0) {
 			release_metapage(mp);
 			jfs_error(ipimap->i_sb,
-				  "the inode is not free in the persistent map\n");
+				  "diUpdatePMap: the inode is not free in the "
+				  "persistent map");
 			return -EIO;
 		}
 		/* update the bitmap for the extent of the allocated inode */
@@ -2797,7 +2864,6 @@ diUpdatePMap(struct inode *ipimap,
 	 */
 	lsn = tblk->lsn;
 	log = JFS_SBI(tblk->sb)->log;
-	LOGSYNC_LOCK(log, flags);
 	if (mp->lsn != 0) {
 		/* inherit older/smaller lsn */
 		logdiff(difft, lsn, log);
@@ -2805,23 +2871,28 @@ diUpdatePMap(struct inode *ipimap,
 		if (difft < diffp) {
 			mp->lsn = lsn;
 			/* move mp after tblock in logsync list */
+			LOGSYNC_LOCK(log);
 			list_move(&mp->synclist, &tblk->synclist);
+			LOGSYNC_UNLOCK(log);
 		}
 		/* inherit younger/larger clsn */
+		LOGSYNC_LOCK(log);
 		assert(mp->clsn);
 		logdiff(difft, tblk->clsn, log);
 		logdiff(diffp, mp->clsn, log);
 		if (difft > diffp)
 			mp->clsn = tblk->clsn;
+		LOGSYNC_UNLOCK(log);
 	} else {
 		mp->log = log;
 		mp->lsn = lsn;
 		/* insert mp after tblock in logsync list */
+		LOGSYNC_LOCK(log);
 		log->count++;
 		list_add(&mp->synclist, &tblk->synclist);
 		mp->clsn = tblk->clsn;
+		LOGSYNC_UNLOCK(log);
 	}
-	LOGSYNC_UNLOCK(log, flags);
 	write_metapage(mp);
 	return (0);
 }
@@ -2830,8 +2901,8 @@ diUpdatePMap(struct inode *ipimap,
  *	diExtendFS()
  *
  * function: update imap for extendfs();
- *
- * note: AG size has been increased s.t. each k old contiguous AGs are
+ * 
+ * note: AG size has been increased s.t. each k old contiguous AGs are 
  * coalesced into a new AG;
  */
 int diExtendFS(struct inode *ipimap, struct inode *ipbmap)
@@ -2850,7 +2921,7 @@ int diExtendFS(struct inode *ipimap, struct inode *ipbmap)
 		   atomic_read(&imap->im_numfree));
 
 	/*
-	 *	reconstruct imap
+	 *      reconstruct imap 
 	 *
 	 * coalesce contiguous k (newAGSize/oldAGSize) AGs;
 	 * i.e., (AGi, ..., AGj) where i = k*n and j = k*(n+1) - 1 to AGn;
@@ -2866,7 +2937,7 @@ int diExtendFS(struct inode *ipimap, struct inode *ipbmap)
 	}
 
 	/*
-	 *	process each iag page of the map.
+	 *      process each iag page of the map.
 	 *
 	 * rebuild AG Free Inode List, AG Free Inode Extent List;
 	 */
@@ -2878,19 +2949,21 @@ int diExtendFS(struct inode *ipimap, struct inode *ipbmap)
 		iagp = (struct iag *) bp->data;
 		if (le32_to_cpu(iagp->iagnum) != i) {
 			release_metapage(bp);
-			jfs_error(ipimap->i_sb, "unexpected value of iagnum\n");
+			jfs_error(ipimap->i_sb,
+				  "diExtendFs: unexpected value of iagnum");
 			return -EIO;
 		}
 
 		/* leave free iag in the free iag list */
-		if (iagp->nfreeexts == cpu_to_le32(EXTSPERIAG)) {
-			release_metapage(bp);
+		if (iagp->nfreeexts == cpu_to_le32(EXTSPERIAG)) {  
+		        release_metapage(bp);
 			continue;
 		}
 
+		/* agstart that computes to the same ag is treated as same; */
 		agstart = le64_to_cpu(iagp->agstart);
+		/* iagp->agstart = agstart & ~(mp->db_agsize - 1); */
 		n = agstart >> mp->db_agl2size;
-		iagp->agstart = cpu_to_le64((s64)n << mp->db_agl2size);
 
 		/* compute backed inodes */
 		numinos = (EXTSPERIAG - le32_to_cpu(iagp->nfreeexts))
@@ -2954,7 +3027,8 @@ int diExtendFS(struct inode *ipimap, struct inode *ipbmap)
 
 	if (xnuminos != atomic_read(&imap->im_numinos) ||
 	    xnumfree != atomic_read(&imap->im_numfree)) {
-		jfs_error(ipimap->i_sb, "numinos or numfree incorrect\n");
+		jfs_error(ipimap->i_sb,
+			  "diExtendFs: numinos or numfree incorrect");
 		return -EIO;
 	}
 
@@ -3013,52 +3087,25 @@ static void duplicateIXtree(struct super_block *sb, s64 blkno,
 }
 
 /*
- * NAME:	copy_from_dinode()
+ * NAME:        copy_from_dinode()
  *
- * FUNCTION:	Copies inode info from disk inode to in-memory inode
+ * FUNCTION:    Copies inode info from disk inode to in-memory inode
  *
  * RETURN VALUES:
- *	0	- success
- *	-ENOMEM	- insufficient memory
+ *      0       - success
+ *      -ENOMEM	- insufficient memory
  */
 static int copy_from_dinode(struct dinode * dip, struct inode *ip)
 {
 	struct jfs_inode_info *jfs_ip = JFS_IP(ip);
-	struct jfs_sb_info *sbi = JFS_SBI(ip->i_sb);
 
 	jfs_ip->fileset = le32_to_cpu(dip->di_fileset);
 	jfs_ip->mode2 = le32_to_cpu(dip->di_mode);
-	jfs_set_inode_flags(ip);
 
 	ip->i_mode = le32_to_cpu(dip->di_mode) & 0xffff;
-	if (sbi->umask != -1) {
-		ip->i_mode = (ip->i_mode & ~0777) | (0777 & ~sbi->umask);
-		/* For directories, add x permission if r is allowed by umask */
-		if (S_ISDIR(ip->i_mode)) {
-			if (ip->i_mode & 0400)
-				ip->i_mode |= 0100;
-			if (ip->i_mode & 0040)
-				ip->i_mode |= 0010;
-			if (ip->i_mode & 0004)
-				ip->i_mode |= 0001;
-		}
-	}
-	set_nlink(ip, le32_to_cpu(dip->di_nlink));
-
-	jfs_ip->saved_uid = make_kuid(&init_user_ns, le32_to_cpu(dip->di_uid));
-	if (!uid_valid(sbi->uid))
-		ip->i_uid = jfs_ip->saved_uid;
-	else {
-		ip->i_uid = sbi->uid;
-	}
-
-	jfs_ip->saved_gid = make_kgid(&init_user_ns, le32_to_cpu(dip->di_gid));
-	if (!gid_valid(sbi->gid))
-		ip->i_gid = jfs_ip->saved_gid;
-	else {
-		ip->i_gid = sbi->gid;
-	}
-
+	ip->i_nlink = le32_to_cpu(dip->di_nlink);
+	ip->i_uid = le32_to_cpu(dip->di_uid);
+	ip->i_gid = le32_to_cpu(dip->di_gid);
 	ip->i_size = le64_to_cpu(dip->di_size);
 	ip->i_atime.tv_sec = le32_to_cpu(dip->di_atime.tv_sec);
 	ip->i_atime.tv_nsec = le32_to_cpu(dip->di_atime.tv_nsec);
@@ -3066,6 +3113,7 @@ static int copy_from_dinode(struct dinode * dip, struct inode *ip)
 	ip->i_mtime.tv_nsec = le32_to_cpu(dip->di_mtime.tv_nsec);
 	ip->i_ctime.tv_sec = le32_to_cpu(dip->di_ctime.tv_sec);
 	ip->i_ctime.tv_nsec = le32_to_cpu(dip->di_ctime.tv_nsec);
+	ip->i_blksize = ip->i_sb->s_blocksize;
 	ip->i_blocks = LBLK2PBLK(ip->i_sb, le64_to_cpu(dip->di_nblocks));
 	ip->i_generation = le32_to_cpu(dip->di_gen);
 
@@ -3082,7 +3130,7 @@ static int copy_from_dinode(struct dinode * dip, struct inode *ip)
 	}
 
 	if (S_ISDIR(ip->i_mode)) {
-		memcpy(&jfs_ip->u.dir, &dip->u._dir, 384);
+		memcpy(&jfs_ip->i_dirtable, &dip->di_dirtable, 384);
 	} else if (S_ISREG(ip->i_mode) || S_ISLNK(ip->i_mode)) {
 		memcpy(&jfs_ip->i_xtroot, &dip->di_xtroot, 288);
 	} else
@@ -3101,42 +3149,28 @@ static int copy_from_dinode(struct dinode * dip, struct inode *ip)
 }
 
 /*
- * NAME:	copy_to_dinode()
+ * NAME:        copy_to_dinode()
  *
- * FUNCTION:	Copies inode info from in-memory inode to disk inode
+ * FUNCTION:    Copies inode info from in-memory inode to disk inode
  */
 static void copy_to_dinode(struct dinode * dip, struct inode *ip)
 {
 	struct jfs_inode_info *jfs_ip = JFS_IP(ip);
-	struct jfs_sb_info *sbi = JFS_SBI(ip->i_sb);
 
 	dip->di_fileset = cpu_to_le32(jfs_ip->fileset);
-	dip->di_inostamp = cpu_to_le32(sbi->inostamp);
+	dip->di_inostamp = cpu_to_le32(JFS_SBI(ip->i_sb)->inostamp);
 	dip->di_number = cpu_to_le32(ip->i_ino);
 	dip->di_gen = cpu_to_le32(ip->i_generation);
 	dip->di_size = cpu_to_le64(ip->i_size);
 	dip->di_nblocks = cpu_to_le64(PBLK2LBLK(ip->i_sb, ip->i_blocks));
 	dip->di_nlink = cpu_to_le32(ip->i_nlink);
-	if (!uid_valid(sbi->uid))
-		dip->di_uid = cpu_to_le32(i_uid_read(ip));
-	else
-		dip->di_uid =cpu_to_le32(from_kuid(&init_user_ns,
-						   jfs_ip->saved_uid));
-	if (!gid_valid(sbi->gid))
-		dip->di_gid = cpu_to_le32(i_gid_read(ip));
-	else
-		dip->di_gid = cpu_to_le32(from_kgid(&init_user_ns,
-						    jfs_ip->saved_gid));
+	dip->di_uid = cpu_to_le32(ip->i_uid);
+	dip->di_gid = cpu_to_le32(ip->i_gid);
 	/*
 	 * mode2 is only needed for storing the higher order bits.
 	 * Trust i_mode for the lower order ones
 	 */
-	if (sbi->umask == -1)
-		dip->di_mode = cpu_to_le32((jfs_ip->mode2 & 0xffff0000) |
-					   ip->i_mode);
-	else /* Leave the original permissions alone */
-		dip->di_mode = cpu_to_le32(jfs_ip->mode2);
-
+	dip->di_mode = cpu_to_le32((jfs_ip->mode2 & 0xffff0000) | ip->i_mode);
 	dip->di_atime.tv_sec = cpu_to_le32(ip->i_atime.tv_sec);
 	dip->di_atime.tv_nsec = cpu_to_le32(ip->i_atime.tv_nsec);
 	dip->di_ctime.tv_sec = cpu_to_le32(ip->i_ctime.tv_sec);
@@ -3153,3 +3187,84 @@ static void copy_to_dinode(struct dinode * dip, struct inode *ip)
 	if (S_ISCHR(ip->i_mode) || S_ISBLK(ip->i_mode))
 		dip->di_rdev = cpu_to_le32(jfs_ip->dev);
 }
+
+#ifdef	_JFS_DEBUG_IMAP
+/*
+ *	DBGdiInit()
+ */
+static void *DBGdiInit(struct inomap * imap)
+{
+	u32 *dimap;
+	int size;
+	size = 64 * 1024;
+	if ((dimap = (u32 *) xmalloc(size, L2PSIZE, kernel_heap)) == NULL)
+		assert(0);
+	bzero((void *) dimap, size);
+	imap->im_DBGdimap = dimap;
+}
+
+/*
+ *	DBGdiAlloc()
+ */
+static void DBGdiAlloc(struct inomap * imap, ino_t ino)
+{
+	u32 *dimap = imap->im_DBGdimap;
+	int w, b;
+	u32 m;
+	w = ino >> 5;
+	b = ino & 31;
+	m = 0x80000000 >> b;
+	assert(w < 64 * 256);
+	if (dimap[w] & m) {
+		printk("DEBUG diAlloc: duplicate alloc ino:0x%x\n", ino);
+	}
+	dimap[w] |= m;
+}
+
+/*
+ *	DBGdiFree()
+ */
+static void DBGdiFree(struct inomap * imap, ino_t ino)
+{
+	u32 *dimap = imap->im_DBGdimap;
+	int w, b;
+	u32 m;
+	w = ino >> 5;
+	b = ino & 31;
+	m = 0x80000000 >> b;
+	assert(w < 64 * 256);
+	if ((dimap[w] & m) == 0) {
+		printk("DEBUG diFree: duplicate free ino:0x%x\n", ino);
+	}
+	dimap[w] &= ~m;
+}
+
+static void dump_cp(struct inomap * ipimap, char *function, int line)
+{
+	printk("\n* ********* *\nControl Page %s %d\n", function, line);
+	printk("FreeIAG %d\tNextIAG %d\n", ipimap->im_freeiag,
+	       ipimap->im_nextiag);
+	printk("NumInos %d\tNumFree %d\n",
+	       atomic_read(&ipimap->im_numinos),
+	       atomic_read(&ipimap->im_numfree));
+	printk("AG InoFree %d\tAG ExtFree %d\n",
+	       ipimap->im_agctl[0].inofree, ipimap->im_agctl[0].extfree);
+	printk("AG NumInos %d\tAG NumFree %d\n",
+	       ipimap->im_agctl[0].numinos, ipimap->im_agctl[0].numfree);
+}
+
+static void dump_iag(struct iag * iag, char *function, int line)
+{
+	printk("\n* ********* *\nIAG %s %d\n", function, line);
+	printk("IagNum %d\tIAG Free %d\n", le32_to_cpu(iag->iagnum),
+	       le32_to_cpu(iag->iagfree));
+	printk("InoFreeFwd %d\tInoFreeBack %d\n",
+	       le32_to_cpu(iag->inofreefwd),
+	       le32_to_cpu(iag->inofreeback));
+	printk("ExtFreeFwd %d\tExtFreeBack %d\n",
+	       le32_to_cpu(iag->extfreefwd),
+	       le32_to_cpu(iag->extfreeback));
+	printk("NFreeInos %d\tNFreeExts %d\n", le32_to_cpu(iag->nfreeinos),
+	       le32_to_cpu(iag->nfreeexts));
+}
+#endif				/* _JFS_DEBUG_IMAP */

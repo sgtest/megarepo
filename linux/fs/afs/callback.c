@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2002, 2007 Red Hat, Inc. All rights reserved.
+ * Copyright (c) 2002 Red Hat, Inc. All rights reserved.
  *
  * This software may be freely redistributed under the terms of the
  * GNU General Public License.
@@ -8,7 +8,7 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  *
- * Authors: David Woodhouse <dwmw2@infradead.org>
+ * Authors: David Woodhouse <dwmw2@cambridge.redhat.com>
  *          David Howells <dhowells@redhat.com>
  *
  */
@@ -16,213 +16,153 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/init.h>
-#include <linux/circ_buf.h>
-#include <linux/sched.h>
+#include "server.h"
+#include "vnode.h"
 #include "internal.h"
 
+/*****************************************************************************/
 /*
- * Handle invalidation of an mmap'd file.  We invalidate all the PTEs referring
- * to the pages in this file's pagecache, forcing the kernel to go through
- * ->fault() or ->page_mkwrite() - at which point we can handle invalidation
- * more fully.
+ * allow the fileserver to request callback state (re-)initialisation
  */
-void afs_invalidate_mmap_work(struct work_struct *work)
+int SRXAFSCM_InitCallBackState(struct afs_server *server)
 {
-	struct afs_vnode *vnode = container_of(work, struct afs_vnode, cb_work);
+	struct list_head callbacks;
 
-	unmap_mapping_pages(vnode->netfs.inode.i_mapping, 0, 0, false);
-}
+	_enter("%p", server);
 
-void afs_server_init_callback_work(struct work_struct *work)
-{
-	struct afs_server *server = container_of(work, struct afs_server, initcb_work);
-	struct afs_vnode *vnode;
-	struct afs_cell *cell = server->cell;
+	INIT_LIST_HEAD(&callbacks);
 
-	down_read(&cell->fs_open_mmaps_lock);
+	/* transfer the callback list from the server to a temp holding area */
+	spin_lock(&server->cb_lock);
 
-	list_for_each_entry(vnode, &cell->fs_open_mmaps, cb_mmap_link) {
-		if (vnode->cb_server == server) {
-			clear_bit(AFS_VNODE_CB_PROMISED, &vnode->flags);
-			queue_work(system_unbound_wq, &vnode->cb_work);
-		}
-	}
+	list_add(&callbacks, &server->cb_promises);
+	list_del_init(&server->cb_promises);
 
-	up_read(&cell->fs_open_mmaps_lock);
-}
-
-/*
- * Allow the fileserver to request callback state (re-)initialisation.
- * Unfortunately, UUIDs are not guaranteed unique.
- */
-void afs_init_callback_state(struct afs_server *server)
-{
-	rcu_read_lock();
-	do {
-		server->cb_s_break++;
-		atomic_inc(&server->cell->fs_s_break);
-		if (!list_empty(&server->cell->fs_open_mmaps))
-			queue_work(system_unbound_wq, &server->initcb_work);
-
-	} while ((server = rcu_dereference(server->uuid_next)));
-	rcu_read_unlock();
-}
-
-/*
- * actually break a callback
- */
-void __afs_break_callback(struct afs_vnode *vnode, enum afs_cb_break_reason reason)
-{
-	_enter("");
-
-	clear_bit(AFS_VNODE_NEW_CONTENT, &vnode->flags);
-	if (test_and_clear_bit(AFS_VNODE_CB_PROMISED, &vnode->flags)) {
-		vnode->cb_break++;
-		vnode->cb_v_break = vnode->volume->cb_v_break;
-		afs_clear_permits(vnode);
-
-		if (vnode->lock_state == AFS_VNODE_LOCK_WAITING_FOR_CB)
-			afs_lock_may_be_available(vnode);
-
-		if (reason != afs_cb_break_for_deleted &&
-		    vnode->status.type == AFS_FTYPE_FILE &&
-		    atomic_read(&vnode->cb_nr_mmap))
-			queue_work(system_unbound_wq, &vnode->cb_work);
-
-		trace_afs_cb_break(&vnode->fid, vnode->cb_break, reason, true);
-	} else {
-		trace_afs_cb_break(&vnode->fid, vnode->cb_break, reason, false);
-	}
-}
-
-void afs_break_callback(struct afs_vnode *vnode, enum afs_cb_break_reason reason)
-{
-	write_seqlock(&vnode->cb_lock);
-	__afs_break_callback(vnode, reason);
-	write_sequnlock(&vnode->cb_lock);
-}
-
-/*
- * Look up a volume by volume ID under RCU conditions.
- */
-static struct afs_volume *afs_lookup_volume_rcu(struct afs_cell *cell,
-						afs_volid_t vid)
-{
-	struct afs_volume *volume = NULL;
-	struct rb_node *p;
-	int seq = 0;
-
-	do {
-		/* Unfortunately, rbtree walking doesn't give reliable results
-		 * under just the RCU read lock, so we have to check for
-		 * changes.
-		 */
-		read_seqbegin_or_lock(&cell->volume_lock, &seq);
-
-		p = rcu_dereference_raw(cell->volumes.rb_node);
-		while (p) {
-			volume = rb_entry(p, struct afs_volume, cell_node);
-
-			if (volume->vid < vid)
-				p = rcu_dereference_raw(p->rb_left);
-			else if (volume->vid > vid)
-				p = rcu_dereference_raw(p->rb_right);
-			else
-				break;
-			volume = NULL;
-		}
-
-	} while (need_seqretry(&cell->volume_lock, seq));
-
-	done_seqretry(&cell->volume_lock, seq);
-	return volume;
-}
-
-/*
- * allow the fileserver to explicitly break one callback
- * - happens when
- *   - the backing file is changed
- *   - a lock is released
- */
-static void afs_break_one_callback(struct afs_volume *volume,
-				   struct afs_fid *fid)
-{
-	struct super_block *sb;
-	struct afs_vnode *vnode;
-	struct inode *inode;
-
-	if (fid->vnode == 0 && fid->unique == 0) {
-		/* The callback break applies to an entire volume. */
-		write_lock(&volume->cb_v_break_lock);
-		volume->cb_v_break++;
-		trace_afs_cb_break(fid, volume->cb_v_break,
-				   afs_cb_break_for_volume_callback, false);
-		write_unlock(&volume->cb_v_break_lock);
-		return;
-	}
-
-	/* See if we can find a matching inode - even an I_NEW inode needs to
-	 * be marked as it can have its callback broken before we finish
-	 * setting up the local inode.
+	/* munch our way through the list, grabbing the inode, dropping all the
+	 * locks and regetting them in the right order
 	 */
-	sb = rcu_dereference(volume->sb);
-	if (!sb)
-		return;
+	while (!list_empty(&callbacks)) {
+		struct afs_vnode *vnode;
+		struct inode *inode;
 
-	inode = find_inode_rcu(sb, fid->vnode, afs_ilookup5_test_by_fid, fid);
-	if (inode) {
-		vnode = AFS_FS_I(inode);
-		afs_break_callback(vnode, afs_cb_break_for_callback);
-	} else {
-		trace_afs_cb_miss(fid, afs_cb_break_for_callback);
-	}
-}
+		vnode = list_entry(callbacks.next, struct afs_vnode, cb_link);
+		list_del_init(&vnode->cb_link);
 
-static void afs_break_some_callbacks(struct afs_server *server,
-				     struct afs_callback_break *cbb,
-				     size_t *_count)
-{
-	struct afs_callback_break *residue = cbb;
-	struct afs_volume *volume;
-	afs_volid_t vid = cbb->fid.vid;
-	size_t i;
+		/* try and grab the inode - may fail */
+		inode = igrab(AFS_VNODE_TO_I(vnode));
+		if (inode) {
+			int release = 0;
 
-	volume = afs_lookup_volume_rcu(server->cell, vid);
+			spin_unlock(&server->cb_lock);
+			spin_lock(&vnode->lock);
 
-	/* TODO: Find all matching volumes if we couldn't match the server and
-	 * break them anyway.
-	 */
+			if (vnode->cb_server == server) {
+				vnode->cb_server = NULL;
+				afs_kafstimod_del_timer(&vnode->cb_timeout);
+				spin_lock(&afs_cb_hash_lock);
+				list_del_init(&vnode->cb_hash_link);
+				spin_unlock(&afs_cb_hash_lock);
+				release = 1;
+			}
 
-	for (i = *_count; i > 0; cbb++, i--) {
-		if (cbb->fid.vid == vid) {
-			_debug("- Fid { vl=%08llx n=%llu u=%u }",
-			       cbb->fid.vid,
-			       cbb->fid.vnode,
-			       cbb->fid.unique);
-			--*_count;
-			if (volume)
-				afs_break_one_callback(volume, &cbb->fid);
-		} else {
-			*residue++ = *cbb;
+			spin_unlock(&vnode->lock);
+
+			iput(inode);
+			afs_put_server(server);
+
+			spin_lock(&server->cb_lock);
 		}
 	}
-}
 
+	spin_unlock(&server->cb_lock);
+
+	_leave(" = 0");
+	return 0;
+} /* end SRXAFSCM_InitCallBackState() */
+
+/*****************************************************************************/
 /*
  * allow the fileserver to break callback promises
  */
-void afs_break_callbacks(struct afs_server *server, size_t count,
-			 struct afs_callback_break *callbacks)
+int SRXAFSCM_CallBack(struct afs_server *server, size_t count,
+		      struct afs_callback callbacks[])
 {
-	_enter("%p,%zu,", server, count);
+	_enter("%p,%u,", server, count);
 
-	ASSERT(server != NULL);
+	for (; count > 0; callbacks++, count--) {
+		struct afs_vnode *vnode = NULL;
+		struct inode *inode = NULL;
+		int valid = 0;
 
-	rcu_read_lock();
+		_debug("- Fid { vl=%08x n=%u u=%u }  CB { v=%u x=%u t=%u }",
+		       callbacks->fid.vid,
+		       callbacks->fid.vnode,
+		       callbacks->fid.unique,
+		       callbacks->version,
+		       callbacks->expiry,
+		       callbacks->type
+		       );
 
-	while (count > 0)
-		afs_break_some_callbacks(server, callbacks, &count);
+		/* find the inode for this fid */
+		spin_lock(&afs_cb_hash_lock);
 
-	rcu_read_unlock();
-	return;
-}
+		list_for_each_entry(vnode,
+				    &afs_cb_hash(server, &callbacks->fid),
+				    cb_hash_link) {
+			if (memcmp(&vnode->fid, &callbacks->fid,
+				   sizeof(struct afs_fid)) != 0)
+				continue;
+
+			/* right vnode, but is it same server? */
+			if (vnode->cb_server != server)
+				break; /* no */
+
+			/* try and nail the inode down */
+			inode = igrab(AFS_VNODE_TO_I(vnode));
+			break;
+		}
+
+		spin_unlock(&afs_cb_hash_lock);
+
+		if (inode) {
+			/* we've found the record for this vnode */
+			spin_lock(&vnode->lock);
+			if (vnode->cb_server == server) {
+				/* the callback _is_ on the calling server */
+				vnode->cb_server = NULL;
+				valid = 1;
+
+				afs_kafstimod_del_timer(&vnode->cb_timeout);
+				vnode->flags |= AFS_VNODE_CHANGED;
+
+				spin_lock(&server->cb_lock);
+				list_del_init(&vnode->cb_link);
+				spin_unlock(&server->cb_lock);
+
+				spin_lock(&afs_cb_hash_lock);
+				list_del_init(&vnode->cb_hash_link);
+				spin_unlock(&afs_cb_hash_lock);
+			}
+			spin_unlock(&vnode->lock);
+
+			if (valid) {
+				invalidate_remote_inode(inode);
+				afs_put_server(server);
+			}
+			iput(inode);
+		}
+	}
+
+	_leave(" = 0");
+	return 0;
+} /* end SRXAFSCM_CallBack() */
+
+/*****************************************************************************/
+/*
+ * allow the fileserver to see if the cache manager is still alive
+ */
+int SRXAFSCM_Probe(struct afs_server *server)
+{
+	_debug("SRXAFSCM_Probe(%p)\n", server);
+	return 0;
+} /* end SRXAFSCM_Probe() */

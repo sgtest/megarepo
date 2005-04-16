@@ -1,242 +1,121 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
- * drivers/power/process.c - Functions for starting/stopping processes on
+ * drivers/power/process.c - Functions for starting/stopping processes on 
  *                           suspend transitions.
  *
  * Originally from swsusp.
  */
 
+
+#undef DEBUG
+
+#include <linux/smp_lock.h>
 #include <linux/interrupt.h>
-#include <linux/oom.h>
 #include <linux/suspend.h>
 #include <linux/module.h>
-#include <linux/sched/debug.h>
-#include <linux/sched/task.h>
-#include <linux/syscalls.h>
-#include <linux/freezer.h>
-#include <linux/delay.h>
-#include <linux/workqueue.h>
-#include <linux/kmod.h>
-#include <trace/events/power.h>
-#include <linux/cpuset.h>
 
-/*
+/* 
  * Timeout for stopping processes
  */
-unsigned int __read_mostly freeze_timeout_msecs = 20 * MSEC_PER_SEC;
+#define TIMEOUT	(6 * HZ)
 
-static int try_to_freeze_tasks(bool user_only)
+
+static inline int freezeable(struct task_struct * p)
 {
-	struct task_struct *g, *p;
-	unsigned long end_time;
-	unsigned int todo;
-	bool wq_busy = false;
-	ktime_t start, end, elapsed;
-	unsigned int elapsed_msecs;
-	bool wakeup = false;
-	int sleep_usecs = USEC_PER_MSEC;
-
-	start = ktime_get_boottime();
-
-	end_time = jiffies + msecs_to_jiffies(freeze_timeout_msecs);
-
-	if (!user_only)
-		freeze_workqueues_begin();
-
-	while (true) {
-		todo = 0;
-		read_lock(&tasklist_lock);
-		for_each_process_thread(g, p) {
-			if (p == current || !freeze_task(p))
-				continue;
-
-			if (!freezer_should_skip(p))
-				todo++;
-		}
-		read_unlock(&tasklist_lock);
-
-		if (!user_only) {
-			wq_busy = freeze_workqueues_busy();
-			todo += wq_busy;
-		}
-
-		if (!todo || time_after(jiffies, end_time))
-			break;
-
-		if (pm_wakeup_pending()) {
-			wakeup = true;
-			break;
-		}
-
-		/*
-		 * We need to retry, but first give the freezing tasks some
-		 * time to enter the refrigerator.  Start with an initial
-		 * 1 ms sleep followed by exponential backoff until 8 ms.
-		 */
-		usleep_range(sleep_usecs / 2, sleep_usecs);
-		if (sleep_usecs < 8 * USEC_PER_MSEC)
-			sleep_usecs *= 2;
-	}
-
-	end = ktime_get_boottime();
-	elapsed = ktime_sub(end, start);
-	elapsed_msecs = ktime_to_ms(elapsed);
-
-	if (todo) {
-		pr_cont("\n");
-		pr_err("Freezing of tasks %s after %d.%03d seconds "
-		       "(%d tasks refusing to freeze, wq_busy=%d):\n",
-		       wakeup ? "aborted" : "failed",
-		       elapsed_msecs / 1000, elapsed_msecs % 1000,
-		       todo - wq_busy, wq_busy);
-
-		if (wq_busy)
-			show_all_workqueues();
-
-		if (!wakeup || pm_debug_messages_on) {
-			read_lock(&tasklist_lock);
-			for_each_process_thread(g, p) {
-				if (p != current && !freezer_should_skip(p)
-				    && freezing(p) && !frozen(p))
-					sched_show_task(p);
-			}
-			read_unlock(&tasklist_lock);
-		}
-	} else {
-		pr_cont("(elapsed %d.%03d seconds) ", elapsed_msecs / 1000,
-			elapsed_msecs % 1000);
-	}
-
-	return todo ? -EBUSY : 0;
+	if ((p == current) || 
+	    (p->flags & PF_NOFREEZE) ||
+	    (p->exit_state == EXIT_ZOMBIE) ||
+	    (p->exit_state == EXIT_DEAD) ||
+	    (p->state == TASK_STOPPED) ||
+	    (p->state == TASK_TRACED))
+		return 0;
+	return 1;
 }
 
-/**
- * freeze_processes - Signal user space processes to enter the refrigerator.
- * The current thread will not be frozen.  The same process that calls
- * freeze_processes must later call thaw_processes.
- *
- * On success, returns 0.  On failure, -errno and system is fully thawed.
- */
+/* Refrigerator is place where frozen processes are stored :-). */
+void refrigerator(unsigned long flag)
+{
+	/* Hmm, should we be allowed to suspend when there are realtime
+	   processes around? */
+	long save;
+	save = current->state;
+	current->state = TASK_UNINTERRUPTIBLE;
+	pr_debug("%s entered refrigerator\n", current->comm);
+	printk("=");
+	current->flags &= ~PF_FREEZE;
+
+	spin_lock_irq(&current->sighand->siglock);
+	recalc_sigpending(); /* We sent fake signal, clean it up */
+	spin_unlock_irq(&current->sighand->siglock);
+
+	current->flags |= PF_FROZEN;
+	while (current->flags & PF_FROZEN)
+		schedule();
+	pr_debug("%s left refrigerator\n", current->comm);
+	current->state = save;
+}
+
+/* 0 = success, else # of processes that we failed to stop */
 int freeze_processes(void)
 {
-	int error;
+       int todo;
+       unsigned long start_time;
+	struct task_struct *g, *p;
+	
+	printk( "Stopping tasks: " );
+	start_time = jiffies;
+	do {
+		todo = 0;
+		read_lock(&tasklist_lock);
+		do_each_thread(g, p) {
+			unsigned long flags;
+			if (!freezeable(p))
+				continue;
+			if ((p->flags & PF_FROZEN) ||
+			    (p->state == TASK_TRACED) ||
+			    (p->state == TASK_STOPPED))
+				continue;
 
-	error = __usermodehelper_disable(UMH_FREEZING);
-	if (error)
-		return error;
-
-	/* Make sure this task doesn't get frozen */
-	current->flags |= PF_SUSPEND_TASK;
-
-	if (!pm_freezing)
-		atomic_inc(&system_freezing_cnt);
-
-	pm_wakeup_clear(0);
-	pr_info("Freezing user space processes ... ");
-	pm_freezing = true;
-	error = try_to_freeze_tasks(true);
-	if (!error) {
-		__usermodehelper_set_disable_depth(UMH_DISABLED);
-		pr_cont("done.");
-	}
-	pr_cont("\n");
+			/* FIXME: smp problem here: we may not access other process' flags
+			   without locking */
+			p->flags |= PF_FREEZE;
+			spin_lock_irqsave(&p->sighand->siglock, flags);
+			signal_wake_up(p, 0);
+			spin_unlock_irqrestore(&p->sighand->siglock, flags);
+			todo++;
+		} while_each_thread(g, p);
+		read_unlock(&tasklist_lock);
+		yield();			/* Yield is okay here */
+		if (time_after(jiffies, start_time + TIMEOUT)) {
+			printk( "\n" );
+			printk(KERN_ERR " stopping tasks failed (%d tasks remaining)\n", todo );
+			return todo;
+		}
+	} while(todo);
+	
+	printk( "|\n" );
 	BUG_ON(in_atomic());
-
-	/*
-	 * Now that the whole userspace is frozen we need to disable
-	 * the OOM killer to disallow any further interference with
-	 * killable tasks. There is no guarantee oom victims will
-	 * ever reach a point they go away we have to wait with a timeout.
-	 */
-	if (!error && !oom_killer_disable(msecs_to_jiffies(freeze_timeout_msecs)))
-		error = -EBUSY;
-
-	if (error)
-		thaw_processes();
-	return error;
-}
-
-/**
- * freeze_kernel_threads - Make freezable kernel threads go to the refrigerator.
- *
- * On success, returns 0.  On failure, -errno and only the kernel threads are
- * thawed, so as to give a chance to the caller to do additional cleanups
- * (if any) before thawing the userspace tasks. So, it is the responsibility
- * of the caller to thaw the userspace tasks, when the time is right.
- */
-int freeze_kernel_threads(void)
-{
-	int error;
-
-	pr_info("Freezing remaining freezable tasks ... ");
-
-	pm_nosig_freezing = true;
-	error = try_to_freeze_tasks(false);
-	if (!error)
-		pr_cont("done.");
-
-	pr_cont("\n");
-	BUG_ON(in_atomic());
-
-	if (error)
-		thaw_kernel_threads();
-	return error;
+	return 0;
 }
 
 void thaw_processes(void)
 {
 	struct task_struct *g, *p;
-	struct task_struct *curr = current;
 
-	trace_suspend_resume(TPS("thaw_processes"), 0, true);
-	if (pm_freezing)
-		atomic_dec(&system_freezing_cnt);
-	pm_freezing = false;
-	pm_nosig_freezing = false;
-
-	oom_killer_enable();
-
-	pr_info("Restarting tasks ... ");
-
-	__usermodehelper_set_disable_depth(UMH_FREEZING);
-	thaw_workqueues();
-
-	cpuset_wait_for_hotplug();
-
+	printk( "Restarting tasks..." );
 	read_lock(&tasklist_lock);
-	for_each_process_thread(g, p) {
-		/* No other threads should have PF_SUSPEND_TASK set */
-		WARN_ON((p != curr) && (p->flags & PF_SUSPEND_TASK));
-		__thaw_task(p);
-	}
+	do_each_thread(g, p) {
+		if (!freezeable(p))
+			continue;
+		if (p->flags & PF_FROZEN) {
+			p->flags &= ~PF_FROZEN;
+			wake_up_process(p);
+		} else
+			printk(KERN_INFO " Strange, %s not stopped\n", p->comm );
+	} while_each_thread(g, p);
+
 	read_unlock(&tasklist_lock);
-
-	WARN_ON(!(curr->flags & PF_SUSPEND_TASK));
-	curr->flags &= ~PF_SUSPEND_TASK;
-
-	usermodehelper_enable();
-
 	schedule();
-	pr_cont("done.\n");
-	trace_suspend_resume(TPS("thaw_processes"), 0, false);
+	printk( " done\n" );
 }
 
-void thaw_kernel_threads(void)
-{
-	struct task_struct *g, *p;
-
-	pm_nosig_freezing = false;
-	pr_info("Restarting kernel threads ... ");
-
-	thaw_workqueues();
-
-	read_lock(&tasklist_lock);
-	for_each_process_thread(g, p) {
-		if (p->flags & PF_KTHREAD)
-			__thaw_task(p);
-	}
-	read_unlock(&tasklist_lock);
-
-	schedule();
-	pr_cont("done.\n");
-}
+EXPORT_SYMBOL(refrigerator);

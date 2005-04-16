@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * arch/alpha/boot/bootpz.c
  *
@@ -11,13 +10,14 @@
  * and the decompression code from MILO.
  */
 #include <linux/kernel.h>
-#include <linux/slab.h>
 #include <linux/string.h>
-#include <generated/utsrelease.h>
+#include <linux/version.h>
 #include <linux/mm.h>
 
+#include <asm/system.h>
 #include <asm/console.h>
 #include <asm/hwrpb.h>
+#include <asm/pgtable.h>
 #include <asm/io.h>
 
 #include <stdarg.h>
@@ -200,7 +200,7 @@ extern char _end;
 	START_ADDR	KSEG address of the entry point of kernel code.
 
 	ZERO_PGE	KSEG address of page full of zeroes, but 
-			upon entry to kernel, it can be expected
+			upon entry to kerne cvan be expected
 			to hold the parameter list and possible
 			INTRD information.
 
@@ -466,10 +466,4 @@ start_kernel(void)
 	srm_printk("Doing 'runkernel()'...\n");
 #endif
 	runkernel();
-}
-
- /* dummy function, should never be called. */
-void *__kmalloc(size_t size, gfp_t flags)
-{
-	return (void *)NULL;
 }

@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Common code for low-level network console, dump, and debugger code
  *
@@ -10,103 +9,59 @@
 
 #include <linux/netdevice.h>
 #include <linux/interrupt.h>
-#include <linux/rcupdate.h>
 #include <linux/list.h>
-#include <linux/refcount.h>
 
-union inet_addr {
-	__u32		all[4];
-	__be32		ip;
-	__be32		ip6[4];
-	struct in_addr	in;
-	struct in6_addr	in6;
-};
+struct netpoll;
 
 struct netpoll {
 	struct net_device *dev;
-	netdevice_tracker dev_tracker;
-	char dev_name[IFNAMSIZ];
-	const char *name;
-
-	union inet_addr local_ip, remote_ip;
-	bool ipv6;
+	char dev_name[16], *name;
+	int rx_flags;
+	void (*rx_hook)(struct netpoll *, int, char *, int);
+	void (*drop)(struct sk_buff *skb);
+	u32 local_ip, remote_ip;
 	u16 local_port, remote_port;
-	u8 remote_mac[ETH_ALEN];
+	unsigned char local_mac[6], remote_mac[6];
+	spinlock_t poll_lock;
+	int poll_owner;
 };
 
-struct netpoll_info {
-	refcount_t refcnt;
-
-	struct semaphore dev_lock;
-
-	struct sk_buff_head txq;
-
-	struct delayed_work tx_work;
-
-	struct netpoll *netpoll;
-	struct rcu_head rcu;
-};
-
-#ifdef CONFIG_NETPOLL
-void netpoll_poll_dev(struct net_device *dev);
-void netpoll_poll_disable(struct net_device *dev);
-void netpoll_poll_enable(struct net_device *dev);
-#else
-static inline void netpoll_poll_disable(struct net_device *dev) { return; }
-static inline void netpoll_poll_enable(struct net_device *dev) { return; }
-#endif
-
+void netpoll_poll(struct netpoll *np);
 void netpoll_send_udp(struct netpoll *np, const char *msg, int len);
-void netpoll_print_options(struct netpoll *np);
 int netpoll_parse_options(struct netpoll *np, char *opt);
-int __netpoll_setup(struct netpoll *np, struct net_device *ndev);
 int netpoll_setup(struct netpoll *np);
-void __netpoll_cleanup(struct netpoll *np);
-void __netpoll_free(struct netpoll *np);
+int netpoll_trap(void);
+void netpoll_set_trap(int trap);
 void netpoll_cleanup(struct netpoll *np);
-netdev_tx_t netpoll_send_skb(struct netpoll *np, struct sk_buff *skb);
+int __netpoll_rx(struct sk_buff *skb);
+void netpoll_queue(struct sk_buff *skb);
 
 #ifdef CONFIG_NETPOLL
-static inline void *netpoll_poll_lock(struct napi_struct *napi)
+static inline int netpoll_rx(struct sk_buff *skb)
 {
-	struct net_device *dev = napi->dev;
+	return skb->dev->np && skb->dev->np->rx_flags && __netpoll_rx(skb);
+}
 
-	if (dev && dev->npinfo) {
-		int owner = smp_processor_id();
-
-		while (cmpxchg(&napi->poll_owner, -1, owner) != -1)
-			cpu_relax();
-
-		return napi;
+static inline void netpoll_poll_lock(struct net_device *dev)
+{
+	if (dev->np) {
+		spin_lock(&dev->np->poll_lock);
+		dev->np->poll_owner = smp_processor_id();
 	}
-	return NULL;
 }
 
-static inline void netpoll_poll_unlock(void *have)
+static inline void netpoll_poll_unlock(struct net_device *dev)
 {
-	struct napi_struct *napi = have;
-
-	if (napi)
-		smp_store_release(&napi->poll_owner, -1);
-}
-
-static inline bool netpoll_tx_running(struct net_device *dev)
-{
-	return irqs_disabled();
+	if (dev->np) {
+		spin_unlock(&dev->np->poll_lock);
+		dev->np->poll_owner = -1;
+	}
 }
 
 #else
-static inline void *netpoll_poll_lock(struct napi_struct *napi)
-{
-	return NULL;
-}
-static inline void netpoll_poll_unlock(void *have)
-{
-}
-static inline bool netpoll_tx_running(struct net_device *dev)
-{
-	return false;
-}
+#define netpoll_rx(a) 0
+#define netpoll_poll_lock(a)
+#define netpoll_poll_unlock(a)
 #endif
 
 #endif

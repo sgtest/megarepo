@@ -1,8 +1,21 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Driver for PowerMac AWACS onboard soundchips
  * Copyright (c) 2001 by Takashi Iwai <tiwai@suse.de>
  *   based on dmasound.c.
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  */
 
 
@@ -103,11 +116,6 @@ struct awacs_regs {
 #define MASK_HDMUTE	MASK_AMUTE
 #define SHIFT_HDMUTE	9
 #define MASK_PAROUT	(0x3 << 10)	/* Parallel Out (???) */
-#define MASK_PAROUT0	(0x1 << 10)	/* Parallel Out (???) */
-#define MASK_PAROUT1	(0x1 << 11)	/* Parallel Out (enable speaker) */
-#define SHIFT_PAROUT	10
-#define SHIFT_PAROUT0	10
-#define SHIFT_PAROUT1	11
 
 #define SAMPLERATE_48000	(0x0 << 3)	/* 48 or 44.1 kHz */
 #define SAMPLERATE_32000	(0x1 << 3)	/* 32 or 29.4 kHz */
@@ -131,7 +139,7 @@ struct awacs_regs {
 #define VOLLEFT(x)	(((~(x)) << 6) & MASK_OUTVOLLEFT)
 
 /* address 6 */
-#define MASK_MIC_BOOST  (0x4)		/* screamer mic boost */
+#define MASK_MIC_BOOST  (0x4)           /* screamer mic boost */
 #define SHIFT_MIC_BOOST	2
 
 /* Audio Codec Status Reg Bit Masks */
@@ -144,15 +152,8 @@ struct awacs_regs {
 #define MASK_REVISION	(0xf << 12)	/* Revision Number */
 #define MASK_MFGID	(0xf << 8)	/* Mfg. ID */
 #define MASK_CODSTATRES	(0xf << 4)	/* bits 4 - 7 reserved */
-#define MASK_INSENSE	(0xf)		/* port sense bits: */
-#define MASK_HDPCONN		8	/* headphone plugged in */
-#define MASK_LOCONN		4	/* line-out plugged in */
-#define MASK_LICONN		2	/* line-in plugged in */
-#define MASK_MICCONN		1	/* microphone plugged in */
-#define MASK_LICONN_IMAC	8	/* line-in plugged in */
-#define MASK_HDPRCONN_IMAC	4	/* headphone right plugged in */
-#define MASK_HDPLCONN_IMAC	2	/* headphone left plugged in */
-#define MASK_LOCONN_IMAC	1	/* line-out plugged in */
+#define MASK_INPPORT	(0xf)		/* Input Port */
+#define MASK_HDPCONN	8		/* headphone plugged in */
 
 /* Clipping Count Reg Bit Masks */
 /* -------- ----- --- --- ----- */
@@ -162,8 +163,7 @@ struct awacs_regs {
 /* DBDMA ChannelStatus Bit Masks */
 /* ----- ------------- --- ----- */
 #define MASK_CSERR	(0x1 << 7)	/* Error */
-#define MASK_EOI	(0x1 << 6)	/* End of Input --
-					   only for Input Channel */
+#define MASK_EOI	(0x1 << 6)	/* End of Input -- only for Input Channel */
 #define MASK_CSUNUSED	(0x1f << 1)	/* bits 1-5 not used */
 #define MASK_WAIT	(0x1)		/* Wait */
 

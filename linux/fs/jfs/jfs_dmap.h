@@ -1,6 +1,19 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- *   Copyright (C) International Business Machines Corp., 2000-2002
+ *   Copyright (c) International Business Machines Corp., 2000-2002
+ *
+ *   This program is free software;  you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or 
+ *   (at your option) any later version.
+ * 
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY;  without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See
+ *   the GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program;  if not, write to the Free Software 
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
  */
 #ifndef	_H_JFS_DMAP
 #define _H_JFS_DMAP
@@ -14,7 +27,7 @@
 #define L2LPERDMAP	8	/* l2 number of leaves per dmap tree */
 #define	DBWORD		32	/* # of blks covered by a map word */
 #define	L2DBWORD	5	/* l2 # of blks covered by a mword */
-#define BUDMIN		L2DBWORD	/* max free string in a map word */
+#define BUDMIN  	L2DBWORD	/* max free string in a map word */
 #define BPERDMAP	(LPERDMAP * DBWORD)	/* num of blks per dmap */
 #define L2BPERDMAP	13	/* l2 num of blks per dmap */
 #define CTLTREESIZE	(1024+256+64+16+4+1)	/* size of a dmapctl tree */
@@ -44,11 +57,11 @@
 
 #define	MAXMAPSIZE	MAXL2SIZE	/* maximum aggregate map size */
 
-/*
+/* 
  * determine the maximum free string for four (lower level) nodes
  * of the tree.
  */
-static inline signed char TREEMAX(signed char *cp)
+static __inline signed char TREEMAX(signed char *cp)
 {
 	signed char tmp1, tmp2;
 
@@ -70,7 +83,7 @@ static inline signed char TREEMAX(signed char *cp)
  *	- 1 is added to account for the control page of the map.
  */
 #define BLKTODMAP(b,s)    \
-	((((b) >> 13) + ((b) >> 23) + ((b) >> 33) + 3 + 1) << (s))
+        ((((b) >> 13) + ((b) >> 23) + ((b) >> 33) + 3 + 1) << (s))
 
 /*
  * convert disk block number to the logical block number of the LEVEL 0
@@ -85,7 +98,7 @@ static inline signed char TREEMAX(signed char *cp)
  *	- 1 is added to account for the control page of the map.
  */
 #define BLKTOL0(b,s)      \
-	(((((b) >> 23) << 10) + ((b) >> 23) + ((b) >> 33) + 2 + 1) << (s))
+        (((((b) >> 23) << 10) + ((b) >> 23) + ((b) >> 33) + 2 + 1) << (s))
 
 /*
  * convert disk block number to the logical block number of the LEVEL 1
@@ -107,9 +120,9 @@ static inline signed char TREEMAX(signed char *cp)
  * at the specified level which describes the disk block.
  */
 #define BLKTOCTL(b,s,l)   \
-	(((l) == 2) ? 1 : ((l) == 1) ? BLKTOL1((b),(s)) : BLKTOL0((b),(s)))
+        (((l) == 2) ? 1 : ((l) == 1) ? BLKTOL1((b),(s)) : BLKTOL0((b),(s)))
 
-/*
+/* 
  * convert aggregate map size to the zero origin dmapctl level of the
  * top dmapctl.
  */
@@ -132,27 +145,27 @@ static inline signed char TREEMAX(signed char *cp)
  * dmaptree must be consistent with dmapctl.
  */
 struct dmaptree {
-	__le32 nleafs;		/* 4: number of tree leafs	*/
-	__le32 l2nleafs;	/* 4: l2 number of tree leafs	*/
-	__le32 leafidx;		/* 4: index of first tree leaf	*/
-	__le32 height;		/* 4: height of the tree	*/
+	__le32 nleafs;		/* 4: number of tree leafs      */
+	__le32 l2nleafs;	/* 4: l2 number of tree leafs   */
+	__le32 leafidx;		/* 4: index of first tree leaf  */
+	__le32 height;		/* 4: height of the tree        */
 	s8 budmin;		/* 1: min l2 tree leaf value to combine */
-	s8 stree[TREESIZE];	/* TREESIZE: tree		*/
-	u8 pad[2];		/* 2: pad to word boundary	*/
-};				/* - 360 -			*/
+	s8 stree[TREESIZE];	/* TREESIZE: tree               */
+	u8 pad[2];		/* 2: pad to word boundary      */
+};				/* - 360 -                      */
 
 /*
  *	dmap page per 8K blocks bitmap
  */
 struct dmap {
-	__le32 nblocks;		/* 4: num blks covered by this dmap	*/
-	__le32 nfree;		/* 4: num of free blks in this dmap	*/
-	__le64 start;		/* 8: starting blkno for this dmap	*/
-	struct dmaptree tree;	/* 360: dmap tree			*/
-	u8 pad[1672];		/* 1672: pad to 2048 bytes		*/
-	__le32 wmap[LPERDMAP];	/* 1024: bits of the working map	*/
-	__le32 pmap[LPERDMAP];	/* 1024: bits of the persistent map	*/
-};				/* - 4096 -				*/
+	__le32 nblocks;		/* 4: num blks covered by this dmap     */
+	__le32 nfree;		/* 4: num of free blks in this dmap     */
+	__le64 start;		/* 8: starting blkno for this dmap      */
+	struct dmaptree tree;	/* 360: dmap tree                       */
+	u8 pad[1672];		/* 1672: pad to 2048 bytes              */
+	__le32 wmap[LPERDMAP];	/* 1024: bits of the working map        */
+	__le32 pmap[LPERDMAP];	/* 1024: bits of the persistent map     */
+};				/* - 4096 -                             */
 
 /*
  *	disk map control page per level.
@@ -160,14 +173,14 @@ struct dmap {
  * dmapctl must be consistent with dmaptree.
  */
 struct dmapctl {
-	__le32 nleafs;		/* 4: number of tree leafs	*/
-	__le32 l2nleafs;	/* 4: l2 number of tree leafs	*/
-	__le32 leafidx;		/* 4: index of the first tree leaf	*/
-	__le32 height;		/* 4: height of tree		*/
-	s8 budmin;		/* 1: minimum l2 tree leaf value	*/
-	s8 stree[CTLTREESIZE];	/* CTLTREESIZE: dmapctl tree	*/
-	u8 pad[2714];		/* 2714: pad to 4096		*/
-};				/* - 4096 -			*/
+	__le32 nleafs;		/* 4: number of tree leafs      */
+	__le32 l2nleafs;	/* 4: l2 number of tree leafs   */
+	__le32 leafidx;		/* 4: index of the first tree leaf      */
+	__le32 height;		/* 4: height of tree            */
+	s8 budmin;		/* 1: minimum l2 tree leaf value        */
+	s8 stree[CTLTREESIZE];	/* CTLTREESIZE: dmapctl tree    */
+	u8 pad[2714];		/* 2714: pad to 4096            */
+};				/* - 4096 -                     */
 
 /*
  *	common definition for dmaptree within dmap and dmapctl
@@ -179,58 +192,58 @@ typedef union dmtree {
 
 /* macros for accessing fields within dmtree */
 #define	dmt_nleafs	t1.nleafs
-#define	dmt_l2nleafs	t1.l2nleafs
-#define	dmt_leafidx	t1.leafidx
-#define	dmt_height	t1.height
-#define	dmt_budmin	t1.budmin
-#define	dmt_stree	t2.stree
+#define	dmt_l2nleafs 	t1.l2nleafs
+#define	dmt_leafidx 	t1.leafidx
+#define	dmt_height 	t1.height
+#define	dmt_budmin 	t1.budmin
+#define	dmt_stree 	t1.stree
 
-/*
+/* 
  *	on-disk aggregate disk allocation map descriptor.
  */
 struct dbmap_disk {
-	__le64 dn_mapsize;	/* 8: number of blocks in aggregate	*/
-	__le64 dn_nfree;	/* 8: num free blks in aggregate map	*/
-	__le32 dn_l2nbperpage;	/* 4: number of blks per page		*/
-	__le32 dn_numag;	/* 4: total number of ags		*/
-	__le32 dn_maxlevel;	/* 4: number of active ags		*/
-	__le32 dn_maxag;	/* 4: max active alloc group number	*/
-	__le32 dn_agpref;	/* 4: preferred alloc group (hint)	*/
-	__le32 dn_aglevel;	/* 4: dmapctl level holding the AG	*/
-	__le32 dn_agheight;	/* 4: height in dmapctl of the AG	*/
-	__le32 dn_agwidth;	/* 4: width in dmapctl of the AG	*/
-	__le32 dn_agstart;	/* 4: start tree index at AG height	*/
-	__le32 dn_agl2size;	/* 4: l2 num of blks per alloc group	*/
-	__le64 dn_agfree[MAXAG];/* 8*MAXAG: per AG free count		*/
-	__le64 dn_agsize;	/* 8: num of blks per alloc group	*/
-	s8 dn_maxfreebud;	/* 1: max free buddy system		*/
-	u8 pad[3007];		/* 3007: pad to 4096			*/
-};				/* - 4096 -				*/
+	__le64 dn_mapsize;	/* 8: number of blocks in aggregate     */
+	__le64 dn_nfree;	/* 8: num free blks in aggregate map    */
+	__le32 dn_l2nbperpage;	/* 4: number of blks per page           */
+	__le32 dn_numag;	/* 4: total number of ags               */
+	__le32 dn_maxlevel;	/* 4: number of active ags              */
+	__le32 dn_maxag;	/* 4: max active alloc group number     */
+	__le32 dn_agpref;	/* 4: preferred alloc group (hint)      */
+	__le32 dn_aglevel;	/* 4: dmapctl level holding the AG      */
+	__le32 dn_agheigth;	/* 4: height in dmapctl of the AG       */
+	__le32 dn_agwidth;	/* 4: width in dmapctl of the AG        */
+	__le32 dn_agstart;	/* 4: start tree index at AG height     */
+	__le32 dn_agl2size;	/* 4: l2 num of blks per alloc group    */
+	__le64 dn_agfree[MAXAG];/* 8*MAXAG: per AG free count           */
+	__le64 dn_agsize;	/* 8: num of blks per alloc group       */
+	s8 dn_maxfreebud;	/* 1: max free buddy system             */
+	u8 pad[3007];		/* 3007: pad to 4096                    */
+};				/* - 4096 -                             */
 
 struct dbmap {
-	s64 dn_mapsize;		/* number of blocks in aggregate	*/
-	s64 dn_nfree;		/* num free blks in aggregate map	*/
-	int dn_l2nbperpage;	/* number of blks per page		*/
-	int dn_numag;		/* total number of ags			*/
-	int dn_maxlevel;	/* number of active ags			*/
-	int dn_maxag;		/* max active alloc group number	*/
-	int dn_agpref;		/* preferred alloc group (hint)		*/
-	int dn_aglevel;		/* dmapctl level holding the AG		*/
-	int dn_agheight;	/* height in dmapctl of the AG		*/
-	int dn_agwidth;		/* width in dmapctl of the AG		*/
-	int dn_agstart;		/* start tree index at AG height	*/
-	int dn_agl2size;	/* l2 num of blks per alloc group	*/
-	s64 dn_agfree[MAXAG];	/* per AG free count			*/
-	s64 dn_agsize;		/* num of blks per alloc group		*/
-	signed char dn_maxfreebud;	/* max free buddy system	*/
-};				/* - 4096 -				*/
-/*
+	s64 dn_mapsize;		/* number of blocks in aggregate     */
+	s64 dn_nfree;		/* num free blks in aggregate map    */
+	int dn_l2nbperpage;	/* number of blks per page           */
+	int dn_numag;		/* total number of ags               */
+	int dn_maxlevel;	/* number of active ags              */
+	int dn_maxag;		/* max active alloc group number     */
+	int dn_agpref;		/* preferred alloc group (hint)      */
+	int dn_aglevel;		/* dmapctl level holding the AG      */
+	int dn_agheigth;	/* height in dmapctl of the AG       */
+	int dn_agwidth;		/* width in dmapctl of the AG        */
+	int dn_agstart;		/* start tree index at AG height     */
+	int dn_agl2size;	/* l2 num of blks per alloc group    */
+	s64 dn_agfree[MAXAG];	/* per AG free count           */
+	s64 dn_agsize;		/* num of blks per alloc group       */
+	signed char dn_maxfreebud;	/* max free buddy system             */
+};				/* - 4096 -                             */
+/* 
  *	in-memory aggregate disk allocation map descriptor.
  */
 struct bmap {
 	struct dbmap db_bmap;		/* on-disk aggregate map descriptor */
 	struct inode *db_ipbmap;	/* ptr to aggregate map incore inode */
-	struct mutex db_bmaplock;	/* aggregate map lock */
+	struct semaphore db_bmaplock;	/* aggregate map lock */
 	atomic_t db_active[MAXAG];	/* count of active, open files in AG */
 	u32 *db_DBmap;
 };
@@ -242,7 +255,7 @@ struct bmap {
 #define	db_agsize	db_bmap.dn_agsize
 #define	db_agl2size	db_bmap.dn_agl2size
 #define	db_agwidth	db_bmap.dn_agwidth
-#define	db_agheight	db_bmap.dn_agheight
+#define	db_agheigth	db_bmap.dn_agheigth
 #define	db_agstart	db_bmap.dn_agstart
 #define	db_numag	db_bmap.dn_numag
 #define	db_maxlevel	db_bmap.dn_maxlevel
@@ -298,6 +311,4 @@ extern int dbAllocBottomUp(struct inode *ip, s64 blkno, s64 nblocks);
 extern int dbExtendFS(struct inode *ipbmap, s64 blkno, s64 nblocks);
 extern void dbFinalizeBmap(struct inode *ipbmap);
 extern s64 dbMapFileSizeToMapSize(struct inode *ipbmap);
-extern s64 dbDiscardAG(struct inode *ip, int agno, s64 minlen);
-
 #endif				/* _H_JFS_DMAP */

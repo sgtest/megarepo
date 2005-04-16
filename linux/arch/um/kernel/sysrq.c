@@ -1,56 +1,81 @@
-// SPDX-License-Identifier: GPL-2.0-only
-/*
- * Copyright (C) 2001 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
- * Copyright (C) 2013 Richard Weinberger <richrd@nod.at>
+/* 
+ * Copyright (C) 2001 Jeff Dike (jdike@karaya.com)
+ * Licensed under the GPL
  */
 
-#include <linux/kallsyms.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/sched.h>
-#include <linux/sched/debug.h>
-#include <linux/sched/task_stack.h>
+#include "linux/sched.h"
+#include "linux/kernel.h"
+#include "linux/module.h"
+#include "linux/kallsyms.h"
+#include "asm/page.h"
+#include "asm/processor.h"
+#include "sysrq.h"
+#include "user_util.h"
 
-#include <asm/sysrq.h>
-#include <asm/stacktrace.h>
-#include <os.h>
-
-static void _print_addr(void *data, unsigned long address, int reliable)
+void show_trace(unsigned long * stack)
 {
-	const char *loglvl = data;
+	/* XXX: Copy the CONFIG_FRAME_POINTER stack-walking backtrace from
+	 * arch/i386/kernel/traps.c, and then move this to sys-i386/sysrq.c.*/
+        unsigned long addr;
 
-	printk("%s [<%08lx>] %s%pS\n", loglvl, address, reliable ? "" : "? ",
-		(void *)address);
+        if (!stack) {
+                stack = (unsigned long*) &stack;
+		WARN_ON(1);
+	}
+
+        printk("Call Trace: \n");
+        while (((long) stack & (THREAD_SIZE-1)) != 0) {
+                addr = *stack;
+		if (__kernel_text_address(addr)) {
+			printk("%08lx:  [<%08lx>]", (unsigned long) stack, addr);
+			print_symbol(" %s", addr);
+			printk("\n");
+                }
+                stack++;
+        }
+        printk("\n");
 }
 
-static const struct stacktrace_ops stackops = {
-	.address = _print_addr
-};
-
-void show_stack(struct task_struct *task, unsigned long *stack,
-		       const char *loglvl)
+/*
+ * stack dumps generator - this is used by arch-independent code.
+ * And this is identical to i386 currently.
+ */
+void dump_stack(void)
 {
-	struct pt_regs *segv_regs = current->thread.segv_regs;
+	unsigned long stack;
+
+	show_trace(&stack);
+}
+EXPORT_SYMBOL(dump_stack);
+
+/*Stolen from arch/i386/kernel/traps.c */
+static int kstack_depth_to_print = 24;
+
+/* This recently started being used in arch-independent code too, as in
+ * kernel/sched.c.*/
+void show_stack(struct task_struct *task, unsigned long *esp)
+{
+	unsigned long *stack;
 	int i;
 
-	if (!segv_regs && os_is_signal_stack()) {
-		pr_err("Received SIGSEGV in SIGSEGV handler,"
-				" aborting stack trace!\n");
-		return;
+	if (esp == NULL) {
+		if (task != current) {
+			esp = (unsigned long *) KSTK_ESP(task);
+			/* Which one? No actual difference - just coding style.*/
+			//esp = (unsigned long *) PT_REGS_IP(&task->thread.regs);
+		} else {
+			esp = (unsigned long *) &esp;
+		}
 	}
 
-	if (!stack)
-		stack = get_stack_pointer(task, segv_regs);
-
-	printk("%sStack:\n", loglvl);
-	for (i = 0; i < 3 * STACKSLOTS_PER_LINE; i++) {
+	stack = esp;
+	for(i = 0; i < kstack_depth_to_print; i++) {
 		if (kstack_end(stack))
 			break;
-		if (i && ((i % STACKSLOTS_PER_LINE) == 0))
-			pr_cont("\n");
-		pr_cont(" %08lx", *stack++);
+		if (i && ((i % 8) == 0))
+			printk("\n       ");
+		printk("%08lx ", *stack++);
 	}
 
-	printk("%sCall Trace:\n", loglvl);
-	dump_trace(current, &stackops, (void *)loglvl);
+	show_trace(esp);
 }

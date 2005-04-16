@@ -24,6 +24,7 @@ static const struct fp_ext fp_one =
 
 extern struct fp_ext *fp_fadd(struct fp_ext *dest, const struct fp_ext *src);
 extern struct fp_ext *fp_fdiv(struct fp_ext *dest, const struct fp_ext *src);
+extern struct fp_ext *fp_fmul(struct fp_ext *dest, const struct fp_ext *src);
 
 struct fp_ext *
 fp_fsqrt(struct fp_ext *dest, struct fp_ext *src)
@@ -50,7 +51,7 @@ fp_fsqrt(struct fp_ext *dest, struct fp_ext *src)
 	 * sqrt(m*2^e) =
 	 *		 sqrt(2*m) * 2^(p)	, if e = 2*p + 1
 	 *
-	 * So we use the last bit of the exponent to decide whether to
+	 * So we use the last bit of the exponent to decide wether to
 	 * use the m or 2*m.
 	 *
 	 * Since only the fractional part of the mantissa is stored and
@@ -64,7 +65,7 @@ fp_fsqrt(struct fp_ext *dest, struct fp_ext *src)
 	fp_copy_ext(&src2, dest);
 
 	/*
-	 * The taylor row around a for sqrt(x) is:
+	 * The taylor row arround a for sqrt(x) is:
 	 *	sqrt(x) = sqrt(a) + 1/(2*sqrt(a))*(x-a) + R
 	 * With a=1 this gives:
 	 *	sqrt(x) = 1 + 1/2*(x-1)
@@ -104,6 +105,9 @@ fp_fetoxm1(struct fp_ext *dest, struct fp_ext *src)
 	uprint("fetoxm1\n");
 
 	fp_monadic_check(dest, src);
+
+	if (IS_ZERO(dest))
+		return dest;
 
 	return dest;
 }

@@ -1,23 +1,28 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *	X.25 Packet Layer release 002
  *
  *	This is ALPHA test software. This code may break your machine,
  *	randomly fail to work with new releases, misbehave and/or generally
- *	screw up. It might even work.
+ *	screw up. It might even work. 
  *
  *	This code REQUIRES 2.1.15 or higher
+ *
+ *	This module:
+ *		This module is free software; you can redistribute it and/or
+ *		modify it under the terms of the GNU General Public License
+ *		as published by the Free Software Foundation; either version
+ *		2 of the License, or (at your option) any later version.
  *
  *	History
  *	X.25 001	Jonathan Naylor	Started coding.
  */
 
+#include <linux/config.h>
 #include <linux/if_arp.h>
 #include <linux/init.h>
-#include <linux/slab.h>
 #include <net/x25.h>
 
-LIST_HEAD(x25_route_list);
+struct list_head x25_route_list = LIST_HEAD_INIT(x25_route_list);
 DEFINE_RWLOCK(x25_route_list_lock);
 
 /*
@@ -27,11 +32,14 @@ static int x25_add_route(struct x25_address *address, unsigned int sigdigits,
 			 struct net_device *dev)
 {
 	struct x25_route *rt;
+	struct list_head *entry;
 	int rc = -EINVAL;
 
 	write_lock_bh(&x25_route_list_lock);
 
-	list_for_each_entry(rt, &x25_route_list, node) {
+	list_for_each(entry, &x25_route_list) {
+		rt = list_entry(entry, struct x25_route, node);
+
 		if (!memcmp(&rt->address, address, sigdigits) &&
 		    rt->sigdigits == sigdigits)
 			goto out;
@@ -47,7 +55,7 @@ static int x25_add_route(struct x25_address *address, unsigned int sigdigits,
 
 	rt->sigdigits = sigdigits;
 	rt->dev       = dev;
-	refcount_set(&rt->refcnt, 1);
+	atomic_set(&rt->refcnt, 1);
 
 	list_add(&rt->node, &x25_route_list);
 	rc = 0;
@@ -58,7 +66,7 @@ out:
 
 /**
  * __x25_remove_route - remove route from x25_route_list
- * @rt: route to remove
+ * @rt - route to remove
  *
  * Remove route from x25_route_list. If it was there.
  * Caller must hold x25_route_list_lock.
@@ -75,11 +83,14 @@ static int x25_del_route(struct x25_address *address, unsigned int sigdigits,
 			 struct net_device *dev)
 {
 	struct x25_route *rt;
+	struct list_head *entry;
 	int rc = -EINVAL;
 
 	write_lock_bh(&x25_route_list_lock);
 
-	list_for_each_entry(rt, &x25_route_list, node) {
+	list_for_each(entry, &x25_route_list) {
+		rt = list_entry(entry, struct x25_route, node);
+
 		if (!memcmp(&rt->address, address, sigdigits) &&
 		    rt->sigdigits == sigdigits && rt->dev == dev) {
 			__x25_remove_route(rt);
@@ -116,29 +127,35 @@ void x25_route_device_down(struct net_device *dev)
  */
 struct net_device *x25_dev_get(char *devname)
 {
-	struct net_device *dev = dev_get_by_name(&init_net, devname);
+	struct net_device *dev = dev_get_by_name(devname);
 
-	if (dev && (!(dev->flags & IFF_UP) || dev->type != ARPHRD_X25)) {
+	if (dev &&
+	    (!(dev->flags & IFF_UP) || (dev->type != ARPHRD_X25
+#if defined(CONFIG_LLC) || defined(CONFIG_LLC_MODULE)
+					&& dev->type != ARPHRD_ETHER
+#endif
+					)))
 		dev_put(dev);
-		dev = NULL;
-	}
 
 	return dev;
 }
 
 /**
  * 	x25_get_route -	Find a route given an X.25 address.
- *	@addr: - address to find a route for
+ * 	@addr - address to find a route for
  *
  * 	Find a route given an X.25 address.
  */
 struct x25_route *x25_get_route(struct x25_address *addr)
 {
 	struct x25_route *rt, *use = NULL;
+	struct list_head *entry;
 
 	read_lock_bh(&x25_route_list_lock);
 
-	list_for_each_entry(rt, &x25_route_list, node) {
+	list_for_each(entry, &x25_route_list) {
+		rt = list_entry(entry, struct x25_route, node);
+
 		if (!memcmp(&rt->address, addr, rt->sigdigits)) {
 			if (!use)
 				use = rt;
@@ -171,7 +188,7 @@ int x25_route_ioctl(unsigned int cmd, void __user *arg)
 		goto out;
 
 	rc = -EINVAL;
-	if (rt.sigdigits > 15)
+	if (rt.sigdigits < 0 || rt.sigdigits > 15)
 		goto out;
 
 	dev = x25_dev_get(rt.device);

@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *  linux/arch/parisc/kernel/time.c
  *
@@ -11,12 +10,10 @@
  * 1998-12-20  Updated NTP code according to technical memorandum Jan '96
  *             "A Kernel Model for Precision Timekeeping" by Dave Mills
  */
+#include <linux/config.h>
 #include <linux/errno.h>
 #include <linux/module.h>
-#include <linux/rtc.h>
 #include <linux/sched.h>
-#include <linux/sched/clock.h>
-#include <linux/sched_clock.h>
 #include <linux/kernel.h>
 #include <linux/param.h>
 #include <linux/string.h>
@@ -26,244 +23,221 @@
 #include <linux/init.h>
 #include <linux/smp.h>
 #include <linux/profile.h>
-#include <linux/clocksource.h>
-#include <linux/platform_device.h>
-#include <linux/ftrace.h>
 
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
 #include <asm/io.h>
 #include <asm/irq.h>
-#include <asm/page.h>
 #include <asm/param.h>
 #include <asm/pdc.h>
 #include <asm/led.h>
 
 #include <linux/timex.h>
 
-int time_keeper_id __read_mostly;	/* CPU used for timekeeping. */
+u64 jiffies_64 = INITIAL_JIFFIES;
 
-static unsigned long clocktick __ro_after_init;	/* timer cycles per tick */
+EXPORT_SYMBOL(jiffies_64);
 
-/*
- * We keep time on PA-RISC Linux by using the Interval Timer which is
- * a pair of registers; one is read-only and one is write-only; both
- * accessed through CR16.  The read-only register is 32 or 64 bits wide,
- * and increments by 1 every CPU clock tick.  The architecture only
- * guarantees us a rate between 0.5 and 2, but all implementations use a
- * rate of 1.  The write-only register is 32-bits wide.  When the lowest
- * 32 bits of the read-only register compare equal to the write-only
- * register, it raises a maskable external interrupt.  Each processor has
- * an Interval Timer of its own and they are not synchronised.  
- *
- * We want to generate an interrupt every 1/HZ seconds.  So we program
- * CR16 to interrupt every @clocktick cycles.  The it_value in cpu_data
- * is programmed with the intended time of the next tick.  We can be
- * held off for an arbitrarily long period of time by interrupts being
- * disabled, so we may miss one or more ticks.
- */
-irqreturn_t __irq_entry timer_interrupt(int irq, void *dev_id)
+/* xtime and wall_jiffies keep wall-clock time */
+extern unsigned long wall_jiffies;
+
+static long clocktick;	/* timer cycles per tick */
+static long halftick;
+
+#ifdef CONFIG_SMP
+extern void smp_do_timer(struct pt_regs *regs);
+#endif
+
+irqreturn_t timer_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 {
-	unsigned long now;
-	unsigned long next_tick;
-	unsigned long ticks_elapsed = 0;
-	unsigned int cpu = smp_processor_id();
-	struct cpuinfo_parisc *cpuinfo = &per_cpu(cpu_data, cpu);
+	long now;
+	long next_tick;
+	int nticks;
+	int cpu = smp_processor_id();
 
-	/* gcc can optimize for "read-only" case with a local clocktick */
-	unsigned long cpt = clocktick;
+	profile_tick(CPU_PROFILING, regs);
 
-	/* Initialize next_tick to the old expected tick time. */
-	next_tick = cpuinfo->it_value;
-
-	/* Calculate how many ticks have elapsed. */
 	now = mfctl(16);
-	do {
-		++ticks_elapsed;
-		next_tick += cpt;
-	} while (next_tick - now > cpt);
+	/* initialize next_tick to time at last clocktick */
+	next_tick = cpu_data[cpu].it_value;
 
-	/* Store (in CR16 cycles) up to when we are accounting right now. */
-	cpuinfo->it_value = next_tick;
-
-	/* Go do system house keeping. */
-	if (IS_ENABLED(CONFIG_SMP) && (cpu != time_keeper_id))
-		ticks_elapsed = 0;
-	legacy_timer_tick(ticks_elapsed);
-
-	/* Skip clockticks on purpose if we know we would miss those.
-	 * The new CR16 must be "later" than current CR16 otherwise
-	 * itimer would not fire until CR16 wrapped - e.g 4 seconds
-	 * later on a 1Ghz processor. We'll account for the missed
-	 * ticks on the next timer interrupt.
-	 * We want IT to fire modulo clocktick even if we miss/skip some.
-	 * But those interrupts don't in fact get delivered that regularly.
+	/* since time passes between the interrupt and the mfctl()
+	 * above, it is never true that last_tick + clocktick == now.  If we
+	 * never miss a clocktick, we could set next_tick = last_tick + clocktick
+	 * but maybe we'll miss ticks, hence the loop.
 	 *
-	 * "next_tick - now" will always give the difference regardless
-	 * if one or the other wrapped. If "now" is "bigger" we'll end up
-	 * with a very large unsigned number.
+	 * Variables are *signed*.
 	 */
-	now = mfctl(16);
-	while (next_tick - now > cpt)
-		next_tick += cpt;
 
-	/* Program the IT when to deliver the next interrupt.
-	 * Only bottom 32-bits of next_tick are writable in CR16!
-	 * Timer interrupt will be delivered at least a few hundred cycles
-	 * after the IT fires, so if we are too close (<= 8000 cycles) to the
-	 * next cycle, simply skip it.
-	 */
-	if (next_tick - now <= 8000)
-		next_tick += cpt;
+	nticks = 0;
+	while((next_tick - now) < halftick) {
+		next_tick += clocktick;
+		nticks++;
+	}
 	mtctl(next_tick, 16);
+	cpu_data[cpu].it_value = next_tick;
+
+	while (nticks--) {
+#ifdef CONFIG_SMP
+		smp_do_timer(regs);
+#else
+		update_process_times(user_mode(regs));
+#endif
+		if (cpu == 0) {
+			write_seqlock(&xtime_lock);
+			do_timer(regs);
+			write_sequnlock(&xtime_lock);
+		}
+	}
+    
+#ifdef CONFIG_CHASSIS_LCD_LED
+	/* Only schedule the led tasklet on cpu 0, and only if it
+	 * is enabled.
+	 */
+	if (cpu == 0 && !atomic_read(&led_tasklet.count))
+		tasklet_schedule(&led_tasklet);
+#endif
+
+	/* check soft power switch status */
+	if (cpu == 0 && !atomic_read(&power_tasklet.count))
+		tasklet_schedule(&power_tasklet);
 
 	return IRQ_HANDLED;
 }
 
-
-unsigned long profile_pc(struct pt_regs *regs)
+/*** converted from ia64 ***/
+/*
+ * Return the number of micro-seconds that elapsed since the last
+ * update to wall time (aka xtime aka wall_jiffies).  The xtime_lock
+ * must be at least read-locked when calling this routine.
+ */
+static inline unsigned long
+gettimeoffset (void)
 {
-	unsigned long pc = instruction_pointer(regs);
+#ifndef CONFIG_SMP
+	/*
+	 * FIXME: This won't work on smp because jiffies are updated by cpu 0.
+	 *    Once parisc-linux learns the cr16 difference between processors,
+	 *    this could be made to work.
+	 */
+	long last_tick;
+	long elapsed_cycles;
 
-	if (regs->gr[0] & PSW_N)
-		pc -= 4;
+	/* it_value is the intended time of the next tick */
+	last_tick = cpu_data[smp_processor_id()].it_value;
 
-#ifdef CONFIG_SMP
-	if (in_lock_functions(pc))
-		pc = regs->gr[2];
-#endif
+	/* Subtract one tick and account for possible difference between
+	 * when we expected the tick and when it actually arrived.
+	 * (aka wall vs real)
+	 */
+	last_tick -= clocktick * (jiffies - wall_jiffies + 1);
+	elapsed_cycles = mfctl(16) - last_tick;
 
-	return pc;
-}
-EXPORT_SYMBOL(profile_pc);
-
-
-/* clock source code */
-
-static u64 notrace read_cr16(struct clocksource *cs)
-{
-	return get_cycles();
-}
-
-static struct clocksource clocksource_cr16 = {
-	.name			= "cr16",
-	.rating			= 300,
-	.read			= read_cr16,
-	.mask			= CLOCKSOURCE_MASK(BITS_PER_LONG),
-	.flags			= CLOCK_SOURCE_IS_CONTINUOUS,
-};
-
-void start_cpu_itimer(void)
-{
-	unsigned int cpu = smp_processor_id();
-	unsigned long next_tick = mfctl(16) + clocktick;
-
-	mtctl(next_tick, 16);		/* kick off Interval Timer (CR16) */
-
-	per_cpu(cpu_data, cpu).it_value = next_tick;
-}
-
-#if IS_ENABLED(CONFIG_RTC_DRV_GENERIC)
-static int rtc_generic_get_time(struct device *dev, struct rtc_time *tm)
-{
-	struct pdc_tod tod_data;
-
-	memset(tm, 0, sizeof(*tm));
-	if (pdc_tod_read(&tod_data) < 0)
-		return -EOPNOTSUPP;
-
-	/* we treat tod_sec as unsigned, so this can work until year 2106 */
-	rtc_time64_to_tm(tod_data.tod_sec, tm);
+	/* the precision of this math could be improved */
+	return elapsed_cycles / (PAGE0->mem_10msec / 10000);
+#else
 	return 0;
+#endif
 }
 
-static int rtc_generic_set_time(struct device *dev, struct rtc_time *tm)
+void
+do_gettimeofday (struct timeval *tv)
 {
-	time64_t secs = rtc_tm_to_time64(tm);
-	int ret;
+	unsigned long flags, seq, usec, sec;
 
-	/* hppa has Y2K38 problem: pdc_tod_set() takes an u32 value! */
-	ret = pdc_tod_set(secs, 0);
-	if (ret != 0) {
-		pr_warn("pdc_tod_set(%lld) returned error %d\n", secs, ret);
-		if (ret == PDC_INVALID_ARG)
-			return -EINVAL;
-		return -EOPNOTSUPP;
+	do {
+		seq = read_seqbegin_irqsave(&xtime_lock, flags);
+		usec = gettimeoffset();
+		sec = xtime.tv_sec;
+		usec += (xtime.tv_nsec / 1000);
+	} while (read_seqretry_irqrestore(&xtime_lock, seq, flags));
+
+	while (usec >= 1000000) {
+		usec -= 1000000;
+		++sec;
 	}
 
+	tv->tv_sec = sec;
+	tv->tv_usec = usec;
+}
+
+EXPORT_SYMBOL(do_gettimeofday);
+
+int
+do_settimeofday (struct timespec *tv)
+{
+	time_t wtm_sec, sec = tv->tv_sec;
+	long wtm_nsec, nsec = tv->tv_nsec;
+
+	if ((unsigned long)tv->tv_nsec >= NSEC_PER_SEC)
+		return -EINVAL;
+
+	write_seqlock_irq(&xtime_lock);
+	{
+		/*
+		 * This is revolting. We need to set "xtime"
+		 * correctly. However, the value in this location is
+		 * the value at the most recent update of wall time.
+		 * Discover what correction gettimeofday would have
+		 * done, and then undo it!
+		 */
+		nsec -= gettimeoffset() * 1000;
+
+		wtm_sec  = wall_to_monotonic.tv_sec + (xtime.tv_sec - sec);
+		wtm_nsec = wall_to_monotonic.tv_nsec + (xtime.tv_nsec - nsec);
+
+		set_normalized_timespec(&xtime, sec, nsec);
+		set_normalized_timespec(&wall_to_monotonic, wtm_sec, wtm_nsec);
+
+		time_adjust = 0;		/* stop active adjtime() */
+		time_status |= STA_UNSYNC;
+		time_maxerror = NTP_PHASE_LIMIT;
+		time_esterror = NTP_PHASE_LIMIT;
+	}
+	write_sequnlock_irq(&xtime_lock);
+	clock_was_set();
 	return 0;
 }
-
-static const struct rtc_class_ops rtc_generic_ops = {
-	.read_time = rtc_generic_get_time,
-	.set_time = rtc_generic_set_time,
-};
-
-static int __init rtc_init(void)
-{
-	struct platform_device *pdev;
-
-	pdev = platform_device_register_data(NULL, "rtc-generic", -1,
-					     &rtc_generic_ops,
-					     sizeof(rtc_generic_ops));
-
-	return PTR_ERR_OR_ZERO(pdev);
-}
-device_initcall(rtc_init);
-#endif
-
-void read_persistent_clock64(struct timespec64 *ts)
-{
-	static struct pdc_tod tod_data;
-	if (pdc_tod_read(&tod_data) == 0) {
-		ts->tv_sec = tod_data.tod_sec;
-		ts->tv_nsec = tod_data.tod_usec * 1000;
-	} else {
-		printk(KERN_ERR "Error reading tod clock\n");
-	        ts->tv_sec = 0;
-		ts->tv_nsec = 0;
-	}
-}
-
-
-static u64 notrace read_cr16_sched_clock(void)
-{
-	return get_cycles();
-}
-
+EXPORT_SYMBOL(do_settimeofday);
 
 /*
- * timer interrupt and sched_clock() initialization
+ * XXX: We can do better than this.
+ * Returns nanoseconds
  */
+
+unsigned long long sched_clock(void)
+{
+	return (unsigned long long)jiffies * (1000000000 / HZ);
+}
+
 
 void __init time_init(void)
 {
-	unsigned long cr16_hz;
+	unsigned long next_tick;
+	static struct pdc_tod tod_data;
 
 	clocktick = (100 * PAGE0->mem_10msec) / HZ;
-	start_cpu_itimer();	/* get CPU 0 started */
+	halftick = clocktick / 2;
 
-	cr16_hz = 100 * PAGE0->mem_10msec;  /* Hz */
+	/* Setup clock interrupt timing */
 
-	/* register as sched_clock source */
-	sched_clock_register(read_cr16_sched_clock, BITS_PER_LONG, cr16_hz);
-}
+	next_tick = mfctl(16);
+	next_tick += clocktick;
+	cpu_data[smp_processor_id()].it_value = next_tick;
 
-static int __init init_cr16_clocksource(void)
-{
-	/*
-	 * The cr16 interval timers are not synchronized across CPUs.
-	 */
-	if (num_online_cpus() > 1 && !running_on_qemu) {
-		clocksource_cr16.name = "cr16_unstable";
-		clocksource_cr16.flags = CLOCK_SOURCE_UNSTABLE;
-		clocksource_cr16.rating = 0;
+	/* kick off Itimer (CR16) */
+	mtctl(next_tick, 16);
+
+	if(pdc_tod_read(&tod_data) == 0) {
+		write_seqlock_irq(&xtime_lock);
+		xtime.tv_sec = tod_data.tod_sec;
+		xtime.tv_nsec = tod_data.tod_usec * 1000;
+		set_normalized_timespec(&wall_to_monotonic,
+		                        -xtime.tv_sec, -xtime.tv_nsec);
+		write_sequnlock_irq(&xtime_lock);
+	} else {
+		printk(KERN_ERR "Error reading tod clock\n");
+	        xtime.tv_sec = 0;
+		xtime.tv_nsec = 0;
 	}
-
-	/* register at clocksource framework */
-	clocksource_register_hz(&clocksource_cr16,
-		100 * PAGE0->mem_10msec);
-
-	return 0;
 }
 
-device_initcall(init_cr16_clocksource);

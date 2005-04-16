@@ -1,15 +1,34 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
-/* SCTP kernel implementation
+/* SCTP kernel reference Implementation
  * (C) Copyright IBM Corp. 2001, 2004
  * Copyright (c) 1999-2000 Cisco, Inc.
  * Copyright (c) 1999-2001 Motorola, Inc.
  * Copyright (c) 2001 Intel Corp.
  *
- * This file is part of the SCTP kernel implementation
+ * This file is part of the SCTP kernel reference Implementation
+ *
+ * The SCTP reference implementation is free software;
+ * you can redistribute it and/or modify it under the terms of
+ * the GNU General Public License as published by
+ * the Free Software Foundation; either version 2, or (at your option)
+ * any later version.
+ *
+ * The SCTP reference implementation is distributed in the hope that it
+ * will be useful, but WITHOUT ANY WARRANTY; without even the implied
+ *                 ************************
+ * warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with GNU CC; see the file COPYING.  If not, write to
+ * the Free Software Foundation, 59 Temple Place - Suite 330,
+ * Boston, MA 02111-1307, USA.
  *
  * Please send any bug reports or fixes you make to the
  * email address(es):
- *    lksctp developers <linux-sctp@vger.kernel.org>
+ *    lksctp developers <lksctp-developers@lists.sourceforge.net>
+ *
+ * Or submit a bug report through the following website:
+ *    http://www.sf.net/projects/lksctp
  *
  * Written or modified by:
  *   La Monte H.P. Yarroll <piggy@acm.org>
@@ -20,14 +39,18 @@
  *   Xingang Guo           <xingang.guo@intel.com>
  *   Sridhar Samudrala     <samudrala@us.ibm.com>
  *   Daisy Chang           <daisyc@us.ibm.com>
+ *
+ * Any bugs reported given to us we will try to fix... any fixes shared will
+ * be incorporated into the next SCTP release.
  */
 
 #ifndef __sctp_constants_h__
 #define __sctp_constants_h__
 
+#include <linux/tcp.h>  /* For TCP states used in sctp_sock_state_t */
 #include <linux/sctp.h>
 #include <linux/ipv6.h> /* For ipv6hdr. */
-#include <net/tcp_states.h>  /* For TCP states used in enum sctp_sock_state */
+#include <net/sctp/user.h>
 
 /* Value used for stream negotiation. */
 enum { SCTP_MAX_STREAM = 0xffff };
@@ -38,36 +61,33 @@ enum { SCTP_DEFAULT_INSTREAMS = SCTP_MAX_STREAM };
  * symbols.  CIDs are dense through SCTP_CID_BASE_MAX.
  */
 #define SCTP_CID_BASE_MAX		SCTP_CID_SHUTDOWN_COMPLETE
+#define SCTP_CID_MAX			SCTP_CID_ASCONF_ACK
 
 #define SCTP_NUM_BASE_CHUNK_TYPES	(SCTP_CID_BASE_MAX + 1)
+#define SCTP_NUM_CHUNK_TYPES		(SCTP_NUM_BASE_CHUNKTYPES + 2)
 
 #define SCTP_NUM_ADDIP_CHUNK_TYPES	2
 
 #define SCTP_NUM_PRSCTP_CHUNK_TYPES	1
 
-#define SCTP_NUM_RECONF_CHUNK_TYPES	1
-
-#define SCTP_NUM_AUTH_CHUNK_TYPES	1
-
-#define SCTP_NUM_CHUNK_TYPES		(SCTP_NUM_BASE_CHUNK_TYPES + \
-					 SCTP_NUM_ADDIP_CHUNK_TYPES +\
-					 SCTP_NUM_PRSCTP_CHUNK_TYPES +\
-					 SCTP_NUM_RECONF_CHUNK_TYPES +\
-					 SCTP_NUM_AUTH_CHUNK_TYPES)
-
 /* These are the different flavours of event.  */
-enum sctp_event_type {
+typedef enum {
+
 	SCTP_EVENT_T_CHUNK = 1,
 	SCTP_EVENT_T_TIMEOUT,
 	SCTP_EVENT_T_OTHER,
 	SCTP_EVENT_T_PRIMITIVE
-};
+
+} sctp_event_t;
+
+#define SCTP_EVENT_T_MAX SCTP_EVENT_T_PRIMITIVE
+#define SCTP_EVENT_T_NUM (SCTP_EVENT_T_MAX + 1)
 
 /* As a convenience for the state machine, we append SCTP_EVENT_* and
  * SCTP_ULP_* to the list of possible chunks.
  */
 
-enum sctp_event_timeout {
+typedef enum {
 	SCTP_EVENT_TIMEOUT_NONE = 0,
 	SCTP_EVENT_TIMEOUT_T1_COOKIE,
 	SCTP_EVENT_TIMEOUT_T1_INIT,
@@ -76,66 +96,72 @@ enum sctp_event_timeout {
 	SCTP_EVENT_TIMEOUT_T4_RTO,
 	SCTP_EVENT_TIMEOUT_T5_SHUTDOWN_GUARD,
 	SCTP_EVENT_TIMEOUT_HEARTBEAT,
-	SCTP_EVENT_TIMEOUT_RECONF,
-	SCTP_EVENT_TIMEOUT_PROBE,
 	SCTP_EVENT_TIMEOUT_SACK,
 	SCTP_EVENT_TIMEOUT_AUTOCLOSE,
-};
+} sctp_event_timeout_t;
 
 #define SCTP_EVENT_TIMEOUT_MAX		SCTP_EVENT_TIMEOUT_AUTOCLOSE
 #define SCTP_NUM_TIMEOUT_TYPES		(SCTP_EVENT_TIMEOUT_MAX + 1)
 
-enum sctp_event_other {
+typedef enum {
 	SCTP_EVENT_NO_PENDING_TSN = 0,
 	SCTP_EVENT_ICMP_PROTO_UNREACH,
-};
+} sctp_event_other_t;
 
 #define SCTP_EVENT_OTHER_MAX		SCTP_EVENT_ICMP_PROTO_UNREACH
 #define SCTP_NUM_OTHER_TYPES		(SCTP_EVENT_OTHER_MAX + 1)
 
 /* These are primitive requests from the ULP.  */
-enum sctp_event_primitive {
+typedef enum {
 	SCTP_PRIMITIVE_ASSOCIATE = 0,
 	SCTP_PRIMITIVE_SHUTDOWN,
 	SCTP_PRIMITIVE_ABORT,
 	SCTP_PRIMITIVE_SEND,
 	SCTP_PRIMITIVE_REQUESTHEARTBEAT,
 	SCTP_PRIMITIVE_ASCONF,
-	SCTP_PRIMITIVE_RECONF,
-};
+} sctp_event_primitive_t;
 
-#define SCTP_EVENT_PRIMITIVE_MAX	SCTP_PRIMITIVE_RECONF
+#define SCTP_EVENT_PRIMITIVE_MAX	SCTP_PRIMITIVE_ASCONF
 #define SCTP_NUM_PRIMITIVE_TYPES	(SCTP_EVENT_PRIMITIVE_MAX + 1)
 
 /* We define here a utility type for manipulating subtypes.
  * The subtype constructors all work like this:
  *
- *   union sctp_subtype foo = SCTP_ST_CHUNK(SCTP_CID_INIT);
+ * 	sctp_subtype_t foo = SCTP_ST_CHUNK(SCTP_CID_INIT);
  */
 
-union sctp_subtype {
-	enum sctp_cid chunk;
-	enum sctp_event_timeout timeout;
-	enum sctp_event_other other;
-	enum sctp_event_primitive primitive;
-};
+typedef union {
+	sctp_cid_t chunk;
+	sctp_event_timeout_t timeout;
+	sctp_event_other_t other;
+	sctp_event_primitive_t primitive;
+} sctp_subtype_t;
 
 #define SCTP_SUBTYPE_CONSTRUCTOR(_name, _type, _elt) \
-static inline union sctp_subtype	\
+static inline sctp_subtype_t	\
 SCTP_ST_## _name (_type _arg)		\
-{ union sctp_subtype _retval; _retval._elt = _arg; return _retval; }
+{ sctp_subtype_t _retval; _retval._elt = _arg; return _retval; }
 
-SCTP_SUBTYPE_CONSTRUCTOR(CHUNK,		enum sctp_cid,		chunk)
-SCTP_SUBTYPE_CONSTRUCTOR(TIMEOUT,	enum sctp_event_timeout, timeout)
-SCTP_SUBTYPE_CONSTRUCTOR(OTHER,		enum sctp_event_other,	other)
-SCTP_SUBTYPE_CONSTRUCTOR(PRIMITIVE,	enum sctp_event_primitive, primitive)
+SCTP_SUBTYPE_CONSTRUCTOR(CHUNK,		sctp_cid_t,		chunk)
+SCTP_SUBTYPE_CONSTRUCTOR(TIMEOUT,	sctp_event_timeout_t,	timeout)
+SCTP_SUBTYPE_CONSTRUCTOR(OTHER,		sctp_event_other_t,	other)
+SCTP_SUBTYPE_CONSTRUCTOR(PRIMITIVE,	sctp_event_primitive_t,	primitive)
 
 
-#define sctp_chunk_is_data(a) (a->chunk_hdr->type == SCTP_CID_DATA || \
-			       a->chunk_hdr->type == SCTP_CID_I_DATA)
+#define sctp_chunk_is_control(a) (a->chunk_hdr->type != SCTP_CID_DATA)
+#define sctp_chunk_is_data(a) (a->chunk_hdr->type == SCTP_CID_DATA)
+
+/* Calculate the actual data size in a data chunk */
+#define SCTP_DATA_SNDSIZE(c) ((int)((unsigned long)(c->chunk_end)\
+		       		- (unsigned long)(c->chunk_hdr)\
+				- sizeof(sctp_data_chunk_t)))
+
+#define SCTP_MAX_ERROR_CAUSE  SCTP_ERROR_NONEXIST_IP
+#define SCTP_NUM_ERROR_CAUSE  10
 
 /* Internal error codes */
-enum sctp_ierror {
+typedef enum {
+
 	SCTP_IERROR_NO_ERROR	        = 0,
 	SCTP_IERROR_BASE		= 1000,
 	SCTP_IERROR_NO_COOKIE,
@@ -151,28 +177,25 @@ enum sctp_ierror {
 	SCTP_IERROR_NO_DATA,
 	SCTP_IERROR_BAD_STREAM,
 	SCTP_IERROR_BAD_PORTS,
-	SCTP_IERROR_AUTH_BAD_HMAC,
-	SCTP_IERROR_AUTH_BAD_KEYID,
-	SCTP_IERROR_PROTO_VIOLATION,
-	SCTP_IERROR_ERROR,
-	SCTP_IERROR_ABORT,
-};
+
+} sctp_ierror_t;
 
 
 
 /* SCTP state defines for internal state machine */
-enum sctp_state {
+typedef enum {
 
-	SCTP_STATE_CLOSED		= 0,
-	SCTP_STATE_COOKIE_WAIT		= 1,
-	SCTP_STATE_COOKIE_ECHOED	= 2,
-	SCTP_STATE_ESTABLISHED		= 3,
-	SCTP_STATE_SHUTDOWN_PENDING	= 4,
-	SCTP_STATE_SHUTDOWN_SENT	= 5,
-	SCTP_STATE_SHUTDOWN_RECEIVED	= 6,
-	SCTP_STATE_SHUTDOWN_ACK_SENT	= 7,
+	SCTP_STATE_EMPTY		= 0,
+	SCTP_STATE_CLOSED		= 1,
+	SCTP_STATE_COOKIE_WAIT		= 2,
+	SCTP_STATE_COOKIE_ECHOED	= 3,
+	SCTP_STATE_ESTABLISHED		= 4,
+	SCTP_STATE_SHUTDOWN_PENDING	= 5,
+	SCTP_STATE_SHUTDOWN_SENT	= 6,
+	SCTP_STATE_SHUTDOWN_RECEIVED	= 7,
+	SCTP_STATE_SHUTDOWN_ACK_SENT	= 8,
 
-};
+} sctp_state_t;
 
 #define SCTP_STATE_MAX			SCTP_STATE_SHUTDOWN_ACK_SENT
 #define SCTP_STATE_NUM_STATES		(SCTP_STATE_MAX + 1)
@@ -193,41 +216,22 @@ enum sctp_state {
  * - A socket in SCTP_SS_ESTABLISHED state indicates that it has a single 
  *   association.
  */
-enum sctp_sock_state {
+typedef enum {
 	SCTP_SS_CLOSED         = TCP_CLOSE,
 	SCTP_SS_LISTENING      = TCP_LISTEN,
 	SCTP_SS_ESTABLISHING   = TCP_SYN_SENT,
 	SCTP_SS_ESTABLISHED    = TCP_ESTABLISHED,
-	SCTP_SS_CLOSING        = TCP_CLOSE_WAIT,
-};
-
-enum sctp_plpmtud_state {
-	SCTP_PL_DISABLED,
-	SCTP_PL_BASE,
-	SCTP_PL_SEARCH,
-	SCTP_PL_COMPLETE,
-	SCTP_PL_ERROR,
-};
-
-#define	SCTP_BASE_PLPMTU	1200
-#define	SCTP_MAX_PLPMTU		9000
-#define	SCTP_MIN_PLPMTU		512
-
-#define	SCTP_MAX_PROBES		3
-
-#define SCTP_PL_BIG_STEP	32
-#define SCTP_PL_MIN_STEP	4
+	SCTP_SS_DISCONNECTING  = TCP_CLOSING,
+} sctp_sock_state_t;
 
 /* These functions map various type to printable names.  */
-const char *sctp_cname(const union sctp_subtype id);	/* chunk types */
-const char *sctp_oname(const union sctp_subtype id);	/* other events */
-const char *sctp_tname(const union sctp_subtype id);	/* timeouts */
-const char *sctp_pname(const union sctp_subtype id);	/* primitives */
+const char *sctp_cname(const sctp_subtype_t);	/* chunk types */
+const char *sctp_oname(const sctp_subtype_t);	/* other events */
+const char *sctp_tname(const sctp_subtype_t);	/* timeouts */
+const char *sctp_pname(const sctp_subtype_t);	/* primitives */
 
 /* This is a table of printable names of sctp_state_t's.  */
-extern const char *const sctp_state_tbl[];
-extern const char *const sctp_evttype_tbl[];
-extern const char *const sctp_status_tbl[];
+extern const char *sctp_state_tbl[], *sctp_evttype_tbl[], *sctp_status_tbl[];
 
 /* Maximum chunk length considering padding requirements. */
 enum { SCTP_MAX_CHUNK_LEN = ((1<<16) - sizeof(__u32)) };
@@ -247,23 +251,42 @@ enum { SCTP_ARBITRARY_COOKIE_ECHO_LEN = 200 };
  * must be less than 65535 (2^16 - 1), or we will have overflow
  * problems creating SACK's.
  */
-#define SCTP_TSN_MAP_INITIAL BITS_PER_LONG
-#define SCTP_TSN_MAP_INCREMENT SCTP_TSN_MAP_INITIAL
-#define SCTP_TSN_MAP_SIZE 4096
+#define SCTP_TSN_MAP_SIZE 2048
+#define SCTP_TSN_MAX_GAP  65535
 
 /* We will not record more than this many duplicate TSNs between two
- * SACKs.  The minimum PMTU is 512.  Remove all the headers and there
- * is enough room for 117 duplicate reports.  Round down to the
+ * SACKs.  The minimum PMTU is 576.  Remove all the headers and there
+ * is enough room for 131 duplicate reports.  Round down to the
  * nearest power of 2.
  */
+enum { SCTP_MIN_PMTU = 576 };
 enum { SCTP_MAX_DUP_TSNS = 16 };
 enum { SCTP_MAX_GABS = 16 };
 
-/* Heartbeat interval - 30 secs */
-#define SCTP_DEFAULT_TIMEOUT_HEARTBEAT	(30*1000)
+typedef enum {
+	SCTP_COUNTER_INIT_ERROR,
+} sctp_counter_t;
 
-/* Delayed sack timer - 200ms */
-#define SCTP_DEFAULT_TIMEOUT_SACK	(200)
+/* How many counters does an association need? */
+#define SCTP_NUMBER_COUNTERS	5
+
+/* Here we define the default timers.  */
+
+/* cookie timer def = ? seconds */
+#define SCTP_DEFAULT_TIMEOUT_T1_COOKIE	(3 * HZ)
+
+/* init timer def = 3 seconds  */
+#define SCTP_DEFAULT_TIMEOUT_T1_INIT	(3 * HZ)
+
+/* shutdown timer def = 300 ms */
+#define SCTP_DEFAULT_TIMEOUT_T2_SHUTDOWN ((300 * HZ) / 1000)
+
+/* 0 seconds + RTO */
+#define SCTP_DEFAULT_TIMEOUT_HEARTBEAT	(10 * HZ)
+
+/* recv timer def = 200ms (in usec) */
+#define SCTP_DEFAULT_TIMEOUT_SACK	((200 * HZ) / 1000)
+#define SCTP_DEFAULT_TIMEOUT_SACK_MAX	((500 * HZ) / 1000) /* 500 ms */
 
 /* RTO.Initial              - 3  seconds
  * RTO.Min                  - 1  second
@@ -271,31 +294,34 @@ enum { SCTP_MAX_GABS = 16 };
  * RTO.Alpha                - 1/8
  * RTO.Beta                 - 1/4
  */
-#define SCTP_RTO_INITIAL	(3 * 1000)
-#define SCTP_RTO_MIN		(1 * 1000)
-#define SCTP_RTO_MAX		(60 * 1000)
+#define SCTP_RTO_INITIAL	(3 * HZ)
+#define SCTP_RTO_MIN		(1 * HZ)
+#define SCTP_RTO_MAX		(60 * HZ)
 
 #define SCTP_RTO_ALPHA          3   /* 1/8 when converted to right shifts. */
 #define SCTP_RTO_BETA           2   /* 1/4 when converted to right shifts. */
 
 /* Maximum number of new data packets that can be sent in a burst.  */
-#define SCTP_DEFAULT_MAX_BURST		4
+#define SCTP_MAX_BURST		4
 
 #define SCTP_CLOCK_GRANULARITY	1	/* 1 jiffy */
 
-#define SCTP_DEFAULT_COOKIE_LIFE	(60 * 1000) /* 60 seconds */
+#define SCTP_DEF_MAX_INIT 6
+#define SCTP_DEF_MAX_SEND 10
+
+#define SCTP_DEFAULT_COOKIE_LIFE_SEC	60 /* seconds */
+#define SCTP_DEFAULT_COOKIE_LIFE_USEC	0  /* microseconds */
 
 #define SCTP_DEFAULT_MINWINDOW	1500	/* default minimum rwnd size */
 #define SCTP_DEFAULT_MAXWINDOW	65535	/* default rwnd size */
-#define SCTP_DEFAULT_RWND_SHIFT  4	/* by default, update on 1/16 of
-					 * rcvbuf, which is 1/8 of initial
-					 * window
-					 */
 #define SCTP_DEFAULT_MAXSEGMENT 1500	/* MTU size, this is the limit
                                          * to which we will raise the P-MTU.
 					 */
 #define SCTP_DEFAULT_MINSEGMENT 512	/* MTU size ... if no mtu disc */
-
+#define SCTP_HOW_MANY_SECRETS 2		/* How many secrets I keep */
+#define SCTP_HOW_LONG_COOKIE_LIVE 3600	/* How many seconds the current
+					 * secret will live?
+					 */
 #define SCTP_SECRET_SIZE 32		/* Number of octets in a 256 bits. */
 
 #define SCTP_SIGNATURE_SIZE 20	        /* size of a SLA-1 signature */
@@ -304,36 +330,29 @@ enum { SCTP_MAX_GABS = 16 };
 				 * functions simpler to write.
 				 */
 
-#define SCTP_DEFAULT_UDP_PORT 9899	/* default UDP tunneling port */
-
-/* These are the values for pf exposure, UNUSED is to keep compatible with old
- * applications by default.
- */
-enum {
-	SCTP_PF_EXPOSE_UNSET,
-	SCTP_PF_EXPOSE_DISABLE,
-	SCTP_PF_EXPOSE_ENABLE,
-};
-#define SCTP_PF_EXPOSE_MAX	SCTP_PF_EXPOSE_ENABLE
-
-#define SCTP_PS_RETRANS_MAX	0xffff
+#if defined (CONFIG_SCTP_HMAC_MD5)
+#define SCTP_COOKIE_HMAC_ALG "md5"
+#elif defined (CONFIG_SCTP_HMAC_SHA1)
+#define SCTP_COOKIE_HMAC_ALG "sha1"
+#else
+#define SCTP_COOKIE_HMAC_ALG NULL
+#endif
 
 /* These return values describe the success or failure of a number of
  * routines which form the lower interface to SCTP_outqueue.
  */
-enum sctp_xmit {
+typedef enum {
 	SCTP_XMIT_OK,
 	SCTP_XMIT_PMTU_FULL,
 	SCTP_XMIT_RWND_FULL,
-	SCTP_XMIT_DELAY,
-};
+	SCTP_XMIT_NAGLE_DELAY,
+} sctp_xmit_t;
 
 /* These are the commands for manipulating transports.  */
-enum sctp_transport_cmd {
+typedef enum {
 	SCTP_TRANSPORT_UP,
 	SCTP_TRANSPORT_DOWN,
-	SCTP_TRANSPORT_PF,
-};
+} sctp_transport_cmd_t;
 
 /* These are the address scopes defined mainly for IPv4 addresses
  * based on draft of SCTP IPv4 scoping <draft-stewart-tsvwg-sctp-ipv4-00.txt>.
@@ -342,104 +361,72 @@ enum sctp_transport_cmd {
  * At this point, the IPv6 scopes will be mapped to these internal scopes
  * as much as possible.
  */
-enum sctp_scope {
+typedef enum {
 	SCTP_SCOPE_GLOBAL,		/* IPv4 global addresses */
 	SCTP_SCOPE_PRIVATE,		/* IPv4 private addresses */
 	SCTP_SCOPE_LINK,		/* IPv4 link local address */
 	SCTP_SCOPE_LOOPBACK,		/* IPv4 loopback address */
 	SCTP_SCOPE_UNUSABLE,		/* IPv4 unusable addresses */
-};
-
-enum {
-	SCTP_SCOPE_POLICY_DISABLE,	/* Disable IPv4 address scoping */
-	SCTP_SCOPE_POLICY_ENABLE,	/* Enable IPv4 address scoping */
-	SCTP_SCOPE_POLICY_PRIVATE,	/* Follow draft but allow IPv4 private addresses */
-	SCTP_SCOPE_POLICY_LINK,		/* Follow draft but allow IPv4 link local addresses */
-};
-
-#define SCTP_SCOPE_POLICY_MAX	SCTP_SCOPE_POLICY_LINK
+} sctp_scope_t;
 
 /* Based on IPv4 scoping <draft-stewart-tsvwg-sctp-ipv4-00.txt>,
- * SCTP IPv4 unusable addresses: 0.0.0.0/8, 224.0.0.0/4, 192.88.99.0/24.
+ * SCTP IPv4 unusable addresses: 0.0.0.0/8, 224.0.0.0/4, 198.18.0.0/24,
+ * 192.88.99.0/24.
  * Also, RFC 8.4, non-unicast addresses are not considered valid SCTP
  * addresses.
  */
-#define IS_IPV4_UNUSABLE_ADDRESS(a)	    \
-	((htonl(INADDR_BROADCAST) == a) ||  \
-	 ipv4_is_multicast(a) ||	    \
-	 ipv4_is_zeronet(a) ||		    \
-	 ipv4_is_anycast_6to4(a))
+#define IS_IPV4_UNUSABLE_ADDRESS(a) \
+	((INADDR_BROADCAST == *a) || \
+	(MULTICAST(*a)) || \
+	(((unsigned char *)(a))[0] == 0) || \
+	((((unsigned char *)(a))[0] == 198) && \
+	(((unsigned char *)(a))[1] == 18) && \
+	(((unsigned char *)(a))[2] == 0)) || \
+	((((unsigned char *)(a))[0] == 192) && \
+	(((unsigned char *)(a))[1] == 88) && \
+	(((unsigned char *)(a))[2] == 99)))
+
+/* IPv4 Link-local addresses: 169.254.0.0/16.  */
+#define IS_IPV4_LINK_ADDRESS(a) \
+	((((unsigned char *)(a))[0] == 169) && \
+	(((unsigned char *)(a))[1] == 254))
+
+/* RFC 1918 "Address Allocation for Private Internets" defines the IPv4
+ * private address space as the following:
+ *
+ * 10.0.0.0 - 10.255.255.255 (10/8 prefix)
+ * 172.16.0.0.0 - 172.31.255.255 (172.16/12 prefix)
+ * 192.168.0.0 - 192.168.255.255 (192.168/16 prefix)
+ */
+#define IS_IPV4_PRIVATE_ADDRESS(a) \
+	((((unsigned char *)(a))[0] == 10) || \
+	((((unsigned char *)(a))[0] == 172) && \
+	(((unsigned char *)(a))[1] >= 16) && \
+	(((unsigned char *)(a))[1] < 32)) || \
+	((((unsigned char *)(a))[0] == 192) && \
+	(((unsigned char *)(a))[1] == 168)))
 
 /* Flags used for the bind address copy functions.  */
-#define SCTP_ADDR4_ALLOWED	0x00000001	/* IPv4 address is allowed by
+#define SCTP_ADDR6_ALLOWED	0x00000001	/* IPv6 address is allowed by
 						   local sock family */
-#define SCTP_ADDR6_ALLOWED	0x00000002	/* IPv6 address is allowed by
-						   local sock family */
-#define SCTP_ADDR4_PEERSUPP	0x00000004	/* IPv4 address is supported by
+#define SCTP_ADDR4_PEERSUPP	0x00000002	/* IPv4 address is supported by
 						   peer */
-#define SCTP_ADDR6_PEERSUPP	0x00000008	/* IPv6 address is supported by
+#define SCTP_ADDR6_PEERSUPP	0x00000004	/* IPv6 address is supported by
 						   peer */
 
 /* Reasons to retransmit. */
-enum sctp_retransmit_reason {
+typedef enum {
 	SCTP_RTXR_T3_RTX,
 	SCTP_RTXR_FAST_RTX,
 	SCTP_RTXR_PMTUD,
-	SCTP_RTXR_T1_RTX,
-};
+} sctp_retransmit_reason_t;
 
 /* Reasons to lower cwnd. */
-enum sctp_lower_cwnd {
+typedef enum {
 	SCTP_LOWER_CWND_T3_RTX,
 	SCTP_LOWER_CWND_FAST_RTX,
 	SCTP_LOWER_CWND_ECNE,
 	SCTP_LOWER_CWND_INACTIVE,
-};
-
-
-/* SCTP-AUTH Necessary constants */
-
-/* SCTP-AUTH, Section 3.3
- *
- *  The following Table 2 shows the currently defined values for HMAC
- *  identifiers.
- *
- *  +-----------------+--------------------------+
- *  | HMAC Identifier | Message Digest Algorithm |
- *  +-----------------+--------------------------+
- *  | 0               | Reserved                 |
- *  | 1               | SHA-1 defined in [8]     |
- *  | 2               | Reserved                 |
- *  | 3               | SHA-256 defined in [8]   |
- *  +-----------------+--------------------------+
- */
-enum {
-	SCTP_AUTH_HMAC_ID_RESERVED_0,
-	SCTP_AUTH_HMAC_ID_SHA1,
-	SCTP_AUTH_HMAC_ID_RESERVED_2,
-#if defined (CONFIG_CRYPTO_SHA256) || defined (CONFIG_CRYPTO_SHA256_MODULE)
-	SCTP_AUTH_HMAC_ID_SHA256,
-#endif
-	__SCTP_AUTH_HMAC_MAX
-};
-
-#define SCTP_AUTH_HMAC_ID_MAX	__SCTP_AUTH_HMAC_MAX - 1
-#define SCTP_AUTH_NUM_HMACS 	__SCTP_AUTH_HMAC_MAX
-#define SCTP_SHA1_SIG_SIZE 20
-#define SCTP_SHA256_SIG_SIZE 32
-
-/*  SCTP-AUTH, Section 3.2
- *     The chunk types for INIT, INIT-ACK, SHUTDOWN-COMPLETE and AUTH chunks
- *     MUST NOT be listed in the CHUNKS parameter
- */
-#define SCTP_NUM_NOAUTH_CHUNKS	4
-#define SCTP_AUTH_MAX_CHUNKS	(SCTP_NUM_CHUNK_TYPES - SCTP_NUM_NOAUTH_CHUNKS)
-
-/* SCTP-AUTH Section 6.1
- * The RANDOM parameter MUST contain a 32 byte random number.
- */
-#define SCTP_AUTH_RANDOM_LENGTH 32
-
-#define SCTP_PROBE_TIMER_MIN	5000
+} sctp_lower_cwnd_t;
 
 #endif /* __sctp_constants_h__ */

@@ -1,11 +1,10 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * arch/alpha/boot/head.S
  *
  * initial bootloader stuff..
  */
 
-#include <asm/pal.h>
+#include <asm/system.h>
 
 	.set noreorder
 	.globl	__start

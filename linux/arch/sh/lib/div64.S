@@ -1,13 +1,12 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*	
- * unsigned long __xdiv64_32(unsigned long long n, unsigned long d); 
+ * unsigned long long __xdiv64_32(unsigned long long n, unsigned long d); 
  */
 
 #include <linux/linkage.h>
 
 .text
 ENTRY(__xdiv64_32)
-#ifdef CONFIG_CPU_LITTLE_ENDIAN
+#ifdef  __LITTLE_ENDIAN__
 	mov	r4, r0
 	mov	r5, r1
 #else
@@ -35,7 +34,7 @@ ENTRY(__xdiv64_32)
 	rotcl	r0
 	div1	r6, r1
 	.endr
-#ifdef CONFIG_CPU_LITTLE_ENDIAN
+#ifdef  __LITTLE_ENDIAN__
 	mov	r2, r1
 	rts
 	 rotcl	r0

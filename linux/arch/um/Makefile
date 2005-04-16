@@ -1,21 +1,7 @@
-#
-# This file is included by the global makefile so that you can add your own
-# architecture-specific flags and dependencies.
-#
-# Copyright (C) 2002 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
+# 
+# Copyright (C) 2002 Jeff Dike (jdike@karaya.com)
 # Licensed under the GPL
 #
-
-# select defconfig based on actual architecture
-ifeq ($(SUBARCH),x86)
-  ifeq ($(shell uname -m),x86_64)
-        KBUILD_DEFCONFIG := x86_64_defconfig
-  else
-        KBUILD_DEFCONFIG := i386_defconfig
-  endif
-else
-        KBUILD_DEFCONFIG := $(SUBARCH)_defconfig
-endif
 
 ARCH_DIR := arch/um
 OS := $(shell uname -s)
@@ -23,127 +9,202 @@ OS := $(shell uname -s)
 # features.
 SHELL := /bin/bash
 
+filechk_gen_header = $<
+
 core-y			+= $(ARCH_DIR)/kernel/		\
 			   $(ARCH_DIR)/drivers/		\
 			   $(ARCH_DIR)/os-$(OS)/
 
-MODE_INCLUDE	+= -I$(srctree)/$(ARCH_DIR)/include/shared/skas
+# Have to precede the include because the included Makefiles reference them.
+SYMLINK_HEADERS := archparam.h system.h sigcontext.h processor.h ptrace.h \
+	arch-signal.h module.h vm-flags.h
+SYMLINK_HEADERS := $(foreach header,$(SYMLINK_HEADERS),include/asm-um/$(header))
 
-HEADER_ARCH 	:= $(SUBARCH)
+# XXX: The "os" symlink is only used by arch/um/include/os.h, which includes
+# ../os/include/file.h
+#
+# These are cleaned up during mrproper. Please DO NOT fix it again, this is
+# the Correct Thing(tm) to do!
+ARCH_SYMLINKS = include/asm-um/arch $(ARCH_DIR)/include/sysdep $(ARCH_DIR)/os \
+	$(SYMLINK_HEADERS) $(ARCH_DIR)/include/uml-config.h
 
-ifneq ($(filter $(SUBARCH),x86 x86_64 i386),)
-	HEADER_ARCH := x86
+GEN_HEADERS += $(ARCH_DIR)/include/task.h $(ARCH_DIR)/include/kern_constants.h
+
+um-modes-$(CONFIG_MODE_TT) += tt
+um-modes-$(CONFIG_MODE_SKAS) += skas
+
+MODE_INCLUDE	+= $(foreach mode,$(um-modes-y),\
+		   -I$(srctree)/$(ARCH_DIR)/kernel/$(mode)/include)
+
+MAKEFILES-INCL	+= $(foreach mode,$(um-modes-y),\
+		   $(srctree)/$(ARCH_DIR)/Makefile-$(mode))
+
+ifneq ($(MAKEFILES-INCL),)
+  include $(MAKEFILES-INCL)
 endif
 
-ifdef CONFIG_64BIT
-	KBUILD_CFLAGS += -mcmodel=large
-endif
+ARCH_INCLUDE	:= -I$(ARCH_DIR)/include
+SYS_DIR		:= $(ARCH_DIR)/include/sysdep-$(SUBARCH)
 
-HOST_DIR := arch/$(HEADER_ARCH)
+include $(srctree)/$(ARCH_DIR)/Makefile-$(SUBARCH)
 
-include $(srctree)/$(ARCH_DIR)/Makefile-skas
-include $(srctree)/$(HOST_DIR)/Makefile.um
+core-y += $(SUBARCH_CORE)
+libs-y += $(SUBARCH_LIBS)
 
-core-y += $(HOST_DIR)/um/
+# -Derrno=kernel_errno - This turns all kernel references to errno into
+# kernel_errno to separate them from the libc errno.  This allows -fno-common
+# in CFLAGS.  Otherwise, it would cause ld to complain about the two different
+# errnos.
 
-SHARED_HEADERS	:= $(ARCH_DIR)/include/shared
-ARCH_INCLUDE	:= -I$(srctree)/$(SHARED_HEADERS)
-ARCH_INCLUDE	+= -I$(srctree)/$(HOST_DIR)/um/shared
-KBUILD_CPPFLAGS += -I$(srctree)/$(HOST_DIR)/um
+CFLAGS += $(CFLAGS-y) -D__arch_um__ -DSUBARCH=\"$(SUBARCH)\" \
+	$(ARCH_INCLUDE) $(MODE_INCLUDE)
 
-# -Dvmap=kernel_vmap prevents anything from referencing the libpcap.o symbol so
-# named - it's a common symbol in libpcap, so we get a binary which crashes.
-#
-# Same things for in6addr_loopback and mktime - found in libc. For these two we
-# only get link-time error, luckily.
-#
-# -Dlongjmp=kernel_longjmp prevents anything from referencing the libpthread.a
-# embedded copy of longjmp, same thing for setjmp.
-#
-# These apply to USER_CFLAGS to.
-
-KBUILD_CFLAGS += $(CFLAGS) $(CFLAGS-y) -D__arch_um__ \
-	$(ARCH_INCLUDE) $(MODE_INCLUDE) -Dvmap=kernel_vmap	\
-	-Dlongjmp=kernel_longjmp -Dsetjmp=kernel_setjmp \
-	-Din6addr_loopback=kernel_in6addr_loopback \
-	-Din6addr_any=kernel_in6addr_any -Dstrrchr=kernel_strrchr
-
-KBUILD_AFLAGS += $(ARCH_INCLUDE)
-
-USER_CFLAGS = $(patsubst $(KERNEL_DEFINES),,$(patsubst -I%,,$(KBUILD_CFLAGS))) \
-		$(ARCH_INCLUDE) $(MODE_INCLUDE) $(filter -I%,$(CFLAGS)) \
-		-D_FILE_OFFSET_BITS=64 -idirafter $(srctree)/include \
-		-idirafter $(objtree)/include -D__KERNEL__ -D__UM_HOST__
+USER_CFLAGS := $(patsubst -I%,,$(CFLAGS))
+USER_CFLAGS := $(patsubst -D__KERNEL__,,$(USER_CFLAGS)) $(ARCH_INCLUDE) \
+	$(MODE_INCLUDE) $(ARCH_USER_CFLAGS)
+CFLAGS += -Derrno=kernel_errno -Dsigprocmask=kernel_sigprocmask
+CFLAGS += $(call cc-option,-fno-unit-at-a-time,)
 
 #This will adjust *FLAGS accordingly to the platform.
 include $(srctree)/$(ARCH_DIR)/Makefile-os-$(OS)
 
-KBUILD_CPPFLAGS += -I$(srctree)/$(HOST_DIR)/include \
-		   -I$(srctree)/$(HOST_DIR)/include/uapi \
-		   -I$(objtree)/$(HOST_DIR)/include/generated \
-		   -I$(objtree)/$(HOST_DIR)/include/generated/uapi
+# These are needed for clean and mrproper, since in that case .config is not
+# included; the values here are meaningless
 
-# -Derrno=kernel_errno - This turns all kernel references to errno into
-# kernel_errno to separate them from the libc errno.  This allows -fno-common
-# in KBUILD_CFLAGS.  Otherwise, it would cause ld to complain about the two different
-# errnos.
-# These apply to kernelspace only.
-#
-# strip leading and trailing whitespace to make the USER_CFLAGS removal of these
-# defines more robust
+CONFIG_NEST_LEVEL ?= 0
+CONFIG_KERNEL_HALF_GIGS ?= 0
 
-KERNEL_DEFINES = $(strip -Derrno=kernel_errno -Dsigprocmask=kernel_sigprocmask \
-			 -Dmktime=kernel_mktime $(ARCH_KERNEL_DEFINES))
-KBUILD_CFLAGS += $(KERNEL_DEFINES)
+SIZE = (($(CONFIG_NEST_LEVEL) + $(CONFIG_KERNEL_HALF_GIGS)) * 0x20000000)
 
-PHONY += linux
+ifeq ($(CONFIG_MODE_SKAS), y)
+$(SYS_HEADERS) : $(ARCH_DIR)/include/skas_ptregs.h
+endif
+
+.PHONY: linux
 
 all: linux
 
 linux: vmlinux
-	@echo '  LINK $@'
-	$(Q)ln -f $< $@
+	ln -f $< $@
 
 define archhelp
   echo '* linux		- Binary kernel image (./linux) - for backward'
   echo '		   compatibility only, this creates a hard link to the'
-  echo '		   real kernel binary, the "vmlinux" binary you'
+  echo '		   real kernel binary, the the "vmlinux" binary you'
   echo '		   find in the kernel root.'
 endef
 
-archheaders:
-	$(Q)$(MAKE) -f $(srctree)/Makefile ARCH=$(HEADER_ARCH) asm-generic archheaders
+$(shell cd $(ARCH_DIR) && ln -sf Kconfig_$(SUBARCH) Kconfig_arch)
 
-archprepare:
-	$(Q)$(MAKE) $(build)=$(HOST_DIR)/um include/generated/user_constants.h
+prepare: $(ARCH_SYMLINKS) $(SYS_HEADERS) $(GEN_HEADERS) \
+	$(ARCH_DIR)/kernel/vmlinux.lds.S
 
 LINK-$(CONFIG_LD_SCRIPT_STATIC) += -static
-LINK-$(CONFIG_LD_SCRIPT_DYN) += $(call cc-option, -no-pie)
-LINK-$(CONFIG_LD_SCRIPT_DYN_RPATH) += -Wl,-rpath,/lib
+LINK-$(CONFIG_LD_SCRIPT_DYN) += -Wl,-rpath,/lib
 
-CFLAGS_NO_HARDENING := $(call cc-option, -fno-PIC,) $(call cc-option, -fno-pic,) \
-	-fno-stack-protector $(call cc-option, -fno-stack-protector-all)
+LD_SCRIPT-$(CONFIG_LD_SCRIPT_STATIC) := uml.lds.S
+LD_SCRIPT-$(CONFIG_LD_SCRIPT_DYN) := dyn.lds.S
 
-# Options used by linker script
-export LDS_START      := $(START)
-export LDS_ELF_ARCH   := $(ELF_ARCH)
-export LDS_ELF_FORMAT := $(ELF_FORMAT)
+CPP_MODE-$(CONFIG_MODE_TT) := -DMODE_TT
+CONFIG_KERNEL_STACK_ORDER ?= 2
+STACK_SIZE := $(shell echo $$[ 4096 * (1 << $(CONFIG_KERNEL_STACK_ORDER)) ] )
 
-# The wrappers will select whether using "malloc" or the kernel allocator.
+ifndef START
+  START = $$(($(TOP_ADDR) - $(SIZE)))
+endif
+
+CPPFLAGS_vmlinux.lds = $(shell echo -U$(SUBARCH) \
+	-DSTART=$(START) -DELF_ARCH=$(ELF_ARCH) \
+	-DELF_FORMAT=\"$(ELF_FORMAT)\" $(CPP_MODE-y) \
+	-DKERNEL_STACK_SIZE=$(STACK_SIZE))
+
+#The wrappers will select whether using "malloc" or the kernel allocator.
 LINK_WRAPS = -Wl,--wrap,malloc -Wl,--wrap,free -Wl,--wrap,calloc
 
-LD_FLAGS_CMDLINE = $(foreach opt,$(KBUILD_LDFLAGS),-Wl,$(opt))
+CFLAGS_vmlinux = $(LINK-y) $(LINK_WRAPS)
+define cmd_vmlinux__
+	$(CC) $(CFLAGS_vmlinux) -o $@ \
+	-Wl,-T,$(vmlinux-lds) $(vmlinux-init) \
+	-Wl,--start-group $(vmlinux-main) -Wl,--end-group \
+	-L/usr/lib -lutil \
+	$(filter-out $(vmlinux-lds) $(vmlinux-init) $(vmlinux-main) \
+	FORCE ,$^) ; rm -f linux
+endef
 
-# Used by link-vmlinux.sh which has special support for um link
-export CFLAGS_vmlinux := $(LINK-y) $(LINK_WRAPS) $(LD_FLAGS_CMDLINE)
+#When cleaning we don't include .config, so we don't include
+#TT or skas makefiles and don't clean skas_ptregs.h.
+CLEAN_FILES += linux x.i gmon.out $(ARCH_DIR)/include/uml-config.h \
+	$(GEN_HEADERS) $(ARCH_DIR)/include/skas_ptregs.h
 
-# When cleaning we don't include .config, so we don't include
-# TT or skas makefiles and don't clean skas_ptregs.h.
-CLEAN_FILES += linux x.i gmon.out
-MRPROPER_FILES += arch/$(SUBARCH)/include/generated
+MRPROPER_FILES += $(SYMLINK_HEADERS) $(ARCH_SYMLINKS) \
+	$(addprefix $(ARCH_DIR)/kernel/,$(KERN_SYMLINKS)) $(ARCH_DIR)/os \
+	$(ARCH_DIR)/Kconfig_arch
 
 archclean:
+	$(Q)$(MAKE) $(clean)=$(ARCH_DIR)/util
 	@find . \( -name '*.bb' -o -name '*.bbg' -o -name '*.da' \
 		-o -name '*.gcov' \) -type f -print | xargs rm -f
 
-export HEADER_ARCH SUBARCH USER_CFLAGS CFLAGS_NO_HARDENING OS DEV_NULL_PATH
+#We need to re-preprocess this when the symlink dest changes.
+#So we touch it when needed.
+$(ARCH_DIR)/kernel/vmlinux.lds.S: FORCE
+	$(Q)if [ "$(shell readlink $@)" != "$(LD_SCRIPT-y)" ]; then \
+		echo '  SYMLINK $@'; \
+		ln -sf $(LD_SCRIPT-y) $@; \
+		touch $@; \
+	fi;
+
+$(SYMLINK_HEADERS):
+	@echo '  SYMLINK $@'
+	$(Q)cd $(TOPDIR)/$(dir $@) ; \
+	ln -sf $(basename $(notdir $@))-$(SUBARCH)$(suffix $@) $(notdir $@)
+
+include/asm-um/arch:
+	@echo '  SYMLINK $@'
+	$(Q)cd $(TOPDIR)/include/asm-um && ln -sf ../asm-$(SUBARCH) arch
+
+$(ARCH_DIR)/include/sysdep:
+	@echo '  SYMLINK $@'
+	$(Q)cd $(ARCH_DIR)/include && ln -sf sysdep-$(SUBARCH) sysdep
+
+$(ARCH_DIR)/os:
+	@echo '  SYMLINK $@'
+	$(Q)cd $(ARCH_DIR) && ln -sf os-$(OS) os
+
+# Generated files
+define filechk_umlconfig
+	sed 's/ CONFIG/ UML_CONFIG/'
+endef
+
+$(ARCH_DIR)/include/uml-config.h : include/linux/autoconf.h
+	$(call filechk,umlconfig)
+
+$(ARCH_DIR)/include/task.h: $(ARCH_DIR)/util/mk_task
+	$(call filechk,gen_header)
+
+$(ARCH_DIR)/include/user_constants.h: $(ARCH_DIR)/os/util/mk_user_constants
+	$(call filechk,gen_header)
+
+$(ARCH_DIR)/include/kern_constants.h: $(ARCH_DIR)/util/mk_constants
+	$(call filechk,gen_header)
+
+$(ARCH_DIR)/include/skas_ptregs.h: $(ARCH_DIR)/kernel/skas/util/mk_ptregs
+	$(call filechk,gen_header)
+
+$(ARCH_DIR)/os/util/mk_user_constants: $(ARCH_DIR)/os/util FORCE ;
+
+$(ARCH_DIR)/util/mk_task $(ARCH_DIR)/util/mk_constants: $(ARCH_DIR)/include/user_constants.h $(ARCH_DIR)/util \
+	FORCE ;
+
+$(ARCH_DIR)/kernel/skas/util/mk_ptregs: $(ARCH_DIR)/kernel/skas/util FORCE ;
+
+$(ARCH_DIR)/util: scripts_basic $(SYS_DIR)/sc.h FORCE
+	$(Q)$(MAKE) $(build)=$@
+
+$(ARCH_DIR)/kernel/skas/util: scripts_basic FORCE
+	$(Q)$(MAKE) $(build)=$@
+
+$(ARCH_DIR)/os/util: scripts_basic FORCE
+	$(Q)$(MAKE) $(build)=$@
+
+export SUBARCH USER_CFLAGS OS

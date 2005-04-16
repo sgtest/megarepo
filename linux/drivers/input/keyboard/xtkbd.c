@@ -1,5 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * $Id: xtkbd.c,v 1.11 2001/09/25 10:12:07 vojtech Exp $
+ *
  *  Copyright (c) 1999-2001 Vojtech Pavlik
  */
 
@@ -8,11 +9,29 @@
  */
 
 /*
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ *
+ * Should you need to contact me, the author, you can do so either by
+ * e-mail - mail your message to <vojtech@ucw.cz>, or by paper mail:
+ * Vojtech Pavlik, Simunkova 1594, Prague 8, 182 00 Czech Republic
  */
 
 #include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/input.h>
+#include <linux/init.h>
 #include <linux/serio.h>
 
 #define DRIVER_DESC	"XT keyboard driver"
@@ -37,15 +56,17 @@ static unsigned char xtkbd_keycode[256] = {
 	106
 };
 
+static char *xtkbd_name = "XT Keyboard";
+
 struct xtkbd {
 	unsigned char keycode[256];
-	struct input_dev *dev;
+	struct input_dev dev;
 	struct serio *serio;
 	char phys[32];
 };
 
 static irqreturn_t xtkbd_interrupt(struct serio *serio,
-	unsigned char data, unsigned int flags)
+	unsigned char data, unsigned int flags, struct pt_regs *regs)
 {
 	struct xtkbd *xtkbd = serio_get_drvdata(serio);
 
@@ -56,8 +77,9 @@ static irqreturn_t xtkbd_interrupt(struct serio *serio,
 		default:
 
 			if (xtkbd->keycode[data & XTKBD_KEY]) {
-				input_report_key(xtkbd->dev, xtkbd->keycode[data & XTKBD_KEY], !(data & XTKBD_RELEASE));
-				input_sync(xtkbd->dev);
+				input_regs(&xtkbd->dev, regs);
+				input_report_key(&xtkbd->dev, xtkbd->keycode[data & XTKBD_KEY], !(data & XTKBD_RELEASE));
+				input_sync(&xtkbd->dev);
 			} else {
 				printk(KERN_WARNING "xtkbd.c: Unknown key (scancode %#x) %s.\n",
 					data & XTKBD_KEY, data & XTKBD_RELEASE ? "released" : "pressed");
@@ -69,67 +91,66 @@ static irqreturn_t xtkbd_interrupt(struct serio *serio,
 static int xtkbd_connect(struct serio *serio, struct serio_driver *drv)
 {
 	struct xtkbd *xtkbd;
-	struct input_dev *input_dev;
-	int err = -ENOMEM;
 	int i;
+	int err;
 
-	xtkbd = kmalloc(sizeof(struct xtkbd), GFP_KERNEL);
-	input_dev = input_allocate_device();
-	if (!xtkbd || !input_dev)
-		goto fail1;
+	if (!(xtkbd = kmalloc(sizeof(struct xtkbd), GFP_KERNEL)))
+		return -ENOMEM;
+
+	memset(xtkbd, 0, sizeof(struct xtkbd));
+
+	xtkbd->dev.evbit[0] = BIT(EV_KEY) | BIT(EV_REP);
 
 	xtkbd->serio = serio;
-	xtkbd->dev = input_dev;
-	snprintf(xtkbd->phys, sizeof(xtkbd->phys), "%s/input0", serio->phys);
-	memcpy(xtkbd->keycode, xtkbd_keycode, sizeof(xtkbd->keycode));
 
-	input_dev->name = "XT Keyboard";
-	input_dev->phys = xtkbd->phys;
-	input_dev->id.bustype = BUS_XTKBD;
-	input_dev->id.vendor  = 0x0001;
-	input_dev->id.product = 0x0001;
-	input_dev->id.version = 0x0100;
-	input_dev->dev.parent = &serio->dev;
-
-	input_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_REP);
-	input_dev->keycode = xtkbd->keycode;
-	input_dev->keycodesize = sizeof(unsigned char);
-	input_dev->keycodemax = ARRAY_SIZE(xtkbd_keycode);
-
-	for (i = 0; i < 255; i++)
-		set_bit(xtkbd->keycode[i], input_dev->keybit);
-	clear_bit(0, input_dev->keybit);
+	init_input_dev(&xtkbd->dev);
+	xtkbd->dev.keycode = xtkbd->keycode;
+	xtkbd->dev.keycodesize = sizeof(unsigned char);
+	xtkbd->dev.keycodemax = ARRAY_SIZE(xtkbd_keycode);
+	xtkbd->dev.private = xtkbd;
 
 	serio_set_drvdata(serio, xtkbd);
 
 	err = serio_open(serio, drv);
-	if (err)
-		goto fail2;
+	if (err) {
+		serio_set_drvdata(serio, NULL);
+		kfree(xtkbd);
+		return err;
+	}
 
-	err = input_register_device(xtkbd->dev);
-	if (err)
-		goto fail3;
+	memcpy(xtkbd->keycode, xtkbd_keycode, sizeof(xtkbd->keycode));
+	for (i = 0; i < 255; i++)
+		set_bit(xtkbd->keycode[i], xtkbd->dev.keybit);
+	clear_bit(0, xtkbd->dev.keybit);
+
+	sprintf(xtkbd->phys, "%s/input0", serio->phys);
+
+	xtkbd->dev.name = xtkbd_name;
+	xtkbd->dev.phys = xtkbd->phys;
+	xtkbd->dev.id.bustype = BUS_XTKBD;
+	xtkbd->dev.id.vendor = 0x0001;
+	xtkbd->dev.id.product = 0x0001;
+	xtkbd->dev.id.version = 0x0100;
+	xtkbd->dev.dev = &serio->dev;
+
+	input_register_device(&xtkbd->dev);
+
+	printk(KERN_INFO "input: %s on %s\n", xtkbd_name, serio->phys);
 
 	return 0;
-
- fail3:	serio_close(serio);
- fail2:	serio_set_drvdata(serio, NULL);
- fail1:	input_free_device(input_dev);
-	kfree(xtkbd);
-	return err;
 }
 
 static void xtkbd_disconnect(struct serio *serio)
 {
 	struct xtkbd *xtkbd = serio_get_drvdata(serio);
 
+	input_unregister_device(&xtkbd->dev);
 	serio_close(serio);
 	serio_set_drvdata(serio, NULL);
-	input_unregister_device(xtkbd->dev);
 	kfree(xtkbd);
 }
 
-static const struct serio_device_id xtkbd_serio_ids[] = {
+static struct serio_device_id xtkbd_serio_ids[] = {
 	{
 		.type	= SERIO_XT,
 		.proto	= SERIO_ANY,
@@ -152,4 +173,16 @@ static struct serio_driver xtkbd_drv = {
 	.disconnect	= xtkbd_disconnect,
 };
 
-module_serio_driver(xtkbd_drv);
+static int __init xtkbd_init(void)
+{
+	serio_register_driver(&xtkbd_drv);
+	return 0;
+}
+
+static void __exit xtkbd_exit(void)
+{
+	serio_unregister_driver(&xtkbd_drv);
+}
+
+module_init(xtkbd_init);
+module_exit(xtkbd_exit);

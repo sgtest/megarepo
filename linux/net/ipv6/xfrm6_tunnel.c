@@ -1,258 +1,455 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Copyright (C)2003,2004 USAGI/WIDE Project
  *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *
  * Authors	Mitsuru KANDA  <mk@linux-ipv6.org>
- *		YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+ * 		YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
  *
  * Based on net/ipv4/xfrm4_tunnel.c
+ *
  */
+#include <linux/config.h>
 #include <linux/module.h>
 #include <linux/xfrm.h>
-#include <linux/slab.h>
-#include <linux/rculist.h>
+#include <linux/list.h>
 #include <net/ip.h>
 #include <net/xfrm.h>
 #include <net/ipv6.h>
+#include <net/protocol.h>
 #include <linux/ipv6.h>
 #include <linux/icmpv6.h>
-#include <linux/mutex.h>
-#include <net/netns/generic.h>
 
-#define XFRM6_TUNNEL_SPI_BYADDR_HSIZE 256
-#define XFRM6_TUNNEL_SPI_BYSPI_HSIZE 256
+#ifdef CONFIG_IPV6_XFRM6_TUNNEL_DEBUG
+# define X6TDEBUG	3
+#else
+# define X6TDEBUG	1
+#endif
+
+#define X6TPRINTK(fmt, args...)		printk(fmt, ## args)
+#define X6TNOPRINTK(fmt, args...)	do { ; } while(0)
+
+#if X6TDEBUG >= 1
+# define X6TPRINTK1	X6TPRINTK
+#else
+# define X6TPRINTK1	X6TNOPRINTK
+#endif
+
+#if X6TDEBUG >= 3
+# define X6TPRINTK3	X6TPRINTK
+#else
+# define X6TPRINTK3	X6TNOPRINTK
+#endif
+
+/*
+ * xfrm_tunnel_spi things are for allocating unique id ("spi") 
+ * per xfrm_address_t.
+ */
+struct xfrm6_tunnel_spi {
+	struct hlist_node list_byaddr;
+	struct hlist_node list_byspi;
+	xfrm_address_t addr;
+	u32 spi;
+	atomic_t refcnt;
+#ifdef XFRM6_TUNNEL_SPI_MAGIC
+	u32 magic;
+#endif
+};
+
+#ifdef CONFIG_IPV6_XFRM6_TUNNEL_DEBUG
+# define XFRM6_TUNNEL_SPI_MAGIC 0xdeadbeef
+#endif
+
+static DEFINE_RWLOCK(xfrm6_tunnel_spi_lock);
+
+static u32 xfrm6_tunnel_spi;
 
 #define XFRM6_TUNNEL_SPI_MIN	1
 #define XFRM6_TUNNEL_SPI_MAX	0xffffffff
 
-struct xfrm6_tunnel_net {
-	struct hlist_head spi_byaddr[XFRM6_TUNNEL_SPI_BYADDR_HSIZE];
-	struct hlist_head spi_byspi[XFRM6_TUNNEL_SPI_BYSPI_HSIZE];
-	u32 spi;
-};
+static kmem_cache_t *xfrm6_tunnel_spi_kmem;
 
-static unsigned int xfrm6_tunnel_net_id __read_mostly;
-static inline struct xfrm6_tunnel_net *xfrm6_tunnel_pernet(struct net *net)
+#define XFRM6_TUNNEL_SPI_BYADDR_HSIZE 256
+#define XFRM6_TUNNEL_SPI_BYSPI_HSIZE 256
+
+static struct hlist_head xfrm6_tunnel_spi_byaddr[XFRM6_TUNNEL_SPI_BYADDR_HSIZE];
+static struct hlist_head xfrm6_tunnel_spi_byspi[XFRM6_TUNNEL_SPI_BYSPI_HSIZE];
+
+#ifdef XFRM6_TUNNEL_SPI_MAGIC
+static int x6spi_check_magic(const struct xfrm6_tunnel_spi *x6spi,
+			     const char *name)
 {
-	return net_generic(net, xfrm6_tunnel_net_id);
+	if (unlikely(x6spi->magic != XFRM6_TUNNEL_SPI_MAGIC)) {
+		X6TPRINTK3(KERN_DEBUG "%s(): x6spi object "
+				      "at %p has corrupted magic %08x "
+				      "(should be %08x)\n",
+			   name, x6spi, x6spi->magic, XFRM6_TUNNEL_SPI_MAGIC);
+		return -1;
+	}
+	return 0;
 }
-
-/*
- * xfrm_tunnel_spi things are for allocating unique id ("spi")
- * per xfrm_address_t.
- */
-struct xfrm6_tunnel_spi {
-	struct hlist_node	list_byaddr;
-	struct hlist_node	list_byspi;
-	xfrm_address_t		addr;
-	u32			spi;
-	refcount_t		refcnt;
-	struct rcu_head		rcu_head;
-};
-
-static DEFINE_SPINLOCK(xfrm6_tunnel_spi_lock);
-
-static struct kmem_cache *xfrm6_tunnel_spi_kmem __read_mostly;
-
-static inline unsigned int xfrm6_tunnel_spi_hash_byaddr(const xfrm_address_t *addr)
+#else
+static int inline x6spi_check_magic(const struct xfrm6_tunnel_spi *x6spi,
+				    const char *name)
 {
-	unsigned int h;
+	return 0;
+}
+#endif
 
-	h = ipv6_addr_hash((const struct in6_addr *)addr);
+#define X6SPI_CHECK_MAGIC(x6spi) x6spi_check_magic((x6spi), __FUNCTION__)
+
+
+static unsigned inline xfrm6_tunnel_spi_hash_byaddr(xfrm_address_t *addr)
+{
+	unsigned h;
+
+	X6TPRINTK3(KERN_DEBUG "%s(addr=%p)\n", __FUNCTION__, addr);
+
+	h = addr->a6[0] ^ addr->a6[1] ^ addr->a6[2] ^ addr->a6[3];
 	h ^= h >> 16;
 	h ^= h >> 8;
 	h &= XFRM6_TUNNEL_SPI_BYADDR_HSIZE - 1;
 
+	X6TPRINTK3(KERN_DEBUG "%s() = %u\n", __FUNCTION__, h);
+
 	return h;
 }
 
-static inline unsigned int xfrm6_tunnel_spi_hash_byspi(u32 spi)
+static unsigned inline xfrm6_tunnel_spi_hash_byspi(u32 spi)
 {
 	return spi % XFRM6_TUNNEL_SPI_BYSPI_HSIZE;
 }
 
-static struct xfrm6_tunnel_spi *__xfrm6_tunnel_spi_lookup(struct net *net, const xfrm_address_t *saddr)
-{
-	struct xfrm6_tunnel_net *xfrm6_tn = xfrm6_tunnel_pernet(net);
-	struct xfrm6_tunnel_spi *x6spi;
 
-	hlist_for_each_entry_rcu(x6spi,
-			     &xfrm6_tn->spi_byaddr[xfrm6_tunnel_spi_hash_byaddr(saddr)],
-			     list_byaddr, lockdep_is_held(&xfrm6_tunnel_spi_lock)) {
-		if (xfrm6_addr_equal(&x6spi->addr, saddr))
-			return x6spi;
+static int xfrm6_tunnel_spi_init(void)
+{
+	int i;
+
+	X6TPRINTK3(KERN_DEBUG "%s()\n", __FUNCTION__);
+
+	xfrm6_tunnel_spi = 0;
+	xfrm6_tunnel_spi_kmem = kmem_cache_create("xfrm6_tunnel_spi",
+						  sizeof(struct xfrm6_tunnel_spi),
+						  0, SLAB_HWCACHE_ALIGN,
+						  NULL, NULL);
+	if (!xfrm6_tunnel_spi_kmem) {
+		X6TPRINTK1(KERN_ERR
+			   "%s(): failed to allocate xfrm6_tunnel_spi_kmem\n",
+		           __FUNCTION__);
+		return -ENOMEM;
 	}
 
+	for (i = 0; i < XFRM6_TUNNEL_SPI_BYADDR_HSIZE; i++)
+		INIT_HLIST_HEAD(&xfrm6_tunnel_spi_byaddr[i]);
+	for (i = 0; i < XFRM6_TUNNEL_SPI_BYSPI_HSIZE; i++)
+		INIT_HLIST_HEAD(&xfrm6_tunnel_spi_byspi[i]);
+	return 0;
+}
+
+static void xfrm6_tunnel_spi_fini(void)
+{
+	int i;
+
+	X6TPRINTK3(KERN_DEBUG "%s()\n", __FUNCTION__);
+
+	for (i = 0; i < XFRM6_TUNNEL_SPI_BYADDR_HSIZE; i++) {
+		if (!hlist_empty(&xfrm6_tunnel_spi_byaddr[i]))
+			goto err;
+	}
+	for (i = 0; i < XFRM6_TUNNEL_SPI_BYSPI_HSIZE; i++) {
+		if (!hlist_empty(&xfrm6_tunnel_spi_byspi[i]))
+			goto err;
+	}
+	kmem_cache_destroy(xfrm6_tunnel_spi_kmem);
+	xfrm6_tunnel_spi_kmem = NULL;
+	return;
+err:
+	X6TPRINTK1(KERN_ERR "%s(): table is not empty\n", __FUNCTION__);
+	return;
+}
+
+static struct xfrm6_tunnel_spi *__xfrm6_tunnel_spi_lookup(xfrm_address_t *saddr)
+{
+	struct xfrm6_tunnel_spi *x6spi;
+	struct hlist_node *pos;
+
+	X6TPRINTK3(KERN_DEBUG "%s(saddr=%p)\n", __FUNCTION__, saddr);
+
+	hlist_for_each_entry(x6spi, pos,
+			     &xfrm6_tunnel_spi_byaddr[xfrm6_tunnel_spi_hash_byaddr(saddr)],
+			     list_byaddr) {
+		if (memcmp(&x6spi->addr, saddr, sizeof(x6spi->addr)) == 0) {
+			X6SPI_CHECK_MAGIC(x6spi);
+			X6TPRINTK3(KERN_DEBUG "%s() = %p(%u)\n", __FUNCTION__, x6spi, x6spi->spi);
+			return x6spi;
+		}
+	}
+
+	X6TPRINTK3(KERN_DEBUG "%s() = NULL(0)\n", __FUNCTION__);
 	return NULL;
 }
 
-__be32 xfrm6_tunnel_spi_lookup(struct net *net, const xfrm_address_t *saddr)
+u32 xfrm6_tunnel_spi_lookup(xfrm_address_t *saddr)
 {
 	struct xfrm6_tunnel_spi *x6spi;
 	u32 spi;
 
-	rcu_read_lock_bh();
-	x6spi = __xfrm6_tunnel_spi_lookup(net, saddr);
+	X6TPRINTK3(KERN_DEBUG "%s(saddr=%p)\n", __FUNCTION__, saddr);
+
+	read_lock_bh(&xfrm6_tunnel_spi_lock);
+	x6spi = __xfrm6_tunnel_spi_lookup(saddr);
 	spi = x6spi ? x6spi->spi : 0;
-	rcu_read_unlock_bh();
-	return htonl(spi);
+	read_unlock_bh(&xfrm6_tunnel_spi_lock);
+	return spi;
 }
+
 EXPORT_SYMBOL(xfrm6_tunnel_spi_lookup);
 
-static int __xfrm6_tunnel_spi_check(struct net *net, u32 spi)
+static u32 __xfrm6_tunnel_alloc_spi(xfrm_address_t *saddr)
 {
-	struct xfrm6_tunnel_net *xfrm6_tn = xfrm6_tunnel_pernet(net);
-	struct xfrm6_tunnel_spi *x6spi;
-	int index = xfrm6_tunnel_spi_hash_byspi(spi);
-
-	hlist_for_each_entry(x6spi,
-			     &xfrm6_tn->spi_byspi[index],
-			     list_byspi) {
-		if (x6spi->spi == spi)
-			return -1;
-	}
-	return index;
-}
-
-static u32 __xfrm6_tunnel_alloc_spi(struct net *net, xfrm_address_t *saddr)
-{
-	struct xfrm6_tunnel_net *xfrm6_tn = xfrm6_tunnel_pernet(net);
 	u32 spi;
 	struct xfrm6_tunnel_spi *x6spi;
-	int index;
+	struct hlist_node *pos;
+	unsigned index;
 
-	if (xfrm6_tn->spi < XFRM6_TUNNEL_SPI_MIN ||
-	    xfrm6_tn->spi >= XFRM6_TUNNEL_SPI_MAX)
-		xfrm6_tn->spi = XFRM6_TUNNEL_SPI_MIN;
+	X6TPRINTK3(KERN_DEBUG "%s(saddr=%p)\n", __FUNCTION__, saddr);
+
+	if (xfrm6_tunnel_spi < XFRM6_TUNNEL_SPI_MIN ||
+	    xfrm6_tunnel_spi >= XFRM6_TUNNEL_SPI_MAX)
+		xfrm6_tunnel_spi = XFRM6_TUNNEL_SPI_MIN;
 	else
-		xfrm6_tn->spi++;
+		xfrm6_tunnel_spi++;
 
-	for (spi = xfrm6_tn->spi; spi <= XFRM6_TUNNEL_SPI_MAX; spi++) {
-		index = __xfrm6_tunnel_spi_check(net, spi);
-		if (index >= 0)
-			goto alloc_spi;
-
-		if (spi == XFRM6_TUNNEL_SPI_MAX)
-			break;
+	for (spi = xfrm6_tunnel_spi; spi <= XFRM6_TUNNEL_SPI_MAX; spi++) {
+		index = xfrm6_tunnel_spi_hash_byspi(spi);
+		hlist_for_each_entry(x6spi, pos, 
+				     &xfrm6_tunnel_spi_byspi[index], 
+				     list_byspi) {
+			if (x6spi->spi == spi)
+				goto try_next_1;
+		}
+		xfrm6_tunnel_spi = spi;
+		goto alloc_spi;
+try_next_1:;
 	}
-	for (spi = XFRM6_TUNNEL_SPI_MIN; spi < xfrm6_tn->spi; spi++) {
-		index = __xfrm6_tunnel_spi_check(net, spi);
-		if (index >= 0)
-			goto alloc_spi;
+	for (spi = XFRM6_TUNNEL_SPI_MIN; spi < xfrm6_tunnel_spi; spi++) {
+		index = xfrm6_tunnel_spi_hash_byspi(spi);
+		hlist_for_each_entry(x6spi, pos, 
+				     &xfrm6_tunnel_spi_byspi[index], 
+				     list_byspi) {
+			if (x6spi->spi == spi)
+				goto try_next_2;
+		}
+		xfrm6_tunnel_spi = spi;
+		goto alloc_spi;
+try_next_2:;
 	}
 	spi = 0;
 	goto out;
 alloc_spi:
-	xfrm6_tn->spi = spi;
-	x6spi = kmem_cache_alloc(xfrm6_tunnel_spi_kmem, GFP_ATOMIC);
-	if (!x6spi)
+	X6TPRINTK3(KERN_DEBUG "%s(): allocate new spi for "
+			      "%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x\n", 
+			      __FUNCTION__, 
+			      NIP6(*(struct in6_addr *)saddr));
+	x6spi = kmem_cache_alloc(xfrm6_tunnel_spi_kmem, SLAB_ATOMIC);
+	if (!x6spi) {
+		X6TPRINTK1(KERN_ERR "%s(): kmem_cache_alloc() failed\n", 
+			   __FUNCTION__);
 		goto out;
-
+	}
+#ifdef XFRM6_TUNNEL_SPI_MAGIC
+	x6spi->magic = XFRM6_TUNNEL_SPI_MAGIC;
+#endif
 	memcpy(&x6spi->addr, saddr, sizeof(x6spi->addr));
 	x6spi->spi = spi;
-	refcount_set(&x6spi->refcnt, 1);
+	atomic_set(&x6spi->refcnt, 1);
 
-	hlist_add_head_rcu(&x6spi->list_byspi, &xfrm6_tn->spi_byspi[index]);
+	hlist_add_head(&x6spi->list_byspi, &xfrm6_tunnel_spi_byspi[index]);
 
 	index = xfrm6_tunnel_spi_hash_byaddr(saddr);
-	hlist_add_head_rcu(&x6spi->list_byaddr, &xfrm6_tn->spi_byaddr[index]);
+	hlist_add_head(&x6spi->list_byaddr, &xfrm6_tunnel_spi_byaddr[index]);
+	X6SPI_CHECK_MAGIC(x6spi);
 out:
+	X6TPRINTK3(KERN_DEBUG "%s() = %u\n", __FUNCTION__, spi);
 	return spi;
 }
 
-__be32 xfrm6_tunnel_alloc_spi(struct net *net, xfrm_address_t *saddr)
+u32 xfrm6_tunnel_alloc_spi(xfrm_address_t *saddr)
 {
 	struct xfrm6_tunnel_spi *x6spi;
 	u32 spi;
 
-	spin_lock_bh(&xfrm6_tunnel_spi_lock);
-	x6spi = __xfrm6_tunnel_spi_lookup(net, saddr);
+	X6TPRINTK3(KERN_DEBUG "%s(saddr=%p)\n", __FUNCTION__, saddr);
+
+	write_lock_bh(&xfrm6_tunnel_spi_lock);
+	x6spi = __xfrm6_tunnel_spi_lookup(saddr);
 	if (x6spi) {
-		refcount_inc(&x6spi->refcnt);
+		atomic_inc(&x6spi->refcnt);
 		spi = x6spi->spi;
 	} else
-		spi = __xfrm6_tunnel_alloc_spi(net, saddr);
-	spin_unlock_bh(&xfrm6_tunnel_spi_lock);
+		spi = __xfrm6_tunnel_alloc_spi(saddr);
+	write_unlock_bh(&xfrm6_tunnel_spi_lock);
 
-	return htonl(spi);
+	X6TPRINTK3(KERN_DEBUG "%s() = %u\n", __FUNCTION__, spi);
+
+	return spi;
 }
+
 EXPORT_SYMBOL(xfrm6_tunnel_alloc_spi);
 
-static void x6spi_destroy_rcu(struct rcu_head *head)
+void xfrm6_tunnel_free_spi(xfrm_address_t *saddr)
 {
-	kmem_cache_free(xfrm6_tunnel_spi_kmem,
-			container_of(head, struct xfrm6_tunnel_spi, rcu_head));
-}
-
-static void xfrm6_tunnel_free_spi(struct net *net, xfrm_address_t *saddr)
-{
-	struct xfrm6_tunnel_net *xfrm6_tn = xfrm6_tunnel_pernet(net);
 	struct xfrm6_tunnel_spi *x6spi;
-	struct hlist_node *n;
+	struct hlist_node *pos, *n;
 
-	spin_lock_bh(&xfrm6_tunnel_spi_lock);
+	X6TPRINTK3(KERN_DEBUG "%s(saddr=%p)\n", __FUNCTION__, saddr);
 
-	hlist_for_each_entry_safe(x6spi, n,
-				  &xfrm6_tn->spi_byaddr[xfrm6_tunnel_spi_hash_byaddr(saddr)],
+	write_lock_bh(&xfrm6_tunnel_spi_lock);
+
+	hlist_for_each_entry_safe(x6spi, pos, n, 
+				  &xfrm6_tunnel_spi_byaddr[xfrm6_tunnel_spi_hash_byaddr(saddr)],
 				  list_byaddr)
 	{
-		if (xfrm6_addr_equal(&x6spi->addr, saddr)) {
-			if (refcount_dec_and_test(&x6spi->refcnt)) {
-				hlist_del_rcu(&x6spi->list_byaddr);
-				hlist_del_rcu(&x6spi->list_byspi);
-				call_rcu(&x6spi->rcu_head, x6spi_destroy_rcu);
+		if (memcmp(&x6spi->addr, saddr, sizeof(x6spi->addr)) == 0) {
+			X6TPRINTK3(KERN_DEBUG "%s(): x6spi object "
+					      "for %04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x "
+					      "found at %p\n",
+				   __FUNCTION__, 
+				   NIP6(*(struct in6_addr *)saddr),
+				   x6spi);
+			X6SPI_CHECK_MAGIC(x6spi);
+			if (atomic_dec_and_test(&x6spi->refcnt)) {
+				hlist_del(&x6spi->list_byaddr);
+				hlist_del(&x6spi->list_byspi);
+				kmem_cache_free(xfrm6_tunnel_spi_kmem, x6spi);
 				break;
 			}
 		}
 	}
-	spin_unlock_bh(&xfrm6_tunnel_spi_lock);
+	write_unlock_bh(&xfrm6_tunnel_spi_lock);
 }
+
+EXPORT_SYMBOL(xfrm6_tunnel_free_spi);
 
 static int xfrm6_tunnel_output(struct xfrm_state *x, struct sk_buff *skb)
 {
-	skb_push(skb, -skb_network_offset(skb));
+	struct ipv6hdr *top_iph;
+
+	top_iph = (struct ipv6hdr *)skb->data;
+	top_iph->payload_len = htons(skb->len - sizeof(struct ipv6hdr));
+
 	return 0;
 }
 
-static int xfrm6_tunnel_input(struct xfrm_state *x, struct sk_buff *skb)
+static int xfrm6_tunnel_input(struct xfrm_state *x, struct xfrm_decap_state *decap, struct sk_buff *skb)
 {
-	return skb_network_header(skb)[IP6CB(skb)->nhoff];
+	return 0;
 }
 
-static int xfrm6_tunnel_rcv(struct sk_buff *skb)
-{
-	struct net *net = dev_net(skb->dev);
-	const struct ipv6hdr *iph = ipv6_hdr(skb);
-	__be32 spi;
+static struct xfrm6_tunnel *xfrm6_tunnel_handler;
+static DECLARE_MUTEX(xfrm6_tunnel_sem);
 
-	spi = xfrm6_tunnel_spi_lookup(net, (const xfrm_address_t *)&iph->saddr);
-	return xfrm6_rcv_spi(skb, IPPROTO_IPV6, spi, NULL);
+int xfrm6_tunnel_register(struct xfrm6_tunnel *handler)
+{
+	int ret;
+
+	down(&xfrm6_tunnel_sem);
+	ret = 0;
+	if (xfrm6_tunnel_handler != NULL)
+		ret = -EINVAL;
+	if (!ret)
+		xfrm6_tunnel_handler = handler;
+	up(&xfrm6_tunnel_sem);
+
+	return ret;
 }
 
-static int xfrm6_tunnel_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
-			    u8 type, u8 code, int offset, __be32 info)
+EXPORT_SYMBOL(xfrm6_tunnel_register);
+
+int xfrm6_tunnel_deregister(struct xfrm6_tunnel *handler)
 {
+	int ret;
+
+	down(&xfrm6_tunnel_sem);
+	ret = 0;
+	if (xfrm6_tunnel_handler != handler)
+		ret = -EINVAL;
+	if (!ret)
+		xfrm6_tunnel_handler = NULL;
+	up(&xfrm6_tunnel_sem);
+
+	synchronize_net();
+
+	return ret;
+}
+
+EXPORT_SYMBOL(xfrm6_tunnel_deregister);
+
+static int xfrm6_tunnel_rcv(struct sk_buff **pskb, unsigned int *nhoffp)
+{
+	struct sk_buff *skb = *pskb;
+	struct xfrm6_tunnel *handler = xfrm6_tunnel_handler;
+	struct ipv6hdr *iph = skb->nh.ipv6h;
+	u32 spi;
+
+	/* device-like_ip6ip6_handler() */
+	if (handler && handler->handler(pskb, nhoffp) == 0)
+		return 0;
+
+	spi = xfrm6_tunnel_spi_lookup((xfrm_address_t *)&iph->saddr);
+	return xfrm6_rcv_spi(pskb, nhoffp, spi);
+}
+
+static void xfrm6_tunnel_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
+			     int type, int code, int offset, __u32 info)
+{
+	struct xfrm6_tunnel *handler = xfrm6_tunnel_handler;
+
+	/* call here first for device-like ip6ip6 err handling */
+	if (handler) {
+		handler->err_handler(skb, opt, type, code, offset, info);
+		return;
+	}
+
 	/* xfrm6_tunnel native err handling */
 	switch (type) {
-	case ICMPV6_DEST_UNREACH:
+	case ICMPV6_DEST_UNREACH: 
 		switch (code) {
-		case ICMPV6_NOROUTE:
+		case ICMPV6_NOROUTE: 
 		case ICMPV6_ADM_PROHIBITED:
 		case ICMPV6_NOT_NEIGHBOUR:
 		case ICMPV6_ADDR_UNREACH:
 		case ICMPV6_PORT_UNREACH:
 		default:
+			X6TPRINTK3(KERN_DEBUG
+				   "xfrm6_tunnel: Destination Unreach.\n");
 			break;
 		}
 		break;
 	case ICMPV6_PKT_TOOBIG:
+			X6TPRINTK3(KERN_DEBUG 
+				   "xfrm6_tunnel: Packet Too Big.\n");
 		break;
 	case ICMPV6_TIME_EXCEED:
 		switch (code) {
 		case ICMPV6_EXC_HOPLIMIT:
+			X6TPRINTK3(KERN_DEBUG
+				   "xfrm6_tunnel: Too small Hoplimit.\n");
 			break;
 		case ICMPV6_EXC_FRAGTIME:
-		default:
+		default: 
 			break;
 		}
 		break;
@@ -266,13 +463,12 @@ static int xfrm6_tunnel_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
 	default:
 		break;
 	}
-
-	return 0;
+	return;
 }
 
-static int xfrm6_tunnel_init_state(struct xfrm_state *x)
+static int xfrm6_tunnel_init_state(struct xfrm_state *x, void *args)
 {
-	if (x->props.mode != XFRM_MODE_TUNNEL)
+	if (!x->props.mode)
 		return -EINVAL;
 
 	if (x->encap)
@@ -285,12 +481,11 @@ static int xfrm6_tunnel_init_state(struct xfrm_state *x)
 
 static void xfrm6_tunnel_destroy(struct xfrm_state *x)
 {
-	struct net *net = xs_net(x);
-
-	xfrm6_tunnel_free_spi(net, (xfrm_address_t *)&x->props.saddr);
+	xfrm6_tunnel_free_spi((xfrm_address_t *)&x->props.saddr);
 }
 
-static const struct xfrm_type xfrm6_tunnel_type = {
+static struct xfrm_type xfrm6_tunnel_type = {
+	.description	= "IP6IP6",
 	.owner          = THIS_MODULE,
 	.proto		= IPPROTO_IPV6,
 	.init_state	= xfrm6_tunnel_init_state,
@@ -299,103 +494,50 @@ static const struct xfrm_type xfrm6_tunnel_type = {
 	.output		= xfrm6_tunnel_output,
 };
 
-static struct xfrm6_tunnel xfrm6_tunnel_handler __read_mostly = {
+static struct inet6_protocol xfrm6_tunnel_protocol = {
 	.handler	= xfrm6_tunnel_rcv,
-	.err_handler	= xfrm6_tunnel_err,
-	.priority	= 3,
-};
-
-static struct xfrm6_tunnel xfrm46_tunnel_handler __read_mostly = {
-	.handler	= xfrm6_tunnel_rcv,
-	.err_handler	= xfrm6_tunnel_err,
-	.priority	= 3,
-};
-
-static int __net_init xfrm6_tunnel_net_init(struct net *net)
-{
-	struct xfrm6_tunnel_net *xfrm6_tn = xfrm6_tunnel_pernet(net);
-	unsigned int i;
-
-	for (i = 0; i < XFRM6_TUNNEL_SPI_BYADDR_HSIZE; i++)
-		INIT_HLIST_HEAD(&xfrm6_tn->spi_byaddr[i]);
-	for (i = 0; i < XFRM6_TUNNEL_SPI_BYSPI_HSIZE; i++)
-		INIT_HLIST_HEAD(&xfrm6_tn->spi_byspi[i]);
-	xfrm6_tn->spi = 0;
-
-	return 0;
-}
-
-static void __net_exit xfrm6_tunnel_net_exit(struct net *net)
-{
-	struct xfrm6_tunnel_net *xfrm6_tn = xfrm6_tunnel_pernet(net);
-	unsigned int i;
-
-	xfrm_flush_gc();
-	xfrm_state_flush(net, 0, false, true);
-
-	for (i = 0; i < XFRM6_TUNNEL_SPI_BYADDR_HSIZE; i++)
-		WARN_ON_ONCE(!hlist_empty(&xfrm6_tn->spi_byaddr[i]));
-
-	for (i = 0; i < XFRM6_TUNNEL_SPI_BYSPI_HSIZE; i++)
-		WARN_ON_ONCE(!hlist_empty(&xfrm6_tn->spi_byspi[i]));
-}
-
-static struct pernet_operations xfrm6_tunnel_net_ops = {
-	.init	= xfrm6_tunnel_net_init,
-	.exit	= xfrm6_tunnel_net_exit,
-	.id	= &xfrm6_tunnel_net_id,
-	.size	= sizeof(struct xfrm6_tunnel_net),
+	.err_handler	= xfrm6_tunnel_err, 
+	.flags          = INET6_PROTO_NOPOLICY|INET6_PROTO_FINAL,
 };
 
 static int __init xfrm6_tunnel_init(void)
 {
-	int rv;
+	X6TPRINTK3(KERN_DEBUG "%s()\n", __FUNCTION__);
 
-	xfrm6_tunnel_spi_kmem = kmem_cache_create("xfrm6_tunnel_spi",
-						  sizeof(struct xfrm6_tunnel_spi),
-						  0, SLAB_HWCACHE_ALIGN,
-						  NULL);
-	if (!xfrm6_tunnel_spi_kmem)
-		return -ENOMEM;
-	rv = register_pernet_subsys(&xfrm6_tunnel_net_ops);
-	if (rv < 0)
-		goto out_pernet;
-	rv = xfrm_register_type(&xfrm6_tunnel_type, AF_INET6);
-	if (rv < 0)
-		goto out_type;
-	rv = xfrm6_tunnel_register(&xfrm6_tunnel_handler, AF_INET6);
-	if (rv < 0)
-		goto out_xfrm6;
-	rv = xfrm6_tunnel_register(&xfrm46_tunnel_handler, AF_INET);
-	if (rv < 0)
-		goto out_xfrm46;
+	if (xfrm_register_type(&xfrm6_tunnel_type, AF_INET6) < 0) {
+		X6TPRINTK1(KERN_ERR
+			   "xfrm6_tunnel init: can't add xfrm type\n");
+		return -EAGAIN;
+	}
+	if (inet6_add_protocol(&xfrm6_tunnel_protocol, IPPROTO_IPV6) < 0) {
+		X6TPRINTK1(KERN_ERR
+			   "xfrm6_tunnel init(): can't add protocol\n");
+		xfrm_unregister_type(&xfrm6_tunnel_type, AF_INET6);
+		return -EAGAIN;
+	}
+	if (xfrm6_tunnel_spi_init() < 0) {
+		X6TPRINTK1(KERN_ERR
+			   "xfrm6_tunnel init: failed to initialize spi\n");
+		inet6_del_protocol(&xfrm6_tunnel_protocol, IPPROTO_IPV6);
+		xfrm_unregister_type(&xfrm6_tunnel_type, AF_INET6);
+		return -EAGAIN;
+	}
 	return 0;
-
-out_xfrm46:
-	xfrm6_tunnel_deregister(&xfrm6_tunnel_handler, AF_INET6);
-out_xfrm6:
-	xfrm_unregister_type(&xfrm6_tunnel_type, AF_INET6);
-out_type:
-	unregister_pernet_subsys(&xfrm6_tunnel_net_ops);
-out_pernet:
-	kmem_cache_destroy(xfrm6_tunnel_spi_kmem);
-	return rv;
 }
 
 static void __exit xfrm6_tunnel_fini(void)
 {
-	xfrm6_tunnel_deregister(&xfrm46_tunnel_handler, AF_INET);
-	xfrm6_tunnel_deregister(&xfrm6_tunnel_handler, AF_INET6);
-	xfrm_unregister_type(&xfrm6_tunnel_type, AF_INET6);
-	unregister_pernet_subsys(&xfrm6_tunnel_net_ops);
-	/* Someone maybe has gotten the xfrm6_tunnel_spi.
-	 * So need to wait it.
-	 */
-	rcu_barrier();
-	kmem_cache_destroy(xfrm6_tunnel_spi_kmem);
+	X6TPRINTK3(KERN_DEBUG "%s()\n", __FUNCTION__);
+
+	xfrm6_tunnel_spi_fini();
+	if (inet6_del_protocol(&xfrm6_tunnel_protocol, IPPROTO_IPV6) < 0)
+		X6TPRINTK1(KERN_ERR 
+			   "xfrm6_tunnel close: can't remove protocol\n");
+	if (xfrm_unregister_type(&xfrm6_tunnel_type, AF_INET6) < 0)
+		X6TPRINTK1(KERN_ERR
+			   "xfrm6_tunnel close: can't remove xfrm type\n");
 }
 
 module_init(xfrm6_tunnel_init);
 module_exit(xfrm6_tunnel_fini);
 MODULE_LICENSE("GPL");
-MODULE_ALIAS_XFRM_TYPE(AF_INET6, XFRM_PROTO_IPV6);

@@ -1,9 +1,12 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  *  linux/arch/arm/vfp/vfpinstr.h
  *
  *  Copyright (C) 2004 ARM Limited.
  *  Written by Deep Blue Solutions Limited.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  *
  * VFP instruction masks.
  */
@@ -49,11 +52,11 @@
 #define FEXT_TO_IDX(inst)	((inst & 0x000f0000) >> 15 | (inst & (1 << 7)) >> 7)
 
 #define vfp_get_sd(inst)	((inst & 0x0000f000) >> 11 | (inst & (1 << 22)) >> 22)
-#define vfp_get_dd(inst)	((inst & 0x0000f000) >> 12 | (inst & (1 << 22)) >> 18)
+#define vfp_get_dd(inst)	((inst & 0x0000f000) >> 12)
 #define vfp_get_sm(inst)	((inst & 0x0000000f) << 1 | (inst & (1 << 5)) >> 5)
-#define vfp_get_dm(inst)	((inst & 0x0000000f) | (inst & (1 << 5)) >> 1)
+#define vfp_get_dm(inst)	((inst & 0x0000000f))
 #define vfp_get_sn(inst)	((inst & 0x000f0000) >> 15 | (inst & (1 << 7)) >> 7)
-#define vfp_get_dn(inst)	((inst & 0x000f0000) >> 16 | (inst & (1 << 7)) >> 3)
+#define vfp_get_dn(inst)	((inst & 0x000f0000) >> 16)
 
 #define vfp_single(inst)	(((inst) & 0x0000f00) == 0xa00)
 
@@ -62,37 +65,22 @@
 #define FPSCR_C (1 << 29)
 #define FPSCR_V	(1 << 28)
 
-#ifdef CONFIG_AS_VFP_VMRS_FPINST
-
-#define fmrx(_vfp_) ({			\
-	u32 __v;			\
-	asm(".fpu	vfpv2\n"	\
-	    "vmrs	%0, " #_vfp_	\
-	    : "=r" (__v) : : "cc");	\
-	__v;				\
- })
-
-#define fmxr(_vfp_,_var_)		\
-	asm(".fpu	vfpv2\n"	\
-	    "vmsr	" #_vfp_ ", %0"	\
-	   : : "r" (_var_) : "cc")
-
-#else
-
+/*
+ * Since we aren't building with -mfpu=vfp, we need to code
+ * these instructions using their MRC/MCR equivalents.
+ */
 #define vfpreg(_vfp_) #_vfp_
 
 #define fmrx(_vfp_) ({			\
 	u32 __v;			\
-	asm("mrc p10, 7, %0, " vfpreg(_vfp_) ", cr0, 0 @ fmrx	%0, " #_vfp_	\
-	    : "=r" (__v) : : "cc");	\
+	asm("mrc%? p10, 7, %0, " vfpreg(_vfp_) ", cr0, 0 @ fmrx	%0, " #_vfp_	\
+	    : "=r" (__v));		\
 	__v;				\
  })
 
 #define fmxr(_vfp_,_var_)		\
-	asm("mcr p10, 7, %0, " vfpreg(_vfp_) ", cr0, 0 @ fmxr	" #_vfp_ ", %0"	\
-	   : : "r" (_var_) : "cc")
-
-#endif
+	asm("mcr%? p10, 7, %0, " vfpreg(_vfp_) ", cr0, 0 @ fmxr	" #_vfp_ ", %0"	\
+	   : : "r" (_var_))
 
 u32 vfp_single_cpdo(u32 inst, u32 fpscr);
 u32 vfp_single_cprt(u32 inst, u32 fpscr, struct pt_regs *regs);

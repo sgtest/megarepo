@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * ethtool.h: Defines for Linux ethtool.
  *
@@ -8,639 +7,318 @@
  * Portions Copyright 2002 Intel (eli.kupermann@intel.com,
  *                                christopher.leech@intel.com,
  *                                scott.feldman@intel.com)
- * Portions Copyright (C) Sun Microsystems 2008
  */
+
 #ifndef _LINUX_ETHTOOL_H
 #define _LINUX_ETHTOOL_H
 
-#include <linux/bitmap.h>
-#include <linux/compat.h>
-#include <linux/netlink.h>
-#include <uapi/linux/ethtool.h>
 
-struct compat_ethtool_rx_flow_spec {
-	u32		flow_type;
-	union ethtool_flow_union h_u;
-	struct ethtool_flow_ext h_ext;
-	union ethtool_flow_union m_u;
-	struct ethtool_flow_ext m_ext;
-	compat_u64	ring_cookie;
-	u32		location;
+/* This should work for both 32 and 64 bit userland. */
+struct ethtool_cmd {
+	u32	cmd;
+	u32	supported;	/* Features this interface supports */
+	u32	advertising;	/* Features this interface advertises */
+	u16	speed;		/* The forced speed, 10Mb, 100Mb, gigabit */
+	u8	duplex;		/* Duplex, half or full */
+	u8	port;		/* Which connector port */
+	u8	phy_address;
+	u8	transceiver;	/* Which transceiver to use */
+	u8	autoneg;	/* Enable or disable autonegotiation */
+	u32	maxtxpkt;	/* Tx pkts before generating tx int */
+	u32	maxrxpkt;	/* Rx pkts before generating rx int */
+	u32	reserved[4];
 };
 
-struct compat_ethtool_rxnfc {
-	u32				cmd;
-	u32				flow_type;
-	compat_u64			data;
-	struct compat_ethtool_rx_flow_spec fs;
-	u32				rule_cnt;
-	u32				rule_locs[];
+#define ETHTOOL_BUSINFO_LEN	32
+/* these strings are set to whatever the driver author decides... */
+struct ethtool_drvinfo {
+	u32	cmd;
+	char	driver[32];	/* driver short name, "tulip", "eepro100" */
+	char	version[32];	/* driver version string */
+	char	fw_version[32];	/* firmware version string, if applicable */
+	char	bus_info[ETHTOOL_BUSINFO_LEN];	/* Bus info for this IF. */
+				/* For PCI devices, use pci_name(pci_dev). */
+	char	reserved1[32];
+	char	reserved2[16];
+	u32	n_stats;	/* number of u64's from ETHTOOL_GSTATS */
+	u32	testinfo_len;
+	u32	eedump_len;	/* Size of data from ETHTOOL_GEEPROM (bytes) */
+	u32	regdump_len;	/* Size of data from ETHTOOL_GREGS (bytes) */
 };
 
-#include <linux/rculist.h>
-
-/**
- * enum ethtool_phys_id_state - indicator state for physical identification
- * @ETHTOOL_ID_INACTIVE: Physical ID indicator should be deactivated
- * @ETHTOOL_ID_ACTIVE: Physical ID indicator should be activated
- * @ETHTOOL_ID_ON: LED should be turned on (used iff %ETHTOOL_ID_ACTIVE
- *	is not supported)
- * @ETHTOOL_ID_OFF: LED should be turned off (used iff %ETHTOOL_ID_ACTIVE
- *	is not supported)
- */
-enum ethtool_phys_id_state {
-	ETHTOOL_ID_INACTIVE,
-	ETHTOOL_ID_ACTIVE,
-	ETHTOOL_ID_ON,
-	ETHTOOL_ID_OFF
+#define SOPASS_MAX	6
+/* wake-on-lan settings */
+struct ethtool_wolinfo {
+	u32	cmd;
+	u32	supported;
+	u32	wolopts;
+	u8	sopass[SOPASS_MAX]; /* SecureOn(tm) password */
 };
 
-enum {
-	ETH_RSS_HASH_TOP_BIT, /* Configurable RSS hash function - Toeplitz */
-	ETH_RSS_HASH_XOR_BIT, /* Configurable RSS hash function - Xor */
-	ETH_RSS_HASH_CRC32_BIT, /* Configurable RSS hash function - Crc32 */
+/* for passing single values */
+struct ethtool_value {
+	u32	cmd;
+	u32	data;
+};
 
-	/*
-	 * Add your fresh new hash function bits above and remember to update
-	 * rss_hash_func_strings[] in ethtool.c
+/* for passing big chunks of data */
+struct ethtool_regs {
+	u32	cmd;
+	u32	version; /* driver-specific, indicates different chips/revs */
+	u32	len; /* bytes */
+	u8	data[0];
+};
+
+/* for passing EEPROM chunks */
+struct ethtool_eeprom {
+	u32	cmd;
+	u32	magic;
+	u32	offset; /* in bytes */
+	u32	len; /* in bytes */
+	u8	data[0];
+};
+
+/* for configuring coalescing parameters of chip */
+struct ethtool_coalesce {
+	u32	cmd;	/* ETHTOOL_{G,S}COALESCE */
+
+	/* How many usecs to delay an RX interrupt after
+	 * a packet arrives.  If 0, only rx_max_coalesced_frames
+	 * is used.
 	 */
-	ETH_RSS_HASH_FUNCS_COUNT
+	u32	rx_coalesce_usecs;
+
+	/* How many packets to delay an RX interrupt after
+	 * a packet arrives.  If 0, only rx_coalesce_usecs is
+	 * used.  It is illegal to set both usecs and max frames
+	 * to zero as this would cause RX interrupts to never be
+	 * generated.
+	 */
+	u32	rx_max_coalesced_frames;
+
+	/* Same as above two parameters, except that these values
+	 * apply while an IRQ is being serviced by the host.  Not
+	 * all cards support this feature and the values are ignored
+	 * in that case.
+	 */
+	u32	rx_coalesce_usecs_irq;
+	u32	rx_max_coalesced_frames_irq;
+
+	/* How many usecs to delay a TX interrupt after
+	 * a packet is sent.  If 0, only tx_max_coalesced_frames
+	 * is used.
+	 */
+	u32	tx_coalesce_usecs;
+
+	/* How many packets to delay a TX interrupt after
+	 * a packet is sent.  If 0, only tx_coalesce_usecs is
+	 * used.  It is illegal to set both usecs and max frames
+	 * to zero as this would cause TX interrupts to never be
+	 * generated.
+	 */
+	u32	tx_max_coalesced_frames;
+
+	/* Same as above two parameters, except that these values
+	 * apply while an IRQ is being serviced by the host.  Not
+	 * all cards support this feature and the values are ignored
+	 * in that case.
+	 */
+	u32	tx_coalesce_usecs_irq;
+	u32	tx_max_coalesced_frames_irq;
+
+	/* How many usecs to delay in-memory statistics
+	 * block updates.  Some drivers do not have an in-memory
+	 * statistic block, and in such cases this value is ignored.
+	 * This value must not be zero.
+	 */
+	u32	stats_block_coalesce_usecs;
+
+	/* Adaptive RX/TX coalescing is an algorithm implemented by
+	 * some drivers to improve latency under low packet rates and
+	 * improve throughput under high packet rates.  Some drivers
+	 * only implement one of RX or TX adaptive coalescing.  Anything
+	 * not implemented by the driver causes these values to be
+	 * silently ignored.
+	 */
+	u32	use_adaptive_rx_coalesce;
+	u32	use_adaptive_tx_coalesce;
+
+	/* When the packet rate (measured in packets per second)
+	 * is below pkt_rate_low, the {rx,tx}_*_low parameters are
+	 * used.
+	 */
+	u32	pkt_rate_low;
+	u32	rx_coalesce_usecs_low;
+	u32	rx_max_coalesced_frames_low;
+	u32	tx_coalesce_usecs_low;
+	u32	tx_max_coalesced_frames_low;
+
+	/* When the packet rate is below pkt_rate_high but above
+	 * pkt_rate_low (both measured in packets per second) the
+	 * normal {rx,tx}_* coalescing parameters are used.
+	 */
+
+	/* When the packet rate is (measured in packets per second)
+	 * is above pkt_rate_high, the {rx,tx}_*_high parameters are
+	 * used.
+	 */
+	u32	pkt_rate_high;
+	u32	rx_coalesce_usecs_high;
+	u32	rx_max_coalesced_frames_high;
+	u32	tx_coalesce_usecs_high;
+	u32	tx_max_coalesced_frames_high;
+
+	/* How often to do adaptive coalescing packet rate sampling,
+	 * measured in seconds.  Must not be zero.
+	 */
+	u32	rate_sample_interval;
 };
 
-/**
- * struct kernel_ethtool_ringparam - RX/TX ring configuration
- * @rx_buf_len: Current length of buffers on the rx ring.
- * @tcp_data_split: Scatter packet headers and data to separate buffers
- * @tx_push: The flag of tx push mode
- * @cqe_size: Size of TX/RX completion queue event
- */
-struct kernel_ethtool_ringparam {
-	u32	rx_buf_len;
-	u8	tcp_data_split;
-	u8	tx_push;
-	u32	cqe_size;
+/* for configuring RX/TX ring parameters */
+struct ethtool_ringparam {
+	u32	cmd;	/* ETHTOOL_{G,S}RINGPARAM */
+
+	/* Read only attributes.  These indicate the maximum number
+	 * of pending RX/TX ring entries the driver will allow the
+	 * user to set.
+	 */
+	u32	rx_max_pending;
+	u32	rx_mini_max_pending;
+	u32	rx_jumbo_max_pending;
+	u32	tx_max_pending;
+
+	/* Values changeable by the user.  The valid values are
+	 * in the range 1 to the "*_max_pending" counterpart above.
+	 */
+	u32	rx_pending;
+	u32	rx_mini_pending;
+	u32	rx_jumbo_pending;
+	u32	tx_pending;
 };
 
-/**
- * enum ethtool_supported_ring_param - indicator caps for setting ring params
- * @ETHTOOL_RING_USE_RX_BUF_LEN: capture for setting rx_buf_len
- * @ETHTOOL_RING_USE_CQE_SIZE: capture for setting cqe_size
- * @ETHTOOL_RING_USE_TX_PUSH: capture for setting tx_push
- */
-enum ethtool_supported_ring_param {
-	ETHTOOL_RING_USE_RX_BUF_LEN = BIT(0),
-	ETHTOOL_RING_USE_CQE_SIZE   = BIT(1),
-	ETHTOOL_RING_USE_TX_PUSH    = BIT(2),
+/* for configuring link flow control parameters */
+struct ethtool_pauseparam {
+	u32	cmd;	/* ETHTOOL_{G,S}PAUSEPARAM */
+
+	/* If the link is being auto-negotiated (via ethtool_cmd.autoneg
+	 * being true) the user may set 'autonet' here non-zero to have the
+	 * pause parameters be auto-negotiated too.  In such a case, the
+	 * {rx,tx}_pause values below determine what capabilities are
+	 * advertised.
+	 *
+	 * If 'autoneg' is zero or the link is not being auto-negotiated,
+	 * then {rx,tx}_pause force the driver to use/not-use pause
+	 * flow control.
+	 */
+	u32	autoneg;
+	u32	rx_pause;
+	u32	tx_pause;
 };
 
-#define __ETH_RSS_HASH_BIT(bit)	((u32)1 << (bit))
-#define __ETH_RSS_HASH(name)	__ETH_RSS_HASH_BIT(ETH_RSS_HASH_##name##_BIT)
+#define ETH_GSTRING_LEN		32
+enum ethtool_stringset {
+	ETH_SS_TEST		= 0,
+	ETH_SS_STATS,
+};
 
-#define ETH_RSS_HASH_TOP	__ETH_RSS_HASH(TOP)
-#define ETH_RSS_HASH_XOR	__ETH_RSS_HASH(XOR)
-#define ETH_RSS_HASH_CRC32	__ETH_RSS_HASH(CRC32)
+/* for passing string sets for data tagging */
+struct ethtool_gstrings {
+	u32	cmd;		/* ETHTOOL_GSTRINGS */
+	u32	string_set;	/* string set id e.c. ETH_SS_TEST, etc*/
+	u32	len;		/* number of strings in the string set */
+	u8	data[0];
+};
 
-#define ETH_RSS_HASH_UNKNOWN	0
-#define ETH_RSS_HASH_NO_CHANGE	0
+enum ethtool_test_flags {
+	ETH_TEST_FL_OFFLINE	= (1 << 0),	/* online / offline */
+	ETH_TEST_FL_FAILED	= (1 << 1),	/* test passed / failed */
+};
+
+/* for requesting NIC test and getting results*/
+struct ethtool_test {
+	u32	cmd;		/* ETHTOOL_TEST */
+	u32	flags;		/* ETH_TEST_FL_xxx */
+	u32	reserved;
+	u32	len;		/* result length, in number of u64 elements */
+	u64	data[0];
+};
+
+/* for dumping NIC-specific statistics */
+struct ethtool_stats {
+	u32	cmd;		/* ETHTOOL_GSTATS */
+	u32	n_stats;	/* number of u64's being returned */
+	u64	data[0];
+};
 
 struct net_device;
-struct netlink_ext_ack;
 
 /* Some generic methods drivers may use in their ethtool_ops */
 u32 ethtool_op_get_link(struct net_device *dev);
-int ethtool_op_get_ts_info(struct net_device *dev, struct ethtool_ts_info *eti);
-
-
-/* Link extended state and substate. */
-struct ethtool_link_ext_state_info {
-	enum ethtool_link_ext_state link_ext_state;
-	union {
-		enum ethtool_link_ext_substate_autoneg autoneg;
-		enum ethtool_link_ext_substate_link_training link_training;
-		enum ethtool_link_ext_substate_link_logical_mismatch link_logical_mismatch;
-		enum ethtool_link_ext_substate_bad_signal_integrity bad_signal_integrity;
-		enum ethtool_link_ext_substate_cable_issue cable_issue;
-		enum ethtool_link_ext_substate_module module;
-		u32 __link_ext_substate;
-	};
-};
+u32 ethtool_op_get_tx_csum(struct net_device *dev);
+int ethtool_op_set_tx_csum(struct net_device *dev, u32 data);
+u32 ethtool_op_get_sg(struct net_device *dev);
+int ethtool_op_set_sg(struct net_device *dev, u32 data);
+u32 ethtool_op_get_tso(struct net_device *dev);
+int ethtool_op_set_tso(struct net_device *dev, u32 data);
 
 /**
- * ethtool_rxfh_indir_default - get default value for RX flow hash indirection
- * @index: Index in RX flow hash indirection table
- * @n_rx_rings: Number of RX rings to use
+ * &ethtool_ops - Alter and report network device settings
+ * get_settings: Get device-specific settings
+ * set_settings: Set device-specific settings
+ * get_drvinfo: Report driver information
+ * get_regs: Get device registers
+ * get_wol: Report whether Wake-on-Lan is enabled
+ * set_wol: Turn Wake-on-Lan on or off
+ * get_msglevel: Report driver message level
+ * set_msglevel: Set driver message level
+ * nway_reset: Restart autonegotiation
+ * get_link: Get link status
+ * get_eeprom: Read data from the device EEPROM
+ * set_eeprom: Write data to the device EEPROM
+ * get_coalesce: Get interrupt coalescing parameters
+ * set_coalesce: Set interrupt coalescing parameters
+ * get_ringparam: Report ring sizes
+ * set_ringparam: Set ring sizes
+ * get_pauseparam: Report pause parameters
+ * set_pauseparam: Set pause paramters
+ * get_rx_csum: Report whether receive checksums are turned on or off
+ * set_rx_csum: Turn receive checksum on or off
+ * get_tx_csum: Report whether transmit checksums are turned on or off
+ * set_tx_csum: Turn transmit checksums on or off
+ * get_sg: Report whether scatter-gather is enabled
+ * set_sg: Turn scatter-gather on or off
+ * get_tso: Report whether TCP segmentation offload is enabled
+ * set_tso: Turn TCP segmentation offload on or off
+ * self_test: Run specified self-tests
+ * get_strings: Return a set of strings that describe the requested objects 
+ * phys_id: Identify the device
+ * get_stats: Return statistics about the device
  *
- * This function provides the default policy for RX flow hash indirection.
- */
-static inline u32 ethtool_rxfh_indir_default(u32 index, u32 n_rx_rings)
-{
-	return index % n_rx_rings;
-}
-
-/* declare a link mode bitmap */
-#define __ETHTOOL_DECLARE_LINK_MODE_MASK(name)		\
-	DECLARE_BITMAP(name, __ETHTOOL_LINK_MODE_MASK_NBITS)
-
-/* drivers must ignore base.cmd and base.link_mode_masks_nwords
- * fields, but they are allowed to overwrite them (will be ignored).
- */
-struct ethtool_link_ksettings {
-	struct ethtool_link_settings base;
-	struct {
-		__ETHTOOL_DECLARE_LINK_MODE_MASK(supported);
-		__ETHTOOL_DECLARE_LINK_MODE_MASK(advertising);
-		__ETHTOOL_DECLARE_LINK_MODE_MASK(lp_advertising);
-	} link_modes;
-	u32	lanes;
-};
-
-/**
- * ethtool_link_ksettings_zero_link_mode - clear link_ksettings link mode mask
- *   @ptr : pointer to struct ethtool_link_ksettings
- *   @name : one of supported/advertising/lp_advertising
- */
-#define ethtool_link_ksettings_zero_link_mode(ptr, name)		\
-	bitmap_zero((ptr)->link_modes.name, __ETHTOOL_LINK_MODE_MASK_NBITS)
-
-/**
- * ethtool_link_ksettings_add_link_mode - set bit in link_ksettings
- * link mode mask
- *   @ptr : pointer to struct ethtool_link_ksettings
- *   @name : one of supported/advertising/lp_advertising
- *   @mode : one of the ETHTOOL_LINK_MODE_*_BIT
- * (not atomic, no bound checking)
- */
-#define ethtool_link_ksettings_add_link_mode(ptr, name, mode)		\
-	__set_bit(ETHTOOL_LINK_MODE_ ## mode ## _BIT, (ptr)->link_modes.name)
-
-/**
- * ethtool_link_ksettings_del_link_mode - clear bit in link_ksettings
- * link mode mask
- *   @ptr : pointer to struct ethtool_link_ksettings
- *   @name : one of supported/advertising/lp_advertising
- *   @mode : one of the ETHTOOL_LINK_MODE_*_BIT
- * (not atomic, no bound checking)
- */
-#define ethtool_link_ksettings_del_link_mode(ptr, name, mode)		\
-	__clear_bit(ETHTOOL_LINK_MODE_ ## mode ## _BIT, (ptr)->link_modes.name)
-
-/**
- * ethtool_link_ksettings_test_link_mode - test bit in ksettings link mode mask
- *   @ptr : pointer to struct ethtool_link_ksettings
- *   @name : one of supported/advertising/lp_advertising
- *   @mode : one of the ETHTOOL_LINK_MODE_*_BIT
- * (not atomic, no bound checking)
+ * Description:
  *
- * Returns true/false.
- */
-#define ethtool_link_ksettings_test_link_mode(ptr, name, mode)		\
-	test_bit(ETHTOOL_LINK_MODE_ ## mode ## _BIT, (ptr)->link_modes.name)
-
-extern int
-__ethtool_get_link_ksettings(struct net_device *dev,
-			     struct ethtool_link_ksettings *link_ksettings);
-
-struct kernel_ethtool_coalesce {
-	u8 use_cqe_mode_tx;
-	u8 use_cqe_mode_rx;
-};
-
-/**
- * ethtool_intersect_link_masks - Given two link masks, AND them together
- * @dst: first mask and where result is stored
- * @src: second mask to intersect with
+ * get_settings:
+ *	@get_settings is passed an &ethtool_cmd to fill in.  It returns
+ *	an negative errno or zero.
  *
- * Given two link mode masks, AND them together and save the result in dst.
- */
-void ethtool_intersect_link_masks(struct ethtool_link_ksettings *dst,
-				  struct ethtool_link_ksettings *src);
-
-void ethtool_convert_legacy_u32_to_link_mode(unsigned long *dst,
-					     u32 legacy_u32);
-
-/* return false if src had higher bits set. lower bits always updated. */
-bool ethtool_convert_link_mode_to_legacy_u32(u32 *legacy_u32,
-				     const unsigned long *src);
-
-#define ETHTOOL_COALESCE_RX_USECS		BIT(0)
-#define ETHTOOL_COALESCE_RX_MAX_FRAMES		BIT(1)
-#define ETHTOOL_COALESCE_RX_USECS_IRQ		BIT(2)
-#define ETHTOOL_COALESCE_RX_MAX_FRAMES_IRQ	BIT(3)
-#define ETHTOOL_COALESCE_TX_USECS		BIT(4)
-#define ETHTOOL_COALESCE_TX_MAX_FRAMES		BIT(5)
-#define ETHTOOL_COALESCE_TX_USECS_IRQ		BIT(6)
-#define ETHTOOL_COALESCE_TX_MAX_FRAMES_IRQ	BIT(7)
-#define ETHTOOL_COALESCE_STATS_BLOCK_USECS	BIT(8)
-#define ETHTOOL_COALESCE_USE_ADAPTIVE_RX	BIT(9)
-#define ETHTOOL_COALESCE_USE_ADAPTIVE_TX	BIT(10)
-#define ETHTOOL_COALESCE_PKT_RATE_LOW		BIT(11)
-#define ETHTOOL_COALESCE_RX_USECS_LOW		BIT(12)
-#define ETHTOOL_COALESCE_RX_MAX_FRAMES_LOW	BIT(13)
-#define ETHTOOL_COALESCE_TX_USECS_LOW		BIT(14)
-#define ETHTOOL_COALESCE_TX_MAX_FRAMES_LOW	BIT(15)
-#define ETHTOOL_COALESCE_PKT_RATE_HIGH		BIT(16)
-#define ETHTOOL_COALESCE_RX_USECS_HIGH		BIT(17)
-#define ETHTOOL_COALESCE_RX_MAX_FRAMES_HIGH	BIT(18)
-#define ETHTOOL_COALESCE_TX_USECS_HIGH		BIT(19)
-#define ETHTOOL_COALESCE_TX_MAX_FRAMES_HIGH	BIT(20)
-#define ETHTOOL_COALESCE_RATE_SAMPLE_INTERVAL	BIT(21)
-#define ETHTOOL_COALESCE_USE_CQE_RX		BIT(22)
-#define ETHTOOL_COALESCE_USE_CQE_TX		BIT(23)
-#define ETHTOOL_COALESCE_ALL_PARAMS		GENMASK(23, 0)
-
-#define ETHTOOL_COALESCE_USECS						\
-	(ETHTOOL_COALESCE_RX_USECS | ETHTOOL_COALESCE_TX_USECS)
-#define ETHTOOL_COALESCE_MAX_FRAMES					\
-	(ETHTOOL_COALESCE_RX_MAX_FRAMES | ETHTOOL_COALESCE_TX_MAX_FRAMES)
-#define ETHTOOL_COALESCE_USECS_IRQ					\
-	(ETHTOOL_COALESCE_RX_USECS_IRQ | ETHTOOL_COALESCE_TX_USECS_IRQ)
-#define ETHTOOL_COALESCE_MAX_FRAMES_IRQ		\
-	(ETHTOOL_COALESCE_RX_MAX_FRAMES_IRQ |	\
-	 ETHTOOL_COALESCE_TX_MAX_FRAMES_IRQ)
-#define ETHTOOL_COALESCE_USE_ADAPTIVE					\
-	(ETHTOOL_COALESCE_USE_ADAPTIVE_RX | ETHTOOL_COALESCE_USE_ADAPTIVE_TX)
-#define ETHTOOL_COALESCE_USECS_LOW_HIGH					\
-	(ETHTOOL_COALESCE_RX_USECS_LOW | ETHTOOL_COALESCE_TX_USECS_LOW | \
-	 ETHTOOL_COALESCE_RX_USECS_HIGH | ETHTOOL_COALESCE_TX_USECS_HIGH)
-#define ETHTOOL_COALESCE_MAX_FRAMES_LOW_HIGH	\
-	(ETHTOOL_COALESCE_RX_MAX_FRAMES_LOW |	\
-	 ETHTOOL_COALESCE_TX_MAX_FRAMES_LOW |	\
-	 ETHTOOL_COALESCE_RX_MAX_FRAMES_HIGH |	\
-	 ETHTOOL_COALESCE_TX_MAX_FRAMES_HIGH)
-#define ETHTOOL_COALESCE_PKT_RATE_RX_USECS				\
-	(ETHTOOL_COALESCE_USE_ADAPTIVE_RX |				\
-	 ETHTOOL_COALESCE_RX_USECS_LOW | ETHTOOL_COALESCE_RX_USECS_HIGH | \
-	 ETHTOOL_COALESCE_PKT_RATE_LOW | ETHTOOL_COALESCE_PKT_RATE_HIGH | \
-	 ETHTOOL_COALESCE_RATE_SAMPLE_INTERVAL)
-#define ETHTOOL_COALESCE_USE_CQE					\
-	(ETHTOOL_COALESCE_USE_CQE_RX | ETHTOOL_COALESCE_USE_CQE_TX)
-
-#define ETHTOOL_STAT_NOT_SET	(~0ULL)
-
-static inline void ethtool_stats_init(u64 *stats, unsigned int n)
-{
-	while (n--)
-		stats[n] = ETHTOOL_STAT_NOT_SET;
-}
-
-/* Basic IEEE 802.3 MAC statistics (30.3.1.1.*), not otherwise exposed
- * via a more targeted API.
- */
-struct ethtool_eth_mac_stats {
-	u64 FramesTransmittedOK;
-	u64 SingleCollisionFrames;
-	u64 MultipleCollisionFrames;
-	u64 FramesReceivedOK;
-	u64 FrameCheckSequenceErrors;
-	u64 AlignmentErrors;
-	u64 OctetsTransmittedOK;
-	u64 FramesWithDeferredXmissions;
-	u64 LateCollisions;
-	u64 FramesAbortedDueToXSColls;
-	u64 FramesLostDueToIntMACXmitError;
-	u64 CarrierSenseErrors;
-	u64 OctetsReceivedOK;
-	u64 FramesLostDueToIntMACRcvError;
-	u64 MulticastFramesXmittedOK;
-	u64 BroadcastFramesXmittedOK;
-	u64 FramesWithExcessiveDeferral;
-	u64 MulticastFramesReceivedOK;
-	u64 BroadcastFramesReceivedOK;
-	u64 InRangeLengthErrors;
-	u64 OutOfRangeLengthField;
-	u64 FrameTooLongErrors;
-};
-
-/* Basic IEEE 802.3 PHY statistics (30.3.2.1.*), not otherwise exposed
- * via a more targeted API.
- */
-struct ethtool_eth_phy_stats {
-	u64 SymbolErrorDuringCarrier;
-};
-
-/* Basic IEEE 802.3 MAC Ctrl statistics (30.3.3.*), not otherwise exposed
- * via a more targeted API.
- */
-struct ethtool_eth_ctrl_stats {
-	u64 MACControlFramesTransmitted;
-	u64 MACControlFramesReceived;
-	u64 UnsupportedOpcodesReceived;
-};
-
-/**
- * struct ethtool_pause_stats - statistics for IEEE 802.3x pause frames
- * @tx_pause_frames: transmitted pause frame count. Reported to user space
- *	as %ETHTOOL_A_PAUSE_STAT_TX_FRAMES.
+ * set_settings:
+ *	@set_settings is passed an &ethtool_cmd and should attempt to set
+ *	all the settings this device supports.  It may return an error value
+ *	if something goes wrong (otherwise 0).
  *
- *	Equivalent to `30.3.4.2 aPAUSEMACCtrlFramesTransmitted`
- *	from the standard.
- *
- * @rx_pause_frames: received pause frame count. Reported to user space
- *	as %ETHTOOL_A_PAUSE_STAT_RX_FRAMES. Equivalent to:
- *
- *	Equivalent to `30.3.4.3 aPAUSEMACCtrlFramesReceived`
- *	from the standard.
- */
-struct ethtool_pause_stats {
-	u64 tx_pause_frames;
-	u64 rx_pause_frames;
-};
-
-#define ETHTOOL_MAX_LANES	8
-
-/**
- * struct ethtool_fec_stats - statistics for IEEE 802.3 FEC
- * @corrected_blocks: number of received blocks corrected by FEC
- *	Reported to user space as %ETHTOOL_A_FEC_STAT_CORRECTED.
- *
- *	Equivalent to `30.5.1.1.17 aFECCorrectedBlocks` from the standard.
- *
- * @uncorrectable_blocks: number of received blocks FEC was not able to correct
- *	Reported to user space as %ETHTOOL_A_FEC_STAT_UNCORR.
- *
- *	Equivalent to `30.5.1.1.18 aFECUncorrectableBlocks` from the standard.
- *
- * @corrected_bits: number of bits corrected by FEC
- *	Similar to @corrected_blocks but counts individual bit changes,
- *	not entire FEC data blocks. This is a non-standard statistic.
- *	Reported to user space as %ETHTOOL_A_FEC_STAT_CORR_BITS.
- *
- * @lane: per-lane/PCS-instance counts as defined by the standard
- * @total: error counts for the entire port, for drivers incapable of reporting
- *	per-lane stats
- *
- * Drivers should fill in either only total or per-lane statistics, core
- * will take care of adding lane values up to produce the total.
- */
-struct ethtool_fec_stats {
-	struct ethtool_fec_stat {
-		u64 total;
-		u64 lanes[ETHTOOL_MAX_LANES];
-	} corrected_blocks, uncorrectable_blocks, corrected_bits;
-};
-
-/**
- * struct ethtool_rmon_hist_range - byte range for histogram statistics
- * @low: low bound of the bucket (inclusive)
- * @high: high bound of the bucket (inclusive)
- */
-struct ethtool_rmon_hist_range {
-	u16 low;
-	u16 high;
-};
-
-#define ETHTOOL_RMON_HIST_MAX	10
-
-/**
- * struct ethtool_rmon_stats - selected RMON (RFC 2819) statistics
- * @undersize_pkts: Equivalent to `etherStatsUndersizePkts` from the RFC.
- * @oversize_pkts: Equivalent to `etherStatsOversizePkts` from the RFC.
- * @fragments: Equivalent to `etherStatsFragments` from the RFC.
- * @jabbers: Equivalent to `etherStatsJabbers` from the RFC.
- * @hist: Packet counter for packet length buckets (e.g.
- *	`etherStatsPkts128to255Octets` from the RFC).
- * @hist_tx: Tx counters in similar form to @hist, not defined in the RFC.
- *
- * Selection of RMON (RFC 2819) statistics which are not exposed via different
- * APIs, primarily the packet-length-based counters.
- * Unfortunately different designs choose different buckets beyond
- * the 1024B mark (jumbo frame teritory), so the definition of the bucket
- * ranges is left to the driver.
- */
-struct ethtool_rmon_stats {
-	u64 undersize_pkts;
-	u64 oversize_pkts;
-	u64 fragments;
-	u64 jabbers;
-
-	u64 hist[ETHTOOL_RMON_HIST_MAX];
-	u64 hist_tx[ETHTOOL_RMON_HIST_MAX];
-};
-
-#define ETH_MODULE_EEPROM_PAGE_LEN	128
-#define ETH_MODULE_MAX_I2C_ADDRESS	0x7f
-
-/**
- * struct ethtool_module_eeprom - EEPROM dump from specified page
- * @offset: Offset within the specified EEPROM page to begin read, in bytes.
- * @length: Number of bytes to read.
- * @page: Page number to read from.
- * @bank: Page bank number to read from, if applicable by EEPROM spec.
- * @i2c_address: I2C address of a page. Value less than 0x7f expected. Most
- *	EEPROMs use 0x50 or 0x51.
- * @data: Pointer to buffer with EEPROM data of @length size.
- *
- * This can be used to manage pages during EEPROM dump in ethtool and pass
- * required information to the driver.
- */
-struct ethtool_module_eeprom {
-	u32	offset;
-	u32	length;
-	u8	page;
-	u8	bank;
-	u8	i2c_address;
-	u8	*data;
-};
-
-/**
- * struct ethtool_module_power_mode_params - module power mode parameters
- * @policy: The power mode policy enforced by the host for the plug-in module.
- * @mode: The operational power mode of the plug-in module. Should be filled by
- *	device drivers on get operations.
- */
-struct ethtool_module_power_mode_params {
-	enum ethtool_module_power_mode_policy policy;
-	enum ethtool_module_power_mode mode;
-};
-
-/**
- * struct ethtool_ops - optional netdev operations
- * @cap_link_lanes_supported: indicates if the driver supports lanes
- *	parameter.
- * @supported_coalesce_params: supported types of interrupt coalescing.
- * @supported_ring_params: supported ring params.
- * @get_drvinfo: Report driver/device information.  Should only set the
- *	@driver, @version, @fw_version and @bus_info fields.  If not
- *	implemented, the @driver and @bus_info fields will be filled in
- *	according to the netdev's parent device.
- * @get_regs_len: Get buffer length required for @get_regs
- * @get_regs: Get device registers
- * @get_wol: Report whether Wake-on-Lan is enabled
- * @set_wol: Turn Wake-on-Lan on or off.  Returns a negative error code
- *	or zero.
- * @get_msglevel: Report driver message level.  This should be the value
- *	of the @msg_enable field used by netif logging functions.
- * @set_msglevel: Set driver message level
- * @nway_reset: Restart autonegotiation.  Returns a negative error code
- *	or zero.
- * @get_link: Report whether physical link is up.  Will only be called if
- *	the netdev is up.  Should usually be set to ethtool_op_get_link(),
- *	which uses netif_carrier_ok().
- * @get_link_ext_state: Report link extended state. Should set link_ext_state and
- *	link_ext_substate (link_ext_substate of 0 means link_ext_substate is unknown,
- *	do not attach ext_substate attribute to netlink message). If link_ext_state
- *	and link_ext_substate are unknown, return -ENODATA. If not implemented,
- *	link_ext_state and link_ext_substate will not be sent to userspace.
- * @get_eeprom_len: Read range of EEPROM addresses for validation of
- *	@get_eeprom and @set_eeprom requests.
- *	Returns 0 if device does not support EEPROM access.
- * @get_eeprom: Read data from the device EEPROM.
+ * get_eeprom:
  *	Should fill in the magic field.  Don't need to check len for zero
  *	or wraparound.  Fill in the data argument with the eeprom values
  *	from offset to offset + len.  Update len to the amount read.
  *	Returns an error or zero.
- * @set_eeprom: Write data to the device EEPROM.
+ *
+ * set_eeprom:
  *	Should validate the magic field.  Don't need to check len for zero
  *	or wraparound.  Update len to the amount written.  Returns an error
  *	or zero.
- * @get_coalesce: Get interrupt coalescing parameters.  Returns a negative
- *	error code or zero.
- * @set_coalesce: Set interrupt coalescing parameters.  Supported coalescing
- *	types should be set in @supported_coalesce_params.
- *	Returns a negative error code or zero.
- * @get_ringparam: Report ring sizes
- * @set_ringparam: Set ring sizes.  Returns a negative error code or zero.
- * @get_pause_stats: Report pause frame statistics. Drivers must not zero
- *	statistics which they don't report. The stats structure is initialized
- *	to ETHTOOL_STAT_NOT_SET indicating driver does not report statistics.
- * @get_pauseparam: Report pause parameters
- * @set_pauseparam: Set pause parameters.  Returns a negative error code
- *	or zero.
- * @self_test: Run specified self-tests
- * @get_strings: Return a set of strings that describe the requested objects
- * @set_phys_id: Identify the physical devices, e.g. by flashing an LED
- *	attached to it.  The implementation may update the indicator
- *	asynchronously or synchronously, but in either case it must return
- *	quickly.  It is initially called with the argument %ETHTOOL_ID_ACTIVE,
- *	and must either activate asynchronous updates and return zero, return
- *	a negative error or return a positive frequency for synchronous
- *	indication (e.g. 1 for one on/off cycle per second).  If it returns
- *	a frequency then it will be called again at intervals with the
- *	argument %ETHTOOL_ID_ON or %ETHTOOL_ID_OFF and should set the state of
- *	the indicator accordingly.  Finally, it is called with the argument
- *	%ETHTOOL_ID_INACTIVE and must deactivate the indicator.  Returns a
- *	negative error code or zero.
- * @get_ethtool_stats: Return extended statistics about the device.
- *	This is only useful if the device maintains statistics not
- *	included in &struct rtnl_link_stats64.
- * @begin: Function to be called before any other operation.  Returns a
- *	negative error code or zero.
- * @complete: Function to be called after any other operation except
- *	@begin.  Will be called even if the other operation failed.
- * @get_priv_flags: Report driver-specific feature flags.
- * @set_priv_flags: Set driver-specific feature flags.  Returns a negative
- *	error code or zero.
- * @get_sset_count: Get number of strings that @get_strings will write.
- * @get_rxnfc: Get RX flow classification rules.  Returns a negative
- *	error code or zero.
- * @set_rxnfc: Set RX flow classification rules.  Returns a negative
- *	error code or zero.
- * @flash_device: Write a firmware image to device's flash memory.
- *	Returns a negative error code or zero.
- * @reset: Reset (part of) the device, as specified by a bitmask of
- *	flags from &enum ethtool_reset_flags.  Returns a negative
- *	error code or zero.
- * @get_rxfh_key_size: Get the size of the RX flow hash key.
- *	Returns zero if not supported for this specific device.
- * @get_rxfh_indir_size: Get the size of the RX flow hash indirection table.
- *	Returns zero if not supported for this specific device.
- * @get_rxfh: Get the contents of the RX flow hash indirection table, hash key
- *	and/or hash function.
- *	Returns a negative error code or zero.
- * @set_rxfh: Set the contents of the RX flow hash indirection table, hash
- *	key, and/or hash function.  Arguments which are set to %NULL or zero
- *	will remain unchanged.
- *	Returns a negative error code or zero. An error code must be returned
- *	if at least one unsupported change was requested.
- * @get_rxfh_context: Get the contents of the RX flow hash indirection table,
- *	hash key, and/or hash function assiciated to the given rss context.
- *	Returns a negative error code or zero.
- * @set_rxfh_context: Create, remove and configure RSS contexts. Allows setting
- *	the contents of the RX flow hash indirection table, hash key, and/or
- *	hash function associated to the given context. Arguments which are set
- *	to %NULL or zero will remain unchanged.
- *	Returns a negative error code or zero. An error code must be returned
- *	if at least one unsupported change was requested.
- * @get_channels: Get number of channels.
- * @set_channels: Set number of channels.  Returns a negative error code or
- *	zero.
- * @get_dump_flag: Get dump flag indicating current dump length, version,
- * 		   and flag of the device.
- * @get_dump_data: Get dump data.
- * @set_dump: Set dump specific flags to the device.
- * @get_ts_info: Get the time stamping and PTP hardware clock capabilities.
- *	Drivers supporting transmit time stamps in software should set this to
- *	ethtool_op_get_ts_info().
- * @get_module_info: Get the size and type of the eeprom contained within
- *	a plug-in module.
- * @get_module_eeprom: Get the eeprom information from the plug-in module
- * @get_eee: Get Energy-Efficient (EEE) supported and status.
- * @set_eee: Set EEE status (enable/disable) as well as LPI timers.
- * @get_tunable: Read the value of a driver / device tunable.
- * @set_tunable: Set the value of a driver / device tunable.
- * @get_per_queue_coalesce: Get interrupt coalescing parameters per queue.
- *	It must check that the given queue number is valid. If neither a RX nor
- *	a TX queue has this number, return -EINVAL. If only a RX queue or a TX
- *	queue has this number, set the inapplicable fields to ~0 and return 0.
- *	Returns a negative error code or zero.
- * @set_per_queue_coalesce: Set interrupt coalescing parameters per queue.
- *	It must check that the given queue number is valid. If neither a RX nor
- *	a TX queue has this number, return -EINVAL. If only a RX queue or a TX
- *	queue has this number, ignore the inapplicable fields. Supported
- *	coalescing types should be set in @supported_coalesce_params.
- *	Returns a negative error code or zero.
- * @get_link_ksettings: Get various device settings including Ethernet link
- *	settings. The %cmd and %link_mode_masks_nwords fields should be
- *	ignored (use %__ETHTOOL_LINK_MODE_MASK_NBITS instead of the latter),
- *	any change to them will be overwritten by kernel. Returns a negative
- *	error code or zero.
- * @set_link_ksettings: Set various device settings including Ethernet link
- *	settings. The %cmd and %link_mode_masks_nwords fields should be
- *	ignored (use %__ETHTOOL_LINK_MODE_MASK_NBITS instead of the latter),
- *	any change to them will be overwritten by kernel. Returns a negative
- *	error code or zero.
- * @get_fec_stats: Report FEC statistics.
- *	Core will sum up per-lane stats to get the total.
- *	Drivers must not zero statistics which they don't report. The stats
- *	structure is initialized to ETHTOOL_STAT_NOT_SET indicating driver does
- *	not report statistics.
- * @get_fecparam: Get the network device Forward Error Correction parameters.
- * @set_fecparam: Set the network device Forward Error Correction parameters.
- * @get_ethtool_phy_stats: Return extended statistics about the PHY device.
- *	This is only useful if the device maintains PHY statistics and
- *	cannot use the standard PHY library helpers.
- * @get_phy_tunable: Read the value of a PHY tunable.
- * @set_phy_tunable: Set the value of a PHY tunable.
- * @get_module_eeprom_by_page: Get a region of plug-in module EEPROM data from
- *	specified page. Returns a negative error code or the amount of bytes
- *	read.
- * @get_eth_phy_stats: Query some of the IEEE 802.3 PHY statistics.
- * @get_eth_mac_stats: Query some of the IEEE 802.3 MAC statistics.
- * @get_eth_ctrl_stats: Query some of the IEEE 802.3 MAC Ctrl statistics.
- * @get_rmon_stats: Query some of the RMON (RFC 2819) statistics.
- *	Set %ranges to a pointer to zero-terminated array of byte ranges.
- * @get_module_power_mode: Get the power mode policy for the plug-in module
- *	used by the network device and its operational power mode, if
- *	plugged-in.
- * @set_module_power_mode: Set the power mode policy for the plug-in module
- *	used by the network device.
- *
- * All operations are optional (i.e. the function pointer may be set
- * to %NULL) and callers must take this into account.  Callers must
- * hold the RTNL lock.
- *
- * See the structures used by these operations for further documentation.
- * Note that for all operations using a structure ending with a zero-
- * length array, the array is allocated separately in the kernel and
- * is passed to the driver as an additional parameter.
- *
- * See &struct net_device and &struct net_device_ops for documentation
- * of the generic netdev features interface.
  */
 struct ethtool_ops {
-	u32     cap_link_lanes_supported:1;
-	u32	supported_coalesce_params;
-	u32	supported_ring_params;
+	int	(*get_settings)(struct net_device *, struct ethtool_cmd *);
+	int	(*set_settings)(struct net_device *, struct ethtool_cmd *);
 	void	(*get_drvinfo)(struct net_device *, struct ethtool_drvinfo *);
 	int	(*get_regs_len)(struct net_device *);
 	void	(*get_regs)(struct net_device *, struct ethtool_regs *, void *);
@@ -650,197 +328,144 @@ struct ethtool_ops {
 	void	(*set_msglevel)(struct net_device *, u32);
 	int	(*nway_reset)(struct net_device *);
 	u32	(*get_link)(struct net_device *);
-	int	(*get_link_ext_state)(struct net_device *,
-				      struct ethtool_link_ext_state_info *);
 	int	(*get_eeprom_len)(struct net_device *);
-	int	(*get_eeprom)(struct net_device *,
-			      struct ethtool_eeprom *, u8 *);
-	int	(*set_eeprom)(struct net_device *,
-			      struct ethtool_eeprom *, u8 *);
-	int	(*get_coalesce)(struct net_device *,
-				struct ethtool_coalesce *,
-				struct kernel_ethtool_coalesce *,
-				struct netlink_ext_ack *);
-	int	(*set_coalesce)(struct net_device *,
-				struct ethtool_coalesce *,
-				struct kernel_ethtool_coalesce *,
-				struct netlink_ext_ack *);
-	void	(*get_ringparam)(struct net_device *,
-				 struct ethtool_ringparam *,
-				 struct kernel_ethtool_ringparam *,
-				 struct netlink_ext_ack *);
-	int	(*set_ringparam)(struct net_device *,
-				 struct ethtool_ringparam *,
-				 struct kernel_ethtool_ringparam *,
-				 struct netlink_ext_ack *);
-	void	(*get_pause_stats)(struct net_device *dev,
-				   struct ethtool_pause_stats *pause_stats);
-	void	(*get_pauseparam)(struct net_device *,
-				  struct ethtool_pauseparam*);
-	int	(*set_pauseparam)(struct net_device *,
-				  struct ethtool_pauseparam*);
+	int	(*get_eeprom)(struct net_device *, struct ethtool_eeprom *, u8 *);
+	int	(*set_eeprom)(struct net_device *, struct ethtool_eeprom *, u8 *);
+	int	(*get_coalesce)(struct net_device *, struct ethtool_coalesce *);
+	int	(*set_coalesce)(struct net_device *, struct ethtool_coalesce *);
+	void	(*get_ringparam)(struct net_device *, struct ethtool_ringparam *);
+	int	(*set_ringparam)(struct net_device *, struct ethtool_ringparam *);
+	void	(*get_pauseparam)(struct net_device *, struct ethtool_pauseparam*);
+	int	(*set_pauseparam)(struct net_device *, struct ethtool_pauseparam*);
+	u32	(*get_rx_csum)(struct net_device *);
+	int	(*set_rx_csum)(struct net_device *, u32);
+	u32	(*get_tx_csum)(struct net_device *);
+	int	(*set_tx_csum)(struct net_device *, u32);
+	u32	(*get_sg)(struct net_device *);
+	int	(*set_sg)(struct net_device *, u32);
+	u32	(*get_tso)(struct net_device *);
+	int	(*set_tso)(struct net_device *, u32);
+	int	(*self_test_count)(struct net_device *);
 	void	(*self_test)(struct net_device *, struct ethtool_test *, u64 *);
 	void	(*get_strings)(struct net_device *, u32 stringset, u8 *);
-	int	(*set_phys_id)(struct net_device *, enum ethtool_phys_id_state);
-	void	(*get_ethtool_stats)(struct net_device *,
-				     struct ethtool_stats *, u64 *);
+	int	(*phys_id)(struct net_device *, u32);
+	int	(*get_stats_count)(struct net_device *);
+	void	(*get_ethtool_stats)(struct net_device *, struct ethtool_stats *, u64 *);
 	int	(*begin)(struct net_device *);
 	void	(*complete)(struct net_device *);
-	u32	(*get_priv_flags)(struct net_device *);
-	int	(*set_priv_flags)(struct net_device *, u32);
-	int	(*get_sset_count)(struct net_device *, int);
-	int	(*get_rxnfc)(struct net_device *,
-			     struct ethtool_rxnfc *, u32 *rule_locs);
-	int	(*set_rxnfc)(struct net_device *, struct ethtool_rxnfc *);
-	int	(*flash_device)(struct net_device *, struct ethtool_flash *);
-	int	(*reset)(struct net_device *, u32 *);
-	u32	(*get_rxfh_key_size)(struct net_device *);
-	u32	(*get_rxfh_indir_size)(struct net_device *);
-	int	(*get_rxfh)(struct net_device *, u32 *indir, u8 *key,
-			    u8 *hfunc);
-	int	(*set_rxfh)(struct net_device *, const u32 *indir,
-			    const u8 *key, const u8 hfunc);
-	int	(*get_rxfh_context)(struct net_device *, u32 *indir, u8 *key,
-				    u8 *hfunc, u32 rss_context);
-	int	(*set_rxfh_context)(struct net_device *, const u32 *indir,
-				    const u8 *key, const u8 hfunc,
-				    u32 *rss_context, bool delete);
-	void	(*get_channels)(struct net_device *, struct ethtool_channels *);
-	int	(*set_channels)(struct net_device *, struct ethtool_channels *);
-	int	(*get_dump_flag)(struct net_device *, struct ethtool_dump *);
-	int	(*get_dump_data)(struct net_device *,
-				 struct ethtool_dump *, void *);
-	int	(*set_dump)(struct net_device *, struct ethtool_dump *);
-	int	(*get_ts_info)(struct net_device *, struct ethtool_ts_info *);
-	int     (*get_module_info)(struct net_device *,
-				   struct ethtool_modinfo *);
-	int     (*get_module_eeprom)(struct net_device *,
-				     struct ethtool_eeprom *, u8 *);
-	int	(*get_eee)(struct net_device *, struct ethtool_eee *);
-	int	(*set_eee)(struct net_device *, struct ethtool_eee *);
-	int	(*get_tunable)(struct net_device *,
-			       const struct ethtool_tunable *, void *);
-	int	(*set_tunable)(struct net_device *,
-			       const struct ethtool_tunable *, const void *);
-	int	(*get_per_queue_coalesce)(struct net_device *, u32,
-					  struct ethtool_coalesce *);
-	int	(*set_per_queue_coalesce)(struct net_device *, u32,
-					  struct ethtool_coalesce *);
-	int	(*get_link_ksettings)(struct net_device *,
-				      struct ethtool_link_ksettings *);
-	int	(*set_link_ksettings)(struct net_device *,
-				      const struct ethtool_link_ksettings *);
-	void	(*get_fec_stats)(struct net_device *dev,
-				 struct ethtool_fec_stats *fec_stats);
-	int	(*get_fecparam)(struct net_device *,
-				      struct ethtool_fecparam *);
-	int	(*set_fecparam)(struct net_device *,
-				      struct ethtool_fecparam *);
-	void	(*get_ethtool_phy_stats)(struct net_device *,
-					 struct ethtool_stats *, u64 *);
-	int	(*get_phy_tunable)(struct net_device *,
-				   const struct ethtool_tunable *, void *);
-	int	(*set_phy_tunable)(struct net_device *,
-				   const struct ethtool_tunable *, const void *);
-	int	(*get_module_eeprom_by_page)(struct net_device *dev,
-					     const struct ethtool_module_eeprom *page,
-					     struct netlink_ext_ack *extack);
-	void	(*get_eth_phy_stats)(struct net_device *dev,
-				     struct ethtool_eth_phy_stats *phy_stats);
-	void	(*get_eth_mac_stats)(struct net_device *dev,
-				     struct ethtool_eth_mac_stats *mac_stats);
-	void	(*get_eth_ctrl_stats)(struct net_device *dev,
-				      struct ethtool_eth_ctrl_stats *ctrl_stats);
-	void	(*get_rmon_stats)(struct net_device *dev,
-				  struct ethtool_rmon_stats *rmon_stats,
-				  const struct ethtool_rmon_hist_range **ranges);
-	int	(*get_module_power_mode)(struct net_device *dev,
-					 struct ethtool_module_power_mode_params *params,
-					 struct netlink_ext_ack *extack);
-	int	(*set_module_power_mode)(struct net_device *dev,
-					 const struct ethtool_module_power_mode_params *params,
-					 struct netlink_ext_ack *extack);
 };
 
-int ethtool_check_ops(const struct ethtool_ops *ops);
+/* CMDs currently supported */
+#define ETHTOOL_GSET		0x00000001 /* Get settings. */
+#define ETHTOOL_SSET		0x00000002 /* Set settings. */
+#define ETHTOOL_GDRVINFO	0x00000003 /* Get driver info. */
+#define ETHTOOL_GREGS		0x00000004 /* Get NIC registers. */
+#define ETHTOOL_GWOL		0x00000005 /* Get wake-on-lan options. */
+#define ETHTOOL_SWOL		0x00000006 /* Set wake-on-lan options. */
+#define ETHTOOL_GMSGLVL		0x00000007 /* Get driver message level */
+#define ETHTOOL_SMSGLVL		0x00000008 /* Set driver msg level. */
+#define ETHTOOL_NWAY_RST	0x00000009 /* Restart autonegotiation. */
+#define ETHTOOL_GLINK		0x0000000a /* Get link status (ethtool_value) */
+#define ETHTOOL_GEEPROM		0x0000000b /* Get EEPROM data */
+#define ETHTOOL_SEEPROM		0x0000000c /* Set EEPROM data. */
+#define ETHTOOL_GCOALESCE	0x0000000e /* Get coalesce config */
+#define ETHTOOL_SCOALESCE	0x0000000f /* Set coalesce config. */
+#define ETHTOOL_GRINGPARAM	0x00000010 /* Get ring parameters */
+#define ETHTOOL_SRINGPARAM	0x00000011 /* Set ring parameters. */
+#define ETHTOOL_GPAUSEPARAM	0x00000012 /* Get pause parameters */
+#define ETHTOOL_SPAUSEPARAM	0x00000013 /* Set pause parameters. */
+#define ETHTOOL_GRXCSUM		0x00000014 /* Get RX hw csum enable (ethtool_value) */
+#define ETHTOOL_SRXCSUM		0x00000015 /* Set RX hw csum enable (ethtool_value) */
+#define ETHTOOL_GTXCSUM		0x00000016 /* Get TX hw csum enable (ethtool_value) */
+#define ETHTOOL_STXCSUM		0x00000017 /* Set TX hw csum enable (ethtool_value) */
+#define ETHTOOL_GSG		0x00000018 /* Get scatter-gather enable
+					    * (ethtool_value) */
+#define ETHTOOL_SSG		0x00000019 /* Set scatter-gather enable
+					    * (ethtool_value). */
+#define ETHTOOL_TEST		0x0000001a /* execute NIC self-test. */
+#define ETHTOOL_GSTRINGS	0x0000001b /* get specified string set */
+#define ETHTOOL_PHYS_ID		0x0000001c /* identify the NIC */
+#define ETHTOOL_GSTATS		0x0000001d /* get NIC-specific statistics */
+#define ETHTOOL_GTSO		0x0000001e /* Get TSO enable (ethtool_value) */
+#define ETHTOOL_STSO		0x0000001f /* Set TSO enable (ethtool_value) */
 
-struct ethtool_rx_flow_rule {
-	struct flow_rule	*rule;
-	unsigned long		priv[];
-};
+/* compatibility with older code */
+#define SPARC_ETH_GSET		ETHTOOL_GSET
+#define SPARC_ETH_SSET		ETHTOOL_SSET
 
-struct ethtool_rx_flow_spec_input {
-	const struct ethtool_rx_flow_spec	*fs;
-	u32					rss_ctx;
-};
+/* Indicates what features are supported by the interface. */
+#define SUPPORTED_10baseT_Half		(1 << 0)
+#define SUPPORTED_10baseT_Full		(1 << 1)
+#define SUPPORTED_100baseT_Half		(1 << 2)
+#define SUPPORTED_100baseT_Full		(1 << 3)
+#define SUPPORTED_1000baseT_Half	(1 << 4)
+#define SUPPORTED_1000baseT_Full	(1 << 5)
+#define SUPPORTED_Autoneg		(1 << 6)
+#define SUPPORTED_TP			(1 << 7)
+#define SUPPORTED_AUI			(1 << 8)
+#define SUPPORTED_MII			(1 << 9)
+#define SUPPORTED_FIBRE			(1 << 10)
+#define SUPPORTED_BNC			(1 << 11)
+#define SUPPORTED_10000baseT_Full	(1 << 12)
 
-struct ethtool_rx_flow_rule *
-ethtool_rx_flow_rule_create(const struct ethtool_rx_flow_spec_input *input);
-void ethtool_rx_flow_rule_destroy(struct ethtool_rx_flow_rule *rule);
+/* Indicates what features are advertised by the interface. */
+#define ADVERTISED_10baseT_Half		(1 << 0)
+#define ADVERTISED_10baseT_Full		(1 << 1)
+#define ADVERTISED_100baseT_Half	(1 << 2)
+#define ADVERTISED_100baseT_Full	(1 << 3)
+#define ADVERTISED_1000baseT_Half	(1 << 4)
+#define ADVERTISED_1000baseT_Full	(1 << 5)
+#define ADVERTISED_Autoneg		(1 << 6)
+#define ADVERTISED_TP			(1 << 7)
+#define ADVERTISED_AUI			(1 << 8)
+#define ADVERTISED_MII			(1 << 9)
+#define ADVERTISED_FIBRE		(1 << 10)
+#define ADVERTISED_BNC			(1 << 11)
+#define ADVERTISED_10000baseT_Full	(1 << 12)
 
-bool ethtool_virtdev_validate_cmd(const struct ethtool_link_ksettings *cmd);
-int ethtool_virtdev_set_link_ksettings(struct net_device *dev,
-				       const struct ethtool_link_ksettings *cmd,
-				       u32 *dev_speed, u8 *dev_duplex);
-
-struct phy_device;
-struct phy_tdr_config;
-
-/**
- * struct ethtool_phy_ops - Optional PHY device options
- * @get_sset_count: Get number of strings that @get_strings will write.
- * @get_strings: Return a set of strings that describe the requested objects
- * @get_stats: Return extended statistics about the PHY device.
- * @start_cable_test: Start a cable test
- * @start_cable_test_tdr: Start a Time Domain Reflectometry cable test
- *
- * All operations are optional (i.e. the function pointer may be set to %NULL)
- * and callers must take this into account. Callers must hold the RTNL lock.
+/* The following are all involved in forcing a particular link
+ * mode for the device for setting things.  When getting the
+ * devices settings, these indicate the current mode and whether
+ * it was foced up into this mode or autonegotiated.
  */
-struct ethtool_phy_ops {
-	int (*get_sset_count)(struct phy_device *dev);
-	int (*get_strings)(struct phy_device *dev, u8 *data);
-	int (*get_stats)(struct phy_device *dev,
-			 struct ethtool_stats *stats, u64 *data);
-	int (*start_cable_test)(struct phy_device *phydev,
-				struct netlink_ext_ack *extack);
-	int (*start_cable_test_tdr)(struct phy_device *phydev,
-				    struct netlink_ext_ack *extack,
-				    const struct phy_tdr_config *config);
-};
 
-/**
- * ethtool_set_ethtool_phy_ops - Set the ethtool_phy_ops singleton
- * @ops: Ethtool PHY operations to set
- */
-void ethtool_set_ethtool_phy_ops(const struct ethtool_phy_ops *ops);
+/* The forced speed, 10Mb, 100Mb, gigabit, 10GbE. */
+#define SPEED_10		10
+#define SPEED_100		100
+#define SPEED_1000		1000
+#define SPEED_10000		10000
 
-/**
- * ethtool_params_from_link_mode - Derive link parameters from a given link mode
- * @link_ksettings: Link parameters to be derived from the link mode
- * @link_mode: Link mode
- */
-void
-ethtool_params_from_link_mode(struct ethtool_link_ksettings *link_ksettings,
-			      enum ethtool_link_mode_bit_indices link_mode);
+/* Duplex, half or full. */
+#define DUPLEX_HALF		0x00
+#define DUPLEX_FULL		0x01
 
-/**
- * ethtool_get_phc_vclocks - Derive phc vclocks information, and caller
- *                           is responsible to free memory of vclock_index
- * @dev: pointer to net_device structure
- * @vclock_index: pointer to pointer of vclock index
- *
- * Return number of phc vclocks
- */
-int ethtool_get_phc_vclocks(struct net_device *dev, int **vclock_index);
+/* Which connector port. */
+#define PORT_TP			0x00
+#define PORT_AUI		0x01
+#define PORT_MII		0x02
+#define PORT_FIBRE		0x03
+#define PORT_BNC		0x04
 
-/**
- * ethtool_sprintf - Write formatted string to ethtool string data
- * @data: Pointer to start of string to update
- * @fmt: Format of string to write
- *
- * Write formatted string to data. Update data to point at start of
- * next string.
+/* Which transceiver to use. */
+#define XCVR_INTERNAL		0x00
+#define XCVR_EXTERNAL		0x01
+#define XCVR_DUMMY1		0x02
+#define XCVR_DUMMY2		0x03
+#define XCVR_DUMMY3		0x04
+
+/* Enable or disable autonegotiation.  If this is set to enable,
+ * the forced link modes above are completely ignored.
  */
-extern __printf(2, 3) void ethtool_sprintf(u8 **data, const char *fmt, ...);
+#define AUTONEG_DISABLE		0x00
+#define AUTONEG_ENABLE		0x01
+
+/* Wake-On-Lan options. */
+#define WAKE_PHY		(1 << 0)
+#define WAKE_UCAST		(1 << 1)
+#define WAKE_MCAST		(1 << 2)
+#define WAKE_BCAST		(1 << 3)
+#define WAKE_ARP		(1 << 4)
+#define WAKE_MAGIC		(1 << 5)
+#define WAKE_MAGICSECURE	(1 << 6) /* only meaningful if WAKE_MAGIC */
+
 #endif /* _LINUX_ETHTOOL_H */

@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef __SOUND_WAVEFRONT_H__
 #define __SOUND_WAVEFRONT_H__
 
@@ -6,6 +5,20 @@
  *  Driver for Turtle Beach Wavefront cards (Maui,Tropez,Tropez+)
  *
  *  Copyright (c) by Paul Barton-Davis <pbd@op.net>
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  */
 
 #if (!defined(__GNUC__) && !defined(__GNUG__))
@@ -441,22 +454,22 @@ typedef struct wf_multisample {
 } wavefront_multisample;
 
 typedef struct wf_alias {
-    s16 OriginalSample;
+    s16 OriginalSample __attribute__ ((packed));
 
-    struct wf_sample_offset sampleStartOffset;
-    struct wf_sample_offset loopStartOffset;
-    struct wf_sample_offset sampleEndOffset;
-    struct wf_sample_offset loopEndOffset;
+    struct wf_sample_offset sampleStartOffset __attribute__ ((packed));
+    struct wf_sample_offset loopStartOffset __attribute__ ((packed));
+    struct wf_sample_offset sampleEndOffset __attribute__ ((packed));
+    struct wf_sample_offset loopEndOffset __attribute__ ((packed));
 
-    s16  FrequencyBias;
+    s16  FrequencyBias __attribute__ ((packed));
 
-    u8 SampleResolution:2;
-    u8 Unused1:1;
-    u8 Loop:1;
-    u8 Bidirectional:1;
-    u8 Unused2:1;
-    u8 Reverse:1;
-    u8 Unused3:1;
+    u8 SampleResolution:2  __attribute__ ((packed));
+    u8 Unused1:1  __attribute__ ((packed));
+    u8 Loop:1 __attribute__ ((packed));
+    u8 Bidirectional:1  __attribute__ ((packed));
+    u8 Unused2:1 __attribute__ ((packed));
+    u8 Reverse:1 __attribute__ ((packed));
+    u8 Unused3:1 __attribute__ ((packed)); 
     
     /* This structure is meant to be padded only to 16 bits on their
        original. Of course, whoever wrote their documentation didn't
@@ -467,8 +480,8 @@ typedef struct wf_alias {
        standard 16->32 bit issues.
     */
 
-    u8 sixteen_bit_padding;
-} __attribute__((packed)) wavefront_alias;
+    u8 sixteen_bit_padding __attribute__ ((packed));
+} wavefront_alias;
 
 typedef struct wf_drum {
     u8 PatchNumber;

@@ -1,5 +1,5 @@
 /*
- * linux/fs/nls/nls_euc-jp.c
+ * linux/fs/nls_euc-jp.c
  *
  * Added `OSF/JVC Recommended Code Set Conversion Specification
  * between Japanese EUC and Shift-JIS' support: <hirofumi@mail.parknet.co.jp>
@@ -57,7 +57,7 @@ static struct nls_table *p_nls;
 } while(0)
 
 /* SJIS IBM extended characters to EUC map */
-static const unsigned char sjisibm2euc_map[][2] = {
+static unsigned char sjisibm2euc_map[][2] = {
 	{0xF3, 0xF3}, {0xF3, 0xF4}, {0xF3, 0xF5}, {0xF3, 0xF6}, {0xF3, 0xF7},
 	{0xF3, 0xF8}, {0xF3, 0xF9}, {0xF3, 0xFA}, {0xF3, 0xFB}, {0xF3, 0xFC},
 	{0xF3, 0xFD}, {0xF3, 0xFE}, {0xF4, 0xA1}, {0xF4, 0xA2}, {0xF4, 0xA3},
@@ -243,7 +243,7 @@ static struct {
 };
 
 /* EUC to SJIS IBM extended characters map (G3 Upper block) */
-static const unsigned char euc2sjisibm_g3upper_map[][2] = {
+static unsigned char euc2sjisibm_g3upper_map[][2] = {
 	{0xFA, 0x40}, {0xFA, 0x41}, {0xFA, 0x42}, {0xFA, 0x43}, {0xFA, 0x44},
 	{0xFA, 0x45}, {0xFA, 0x46}, {0xFA, 0x47}, {0xFA, 0x48}, {0xFA, 0x49},
 	{0xFA, 0x4A}, {0xFA, 0x4B}, {0xFA, 0x4C}, {0xFA, 0x4D}, {0xFA, 0x4E},
@@ -267,6 +267,8 @@ static const unsigned char euc2sjisibm_g3upper_map[][2] = {
 	{0xFB, 0xF9}, {0xFB, 0xFA}, {0xFB, 0xFC}, {0xFC, 0x42}, {0xFC, 0x49},
 	{0xFC, 0x4B},
 };
+
+#define MAP_ELEMENT_OF(map)	(sizeof(map) / sizeof(map[0]))
 
 static inline int sjisibm2euc(unsigned char *euc, const unsigned char sjis_hi,
 			      const unsigned char sjis_lo);
@@ -308,7 +310,7 @@ static inline int euc2sjisibm_jisx0212(unsigned char *sjis, const unsigned char 
 	unsigned short euc;
 
 	min_index = 0;
-	max_index = ARRAY_SIZE(euc2sjisibm_jisx0212_map) - 1;
+	max_index = MAP_ELEMENT_OF(euc2sjisibm_jisx0212_map) - 1;
 	euc = (euc_hi << 8) | euc_lo;
 
 	while (min_index <= max_index) {
@@ -337,7 +339,7 @@ static inline int euc2sjisibm_g3upper(unsigned char *sjis, const unsigned char e
 	else
 		index = ((euc_hi << 8) | euc_lo) - 0xF4A1 + 12;
 
-	if ((index < 0) || (index >= ARRAY_SIZE(euc2sjisibm_g3upper_map)))
+	if ((index < 0) || (index >= MAP_ELEMENT_OF(euc2sjisibm_g3upper_map)))
 		return 0;
 
 	sjis[0] = euc2sjisibm_g3upper_map[index][0];
@@ -553,6 +555,7 @@ static struct nls_table table = {
 	.charset	= "euc-jp",
 	.uni2char	= uni2char,
 	.char2uni	= char2uni,
+	.owner		= THIS_MODULE,
 };
 
 static int __init init_nls_euc_jp(void)

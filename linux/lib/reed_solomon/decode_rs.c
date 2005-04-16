@@ -1,16 +1,22 @@
-// SPDX-License-Identifier: GPL-2.0
-/*
- * Generic Reed Solomon encoder / decoder library
+/* 
+ * lib/reed_solomon/decode_rs.c
  *
+ * Overview:
+ *   Generic Reed Solomon encoder / decoder library
+ *   
  * Copyright 2002, Phil Karn, KA9Q
  * May be used under the terms of the GNU General Public License (GPL)
  *
  * Adaption to the kernel by Thomas Gleixner (tglx@linutronix.de)
  *
- * Generic data width independent code which is included by the wrappers.
+ * $Id: decode_rs.c,v 1.6 2004/10/22 15:41:47 gleixner Exp $
+ *
  */
-{
-	struct rs_codec *rs = rsc->codec;
+
+/* Generic data width independent code which is included by the 
+ * wrappers.
+ */
+{ 
 	int deg_lambda, el, deg_omega;
 	int i, j, r, k, pad;
 	int nn = rs->nn;
@@ -21,40 +27,24 @@
 	uint16_t *alpha_to = rs->alpha_to;
 	uint16_t *index_of = rs->index_of;
 	uint16_t u, q, tmp, num1, num2, den, discr_r, syn_error;
-	int count = 0;
-	int num_corrected;
-	uint16_t msk = (uint16_t) rs->nn;
-
-	/*
-	 * The decoder buffers are in the rs control struct. They are
-	 * arrays sized [nroots + 1]
+	/* Err+Eras Locator poly and syndrome poly The maximum value
+	 * of nroots is 8. So the necessary stack size will be about
+	 * 220 bytes max.
 	 */
-	uint16_t *lambda = rsc->buffers + RS_DECODE_LAMBDA * (nroots + 1);
-	uint16_t *syn = rsc->buffers + RS_DECODE_SYN * (nroots + 1);
-	uint16_t *b = rsc->buffers + RS_DECODE_B * (nroots + 1);
-	uint16_t *t = rsc->buffers + RS_DECODE_T * (nroots + 1);
-	uint16_t *omega = rsc->buffers + RS_DECODE_OMEGA * (nroots + 1);
-	uint16_t *root = rsc->buffers + RS_DECODE_ROOT * (nroots + 1);
-	uint16_t *reg = rsc->buffers + RS_DECODE_REG * (nroots + 1);
-	uint16_t *loc = rsc->buffers + RS_DECODE_LOC * (nroots + 1);
+	uint16_t lambda[nroots + 1], syn[nroots];
+	uint16_t b[nroots + 1], t[nroots + 1], omega[nroots + 1];
+	uint16_t root[nroots], reg[nroots + 1], loc[nroots];
+	int count = 0;
+	uint16_t msk = (uint16_t) rs->nn;
 
 	/* Check length parameter for validity */
 	pad = nn - nroots - len;
-	BUG_ON(pad < 0 || pad >= nn - nroots);
-
+	if (pad < 0 || pad >= nn)
+		return -ERANGE;
+		
 	/* Does the caller provide the syndrome ? */
-	if (s != NULL) {
-		for (i = 0; i < nroots; i++) {
-			/* The syndrome is in index form,
-			 * so nn represents zero
-			 */
-			if (s[i] != nn)
-				goto decode;
-		}
-
-		/* syndrome is zero, no errors to correct  */
-		return 0;
-	}
+	if (s != NULL) 
+		goto decode;
 
 	/* form the syndromes; i.e., evaluate data(x) at roots of
 	 * g(x) */
@@ -64,11 +54,11 @@
 	for (j = 1; j < len; j++) {
 		for (i = 0; i < nroots; i++) {
 			if (syn[i] == 0) {
-				syn[i] = (((uint16_t) data[j]) ^
+				syn[i] = (((uint16_t) data[j]) ^ 
 					  invmsk) & msk;
 			} else {
 				syn[i] = ((((uint16_t) data[j]) ^
-					   invmsk) & msk) ^
+					   invmsk) & msk) ^ 
 					alpha_to[rs_modnn(rs, index_of[syn[i]] +
 						       (fcr + i) * prim)];
 			}
@@ -80,7 +70,7 @@
 			if (syn[i] == 0) {
 				syn[i] = ((uint16_t) par[j]) & msk;
 			} else {
-				syn[i] = (((uint16_t) par[j]) & msk) ^
+				syn[i] = (((uint16_t) par[j]) & msk) ^ 
 					alpha_to[rs_modnn(rs, index_of[syn[i]] +
 						       (fcr+i)*prim)];
 			}
@@ -99,7 +89,8 @@
 		/* if syndrome is zero, data[] is a codeword and there are no
 		 * errors to correct. So return data[] unmodified
 		 */
-		return 0;
+		count = 0;
+		goto finish;
 	}
 
  decode:
@@ -108,14 +99,14 @@
 
 	if (no_eras > 0) {
 		/* Init lambda to be the erasure locator polynomial */
-		lambda[1] = alpha_to[rs_modnn(rs,
-					prim * (nn - 1 - (eras_pos[0] + pad)))];
+		lambda[1] = alpha_to[rs_modnn(rs, 
+					      prim * (nn - 1 - eras_pos[0]))];
 		for (i = 1; i < no_eras; i++) {
-			u = rs_modnn(rs, prim * (nn - 1 - (eras_pos[i] + pad)));
+			u = rs_modnn(rs, prim * (nn - 1 - eras_pos[i]));
 			for (j = i + 1; j > 0; j--) {
 				tmp = index_of[lambda[j - 1]];
 				if (tmp != nn) {
-					lambda[j] ^=
+					lambda[j] ^= 
 						alpha_to[rs_modnn(rs, u + tmp)];
 				}
 			}
@@ -136,8 +127,8 @@
 		discr_r = 0;
 		for (i = 0; i < r; i++) {
 			if ((lambda[i] != 0) && (s[r - i - 1] != nn)) {
-				discr_r ^=
-					alpha_to[rs_modnn(rs,
+				discr_r ^= 
+					alpha_to[rs_modnn(rs, 
 							  index_of[lambda[i]] +
 							  s[r - i - 1])];
 			}
@@ -152,7 +143,7 @@
 			t[0] = lambda[0];
 			for (i = 0; i < nroots; i++) {
 				if (b[i] != nn) {
-					t[i + 1] = lambda[i + 1] ^
+					t[i + 1] = lambda[i + 1] ^ 
 						alpha_to[rs_modnn(rs, discr_r +
 								  b[i])];
 				} else
@@ -185,15 +176,6 @@
 		if (lambda[i] != nn)
 			deg_lambda = i;
 	}
-
-	if (deg_lambda == 0) {
-		/*
-		 * deg(lambda) is zero even though the syndrome is non-zero
-		 * => uncorrectable error detected
-		 */
-		return -EBADMSG;
-	}
-
 	/* Find roots of error+erasure locator polynomial by Chien search */
 	memcpy(&reg[1], &lambda[1], nroots * sizeof(reg[0]));
 	count = 0;		/* Number of roots of lambda(x) */
@@ -207,12 +189,6 @@
 		}
 		if (q != 0)
 			continue;	/* Not a root */
-
-		if (k < pad) {
-			/* Impossible error location. Uncorrectable error. */
-			return -EBADMSG;
-		}
-
 		/* store root (index-form) and error location number */
 		root[count] = i;
 		loc[count] = k;
@@ -227,7 +203,8 @@
 		 * deg(lambda) unequal to number of roots => uncorrectable
 		 * error detected
 		 */
-		return -EBADMSG;
+		count = -1;
+		goto finish;
 	}
 	/*
 	 * Compute err+eras evaluator poly omega(x) = s(x)*lambda(x) (modulo
@@ -247,23 +224,14 @@
 	/*
 	 * Compute error values in poly-form. num1 = omega(inv(X(l))), num2 =
 	 * inv(X(l))**(fcr-1) and den = lambda_pr(inv(X(l))) all in poly-form
-	 * Note: we reuse the buffer for b to store the correction pattern
 	 */
-	num_corrected = 0;
 	for (j = count - 1; j >= 0; j--) {
 		num1 = 0;
 		for (i = deg_omega; i >= 0; i--) {
 			if (omega[i] != nn)
-				num1 ^= alpha_to[rs_modnn(rs, omega[i] +
+				num1 ^= alpha_to[rs_modnn(rs, omega[i] + 
 							i * root[j])];
 		}
-
-		if (num1 == 0) {
-			/* Nothing to correct at this position */
-			b[j] = 0;
-			continue;
-		}
-
 		num2 = alpha_to[rs_modnn(rs, root[j] * (fcr - 1) + nn)];
 		den = 0;
 
@@ -271,56 +239,34 @@
 		 * lambda_pr of lambda[i] */
 		for (i = min(deg_lambda, nroots - 1) & ~1; i >= 0; i -= 2) {
 			if (lambda[i + 1] != nn) {
-				den ^= alpha_to[rs_modnn(rs, lambda[i + 1] +
+				den ^= alpha_to[rs_modnn(rs, lambda[i + 1] + 
 						       i * root[j])];
 			}
 		}
-
-		b[j] = alpha_to[rs_modnn(rs, index_of[num1] +
-					       index_of[num2] +
-					       nn - index_of[den])];
-		num_corrected++;
-	}
-
-	/*
-	 * We compute the syndrome of the 'error' and check that it matches
-	 * the syndrome of the received word
-	 */
-	for (i = 0; i < nroots; i++) {
-		tmp = 0;
-		for (j = 0; j < count; j++) {
-			if (b[j] == 0)
-				continue;
-
-			k = (fcr + i) * prim * (nn-loc[j]-1);
-			tmp ^= alpha_to[rs_modnn(rs, index_of[b[j]] + k)];
-		}
-
-		if (tmp != alpha_to[s[i]])
-			return -EBADMSG;
-	}
-
-	/*
-	 * Store the error correction pattern, if a
-	 * correction buffer is available
-	 */
-	if (corr && eras_pos) {
-		j = 0;
-		for (i = 0; i < count; i++) {
-			if (b[i]) {
-				corr[j] = b[i];
-				eras_pos[j++] = loc[i] - pad;
+		/* Apply error to data */
+		if (num1 != 0 && loc[j] >= pad) {
+			uint16_t cor = alpha_to[rs_modnn(rs,index_of[num1] + 
+						       index_of[num2] +
+						       nn - index_of[den])];
+			/* Store the error correction pattern, if a
+			 * correction buffer is available */
+			if (corr) {
+				corr[j] = cor;
+			} else {
+				/* If a data buffer is given and the
+				 * error is inside the message,
+				 * correct it */
+				if (data && (loc[j] < (nn - nroots)))
+					data[loc[j] - pad] ^= cor;
 			}
 		}
-	} else if (data && par) {
-		/* Apply error to data and parity */
-		for (i = 0; i < count; i++) {
-			if (loc[i] < (nn - nroots))
-				data[loc[i] - pad] ^= b[i];
-			else
-				par[loc[i] - pad - len] ^= b[i];
-		}
 	}
 
-	return  num_corrected;
+finish:
+	if (eras_pos != NULL) {
+		for (i = 0; i < count; i++)
+			eras_pos[i] = loc[i] - pad;
+	}
+	return count;
+
 }

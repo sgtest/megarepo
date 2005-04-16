@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *  linux/arch/arm/kernel/dma-ebsa285.c
  *
@@ -11,27 +10,26 @@
  *   17-Mar-1999 RMK	Allow any EBSA285-like architecture to have
  *			ISA DMA controllers.
  */
+#include <linux/config.h>
 #include <linux/init.h>
-#include <linux/io.h>
-#include <linux/spinlock.h>
-#include <linux/scatterlist.h>
 
 #include <asm/dma.h>
+#include <asm/io.h>
 
 #include <asm/mach/dma.h>
 #include <asm/hardware/dec21285.h>
 
 #if 0
-static int fb_dma_request(unsigned int chan, dma_t *dma)
+static int fb_dma_request(dmach_t channel, dma_t *dma)
 {
 	return -EINVAL;
 }
 
-static void fb_dma_enable(unsigned int chan, dma_t *dma)
+static void fb_dma_enable(dmach_t channel, dma_t *dma)
 {
 }
 
-static void fb_dma_disable(unsigned int chan, dma_t *dma)
+static void fb_dma_disable(dmach_t channel, dma_t *dma)
 {
 }
 
@@ -43,7 +41,7 @@ static struct dma_ops fb_dma_ops = {
 };
 #endif
 
-static int __init fb_dma_init(void)
+void __init arch_dma_init(dma_t *dma)
 {
 #if 0
 	dma[_DC21285_DMA(0)].d_ops = &fb_dma_ops;
@@ -51,8 +49,6 @@ static int __init fb_dma_init(void)
 #endif
 #ifdef CONFIG_ISA_DMA
 	if (footbridge_cfn_mode())
-		isa_init_dma();
+		isa_init_dma(dma + _ISA_DMA(0));
 #endif
-	return 0;
 }
-core_initcall(fb_dma_init);

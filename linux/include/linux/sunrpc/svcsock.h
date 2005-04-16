@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * linux/include/linux/sunrpc/svcsock.h
  *
@@ -11,68 +10,56 @@
 #define SUNRPC_SVCSOCK_H
 
 #include <linux/sunrpc/svc.h>
-#include <linux/sunrpc/svc_xprt.h>
 
 /*
  * RPC server socket.
  */
 struct svc_sock {
-	struct svc_xprt		sk_xprt;
+	struct list_head	sk_ready;	/* list of ready sockets */
+	struct list_head	sk_list;	/* list of all sockets */
 	struct socket *		sk_sock;	/* berkeley socket layer */
 	struct sock *		sk_sk;		/* INET layer */
 
+	struct svc_serv *	sk_server;	/* service for this socket */
+	unsigned int		sk_inuse;	/* use count */
+	unsigned long		sk_flags;
+#define	SK_BUSY		0			/* enqueued/receiving */
+#define	SK_CONN		1			/* conn pending */
+#define	SK_CLOSE	2			/* dead or dying */
+#define	SK_DATA		3			/* data pending */
+#define	SK_TEMP		4			/* temp (TCP) socket */
+#define	SK_DEAD		6			/* socket closed */
+#define	SK_CHNGBUF	7			/* need to change snd/rcv buffer sizes */
+#define	SK_DEFERRED	8			/* request on sk_deferred */
+
+	int			sk_reserved;	/* space on outq that is reserved */
+
+	struct list_head	sk_deferred;	/* deferred requests that need to
+						 * be revisted */
+	struct semaphore        sk_sem;		/* to serialize sending data */
+
+	int			(*sk_recvfrom)(struct svc_rqst *rqstp);
+	int			(*sk_sendto)(struct svc_rqst *rqstp);
+
 	/* We keep the old state_change and data_ready CB's here */
 	void			(*sk_ostate)(struct sock *);
-	void			(*sk_odata)(struct sock *);
+	void			(*sk_odata)(struct sock *, int bytes);
 	void			(*sk_owspace)(struct sock *);
 
 	/* private TCP part */
-	/* On-the-wire fragment header: */
-	__be32			sk_marker;
-	/* As we receive a record, this includes the length received so
-	 * far (including the fragment header): */
-	u32			sk_tcplen;
-	/* Total length of the data (not including fragment headers)
-	 * received so far in the fragments making up this rpc: */
-	u32			sk_datalen;
-	/* Number of queued send requests */
-	atomic_t		sk_sendqlen;
-
-	struct page *		sk_pages[RPCSVC_MAXPAGES];	/* received data */
+	int			sk_reclen;	/* length of record */
+	int			sk_tcplen;	/* current read length */
+	time_t			sk_lastrecv;	/* time of last received request */
 };
-
-static inline u32 svc_sock_reclen(struct svc_sock *svsk)
-{
-	return be32_to_cpu(svsk->sk_marker) & RPC_FRAGMENT_SIZE_MASK;
-}
-
-static inline u32 svc_sock_final_rec(struct svc_sock *svsk)
-{
-	return be32_to_cpu(svsk->sk_marker) & RPC_LAST_STREAM_FRAGMENT;
-}
 
 /*
  * Function prototypes.
  */
-void		svc_close_net(struct svc_serv *, struct net *);
-int		svc_recv(struct svc_rqst *, long);
+int		svc_makesock(struct svc_serv *, int, unsigned short);
+void		svc_delete_socket(struct svc_sock *);
+int		svc_recv(struct svc_serv *, struct svc_rqst *, long);
 int		svc_send(struct svc_rqst *);
 void		svc_drop(struct svc_rqst *);
 void		svc_sock_update_bufs(struct svc_serv *serv);
-bool		svc_alien_sock(struct net *net, int fd);
-int		svc_addsock(struct svc_serv *serv, const int fd,
-					char *name_return, const size_t len,
-					const struct cred *cred);
-void		svc_init_xprt_sock(void);
-void		svc_cleanup_xprt_sock(void);
-struct svc_xprt *svc_sock_create(struct svc_serv *serv, int prot);
-void		svc_sock_destroy(struct svc_xprt *);
-
-/*
- * svc_makesock socket characteristics
- */
-#define SVC_SOCK_DEFAULTS	(0U)
-#define SVC_SOCK_ANONYMOUS	(1U << 0)	/* don't register with pmap */
-#define SVC_SOCK_TEMPORARY	(1U << 1)	/* flag socket as temporary */
 
 #endif /* SUNRPC_SVCSOCK_H */

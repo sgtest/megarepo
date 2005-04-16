@@ -1,13 +1,25 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 
 /*
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
  *
  * Copyright (C) IBM Corporation, 2004
  *
- * Author: Max AsbÃ¶ck <amax@us.ibm.com>
+ * Author: Max Asböck <amax@us.ibm.com> 
+ *
  */
 
-#include <linux/sched/signal.h>
 #include "ibmasm.h"
 #include "dot_command.h"
 
@@ -24,10 +36,10 @@ static struct {
 	unsigned char			command[3];
 } rhb_dot_cmd = {
 	.header = {
-		.type =		sp_read,
+		.type = 	sp_read,
 		.command_size = 3,
 		.data_size =	0,
-		.status =	0
+		.status = 	0
 	},
 	.command = { 4, 3, 6 }
 };
@@ -39,7 +51,7 @@ void ibmasm_init_reverse_heartbeat(struct service_processor *sp, struct reverse_
 	rhb->stopped = 0;
 }
 
-/*
+/**
  * start_reverse_heartbeat
  * Loop forever, sending a reverse heartbeat dot command to the service
  * processor, then sleeping. The loop comes to an end if the service
@@ -51,7 +63,7 @@ int ibmasm_start_reverse_heartbeat(struct service_processor *sp, struct reverse_
 	int times_failed = 0;
 	int result = 1;
 
-	cmd = ibmasm_new_command(sp, sizeof rhb_dot_cmd);
+	cmd = ibmasm_new_command(sizeof rhb_dot_cmd);
 	if (!cmd)
 		return -ENOMEM;
 
@@ -64,9 +76,9 @@ int ibmasm_start_reverse_heartbeat(struct service_processor *sp, struct reverse_
 		if (cmd->status != IBMASM_CMD_COMPLETE)
 			times_failed++;
 
-		wait_event_interruptible_timeout(rhb->wait,
+		wait_event_interruptible_timeout(rhb->wait, 
 			rhb->stopped,
-			REVERSE_HEARTBEAT_TIMEOUT * HZ);
+			REVERSE_HEARTBEAT_TIMEOUT * HZ); 	
 
 		if (signal_pending(current) || rhb->stopped) {
 			result = -EINTR;

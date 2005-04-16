@@ -1,5 +1,5 @@
 /*
- * Aic7xxx SCSI host adapter firmware assembler
+ * Aic7xxx SCSI host adapter firmware asssembler
  *
  * Copyright (c) 1997, 1998, 2000, 2001 Justin T. Gibbs.
  * Copyright (c) 2001, 2002 Adaptec Inc.
@@ -37,7 +37,7 @@
  * IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGES.
  *
- * $Id: //depot/aic7xxx/aic7xxx/aicasm/aicasm.c#23 $
+ * $Id: //depot/aic7xxx/aic7xxx/aicasm/aicasm.c#22 $
  *
  * $FreeBSD$
  */
@@ -254,7 +254,7 @@ main(int argc, char *argv[])
 	argv += optind;
 
 	if (argc != 1) {
-		fprintf(stderr, "%s: No input file specified\n", appname);
+		fprintf(stderr, "%s: No input file specifiled\n", appname);
 		usage();
 		/* NOTREACHED */
 	}
@@ -283,7 +283,7 @@ main(int argc, char *argv[])
 		/*
 		 * Decend the tree of scopes and insert/emit
 		 * patches as appropriate.  We perform a depth first
-		 * traversal, recursively handling each scope.
+		 * tranversal, recursively handling each scope.
 		 */
 		/* start at the root scope */
 		dump_scope(SLIST_FIRST(&scope_stack));
@@ -362,14 +362,14 @@ output_code()
 " *\n"
 "%s */\n", versions);
 
-	fprintf(ofile, "static const uint8_t seqprog[] = {\n");
+	fprintf(ofile, "static uint8_t seqprog[] = {\n");
 	for (cur_instr = STAILQ_FIRST(&seq_program);
 	     cur_instr != NULL;
 	     cur_instr = STAILQ_NEXT(cur_instr, links)) {
 
 		fprintf(ofile, "%s\t0x%02x, 0x%02x, 0x%02x, 0x%02x",
 			cur_instr == STAILQ_FIRST(&seq_program) ? "" : ",\n",
-#ifdef __LITTLE_ENDIAN
+#if BYTE_ORDER == LITTLE_ENDIAN
 			cur_instr->format.bytes[0],
 			cur_instr->format.bytes[1],
 			cur_instr->format.bytes[2],
@@ -415,7 +415,7 @@ output_code()
 	}
 
 	fprintf(ofile,
-"static const struct patch {\n"
+"static struct patch {\n"
 "	%spatch_func_t		*patch_func;\n"
 "	uint32_t		 begin		:10,\n"
 "				 skip_instr	:10,\n"
@@ -435,7 +435,7 @@ output_code()
 	fprintf(ofile, "\n};\n\n");
 
 	fprintf(ofile,
-"static const struct cs {\n"
+"static struct cs {\n"
 "	uint16_t	begin;\n"
 "	uint16_t	end;\n"
 "} critical_sections[] = {\n");
@@ -451,7 +451,8 @@ output_code()
 	fprintf(ofile, "\n};\n\n");
 
 	fprintf(ofile,
-	"#define NUM_CRITICAL_SECTIONS ARRAY_SIZE(critical_sections)\n");
+"static const int num_critical_sections = sizeof(critical_sections)\n"
+"				       / sizeof(*critical_sections);\n");
 
 	fprintf(stderr, "%s: %d instructions used\n", appname, instrcount);
 }
@@ -608,11 +609,11 @@ output_listing(char *ifilename)
 
 		while (line < cur_instr->srcline) {
 			fgets(buf, sizeof(buf), ifile);
-				fprintf(listfile, "             \t%s", buf);
+				fprintf(listfile, "\t\t%s", buf);
 				line++;
 		}
-		fprintf(listfile, "%04x %02x%02x%02x%02x", instrptr,
-#ifdef __LITTLE_ENDIAN
+		fprintf(listfile, "%03x %02x%02x%02x%02x", instrptr,
+#if BYTE_ORDER == LITTLE_ENDIAN
 			cur_instr->format.bytes[0],
 			cur_instr->format.bytes[1],
 			cur_instr->format.bytes[2],
@@ -623,23 +624,14 @@ output_listing(char *ifilename)
 			cur_instr->format.bytes[1],
 			cur_instr->format.bytes[0]);
 #endif
-		/*
-		 * Macro expansions can cause several instructions
-		 * to be output for a single source line.  Only
-		 * advance the line once in these cases.
-		 */
-		if (line == cur_instr->srcline) {
-			fgets(buf, sizeof(buf), ifile);
-			fprintf(listfile, "\t%s", buf);
-			line++;
-		} else {
-			fprintf(listfile, "\n");
-		}
+		fgets(buf, sizeof(buf), ifile);
+		fprintf(listfile, "\t%s", buf);
+		line++;
 		instrptr++;
 	}
 	/* Dump the remainder of the file */
 	while(fgets(buf, sizeof(buf), ifile) != NULL)
-		fprintf(listfile, "             %s", buf);
+		fprintf(listfile, "\t\t%s", buf);
 
 	fclose(ifile);
 }

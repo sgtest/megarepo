@@ -1,32 +1,34 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *	X.25 Packet Layer release 002
  *
  *	This is ALPHA test software. This code may break your machine,
  *	randomly fail to work with new releases, misbehave and/or generally
- *	screw up. It might even work.
+ *	screw up. It might even work. 
  *
  *	This code REQUIRES 2.1.15 or higher
+ *
+ *	This module:
+ *		This module is free software; you can redistribute it and/or
+ *		modify it under the terms of the GNU General Public License
+ *		as published by the Free Software Foundation; either version
+ *		2 of the License, or (at your option) any later version.
  *
  *	History
  *	X.25 001	Jonathan Naylor	  Started coding.
  *	X.25 002	Jonathan Naylor	  Centralised disconnection code.
  *					  New timer architecture.
- *	2000-03-20	Daniela Squassoni Disabling/enabling of facilities
+ *	2000-03-20	Daniela Squassoni Disabling/enabling of facilities 
  *					  negotiation.
  *	2000-11-10	Henner Eisen	  Check and reset for out-of-sequence
  *					  i-frames.
  */
 
-#define pr_fmt(fmt) "X25: " fmt
-
-#include <linux/slab.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/skbuff.h>
 #include <net/sock.h>
-#include <net/tcp_states.h>
+#include <net/tcp.h>
 #include <net/x25.h>
 
 static int x25_queue_rx_frame(struct sock *sk, struct sk_buff *skb, int more)
@@ -41,7 +43,7 @@ static int x25_queue_rx_frame(struct sock *sk, struct sk_buff *skb, int more)
 		return 0;
 	}
 
-	if (x25->fraglen > 0) {	/* End of fragment */
+	if (!more && x25->fraglen > 0) {	/* End of fragment */
 		int len = x25->fraglen + skb->len;
 
 		if ((skbn = alloc_skb(len, GFP_ATOMIC)) == NULL){
@@ -51,30 +53,27 @@ static int x25_queue_rx_frame(struct sock *sk, struct sk_buff *skb, int more)
 
 		skb_queue_tail(&x25->fragment_queue, skb);
 
-		skb_reset_transport_header(skbn);
+		skbn->h.raw = skbn->data;
 
 		skbo = skb_dequeue(&x25->fragment_queue);
-		skb_copy_from_linear_data(skbo, skb_put(skbn, skbo->len),
-					  skbo->len);
+		memcpy(skb_put(skbn, skbo->len), skbo->data, skbo->len);
 		kfree_skb(skbo);
 
 		while ((skbo =
 			skb_dequeue(&x25->fragment_queue)) != NULL) {
 			skb_pull(skbo, (x25->neighbour->extended) ?
 					X25_EXT_MIN_LEN : X25_STD_MIN_LEN);
-			skb_copy_from_linear_data(skbo,
-						  skb_put(skbn, skbo->len),
-						  skbo->len);
+			memcpy(skb_put(skbn, skbo->len), skbo->data, skbo->len);
 			kfree_skb(skbo);
 		}
 
-		x25->fraglen = 0;
+		x25->fraglen = 0;		
 	}
 
 	skb_set_owner_r(skbn, sk);
 	skb_queue_tail(&sk->sk_receive_queue, skbn);
 	if (!sock_flag(sk, SOCK_DEAD))
-		sk->sk_data_ready(sk);
+		sk->sk_data_ready(sk, skbn->len);
 
 	return 0;
 }
@@ -87,83 +86,48 @@ static int x25_queue_rx_frame(struct sock *sk, struct sk_buff *skb, int more)
 static int x25_state1_machine(struct sock *sk, struct sk_buff *skb, int frametype)
 {
 	struct x25_address source_addr, dest_addr;
-	int len;
-	struct x25_sock *x25 = x25_sk(sk);
 
 	switch (frametype) {
-	case X25_CALL_ACCEPTED: {
+		case X25_CALL_ACCEPTED: {
+			struct x25_sock *x25 = x25_sk(sk);
 
-		x25_stop_timer(sk);
-		x25->condition = 0x00;
-		x25->vs        = 0;
-		x25->va        = 0;
-		x25->vr        = 0;
-		x25->vl        = 0;
-		x25->state     = X25_STATE_3;
-		sk->sk_state   = TCP_ESTABLISHED;
-		/*
-		 *	Parse the data in the frame.
-		 */
-		if (!pskb_may_pull(skb, X25_STD_MIN_LEN))
-			goto out_clear;
-		skb_pull(skb, X25_STD_MIN_LEN);
-
-		len = x25_parse_address_block(skb, &source_addr,
-					      &dest_addr);
-		if (len > 0)
-			skb_pull(skb, len);
-		else if (len < 0)
-			goto out_clear;
-
-		len = x25_parse_facilities(skb, &x25->facilities,
-					   &x25->dte_facilities,
-					   &x25->vc_facil_mask);
-		if (len > 0)
-			skb_pull(skb, len);
-		else if (len < 0)
-			goto out_clear;
-		/*
-		 *	Copy any Call User Data.
-		 */
-		if (skb->len > 0) {
-			if (skb->len > X25_MAX_CUD_LEN)
-				goto out_clear;
-
-			skb_copy_bits(skb, 0, x25->calluserdata.cuddata,
-				skb->len);
-			x25->calluserdata.cudlength = skb->len;
+			x25_stop_timer(sk);
+			x25->condition = 0x00;
+			x25->vs        = 0;
+			x25->va        = 0;
+			x25->vr        = 0;
+			x25->vl        = 0;
+			x25->state     = X25_STATE_3;
+			sk->sk_state   = TCP_ESTABLISHED;
+			/*
+			 *	Parse the data in the frame.
+			 */
+			skb_pull(skb, X25_STD_MIN_LEN);
+			skb_pull(skb, x25_addr_ntoa(skb->data, &source_addr, &dest_addr));
+			skb_pull(skb,
+				 x25_parse_facilities(skb, &x25->facilities,
+						      &x25->vc_facil_mask));
+			/*
+			 *	Copy any Call User Data.
+			 */
+			if (skb->len >= 0) {
+				memcpy(x25->calluserdata.cuddata, skb->data,
+				       skb->len);
+				x25->calluserdata.cudlength = skb->len;
+			}
+			if (!sock_flag(sk, SOCK_DEAD))
+				sk->sk_state_change(sk);
+			break;
 		}
-		if (!sock_flag(sk, SOCK_DEAD))
-			sk->sk_state_change(sk);
-		break;
-	}
-	case X25_CALL_REQUEST:
-		/* call collision */
-		x25->causediag.cause      = 0x01;
-		x25->causediag.diagnostic = 0x48;
+		case X25_CLEAR_REQUEST:
+			x25_write_internal(sk, X25_CLEAR_CONFIRMATION);
+			x25_disconnect(sk, ECONNREFUSED, skb->data[3], skb->data[4]);
+			break;
 
-		x25_write_internal(sk, X25_CLEAR_REQUEST);
-		x25_disconnect(sk, EISCONN, 0x01, 0x48);
-		break;
-
-	case X25_CLEAR_REQUEST:
-		if (!pskb_may_pull(skb, X25_STD_MIN_LEN + 2))
-			goto out_clear;
-
-		x25_write_internal(sk, X25_CLEAR_CONFIRMATION);
-		x25_disconnect(sk, ECONNREFUSED, skb->data[3], skb->data[4]);
-		break;
-
-	default:
-		break;
+		default:
+			break;
 	}
 
-	return 0;
-
-out_clear:
-	x25_write_internal(sk, X25_CLEAR_REQUEST);
-	x25->state = X25_STATE_2;
-	x25_start_t23timer(sk);
 	return 0;
 }
 
@@ -177,9 +141,6 @@ static int x25_state2_machine(struct sock *sk, struct sk_buff *skb, int frametyp
 	switch (frametype) {
 
 		case X25_CLEAR_REQUEST:
-			if (!pskb_may_pull(skb, X25_STD_MIN_LEN + 2))
-				goto out_clear;
-
 			x25_write_internal(sk, X25_CLEAR_CONFIRMATION);
 			x25_disconnect(sk, 0, skb->data[3], skb->data[4]);
 			break;
@@ -193,11 +154,6 @@ static int x25_state2_machine(struct sock *sk, struct sk_buff *skb, int frametyp
 	}
 
 	return 0;
-
-out_clear:
-	x25_write_internal(sk, X25_CLEAR_REQUEST);
-	x25_start_t23timer(sk);
-	return 0;
 }
 
 /*
@@ -210,7 +166,7 @@ static int x25_state3_machine(struct sock *sk, struct sk_buff *skb, int frametyp
 	int queued = 0;
 	int modulus;
 	struct x25_sock *x25 = x25_sk(sk);
-
+	
 	modulus = (x25->neighbour->extended) ? X25_EMODULUS : X25_SMODULUS;
 
 	switch (frametype) {
@@ -227,9 +183,6 @@ static int x25_state3_machine(struct sock *sk, struct sk_buff *skb, int frametyp
 			break;
 
 		case X25_CLEAR_REQUEST:
-			if (!pskb_may_pull(skb, X25_STD_MIN_LEN + 2))
-				goto out_clear;
-
 			x25_write_internal(sk, X25_CLEAR_CONFIRMATION);
 			x25_disconnect(sk, 0, skb->data[3], skb->data[4]);
 			break;
@@ -289,7 +242,7 @@ static int x25_state3_machine(struct sock *sk, struct sk_buff *skb, int frametyp
 					break;
 				}
 				if (atomic_read(&sk->sk_rmem_alloc) >
-				    (sk->sk_rcvbuf >> 1))
+				    (sk->sk_rcvbuf / 2))
 					x25->condition |= X25_COND_OWN_RX_BUSY;
 			}
 			/*
@@ -307,7 +260,7 @@ static int x25_state3_machine(struct sock *sk, struct sk_buff *skb, int frametyp
 			break;
 
 		case X25_INTERRUPT_CONFIRMATION:
-			clear_bit(X25_INTERRUPT_FLAG, &x25->flags);
+			x25->intflag = 0;
 			break;
 
 		case X25_INTERRUPT:
@@ -323,17 +276,11 @@ static int x25_state3_machine(struct sock *sk, struct sk_buff *skb, int frametyp
 			break;
 
 		default:
-			pr_warn("unknown %02X in state 3\n", frametype);
+			printk(KERN_WARNING "x25: unknown %02X in state 3\n", frametype);
 			break;
 	}
 
 	return queued;
-
-out_clear:
-	x25_write_internal(sk, X25_CLEAR_REQUEST);
-	x25->state = X25_STATE_2;
-	x25_start_t23timer(sk);
-	return 0;
 }
 
 /*
@@ -343,14 +290,13 @@ out_clear:
  */
 static int x25_state4_machine(struct sock *sk, struct sk_buff *skb, int frametype)
 {
-	struct x25_sock *x25 = x25_sk(sk);
-
 	switch (frametype) {
 
 		case X25_RESET_REQUEST:
 			x25_write_internal(sk, X25_RESET_CONFIRMATION);
-			fallthrough;
 		case X25_RESET_CONFIRMATION: {
+			struct x25_sock *x25 = x25_sk(sk);
+
 			x25_stop_timer(sk);
 			x25->condition = 0x00;
 			x25->va        = 0;
@@ -362,44 +308,6 @@ static int x25_state4_machine(struct sock *sk, struct sk_buff *skb, int frametyp
 			break;
 		}
 		case X25_CLEAR_REQUEST:
-			if (!pskb_may_pull(skb, X25_STD_MIN_LEN + 2))
-				goto out_clear;
-
-			x25_write_internal(sk, X25_CLEAR_CONFIRMATION);
-			x25_disconnect(sk, 0, skb->data[3], skb->data[4]);
-			break;
-
-		default:
-			break;
-	}
-
-	return 0;
-
-out_clear:
-	x25_write_internal(sk, X25_CLEAR_REQUEST);
-	x25->state = X25_STATE_2;
-	x25_start_t23timer(sk);
-	return 0;
-}
-
-/*
- * State machine for state 5, Call Accepted / Call Connected pending (X25_ACCPT_APPRV_FLAG).
- * The handling of the timer(s) is in file x25_timer.c
- * Handling of state 0 and connection release is in af_x25.c.
- */
-static int x25_state5_machine(struct sock *sk, struct sk_buff *skb, int frametype)
-{
-	struct x25_sock *x25 = x25_sk(sk);
-
-	switch (frametype) {
-		case X25_CLEAR_REQUEST:
-			if (!pskb_may_pull(skb, X25_STD_MIN_LEN + 2)) {
-				x25_write_internal(sk, X25_CLEAR_REQUEST);
-				x25->state = X25_STATE_2;
-				x25_start_t23timer(sk);
-				return 0;
-			}
-
 			x25_write_internal(sk, X25_CLEAR_CONFIRMATION);
 			x25_disconnect(sk, 0, skb->data[3], skb->data[4]);
 			break;
@@ -423,21 +331,18 @@ int x25_process_rx_frame(struct sock *sk, struct sk_buff *skb)
 	frametype = x25_decode(sk, skb, &ns, &nr, &q, &d, &m);
 
 	switch (x25->state) {
-	case X25_STATE_1:
-		queued = x25_state1_machine(sk, skb, frametype);
-		break;
-	case X25_STATE_2:
-		queued = x25_state2_machine(sk, skb, frametype);
-		break;
-	case X25_STATE_3:
-		queued = x25_state3_machine(sk, skb, frametype, ns, nr, q, d, m);
-		break;
-	case X25_STATE_4:
-		queued = x25_state4_machine(sk, skb, frametype);
-		break;
-	case X25_STATE_5:
-		queued = x25_state5_machine(sk, skb, frametype);
-		break;
+		case X25_STATE_1:
+			queued = x25_state1_machine(sk, skb, frametype);
+			break;
+		case X25_STATE_2:
+			queued = x25_state2_machine(sk, skb, frametype);
+			break;
+		case X25_STATE_3:
+			queued = x25_state3_machine(sk, skb, frametype, ns, nr, q, d, m);
+			break;
+		case X25_STATE_4:
+			queued = x25_state4_machine(sk, skb, frametype);
+			break;
 	}
 
 	x25_kick(sk);

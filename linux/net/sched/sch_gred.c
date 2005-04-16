@@ -1,912 +1,592 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * net/sched/sch_gred.c	Generic Random Early Detection queue.
+ *
+ *
+ *              This program is free software; you can redistribute it and/or
+ *              modify it under the terms of the GNU General Public License
+ *              as published by the Free Software Foundation; either version
+ *              2 of the License, or (at your option) any later version.
  *
  * Authors:    J Hadi Salim (hadi@cyberus.ca) 1998-2002
  *
  *             991129: -  Bug fix with grio mode
  *		       - a better sing. AvgQ mode with Grio(WRED)
- *		       - A finer grained VQ dequeue based on suggestion
+ *		       - A finer grained VQ dequeue based on sugestion
  *		         from Ren Liu
  *		       - More error checks
  *
- *  For all the glorious comments look at include/net/red.h
+ *
+ *
+ *  For all the glorious comments look at Alexey's sch_red.c
  */
 
-#include <linux/slab.h>
+#include <linux/config.h>
 #include <linux/module.h>
+#include <asm/uaccess.h>
+#include <asm/system.h>
+#include <linux/bitops.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
+#include <linux/sched.h>
+#include <linux/string.h>
+#include <linux/mm.h>
+#include <linux/socket.h>
+#include <linux/sockios.h>
+#include <linux/in.h>
+#include <linux/errno.h>
+#include <linux/interrupt.h>
+#include <linux/if_ether.h>
+#include <linux/inet.h>
+#include <linux/netdevice.h>
+#include <linux/etherdevice.h>
+#include <linux/notifier.h>
+#include <net/ip.h>
+#include <net/route.h>
 #include <linux/skbuff.h>
-#include <net/pkt_cls.h>
+#include <net/sock.h>
 #include <net/pkt_sched.h>
-#include <net/red.h>
 
-#define GRED_DEF_PRIO (MAX_DPs / 2)
-#define GRED_VQ_MASK (MAX_DPs - 1)
+#if 1 /* control */
+#define DPRINTK(format,args...) printk(KERN_DEBUG format,##args)
+#else
+#define DPRINTK(format,args...)
+#endif
 
-#define GRED_VQ_RED_FLAGS	(TC_RED_ECN | TC_RED_HARDDROP)
+#if 0 /* data */
+#define D2PRINTK(format,args...) printk(KERN_DEBUG format,##args)
+#else
+#define D2PRINTK(format,args...)
+#endif
 
 struct gred_sched_data;
 struct gred_sched;
 
-struct gred_sched_data {
+struct gred_sched_data
+{
+/* Parameters */
 	u32		limit;		/* HARD maximal queue length	*/
-	u32		DP;		/* the drop parameters */
-	u32		red_flags;	/* virtualQ version of red_flags */
-	u64		bytesin;	/* bytes seen on virtualQ so far*/
+	u32		qth_min;	/* Min average length threshold: A scaled */
+	u32		qth_max;	/* Max average length threshold: A scaled */
+	u32      	DP;		/* the drop pramaters */
+	char		Wlog;		/* log(W)		*/
+	char		Plog;		/* random number bits	*/
+	u32		Scell_max;
+	u32		Rmask;
+	u32		bytesin;	/* bytes seen on virtualQ so far*/
 	u32		packetsin;	/* packets seen on virtualQ so far*/
 	u32		backlog;	/* bytes on the virtualQ */
-	u8		prio;		/* the prio of this vq */
+	u32		forced;	/* packets dropped for exceeding limits */
+	u32		early;	/* packets dropped as a warning */
+	u32		other;	/* packets dropped by invoking drop() */
+	u32		pdrop;	/* packets dropped because we exceeded physical queue limits */
+	char		Scell_log;
+	u8		Stab[256];
+	u8              prio;        /* the prio of this vq */
 
-	struct red_parms parms;
-	struct red_vars  vars;
-	struct red_stats stats;
+/* Variables */
+	unsigned long	qave;		/* Average queue length: A scaled */
+	int		qcount;		/* Packets since last random number generation */
+	u32		qR;		/* Cached random number */
+
+	psched_time_t	qidlestart;	/* Start of idle period	*/
 };
 
-enum {
-	GRED_WRED_MODE = 1,
-	GRED_RIO_MODE,
-};
-
-struct gred_sched {
+struct gred_sched
+{
 	struct gred_sched_data *tab[MAX_DPs];
-	unsigned long	flags;
-	u32		red_flags;
-	u32 		DPs;
-	u32 		def;
-	struct red_vars wred_set;
-	struct tc_gred_qopt_offload *opt;
+	u32 		DPs;   
+	u32 		def; 
+	u8 		initd; 
+	u8 		grio; 
+	u8 		eqp; 
 };
 
-static inline int gred_wred_mode(struct gred_sched *table)
+static int
+gred_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 {
-	return test_bit(GRED_WRED_MODE, &table->flags);
-}
+	psched_time_t now;
+	struct gred_sched_data *q=NULL;
+	struct gred_sched *t= qdisc_priv(sch);
+	unsigned long	qave=0;	
+	int i=0;
 
-static inline void gred_enable_wred_mode(struct gred_sched *table)
-{
-	__set_bit(GRED_WRED_MODE, &table->flags);
-}
-
-static inline void gred_disable_wred_mode(struct gred_sched *table)
-{
-	__clear_bit(GRED_WRED_MODE, &table->flags);
-}
-
-static inline int gred_rio_mode(struct gred_sched *table)
-{
-	return test_bit(GRED_RIO_MODE, &table->flags);
-}
-
-static inline void gred_enable_rio_mode(struct gred_sched *table)
-{
-	__set_bit(GRED_RIO_MODE, &table->flags);
-}
-
-static inline void gred_disable_rio_mode(struct gred_sched *table)
-{
-	__clear_bit(GRED_RIO_MODE, &table->flags);
-}
-
-static inline int gred_wred_mode_check(struct Qdisc *sch)
-{
-	struct gred_sched *table = qdisc_priv(sch);
-	int i;
-
-	/* Really ugly O(n^2) but shouldn't be necessary too frequent. */
-	for (i = 0; i < table->DPs; i++) {
-		struct gred_sched_data *q = table->tab[i];
-		int n;
-
-		if (q == NULL)
-			continue;
-
-		for (n = i + 1; n < table->DPs; n++)
-			if (table->tab[n] && table->tab[n]->prio == q->prio)
-				return 1;
+	if (!t->initd && skb_queue_len(&sch->q) < (sch->dev->tx_queue_len ? : 1)) {
+		D2PRINTK("NO GRED Queues setup yet! Enqueued anyway\n");
+		goto do_enqueue;
 	}
 
-	return 0;
-}
 
-static inline unsigned int gred_backlog(struct gred_sched *table,
-					struct gred_sched_data *q,
-					struct Qdisc *sch)
-{
-	if (gred_wred_mode(table))
-		return sch->qstats.backlog;
-	else
-		return q->backlog;
-}
-
-static inline u16 tc_index_to_dp(struct sk_buff *skb)
-{
-	return skb->tc_index & GRED_VQ_MASK;
-}
-
-static inline void gred_load_wred_set(const struct gred_sched *table,
-				      struct gred_sched_data *q)
-{
-	q->vars.qavg = table->wred_set.qavg;
-	q->vars.qidlestart = table->wred_set.qidlestart;
-}
-
-static inline void gred_store_wred_set(struct gred_sched *table,
-				       struct gred_sched_data *q)
-{
-	table->wred_set.qavg = q->vars.qavg;
-	table->wred_set.qidlestart = q->vars.qidlestart;
-}
-
-static int gred_use_ecn(struct gred_sched_data *q)
-{
-	return q->red_flags & TC_RED_ECN;
-}
-
-static int gred_use_harddrop(struct gred_sched_data *q)
-{
-	return q->red_flags & TC_RED_HARDDROP;
-}
-
-static bool gred_per_vq_red_flags_used(struct gred_sched *table)
-{
-	unsigned int i;
-
-	/* Local per-vq flags couldn't have been set unless global are 0 */
-	if (table->red_flags)
-		return false;
-	for (i = 0; i < MAX_DPs; i++)
-		if (table->tab[i] && table->tab[i]->red_flags)
-			return true;
-	return false;
-}
-
-static int gred_enqueue(struct sk_buff *skb, struct Qdisc *sch,
-			struct sk_buff **to_free)
-{
-	struct gred_sched_data *q = NULL;
-	struct gred_sched *t = qdisc_priv(sch);
-	unsigned long qavg = 0;
-	u16 dp = tc_index_to_dp(skb);
-
-	if (dp >= t->DPs || (q = t->tab[dp]) == NULL) {
-		dp = t->def;
-
-		q = t->tab[dp];
-		if (!q) {
-			/* Pass through packets not assigned to a DP
-			 * if no default DP has been configured. This
-			 * allows for DP flows to be left untouched.
-			 */
-			if (likely(sch->qstats.backlog + qdisc_pkt_len(skb) <=
-					sch->limit))
-				return qdisc_enqueue_tail(skb, sch);
-			else
-				goto drop;
+	if ( ((skb->tc_index&0xf) > (t->DPs -1)) || !(q=t->tab[skb->tc_index&0xf])) {
+		printk("GRED: setting to default (%d)\n ",t->def);
+		if (!(q=t->tab[t->def])) {
+			DPRINTK("GRED: setting to default FAILED! dropping!! "
+			    "(%d)\n ", t->def);
+			goto drop;
 		}
-
-		/* fix tc_index? --could be controversial but needed for
+		/* fix tc_index? --could be controvesial but needed for
 		   requeueing */
-		skb->tc_index = (skb->tc_index & ~GRED_VQ_MASK) | dp;
+		skb->tc_index=(skb->tc_index&0xfffffff0) | t->def;
 	}
 
-	/* sum up all the qaves of prios < ours to get the new qave */
-	if (!gred_wred_mode(t) && gred_rio_mode(t)) {
-		int i;
-
-		for (i = 0; i < t->DPs; i++) {
-			if (t->tab[i] && t->tab[i]->prio < q->prio &&
-			    !red_is_idling(&t->tab[i]->vars))
-				qavg += t->tab[i]->vars.qavg;
+	D2PRINTK("gred_enqueue virtualQ 0x%x classid %x backlog %d "
+	    "general backlog %d\n",skb->tc_index&0xf,sch->handle,q->backlog,
+	    sch->qstats.backlog);
+	/* sum up all the qaves of prios <= to ours to get the new qave*/
+	if (!t->eqp && t->grio) {
+		for (i=0;i<t->DPs;i++) {
+			if ((!t->tab[i]) || (i==q->DP))	
+				continue; 
+				
+			if ((t->tab[i]->prio < q->prio) && (PSCHED_IS_PASTPERFECT(t->tab[i]->qidlestart)))
+				qave +=t->tab[i]->qave;
 		}
-
+			
 	}
 
 	q->packetsin++;
-	q->bytesin += qdisc_pkt_len(skb);
+	q->bytesin+=skb->len;
 
-	if (gred_wred_mode(t))
-		gred_load_wred_set(t, q);
-
-	q->vars.qavg = red_calc_qavg(&q->parms,
-				     &q->vars,
-				     gred_backlog(t, q, sch));
-
-	if (red_is_idling(&q->vars))
-		red_end_of_idle_period(&q->vars);
-
-	if (gred_wred_mode(t))
-		gred_store_wred_set(t, q);
-
-	switch (red_action(&q->parms, &q->vars, q->vars.qavg + qavg)) {
-	case RED_DONT_MARK:
-		break;
-
-	case RED_PROB_MARK:
-		qdisc_qstats_overlimit(sch);
-		if (!gred_use_ecn(q) || !INET_ECN_set_ce(skb)) {
-			q->stats.prob_drop++;
-			goto congestion_drop;
-		}
-
-		q->stats.prob_mark++;
-		break;
-
-	case RED_HARD_MARK:
-		qdisc_qstats_overlimit(sch);
-		if (gred_use_harddrop(q) || !gred_use_ecn(q) ||
-		    !INET_ECN_set_ce(skb)) {
-			q->stats.forced_drop++;
-			goto congestion_drop;
-		}
-		q->stats.forced_mark++;
-		break;
+	if (t->eqp && t->grio) {
+		qave=0;
+		q->qave=t->tab[t->def]->qave;
+		q->qidlestart=t->tab[t->def]->qidlestart;
 	}
 
-	if (gred_backlog(t, q, sch) + qdisc_pkt_len(skb) <= q->limit) {
-		q->backlog += qdisc_pkt_len(skb);
-		return qdisc_enqueue_tail(skb, sch);
-	}
+	if (!PSCHED_IS_PASTPERFECT(q->qidlestart)) {
+		long us_idle;
+		PSCHED_GET_TIME(now);
+		us_idle = PSCHED_TDIFF_SAFE(now, q->qidlestart, q->Scell_max);
+		PSCHED_SET_PASTPERFECT(q->qidlestart);
 
-	q->stats.pdrop++;
+		q->qave >>= q->Stab[(us_idle>>q->Scell_log)&0xFF];
+	} else {
+		if (t->eqp) {
+			q->qave += sch->qstats.backlog - (q->qave >> q->Wlog);
+		} else {
+			q->qave += q->backlog - (q->qave >> q->Wlog);
+		}
+
+	}
+	
+
+	if (t->eqp && t->grio) 
+		t->tab[t->def]->qave=q->qave;
+
+	if ((q->qave+qave) < q->qth_min) {
+		q->qcount = -1;
+enqueue:
+		if (q->backlog + skb->len <= q->limit) {
+			q->backlog += skb->len;
+do_enqueue:
+			__skb_queue_tail(&sch->q, skb);
+			sch->qstats.backlog += skb->len;
+			sch->bstats.bytes += skb->len;
+			sch->bstats.packets++;
+			return 0;
+		} else {
+			q->pdrop++;
+		}
+
 drop:
-	return qdisc_drop(skb, sch, to_free);
-
-congestion_drop:
-	qdisc_drop(skb, sch, to_free);
-	return NET_XMIT_CN;
+		kfree_skb(skb);
+		sch->qstats.drops++;
+		return NET_XMIT_DROP;
+	}
+	if ((q->qave+qave) >= q->qth_max) {
+		q->qcount = -1;
+		sch->qstats.overlimits++;
+		q->forced++;
+		goto drop;
+	}
+	if (++q->qcount) {
+		if ((((qave+q->qave) - q->qth_min)>>q->Wlog)*q->qcount < q->qR)
+			goto enqueue;
+		q->qcount = 0;
+		q->qR = net_random()&q->Rmask;
+		sch->qstats.overlimits++;
+		q->early++;
+		goto drop;
+	}
+	q->qR = net_random()&q->Rmask;
+	goto enqueue;
 }
 
-static struct sk_buff *gred_dequeue(struct Qdisc *sch)
+static int
+gred_requeue(struct sk_buff *skb, struct Qdisc* sch)
+{
+	struct gred_sched_data *q;
+	struct gred_sched *t= qdisc_priv(sch);
+	q= t->tab[(skb->tc_index&0xf)];
+/* error checking here -- probably unnecessary */
+	PSCHED_SET_PASTPERFECT(q->qidlestart);
+
+	__skb_queue_head(&sch->q, skb);
+	sch->qstats.backlog += skb->len;
+	sch->qstats.requeues++;
+	q->backlog += skb->len;
+	return 0;
+}
+
+static struct sk_buff *
+gred_dequeue(struct Qdisc* sch)
 {
 	struct sk_buff *skb;
-	struct gred_sched *t = qdisc_priv(sch);
+	struct gred_sched_data *q;
+	struct gred_sched *t= qdisc_priv(sch);
 
-	skb = qdisc_dequeue_head(sch);
-
+	skb = __skb_dequeue(&sch->q);
 	if (skb) {
-		struct gred_sched_data *q;
-		u16 dp = tc_index_to_dp(skb);
-
-		if (dp >= t->DPs || (q = t->tab[dp]) == NULL) {
-			net_warn_ratelimited("GRED: Unable to relocate VQ 0x%x after dequeue, screwing up backlog\n",
-					     tc_index_to_dp(skb));
+		sch->qstats.backlog -= skb->len;
+		q= t->tab[(skb->tc_index&0xf)];
+		if (q) {
+			q->backlog -= skb->len;
+			if (!q->backlog && !t->eqp)
+				PSCHED_GET_TIME(q->qidlestart);
 		} else {
-			q->backlog -= qdisc_pkt_len(skb);
-
-			if (gred_wred_mode(t)) {
-				if (!sch->qstats.backlog)
-					red_start_of_idle_period(&t->wred_set);
-			} else {
-				if (!q->backlog)
-					red_start_of_idle_period(&q->vars);
-			}
+			D2PRINTK("gred_dequeue: skb has bad tcindex %x\n",skb->tc_index&0xf); 
 		}
-
 		return skb;
+	}
+
+	if (t->eqp) {
+			q= t->tab[t->def];
+			if (!q)	
+				D2PRINTK("no default VQ set: Results will be "
+				       "screwed up\n");
+			else
+				PSCHED_GET_TIME(q->qidlestart);
 	}
 
 	return NULL;
 }
 
-static void gred_reset(struct Qdisc *sch)
+static unsigned int gred_drop(struct Qdisc* sch)
+{
+	struct sk_buff *skb;
+
+	struct gred_sched_data *q;
+	struct gred_sched *t= qdisc_priv(sch);
+
+	skb = __skb_dequeue_tail(&sch->q);
+	if (skb) {
+		unsigned int len = skb->len;
+		sch->qstats.backlog -= len;
+		sch->qstats.drops++;
+		q= t->tab[(skb->tc_index&0xf)];
+		if (q) {
+			q->backlog -= len;
+			q->other++;
+			if (!q->backlog && !t->eqp)
+				PSCHED_GET_TIME(q->qidlestart);
+		} else {
+			D2PRINTK("gred_dequeue: skb has bad tcindex %x\n",skb->tc_index&0xf); 
+		}
+
+		kfree_skb(skb);
+		return len;
+	}
+
+	q=t->tab[t->def];
+	if (!q) {
+		D2PRINTK("no default VQ set: Results might be screwed up\n");
+		return 0;
+	}
+
+	PSCHED_GET_TIME(q->qidlestart);
+	return 0;
+
+}
+
+static void gred_reset(struct Qdisc* sch)
 {
 	int i;
-	struct gred_sched *t = qdisc_priv(sch);
+	struct gred_sched_data *q;
+	struct gred_sched *t= qdisc_priv(sch);
 
-	qdisc_reset_queue(sch);
+	__skb_queue_purge(&sch->q);
 
-	for (i = 0; i < t->DPs; i++) {
-		struct gred_sched_data *q = t->tab[i];
+	sch->qstats.backlog = 0;
 
-		if (!q)
-			continue;
-
-		red_restart(&q->vars);
+        for (i=0;i<t->DPs;i++) {
+	        q= t->tab[i];
+		if (!q)	
+			continue; 
+		PSCHED_SET_PASTPERFECT(q->qidlestart);
+		q->qave = 0;
+		q->qcount = -1;
 		q->backlog = 0;
+		q->other=0;
+		q->forced=0;
+		q->pdrop=0;
+		q->early=0;
 	}
 }
 
-static void gred_offload(struct Qdisc *sch, enum tc_gred_command command)
+static int gred_change(struct Qdisc *sch, struct rtattr *opt)
 {
 	struct gred_sched *table = qdisc_priv(sch);
-	struct net_device *dev = qdisc_dev(sch);
-	struct tc_gred_qopt_offload *opt = table->opt;
+	struct gred_sched_data *q;
+	struct tc_gred_qopt *ctl;
+	struct tc_gred_sopt *sopt;
+	struct rtattr *tb[TCA_GRED_STAB];
+	struct rtattr *tb2[TCA_GRED_DPS];
+	int i;
 
-	if (!tc_can_offload(dev) || !dev->netdev_ops->ndo_setup_tc)
-		return;
+	if (opt == NULL || rtattr_parse_nested(tb, TCA_GRED_STAB, opt))
+		return -EINVAL;
 
-	memset(opt, 0, sizeof(*opt));
-	opt->command = command;
-	opt->handle = sch->handle;
-	opt->parent = sch->parent;
+	if (tb[TCA_GRED_PARMS-1] == 0 && tb[TCA_GRED_STAB-1] == 0) {
+		rtattr_parse_nested(tb2, TCA_GRED_DPS, opt);
 
-	if (command == TC_GRED_REPLACE) {
-		unsigned int i;
+	    if (tb2[TCA_GRED_DPS-1] == 0) 
+			return -EINVAL;
 
-		opt->set.grio_on = gred_rio_mode(table);
-		opt->set.wred_on = gred_wred_mode(table);
-		opt->set.dp_cnt = table->DPs;
-		opt->set.dp_def = table->def;
+		sopt = RTA_DATA(tb2[TCA_GRED_DPS-1]);
+		table->DPs=sopt->DPs;   
+		table->def=sopt->def_DP; 
+		table->grio=sopt->grio; 
+		table->initd=0;
+		/* probably need to clear all the table DP entries as well */
+		return 0;
+	    }
 
-		for (i = 0; i < table->DPs; i++) {
-			struct gred_sched_data *q = table->tab[i];
 
-			if (!q)
-				continue;
-			opt->set.tab[i].present = true;
-			opt->set.tab[i].limit = q->limit;
-			opt->set.tab[i].prio = q->prio;
-			opt->set.tab[i].min = q->parms.qth_min >> q->parms.Wlog;
-			opt->set.tab[i].max = q->parms.qth_max >> q->parms.Wlog;
-			opt->set.tab[i].is_ecn = gred_use_ecn(q);
-			opt->set.tab[i].is_harddrop = gred_use_harddrop(q);
-			opt->set.tab[i].probability = q->parms.max_P;
-			opt->set.tab[i].backlog = &q->backlog;
+	if (!table->DPs || tb[TCA_GRED_PARMS-1] == 0 || tb[TCA_GRED_STAB-1] == 0 ||
+		RTA_PAYLOAD(tb[TCA_GRED_PARMS-1]) < sizeof(*ctl) ||
+		RTA_PAYLOAD(tb[TCA_GRED_STAB-1]) < 256)
+			return -EINVAL;
+
+	ctl = RTA_DATA(tb[TCA_GRED_PARMS-1]);
+	if (ctl->DP > MAX_DPs-1 ) {
+		/* misbehaving is punished! Put in the default drop probability */
+		DPRINTK("\nGRED: DP %u not in  the proper range fixed. New DP "
+			"set to default at %d\n",ctl->DP,table->def);
+		ctl->DP=table->def;
+	}
+	
+	if (table->tab[ctl->DP] == NULL) {
+		table->tab[ctl->DP]=kmalloc(sizeof(struct gred_sched_data),
+					    GFP_KERNEL);
+		if (NULL == table->tab[ctl->DP])
+			return -ENOMEM;
+		memset(table->tab[ctl->DP], 0, (sizeof(struct gred_sched_data)));
+	}
+	q= table->tab[ctl->DP]; 
+
+	if (table->grio) {
+		if (ctl->prio <=0) {
+			if (table->def && table->tab[table->def]) {
+				DPRINTK("\nGRED: DP %u does not have a prio"
+					"setting default to %d\n",ctl->DP,
+					table->tab[table->def]->prio);
+				q->prio=table->tab[table->def]->prio;
+			} else { 
+				DPRINTK("\nGRED: DP %u does not have a prio"
+					" setting default to 8\n",ctl->DP);
+				q->prio=8;
+			}
+		} else {
+			q->prio=ctl->prio;
 		}
-		opt->set.qstats = &sch->qstats;
+	} else {
+		q->prio=8;
 	}
 
-	dev->netdev_ops->ndo_setup_tc(dev, TC_SETUP_QDISC_GRED, opt);
-}
 
-static int gred_offload_dump_stats(struct Qdisc *sch)
-{
-	struct gred_sched *table = qdisc_priv(sch);
-	struct tc_gred_qopt_offload *hw_stats;
-	u64 bytes = 0, packets = 0;
-	unsigned int i;
-	int ret;
+	q->DP=ctl->DP;
+	q->Wlog = ctl->Wlog;
+	q->Plog = ctl->Plog;
+	q->limit = ctl->limit;
+	q->Scell_log = ctl->Scell_log;
+	q->Rmask = ctl->Plog < 32 ? ((1<<ctl->Plog) - 1) : ~0UL;
+	q->Scell_max = (255<<q->Scell_log);
+	q->qth_min = ctl->qth_min<<ctl->Wlog;
+	q->qth_max = ctl->qth_max<<ctl->Wlog;
+	q->qave=0;
+	q->backlog=0;
+	q->qcount = -1;
+	q->other=0;
+	q->forced=0;
+	q->pdrop=0;
+	q->early=0;
 
-	hw_stats = kzalloc(sizeof(*hw_stats), GFP_KERNEL);
-	if (!hw_stats)
-		return -ENOMEM;
+	PSCHED_SET_PASTPERFECT(q->qidlestart);
+	memcpy(q->Stab, RTA_DATA(tb[TCA_GRED_STAB-1]), 256);
 
-	hw_stats->command = TC_GRED_STATS;
-	hw_stats->handle = sch->handle;
-	hw_stats->parent = sch->parent;
-
-	for (i = 0; i < MAX_DPs; i++) {
-		gnet_stats_basic_sync_init(&hw_stats->stats.bstats[i]);
-		if (table->tab[i])
-			hw_stats->stats.xstats[i] = &table->tab[i]->stats;
+	if ( table->initd && table->grio) {
+	/* this looks ugly but it's not in the fast path */
+		for (i=0;i<table->DPs;i++) {
+			if ((!table->tab[i]) || (i==q->DP) )    
+				continue; 
+			if (table->tab[i]->prio == q->prio ){
+				/* WRED mode detected */
+				table->eqp=1;
+				break;
+			}
+		}
 	}
 
-	ret = qdisc_offload_dump_helper(sch, TC_SETUP_QDISC_GRED, hw_stats);
-	/* Even if driver returns failure adjust the stats - in case offload
-	 * ended but driver still wants to adjust the values.
-	 */
-	for (i = 0; i < MAX_DPs; i++) {
-		if (!table->tab[i])
-			continue;
-		table->tab[i]->packetsin += u64_stats_read(&hw_stats->stats.bstats[i].packets);
-		table->tab[i]->bytesin += u64_stats_read(&hw_stats->stats.bstats[i].bytes);
-		table->tab[i]->backlog += hw_stats->stats.qstats[i].backlog;
+	if (!table->initd) {
+		table->initd=1;
+		/* 
+        	the first entry also goes into the default until
+        	over-written 
+		*/
 
-		bytes += u64_stats_read(&hw_stats->stats.bstats[i].bytes);
-		packets += u64_stats_read(&hw_stats->stats.bstats[i].packets);
-		sch->qstats.qlen += hw_stats->stats.qstats[i].qlen;
-		sch->qstats.backlog += hw_stats->stats.qstats[i].backlog;
-		sch->qstats.drops += hw_stats->stats.qstats[i].drops;
-		sch->qstats.requeues += hw_stats->stats.qstats[i].requeues;
-		sch->qstats.overlimits += hw_stats->stats.qstats[i].overlimits;
+		if (table->tab[table->def] == NULL) {
+			table->tab[table->def]=
+				kmalloc(sizeof(struct gred_sched_data), GFP_KERNEL);
+			if (NULL == table->tab[table->def])
+				return -ENOMEM;
+
+			memset(table->tab[table->def], 0,
+			       (sizeof(struct gred_sched_data)));
+		}
+		q= table->tab[table->def]; 
+		q->DP=table->def;
+		q->Wlog = ctl->Wlog;
+		q->Plog = ctl->Plog;
+		q->limit = ctl->limit;
+		q->Scell_log = ctl->Scell_log;
+		q->Rmask = ctl->Plog < 32 ? ((1<<ctl->Plog) - 1) : ~0UL;
+		q->Scell_max = (255<<q->Scell_log);
+		q->qth_min = ctl->qth_min<<ctl->Wlog;
+		q->qth_max = ctl->qth_max<<ctl->Wlog;
+
+		if (table->grio)
+			q->prio=table->tab[ctl->DP]->prio;
+		else
+			q->prio=8;
+
+		q->qcount = -1;
+		PSCHED_SET_PASTPERFECT(q->qidlestart);
+		memcpy(q->Stab, RTA_DATA(tb[TCA_GRED_STAB-1]), 256);
 	}
-	_bstats_update(&sch->bstats, bytes, packets);
+	return 0;
 
-	kfree(hw_stats);
-	return ret;
 }
 
-static inline void gred_destroy_vq(struct gred_sched_data *q)
-{
-	kfree(q);
-}
-
-static int gred_change_table_def(struct Qdisc *sch, struct nlattr *dps,
-				 struct netlink_ext_ack *extack)
+static int gred_init(struct Qdisc *sch, struct rtattr *opt)
 {
 	struct gred_sched *table = qdisc_priv(sch);
 	struct tc_gred_sopt *sopt;
-	bool red_flags_changed;
-	int i;
+	struct rtattr *tb[TCA_GRED_STAB];
+	struct rtattr *tb2[TCA_GRED_DPS];
 
-	if (!dps)
+	if (opt == NULL || rtattr_parse_nested(tb, TCA_GRED_STAB, opt))
 		return -EINVAL;
 
-	sopt = nla_data(dps);
+	if (tb[TCA_GRED_PARMS-1] == 0 && tb[TCA_GRED_STAB-1] == 0) {
+		rtattr_parse_nested(tb2, TCA_GRED_DPS, opt);
 
-	if (sopt->DPs > MAX_DPs) {
-		NL_SET_ERR_MSG_MOD(extack, "number of virtual queues too high");
-		return -EINVAL;
-	}
-	if (sopt->DPs == 0) {
-		NL_SET_ERR_MSG_MOD(extack,
-				   "number of virtual queues can't be 0");
-		return -EINVAL;
-	}
-	if (sopt->def_DP >= sopt->DPs) {
-		NL_SET_ERR_MSG_MOD(extack, "default virtual queue above virtual queue count");
-		return -EINVAL;
-	}
-	if (sopt->flags && gred_per_vq_red_flags_used(table)) {
-		NL_SET_ERR_MSG_MOD(extack, "can't set per-Qdisc RED flags when per-virtual queue flags are used");
-		return -EINVAL;
-	}
-
-	sch_tree_lock(sch);
-	table->DPs = sopt->DPs;
-	table->def = sopt->def_DP;
-	red_flags_changed = table->red_flags != sopt->flags;
-	table->red_flags = sopt->flags;
-
-	/*
-	 * Every entry point to GRED is synchronized with the above code
-	 * and the DP is checked against DPs, i.e. shadowed VQs can no
-	 * longer be found so we can unlock right here.
-	 */
-	sch_tree_unlock(sch);
-
-	if (sopt->grio) {
-		gred_enable_rio_mode(table);
-		gred_disable_wred_mode(table);
-		if (gred_wred_mode_check(sch))
-			gred_enable_wred_mode(table);
-	} else {
-		gred_disable_rio_mode(table);
-		gred_disable_wred_mode(table);
-	}
-
-	if (red_flags_changed)
-		for (i = 0; i < table->DPs; i++)
-			if (table->tab[i])
-				table->tab[i]->red_flags =
-					table->red_flags & GRED_VQ_RED_FLAGS;
-
-	for (i = table->DPs; i < MAX_DPs; i++) {
-		if (table->tab[i]) {
-			pr_warn("GRED: Warning: Destroying shadowed VQ 0x%x\n",
-				i);
-			gred_destroy_vq(table->tab[i]);
-			table->tab[i] = NULL;
-		}
-	}
-
-	gred_offload(sch, TC_GRED_REPLACE);
-	return 0;
-}
-
-static inline int gred_change_vq(struct Qdisc *sch, int dp,
-				 struct tc_gred_qopt *ctl, int prio,
-				 u8 *stab, u32 max_P,
-				 struct gred_sched_data **prealloc,
-				 struct netlink_ext_ack *extack)
-{
-	struct gred_sched *table = qdisc_priv(sch);
-	struct gred_sched_data *q = table->tab[dp];
-
-	if (!red_check_params(ctl->qth_min, ctl->qth_max, ctl->Wlog, ctl->Scell_log, stab)) {
-		NL_SET_ERR_MSG_MOD(extack, "invalid RED parameters");
-		return -EINVAL;
-	}
-
-	if (!q) {
-		table->tab[dp] = q = *prealloc;
-		*prealloc = NULL;
-		if (!q)
-			return -ENOMEM;
-		q->red_flags = table->red_flags & GRED_VQ_RED_FLAGS;
-	}
-
-	q->DP = dp;
-	q->prio = prio;
-	if (ctl->limit > sch->limit)
-		q->limit = sch->limit;
-	else
-		q->limit = ctl->limit;
-
-	if (q->backlog == 0)
-		red_end_of_idle_period(&q->vars);
-
-	red_set_parms(&q->parms,
-		      ctl->qth_min, ctl->qth_max, ctl->Wlog, ctl->Plog,
-		      ctl->Scell_log, stab, max_P);
-	red_set_vars(&q->vars);
-	return 0;
-}
-
-static const struct nla_policy gred_vq_policy[TCA_GRED_VQ_MAX + 1] = {
-	[TCA_GRED_VQ_DP]	= { .type = NLA_U32 },
-	[TCA_GRED_VQ_FLAGS]	= { .type = NLA_U32 },
-};
-
-static const struct nla_policy gred_vqe_policy[TCA_GRED_VQ_ENTRY_MAX + 1] = {
-	[TCA_GRED_VQ_ENTRY]	= { .type = NLA_NESTED },
-};
-
-static const struct nla_policy gred_policy[TCA_GRED_MAX + 1] = {
-	[TCA_GRED_PARMS]	= { .len = sizeof(struct tc_gred_qopt) },
-	[TCA_GRED_STAB]		= { .len = 256 },
-	[TCA_GRED_DPS]		= { .len = sizeof(struct tc_gred_sopt) },
-	[TCA_GRED_MAX_P]	= { .type = NLA_U32 },
-	[TCA_GRED_LIMIT]	= { .type = NLA_U32 },
-	[TCA_GRED_VQ_LIST]	= { .type = NLA_NESTED },
-};
-
-static void gred_vq_apply(struct gred_sched *table, const struct nlattr *entry)
-{
-	struct nlattr *tb[TCA_GRED_VQ_MAX + 1];
-	u32 dp;
-
-	nla_parse_nested_deprecated(tb, TCA_GRED_VQ_MAX, entry,
-				    gred_vq_policy, NULL);
-
-	dp = nla_get_u32(tb[TCA_GRED_VQ_DP]);
-
-	if (tb[TCA_GRED_VQ_FLAGS])
-		table->tab[dp]->red_flags = nla_get_u32(tb[TCA_GRED_VQ_FLAGS]);
-}
-
-static void gred_vqs_apply(struct gred_sched *table, struct nlattr *vqs)
-{
-	const struct nlattr *attr;
-	int rem;
-
-	nla_for_each_nested(attr, vqs, rem) {
-		switch (nla_type(attr)) {
-		case TCA_GRED_VQ_ENTRY:
-			gred_vq_apply(table, attr);
-			break;
-		}
-	}
-}
-
-static int gred_vq_validate(struct gred_sched *table, u32 cdp,
-			    const struct nlattr *entry,
-			    struct netlink_ext_ack *extack)
-{
-	struct nlattr *tb[TCA_GRED_VQ_MAX + 1];
-	int err;
-	u32 dp;
-
-	err = nla_parse_nested_deprecated(tb, TCA_GRED_VQ_MAX, entry,
-					  gred_vq_policy, extack);
-	if (err < 0)
-		return err;
-
-	if (!tb[TCA_GRED_VQ_DP]) {
-		NL_SET_ERR_MSG_MOD(extack, "Virtual queue with no index specified");
-		return -EINVAL;
-	}
-	dp = nla_get_u32(tb[TCA_GRED_VQ_DP]);
-	if (dp >= table->DPs) {
-		NL_SET_ERR_MSG_MOD(extack, "Virtual queue with index out of bounds");
-		return -EINVAL;
-	}
-	if (dp != cdp && !table->tab[dp]) {
-		NL_SET_ERR_MSG_MOD(extack, "Virtual queue not yet instantiated");
-		return -EINVAL;
-	}
-
-	if (tb[TCA_GRED_VQ_FLAGS]) {
-		u32 red_flags = nla_get_u32(tb[TCA_GRED_VQ_FLAGS]);
-
-		if (table->red_flags && table->red_flags != red_flags) {
-			NL_SET_ERR_MSG_MOD(extack, "can't change per-virtual queue RED flags when per-Qdisc flags are used");
+	    if (tb2[TCA_GRED_DPS-1] == 0) 
 			return -EINVAL;
-		}
-		if (red_flags & ~GRED_VQ_RED_FLAGS) {
-			NL_SET_ERR_MSG_MOD(extack,
-					   "invalid RED flags specified");
-			return -EINVAL;
-		}
+
+		sopt = RTA_DATA(tb2[TCA_GRED_DPS-1]);
+		table->DPs=sopt->DPs;   
+		table->def=sopt->def_DP; 
+		table->grio=sopt->grio; 
+		table->initd=0;
+		return 0;
 	}
 
-	return 0;
-}
-
-static int gred_vqs_validate(struct gred_sched *table, u32 cdp,
-			     struct nlattr *vqs, struct netlink_ext_ack *extack)
-{
-	const struct nlattr *attr;
-	int rem, err;
-
-	err = nla_validate_nested_deprecated(vqs, TCA_GRED_VQ_ENTRY_MAX,
-					     gred_vqe_policy, extack);
-	if (err < 0)
-		return err;
-
-	nla_for_each_nested(attr, vqs, rem) {
-		switch (nla_type(attr)) {
-		case TCA_GRED_VQ_ENTRY:
-			err = gred_vq_validate(table, cdp, attr, extack);
-			if (err)
-				return err;
-			break;
-		default:
-			NL_SET_ERR_MSG_MOD(extack, "GRED_VQ_LIST can contain only entry attributes");
-			return -EINVAL;
-		}
-	}
-
-	if (rem > 0) {
-		NL_SET_ERR_MSG_MOD(extack, "Trailing data after parsing virtual queue list");
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static int gred_change(struct Qdisc *sch, struct nlattr *opt,
-		       struct netlink_ext_ack *extack)
-{
-	struct gred_sched *table = qdisc_priv(sch);
-	struct tc_gred_qopt *ctl;
-	struct nlattr *tb[TCA_GRED_MAX + 1];
-	int err, prio = GRED_DEF_PRIO;
-	u8 *stab;
-	u32 max_P;
-	struct gred_sched_data *prealloc;
-
-	if (opt == NULL)
-		return -EINVAL;
-
-	err = nla_parse_nested_deprecated(tb, TCA_GRED_MAX, opt, gred_policy,
-					  extack);
-	if (err < 0)
-		return err;
-
-	if (tb[TCA_GRED_PARMS] == NULL && tb[TCA_GRED_STAB] == NULL) {
-		if (tb[TCA_GRED_LIMIT] != NULL)
-			sch->limit = nla_get_u32(tb[TCA_GRED_LIMIT]);
-		return gred_change_table_def(sch, tb[TCA_GRED_DPS], extack);
-	}
-
-	if (tb[TCA_GRED_PARMS] == NULL ||
-	    tb[TCA_GRED_STAB] == NULL ||
-	    tb[TCA_GRED_LIMIT] != NULL) {
-		NL_SET_ERR_MSG_MOD(extack, "can't configure Qdisc and virtual queue at the same time");
-		return -EINVAL;
-	}
-
-	max_P = tb[TCA_GRED_MAX_P] ? nla_get_u32(tb[TCA_GRED_MAX_P]) : 0;
-
-	ctl = nla_data(tb[TCA_GRED_PARMS]);
-	stab = nla_data(tb[TCA_GRED_STAB]);
-
-	if (ctl->DP >= table->DPs) {
-		NL_SET_ERR_MSG_MOD(extack, "virtual queue index above virtual queue count");
-		return -EINVAL;
-	}
-
-	if (tb[TCA_GRED_VQ_LIST]) {
-		err = gred_vqs_validate(table, ctl->DP, tb[TCA_GRED_VQ_LIST],
-					extack);
-		if (err)
-			return err;
-	}
-
-	if (gred_rio_mode(table)) {
-		if (ctl->prio == 0) {
-			int def_prio = GRED_DEF_PRIO;
-
-			if (table->tab[table->def])
-				def_prio = table->tab[table->def]->prio;
-
-			printk(KERN_DEBUG "GRED: DP %u does not have a prio "
-			       "setting default to %d\n", ctl->DP, def_prio);
-
-			prio = def_prio;
-		} else
-			prio = ctl->prio;
-	}
-
-	prealloc = kzalloc(sizeof(*prealloc), GFP_KERNEL);
-	sch_tree_lock(sch);
-
-	err = gred_change_vq(sch, ctl->DP, ctl, prio, stab, max_P, &prealloc,
-			     extack);
-	if (err < 0)
-		goto err_unlock_free;
-
-	if (tb[TCA_GRED_VQ_LIST])
-		gred_vqs_apply(table, tb[TCA_GRED_VQ_LIST]);
-
-	if (gred_rio_mode(table)) {
-		gred_disable_wred_mode(table);
-		if (gred_wred_mode_check(sch))
-			gred_enable_wred_mode(table);
-	}
-
-	sch_tree_unlock(sch);
-	kfree(prealloc);
-
-	gred_offload(sch, TC_GRED_REPLACE);
-	return 0;
-
-err_unlock_free:
-	sch_tree_unlock(sch);
-	kfree(prealloc);
-	return err;
-}
-
-static int gred_init(struct Qdisc *sch, struct nlattr *opt,
-		     struct netlink_ext_ack *extack)
-{
-	struct gred_sched *table = qdisc_priv(sch);
-	struct nlattr *tb[TCA_GRED_MAX + 1];
-	int err;
-
-	if (!opt)
-		return -EINVAL;
-
-	err = nla_parse_nested_deprecated(tb, TCA_GRED_MAX, opt, gred_policy,
-					  extack);
-	if (err < 0)
-		return err;
-
-	if (tb[TCA_GRED_PARMS] || tb[TCA_GRED_STAB]) {
-		NL_SET_ERR_MSG_MOD(extack,
-				   "virtual queue configuration can't be specified at initialization time");
-		return -EINVAL;
-	}
-
-	if (tb[TCA_GRED_LIMIT])
-		sch->limit = nla_get_u32(tb[TCA_GRED_LIMIT]);
-	else
-		sch->limit = qdisc_dev(sch)->tx_queue_len
-		             * psched_mtu(qdisc_dev(sch));
-
-	if (qdisc_dev(sch)->netdev_ops->ndo_setup_tc) {
-		table->opt = kzalloc(sizeof(*table->opt), GFP_KERNEL);
-		if (!table->opt)
-			return -ENOMEM;
-	}
-
-	return gred_change_table_def(sch, tb[TCA_GRED_DPS], extack);
+	DPRINTK("\n GRED_INIT error!\n");
+	return -EINVAL;
 }
 
 static int gred_dump(struct Qdisc *sch, struct sk_buff *skb)
 {
+	unsigned long qave;
+	struct rtattr *rta;
+	struct tc_gred_qopt *opt = NULL ;
+	struct tc_gred_qopt *dst;
 	struct gred_sched *table = qdisc_priv(sch);
-	struct nlattr *parms, *vqs, *opts = NULL;
+	struct gred_sched_data *q;
 	int i;
-	u32 max_p[MAX_DPs];
-	struct tc_gred_sopt sopt = {
-		.DPs	= table->DPs,
-		.def_DP	= table->def,
-		.grio	= gred_rio_mode(table),
-		.flags	= table->red_flags,
-	};
+	unsigned char	 *b = skb->tail;
 
-	if (gred_offload_dump_stats(sch))
-		goto nla_put_failure;
+	rta = (struct rtattr*)b;
+	RTA_PUT(skb, TCA_OPTIONS, 0, NULL);
 
-	opts = nla_nest_start_noflag(skb, TCA_OPTIONS);
-	if (opts == NULL)
-		goto nla_put_failure;
-	if (nla_put(skb, TCA_GRED_DPS, sizeof(sopt), &sopt))
-		goto nla_put_failure;
+	opt=kmalloc(sizeof(struct tc_gred_qopt)*MAX_DPs, GFP_KERNEL);
 
-	for (i = 0; i < MAX_DPs; i++) {
-		struct gred_sched_data *q = table->tab[i];
-
-		max_p[i] = q ? q->parms.max_P : 0;
+	if (opt  == NULL) {
+		DPRINTK("gred_dump:failed to malloc for %Zd\n",
+		    sizeof(struct tc_gred_qopt)*MAX_DPs);
+		goto rtattr_failure;
 	}
-	if (nla_put(skb, TCA_GRED_MAX_P, sizeof(max_p), max_p))
-		goto nla_put_failure;
 
-	if (nla_put_u32(skb, TCA_GRED_LIMIT, sch->limit))
-		goto nla_put_failure;
+	memset(opt, 0, (sizeof(struct tc_gred_qopt))*table->DPs);
 
-	/* Old style all-in-one dump of VQs */
-	parms = nla_nest_start_noflag(skb, TCA_GRED_PARMS);
-	if (parms == NULL)
-		goto nla_put_failure;
+	if (!table->initd) {
+		DPRINTK("NO GRED Queues setup!\n");
+	}
 
-	for (i = 0; i < MAX_DPs; i++) {
-		struct gred_sched_data *q = table->tab[i];
-		struct tc_gred_qopt opt;
-		unsigned long qavg;
-
-		memset(&opt, 0, sizeof(opt));
+	for (i=0;i<MAX_DPs;i++) {
+		dst= &opt[i]; 
+		q= table->tab[i]; 
 
 		if (!q) {
 			/* hack -- fix at some point with proper message
 			   This is how we indicate to tc that there is no VQ
 			   at this DP */
 
-			opt.DP = MAX_DPs + i;
-			goto append_opt;
+			dst->DP=MAX_DPs+i;
+			continue;
 		}
 
-		opt.limit	= q->limit;
-		opt.DP		= q->DP;
-		opt.backlog	= gred_backlog(table, q, sch);
-		opt.prio	= q->prio;
-		opt.qth_min	= q->parms.qth_min >> q->parms.Wlog;
-		opt.qth_max	= q->parms.qth_max >> q->parms.Wlog;
-		opt.Wlog	= q->parms.Wlog;
-		opt.Plog	= q->parms.Plog;
-		opt.Scell_log	= q->parms.Scell_log;
-		opt.other	= q->stats.other;
-		opt.early	= q->stats.prob_drop;
-		opt.forced	= q->stats.forced_drop;
-		opt.pdrop	= q->stats.pdrop;
-		opt.packets	= q->packetsin;
-		opt.bytesin	= q->bytesin;
+		dst->limit=q->limit;
+		dst->qth_min=q->qth_min>>q->Wlog;
+		dst->qth_max=q->qth_max>>q->Wlog;
+		dst->DP=q->DP;
+		dst->backlog=q->backlog;
+		if (q->qave) {
+			if (table->eqp && table->grio) {
+				q->qidlestart=table->tab[table->def]->qidlestart;
+				q->qave=table->tab[table->def]->qave;
+			}
+			if (!PSCHED_IS_PASTPERFECT(q->qidlestart)) {
+				long idle;
+				psched_time_t now;
+				PSCHED_GET_TIME(now);
+				idle = PSCHED_TDIFF_SAFE(now, q->qidlestart, q->Scell_max);
+				qave  = q->qave >> q->Stab[(idle>>q->Scell_log)&0xFF];
+				dst->qave = qave >> q->Wlog;
 
-		if (gred_wred_mode(table))
-			gred_load_wred_set(table, q);
+			} else {
+				dst->qave = q->qave >> q->Wlog;
+			}
+		} else {
+			dst->qave = 0;
+		}
+		
 
-		qavg = red_calc_qavg(&q->parms, &q->vars,
-				     q->vars.qavg >> q->parms.Wlog);
-		opt.qave = qavg >> q->parms.Wlog;
-
-append_opt:
-		if (nla_append(skb, sizeof(opt), &opt) < 0)
-			goto nla_put_failure;
+		dst->Wlog = q->Wlog;
+		dst->Plog = q->Plog;
+		dst->Scell_log = q->Scell_log;
+		dst->other = q->other;
+		dst->forced = q->forced;
+		dst->early = q->early;
+		dst->pdrop = q->pdrop;
+		dst->prio = q->prio;
+		dst->packets=q->packetsin;
+		dst->bytesin=q->bytesin;
 	}
 
-	nla_nest_end(skb, parms);
+	RTA_PUT(skb, TCA_GRED_PARMS, sizeof(struct tc_gred_qopt)*MAX_DPs, opt);
+	rta->rta_len = skb->tail - b;
 
-	/* Dump the VQs again, in more structured way */
-	vqs = nla_nest_start_noflag(skb, TCA_GRED_VQ_LIST);
-	if (!vqs)
-		goto nla_put_failure;
+	kfree(opt);
+	return skb->len;
 
-	for (i = 0; i < MAX_DPs; i++) {
-		struct gred_sched_data *q = table->tab[i];
-		struct nlattr *vq;
+rtattr_failure:
+	if (opt)
+		kfree(opt);
+	DPRINTK("gred_dump: FAILURE!!!!\n");
 
-		if (!q)
-			continue;
-
-		vq = nla_nest_start_noflag(skb, TCA_GRED_VQ_ENTRY);
-		if (!vq)
-			goto nla_put_failure;
-
-		if (nla_put_u32(skb, TCA_GRED_VQ_DP, q->DP))
-			goto nla_put_failure;
-
-		if (nla_put_u32(skb, TCA_GRED_VQ_FLAGS, q->red_flags))
-			goto nla_put_failure;
-
-		/* Stats */
-		if (nla_put_u64_64bit(skb, TCA_GRED_VQ_STAT_BYTES, q->bytesin,
-				      TCA_GRED_VQ_PAD))
-			goto nla_put_failure;
-		if (nla_put_u32(skb, TCA_GRED_VQ_STAT_PACKETS, q->packetsin))
-			goto nla_put_failure;
-		if (nla_put_u32(skb, TCA_GRED_VQ_STAT_BACKLOG,
-				gred_backlog(table, q, sch)))
-			goto nla_put_failure;
-		if (nla_put_u32(skb, TCA_GRED_VQ_STAT_PROB_DROP,
-				q->stats.prob_drop))
-			goto nla_put_failure;
-		if (nla_put_u32(skb, TCA_GRED_VQ_STAT_PROB_MARK,
-				q->stats.prob_mark))
-			goto nla_put_failure;
-		if (nla_put_u32(skb, TCA_GRED_VQ_STAT_FORCED_DROP,
-				q->stats.forced_drop))
-			goto nla_put_failure;
-		if (nla_put_u32(skb, TCA_GRED_VQ_STAT_FORCED_MARK,
-				q->stats.forced_mark))
-			goto nla_put_failure;
-		if (nla_put_u32(skb, TCA_GRED_VQ_STAT_PDROP, q->stats.pdrop))
-			goto nla_put_failure;
-		if (nla_put_u32(skb, TCA_GRED_VQ_STAT_OTHER, q->stats.other))
-			goto nla_put_failure;
-
-		nla_nest_end(skb, vq);
-	}
-	nla_nest_end(skb, vqs);
-
-	return nla_nest_end(skb, opts);
-
-nla_put_failure:
-	nla_nest_cancel(skb, opts);
-	return -EMSGSIZE;
+/* also free the opt struct here */
+	skb_trim(skb, b - skb->data);
+	return -1;
 }
 
 static void gred_destroy(struct Qdisc *sch)
@@ -914,20 +594,21 @@ static void gred_destroy(struct Qdisc *sch)
 	struct gred_sched *table = qdisc_priv(sch);
 	int i;
 
-	for (i = 0; i < table->DPs; i++) {
+	for (i = 0;i < table->DPs; i++) {
 		if (table->tab[i])
-			gred_destroy_vq(table->tab[i]);
+			kfree(table->tab[i]);
 	}
-	gred_offload(sch, TC_GRED_DESTROY);
-	kfree(table->opt);
 }
 
-static struct Qdisc_ops gred_qdisc_ops __read_mostly = {
+static struct Qdisc_ops gred_qdisc_ops = {
+	.next		=	NULL,
+	.cl_ops		=	NULL,
 	.id		=	"gred",
 	.priv_size	=	sizeof(struct gred_sched),
 	.enqueue	=	gred_enqueue,
 	.dequeue	=	gred_dequeue,
-	.peek		=	qdisc_peek_head,
+	.requeue	=	gred_requeue,
+	.drop		=	gred_drop,
 	.init		=	gred_init,
 	.reset		=	gred_reset,
 	.destroy	=	gred_destroy,
@@ -940,13 +621,10 @@ static int __init gred_module_init(void)
 {
 	return register_qdisc(&gred_qdisc_ops);
 }
-
-static void __exit gred_module_exit(void)
+static void __exit gred_module_exit(void) 
 {
 	unregister_qdisc(&gred_qdisc_ops);
 }
-
 module_init(gred_module_init)
 module_exit(gred_module_exit)
-
 MODULE_LICENSE("GPL");

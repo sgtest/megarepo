@@ -1,15 +1,27 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * namei.c - NTFS kernel directory inode operations. Part of the Linux-NTFS
  *	     project.
  *
- * Copyright (c) 2001-2006 Anton Altaparmakov
+ * Copyright (c) 2001-2004 Anton Altaparmakov
+ *
+ * This program/include file is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License as published
+ * by the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program/include file is distributed in the hope that it will be
+ * useful, but WITHOUT ANY WARRANTY; without even the implied warranty
+ * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program (in the main directory of the Linux-NTFS
+ * distribution in the file COPYING); if not, write to the Free Software
+ * Foundation,Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
 #include <linux/dcache.h>
-#include <linux/exportfs.h>
 #include <linux/security.h>
-#include <linux/slab.h>
 
 #include "attrib.h"
 #include "debug.h"
@@ -21,7 +33,7 @@
  * ntfs_lookup - find the inode represented by a dentry in a directory inode
  * @dir_ino:	directory inode in which to look for the inode
  * @dent:	dentry representing the inode to look for
- * @flags:	lookup flags
+ * @nd:		lookup nameidata
  *
  * In short, ntfs_lookup() looks for the inode represented by the dentry @dent
  * in the directory inode @dir_ino and if found attaches the inode to the
@@ -84,10 +96,10 @@
  *    name. We then convert the name to the current NLS code page, and proceed
  *    searching for a dentry with this name, etc, as in case 2), above.
  *
- * Locking: Caller must hold i_mutex on the directory.
+ * Locking: Caller must hold i_sem on the directory.
  */
 static struct dentry *ntfs_lookup(struct inode *dir_ino, struct dentry *dent,
-		unsigned int flags)
+		struct nameidata *nd)
 {
 	ntfs_volume *vol = NTFS_SB(dir_ino->i_sb);
 	struct inode *dent_inode;
@@ -97,15 +109,13 @@ static struct dentry *ntfs_lookup(struct inode *dir_ino, struct dentry *dent,
 	unsigned long dent_ino;
 	int uname_len;
 
-	ntfs_debug("Looking up %pd in directory inode 0x%lx.",
-			dent, dir_ino->i_ino);
+	ntfs_debug("Looking up %s in directory inode 0x%lx.",
+			dent->d_name.name, dir_ino->i_ino);
 	/* Convert the name of the dentry to Unicode. */
 	uname_len = ntfs_nlstoucs(vol, dent->d_name.name, dent->d_name.len,
 			&uname);
 	if (uname_len < 0) {
-		if (uname_len != -ENAMETOOLONG)
-			ntfs_error(vol->sb, "Failed to convert name to "
-					"Unicode.");
+		ntfs_error(vol->sb, "Failed to convert name to Unicode.");
 		return ERR_PTR(uname_len);
 	}
 	mref = ntfs_lookup_inode_by_name(NTFS_I(dir_ino), uname, uname_len,
@@ -115,7 +125,7 @@ static struct dentry *ntfs_lookup(struct inode *dir_ino, struct dentry *dent,
 		dent_ino = MREF(mref);
 		ntfs_debug("Found inode 0x%lx. Calling ntfs_iget.", dent_ino);
 		dent_inode = ntfs_iget(vol->sb, dent_ino);
-		if (!IS_ERR(dent_inode)) {
+		if (likely(!IS_ERR(dent_inode))) {
 			/* Consistency check. */
 			if (is_bad_inode(dent_inode) || MSEQNO(mref) ==
 					NTFS_I(dent_inode)->seq_no ||
@@ -143,11 +153,12 @@ static struct dentry *ntfs_lookup(struct inode *dir_ino, struct dentry *dent,
 			ntfs_error(vol->sb, "ntfs_iget(0x%lx) failed with "
 					"error code %li.", dent_ino,
 					PTR_ERR(dent_inode));
-		kfree(name);
+		if (name)
+			kfree(name);
 		/* Return the error code. */
-		return ERR_CAST(dent_inode);
+		return (struct dentry *)dent_inode;
 	}
-	/* It is guaranteed that @name is no longer allocated at this point. */
+	/* It is guaranteed that name is no longer allocated at this point. */
 	if (MREF_ERR(mref) == -ENOENT) {
 		ntfs_debug("Entry was not found, adding negative dentry.");
 		/* The dcache will handle negative entries. */
@@ -158,9 +169,11 @@ static struct dentry *ntfs_lookup(struct inode *dir_ino, struct dentry *dent,
 	ntfs_error(vol->sb, "ntfs_lookup_ino_by_name() failed with error "
 			"code %i.", -MREF_ERR(mref));
 	return ERR_PTR(MREF_ERR(mref));
+
 	// TODO: Consider moving this lot to a separate function! (AIA)
 handle_name:
    {
+	struct dentry *real_dent, *new_dent;
 	MFT_RECORD *m;
 	ntfs_attr_search_ctx *ctx;
 	ntfs_inode *ni = NTFS_I(dent_inode);
@@ -239,11 +252,95 @@ handle_name:
 		err = (signed)nls_name.len;
 		goto err_out;
 	}
-	nls_name.hash = full_name_hash(dent, nls_name.name, nls_name.len);
+	nls_name.hash = full_name_hash(nls_name.name, nls_name.len);
 
-	dent = d_add_ci(dent, dent_inode, &nls_name);
+	/*
+	 * Note: No need for dent->d_lock lock as i_sem is held on the
+	 * parent inode.
+	 */
+
+	/* Does a dentry matching the nls_name exist already? */
+	real_dent = d_lookup(dent->d_parent, &nls_name);
+	/* If not, create it now. */
+	if (!real_dent) {
+		real_dent = d_alloc(dent->d_parent, &nls_name);
+		kfree(nls_name.name);
+		if (!real_dent) {
+			err = -ENOMEM;
+			goto err_out;
+		}
+		new_dent = d_splice_alias(dent_inode, real_dent);
+		if (new_dent)
+			dput(real_dent);
+		else
+			new_dent = real_dent;
+		ntfs_debug("Done.  (Created new dentry.)");
+		return new_dent;
+	}
 	kfree(nls_name.name);
-	return dent;
+	/* Matching dentry exists, check if it is negative. */
+	if (real_dent->d_inode) {
+		if (unlikely(real_dent->d_inode != dent_inode)) {
+			/* This can happen because bad inodes are unhashed. */
+			BUG_ON(!is_bad_inode(dent_inode));
+			BUG_ON(!is_bad_inode(real_dent->d_inode));
+		}
+		/*
+		 * Already have the inode and the dentry attached, decrement
+		 * the reference count to balance the ntfs_iget() we did
+		 * earlier on.  We found the dentry using d_lookup() so it
+		 * cannot be disconnected and thus we do not need to worry
+		 * about any NFS/disconnectedness issues here.
+		 */
+		iput(dent_inode);
+		ntfs_debug("Done.  (Already had inode and dentry.)");
+		return real_dent;
+	}
+	/*
+	 * Negative dentry: instantiate it unless the inode is a directory and
+	 * has a 'disconnected' dentry (i.e. IS_ROOT and DCACHE_DISCONNECTED),
+	 * in which case d_move() that in place of the found dentry.
+	 */
+	if (!S_ISDIR(dent_inode->i_mode)) {
+		/* Not a directory; everything is easy. */
+		d_instantiate(real_dent, dent_inode);
+		ntfs_debug("Done.  (Already had negative file dentry.)");
+		return real_dent;
+	}
+	spin_lock(&dcache_lock);
+	if (list_empty(&dent_inode->i_dentry)) {
+		/*
+		 * Directory without a 'disconnected' dentry; we need to do
+		 * d_instantiate() by hand because it takes dcache_lock which
+		 * we already hold.
+		 */
+		list_add(&real_dent->d_alias, &dent_inode->i_dentry);
+		real_dent->d_inode = dent_inode;
+		spin_unlock(&dcache_lock);
+		security_d_instantiate(real_dent, dent_inode);
+		ntfs_debug("Done.  (Already had negative directory dentry.)");
+		return real_dent;
+	}
+	/*
+	 * Directory with a 'disconnected' dentry; get a reference to the
+	 * 'disconnected' dentry.
+	 */
+	new_dent = list_entry(dent_inode->i_dentry.next, struct dentry,
+			d_alias);
+	dget_locked(new_dent);
+	spin_unlock(&dcache_lock);
+	/* Do security vodoo. */
+	security_d_instantiate(real_dent, dent_inode);
+	/* Move new_dent in place of real_dent. */
+	d_move(new_dent, real_dent);
+	/* Balance the ntfs_iget() we did above. */
+	iput(dent_inode);
+	/* Throw away real_dent. */
+	dput(real_dent);
+	/* Use new_dent as the actual dentry. */
+	ntfs_debug("Done.  (Already had negative, disconnected directory "
+			"dentry.)");
+	return new_dent;
 
 eio_err_out:
 	ntfs_error(vol->sb, "Illegal file name attribute. Run chkdsk.");
@@ -262,7 +359,7 @@ err_out:
 /**
  * Inode operations for directories.
  */
-const struct inode_operations ntfs_dir_inode_ops = {
+struct inode_operations ntfs_dir_inode_ops = {
 	.lookup	= ntfs_lookup,	/* VFS: Lookup directory. */
 };
 
@@ -278,19 +375,21 @@ const struct inode_operations ntfs_dir_inode_ops = {
  * The code is based on the ext3 ->get_parent() implementation found in
  * fs/ext3/namei.c::ext3_get_parent().
  *
- * Note: ntfs_get_parent() is called with @d_inode(child_dent)->i_mutex down.
+ * Note: ntfs_get_parent() is called with @child_dent->d_inode->i_sem down.
  *
  * Return the dentry of the parent directory on success or the error code on
  * error (IS_ERR() is true).
  */
-static struct dentry *ntfs_get_parent(struct dentry *child_dent)
+struct dentry *ntfs_get_parent(struct dentry *child_dent)
 {
-	struct inode *vi = d_inode(child_dent);
+	struct inode *vi = child_dent->d_inode;
 	ntfs_inode *ni = NTFS_I(vi);
 	MFT_RECORD *mrec;
 	ntfs_attr_search_ctx *ctx;
 	ATTR_RECORD *attr;
 	FILE_NAME_ATTR *fn;
+	struct inode *parent_vi;
+	struct dentry *parent_dent;
 	unsigned long parent_ino;
 	int err;
 
@@ -298,7 +397,7 @@ static struct dentry *ntfs_get_parent(struct dentry *child_dent)
 	/* Get the mft record of the inode belonging to the child dentry. */
 	mrec = map_mft_record(ni);
 	if (IS_ERR(mrec))
-		return ERR_CAST(mrec);
+		return (struct dentry *)mrec;
 	/* Find the first file name attribute in the mft record. */
 	ctx = ntfs_attr_get_search_ctx(ni, mrec);
 	if (unlikely(!ctx)) {
@@ -330,62 +429,70 @@ try_next:
 	/* Release the search context and the mft record of the child. */
 	ntfs_attr_put_search_ctx(ctx);
 	unmap_mft_record(ni);
-
-	return d_obtain_alias(ntfs_iget(vi->i_sb, parent_ino));
-}
-
-static struct inode *ntfs_nfs_get_inode(struct super_block *sb,
-		u64 ino, u32 generation)
-{
-	struct inode *inode;
-
-	inode = ntfs_iget(sb, ino);
-	if (!IS_ERR(inode)) {
-		if (is_bad_inode(inode) || inode->i_generation != generation) {
-			iput(inode);
-			inode = ERR_PTR(-ESTALE);
-		}
+	/* Get the inode of the parent directory. */
+	parent_vi = ntfs_iget(vi->i_sb, parent_ino);
+	if (IS_ERR(parent_vi) || unlikely(is_bad_inode(parent_vi))) {
+		if (!IS_ERR(parent_vi))
+			iput(parent_vi);
+		ntfs_error(vi->i_sb, "Failed to get parent directory inode "
+				"0x%lx of child inode 0x%lx.", parent_ino,
+				vi->i_ino);
+		return ERR_PTR(-EACCES);
 	}
-
-	return inode;
-}
-
-static struct dentry *ntfs_fh_to_dentry(struct super_block *sb, struct fid *fid,
-		int fh_len, int fh_type)
-{
-	return generic_fh_to_dentry(sb, fid, fh_len, fh_type,
-				    ntfs_nfs_get_inode);
-}
-
-static struct dentry *ntfs_fh_to_parent(struct super_block *sb, struct fid *fid,
-		int fh_len, int fh_type)
-{
-	return generic_fh_to_parent(sb, fid, fh_len, fh_type,
-				    ntfs_nfs_get_inode);
+	/* Finally get a dentry for the parent directory and return it. */
+	parent_dent = d_alloc_anon(parent_vi);
+	if (unlikely(!parent_dent)) {
+		iput(parent_vi);
+		return ERR_PTR(-ENOMEM);
+	}
+	ntfs_debug("Done for inode 0x%lx.", vi->i_ino);
+	return parent_dent;
 }
 
 /**
- * Export operations allowing NFS exporting of mounted NTFS partitions.
+ * ntfs_get_dentry - find a dentry for the inode from a file handle sub-fragment
+ * @sb:		super block identifying the mounted ntfs volume
+ * @fh:		the file handle sub-fragment
  *
- * We use the default ->encode_fh() for now.  Note that they
- * use 32 bits to store the inode number which is an unsigned long so on 64-bit
- * architectures is usually 64 bits so it would all fail horribly on huge
- * volumes.  I guess we need to define our own encode and decode fh functions
- * that store 64-bit inode numbers at some point but for now we will ignore the
- * problem...
+ * Find a dentry for the inode given a file handle sub-fragment.  This function
+ * is called from fs/exportfs/expfs.c::find_exported_dentry() which in turn is
+ * called from the default ->decode_fh() which is export_decode_fh() in the
+ * same file.  The code is closely based on the default ->get_dentry() helper
+ * fs/exportfs/expfs.c::get_object().
  *
- * We also use the default ->get_name() helper (used by ->decode_fh() via
- * fs/exportfs/expfs.c::find_exported_dentry()) as that is completely fs
- * independent.
+ * The @fh contains two 32-bit unsigned values, the first one is the inode
+ * number and the second one is the inode generation.
  *
- * The default ->get_parent() just returns -EACCES so we have to provide our
- * own and the default ->get_dentry() is incompatible with NTFS due to not
- * allowing the inode number 0 which is used in NTFS for the system file $MFT
- * and due to using iget() whereas NTFS needs ntfs_iget().
+ * Return the dentry on success or the error code on error (IS_ERR() is true).
  */
-const struct export_operations ntfs_export_ops = {
-	.get_parent	= ntfs_get_parent,	/* Find the parent of a given
-						   directory. */
-	.fh_to_dentry	= ntfs_fh_to_dentry,
-	.fh_to_parent	= ntfs_fh_to_parent,
-};
+struct dentry *ntfs_get_dentry(struct super_block *sb, void *fh)
+{
+	struct inode *vi;
+	struct dentry *dent;
+	unsigned long ino = ((u32 *)fh)[0];
+	u32 gen = ((u32 *)fh)[1];
+
+	ntfs_debug("Entering for inode 0x%lx, generation 0x%x.", ino, gen);
+	vi = ntfs_iget(sb, ino);
+	if (IS_ERR(vi)) {
+		ntfs_error(sb, "Failed to get inode 0x%lx.", ino);
+		return (struct dentry *)vi;
+	}
+	if (unlikely(is_bad_inode(vi) || vi->i_generation != gen)) {
+		/* We didn't find the right inode. */
+		ntfs_error(sb, "Inode 0x%lx, bad count: %d %d or version 0x%x "
+				"0x%x.", vi->i_ino, vi->i_nlink,
+				atomic_read(&vi->i_count), vi->i_generation,
+				gen);
+		iput(vi);
+		return ERR_PTR(-ESTALE);
+	}
+	/* Now find a dentry.  If possible, get a well-connected one. */
+	dent = d_alloc_anon(vi);
+	if (unlikely(!dent)) {
+		iput(vi);
+		return ERR_PTR(-ENOMEM);
+	}
+	ntfs_debug("Done for inode 0x%lx, generation 0x%x.", ino, gen);
+	return dent;
+}

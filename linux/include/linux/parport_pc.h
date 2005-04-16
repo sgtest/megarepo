@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __LINUX_PARPORT_PC_H
 #define __LINUX_PARPORT_PC_H
 
@@ -39,6 +38,7 @@ struct parport_pc_private {
 	/* buffer suitable for DMA, if DMA enabled */
 	char *dma_buf;
 	dma_addr_t dma_handle;
+	struct pci_dev *dev;
 	struct list_head list;
 	struct parport *port;
 };
@@ -79,14 +79,14 @@ static __inline__ unsigned char parport_pc_read_data(struct parport *p)
 }
 
 #ifdef DEBUG_PARPORT
-static inline void dump_parport_state (char *str, struct parport *p)
+extern __inline__ void dump_parport_state (char *str, struct parport *p)
 {
 	/* here's hoping that reading these ports won't side-effect anything underneath */
 	unsigned char ecr = inb (ECONTROL (p));
 	unsigned char dcr = inb (CONTROL (p));
 	unsigned char dsr = inb (STATUS (p));
-	static const char *const ecr_modes[] = {"SPP", "PS2", "PPFIFO", "ECP", "xXx", "yYy", "TST", "CFG"};
-	const struct parport_pc_private *priv = p->physport->private_data;
+	static char *ecr_modes[] = {"SPP", "PS2", "PPFIFO", "ECP", "xXx", "yYy", "TST", "CFG"};
+	const struct parport_pc_private *priv = (parport_pc_private *)p->physport->private_data;
 	int i;
 
 	printk (KERN_DEBUG "*** parport state (%s): ecr=[%s", str, ecr_modes[(ecr & 0xe0) >> 5]);
@@ -229,11 +229,10 @@ extern void parport_pc_release_resources(struct parport *p);
 extern int parport_pc_claim_resources(struct parport *p);
 
 /* PCMCIA code will want to get us to look at a port.  Provide a mechanism. */
-extern struct parport *parport_pc_probe_port(unsigned long base,
-					     unsigned long base_hi,
-					     int irq, int dma,
-					     struct device *dev,
-					     int irqflags);
-extern void parport_pc_unregister_port(struct parport *p);
+extern struct parport *parport_pc_probe_port (unsigned long base,
+					      unsigned long base_hi,
+					      int irq, int dma,
+					      struct pci_dev *dev);
+extern void parport_pc_unregister_port (struct parport *p);
 
 #endif

@@ -1,14 +1,11 @@
-// SPDX-License-Identifier: GPL-2.0
-/*
- * Copyright (C) 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
- */
-
-#include <linux/if_arp.h>
-#include <linux/init.h>
-#include <linux/netdevice.h>
-#include <linux/string.h>
-#include <net_kern.h>
-#include <net_user.h>
+#include "linux/kernel.h"
+#include "linux/stddef.h"
+#include "linux/init.h"
+#include "linux/netdevice.h"
+#include "linux/if_arp.h"
+#include "net_kern.h"
+#include "net_user.h"
+#include "kern.h"
 #include "slirp.h"
 
 struct slirp_init {
@@ -22,46 +19,54 @@ void slirp_init(struct net_device *dev, void *data)
 	struct slirp_init *init = data;
 	int i;
 
-	private = netdev_priv(dev);
+	private = dev->priv;
 	spri = (struct slirp_data *) private->user;
+	*spri = ((struct slirp_data)
+		{ .argw 	= init->argw,
+		  .pid  	= -1,
+		  .slave  	= -1,
+		  .ibuf  	= { '\0' },
+		  .obuf  	= { '\0' },
+		  .pos 		= 0,
+		  .esc 		= 0,
+		  .dev 		= dev });
 
-	spri->argw = init->argw;
-	spri->pid = -1;
-	spri->slave = -1;
-	spri->dev = dev;
-
-	slip_proto_init(&spri->slip);
-
+	dev->init = NULL;
 	dev->hard_header_len = 0;
-	dev->header_ops = NULL;
+	dev->header_cache_update = NULL;
+	dev->hard_header_cache = NULL;
+	dev->hard_header = NULL;
 	dev->addr_len = 0;
 	dev->type = ARPHRD_SLIP;
 	dev->tx_queue_len = 256;
 	dev->flags = IFF_NOARP;
 	printk("SLIRP backend - command line:");
-	for (i = 0; spri->argw.argv[i] != NULL; i++)
+	for(i=0;spri->argw.argv[i]!=NULL;i++) {
 		printk(" '%s'",spri->argw.argv[i]);
+	}
 	printk("\n");
 }
 
 static unsigned short slirp_protocol(struct sk_buff *skbuff)
 {
-	return htons(ETH_P_IP);
+	return(htons(ETH_P_IP));
 }
 
-static int slirp_read(int fd, struct sk_buff *skb, struct uml_net_private *lp)
+static int slirp_read(int fd, struct sk_buff **skb, 
+		       struct uml_net_private *lp)
 {
-	return slirp_user_read(fd, skb_mac_header(skb), skb->dev->mtu,
-			       (struct slirp_data *) &lp->user);
+	return(slirp_user_read(fd, (*skb)->mac.raw, (*skb)->dev->mtu, 
+			      (struct slirp_data *) &lp->user));
 }
 
-static int slirp_write(int fd, struct sk_buff *skb, struct uml_net_private *lp)
+static int slirp_write(int fd, struct sk_buff **skb,
+		      struct uml_net_private *lp)
 {
-	return slirp_user_write(fd, skb->data, skb->len,
-				(struct slirp_data *) &lp->user);
+	return(slirp_user_write(fd, (*skb)->data, (*skb)->len, 
+			       (struct slirp_data *) &lp->user));
 }
 
-const struct net_kern_info slirp_kern_info = {
+struct net_kern_info slirp_kern_info = {
 	.init			= slirp_init,
 	.protocol		= slirp_protocol,
 	.read			= slirp_read,
@@ -73,32 +78,31 @@ static int slirp_setup(char *str, char **mac_out, void *data)
 	struct slirp_init *init = data;
 	int i=0;
 
-	*init = ((struct slirp_init) { .argw = { { "slirp", NULL  } } });
+	*init = ((struct slirp_init)
+		{ argw :		{ { "slirp", NULL  } } });
 
 	str = split_if_spec(str, mac_out, NULL);
 
-	if (str == NULL) /* no command line given after MAC addr */
-		return 1;
+	if(str == NULL) { /* no command line given after MAC addr */
+		return(1);
+	}
 
 	do {
-		if (i >= SLIRP_MAX_ARGS - 1) {
-			printk(KERN_WARNING "slirp_setup: truncating slirp "
-			       "arguments\n");
+		if(i>=SLIRP_MAX_ARGS-1) {
+			printk("slirp_setup: truncating slirp arguments\n");
 			break;
 		}
 		init->argw.argv[i++] = str;
 		while(*str && *str!=',') {
-			if (*str == '_')
-				*str=' ';
+			if(*str=='_') *str=' ';
 			str++;
 		}
-		if (*str != ',')
+		if(*str!=',')
 			break;
-		*str++ = '\0';
-	} while (1);
-
-	init->argw.argv[i] = NULL;
-	return 1;
+		*str++='\0';
+	} while(1);
+	init->argw.argv[i]=NULL;
+	return(1);
 }
 
 static struct transport slirp_transport = {
@@ -114,7 +118,18 @@ static struct transport slirp_transport = {
 static int register_slirp(void)
 {
 	register_transport(&slirp_transport);
-	return 0;
+	return(1);
 }
 
-late_initcall(register_slirp);
+__initcall(register_slirp);
+
+/*
+ * Overrides for Emacs so that we follow Linus's tabbing style.
+ * Emacs will notice this stuff at the end of the file and automatically
+ * adjust the settings for this buffer only.  This must remain at the end
+ * of the file.
+ * ---------------------------------------------------------------------------
+ * Local variables:
+ * c-file-style: "linux"
+ * End:
+ */

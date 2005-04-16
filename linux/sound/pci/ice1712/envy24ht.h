@@ -1,11 +1,25 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef __SOUND_VT1724_H
 #define __SOUND_VT1724_H
 
 /*
  *   ALSA driver for ICEnsemble VT1724 (Envy24)
  *
- *	Copyright (c) 2000 Jaroslav Kysela <perex@perex.cz>
+ *	Copyright (c) 2000 Jaroslav Kysela <perex@suse.cz>
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ *
  */      
 
 #include <sound/control.h>
@@ -52,7 +66,6 @@ enum {
 #define     VT1724_CFG_CLOCK384  0x40	/* 16.9344Mhz, 44.1kHz*384 */
 #define   VT1724_CFG_MPU401	0x20		/* MPU401 UARTs */
 #define   VT1724_CFG_ADC_MASK	0x0c	/* one, two or one and S/PDIF, stereo ADCs */
-#define   VT1724_CFG_ADC_NONE	0x0c	/* no ADCs */
 #define   VT1724_CFG_DAC_MASK	0x03	/* one, two, three, four stereo DACs */
 
 #define VT1724_REG_AC97_CFG		0x05	/* byte */
@@ -80,13 +93,9 @@ enum {
 #define VT1724_REG_MPU_TXFIFO		0x0a	/*byte ro. number of bytes in TX fifo*/
 #define VT1724_REG_MPU_RXFIFO		0x0b	/*byte ro. number of bytes in RX fifo*/
 
-#define VT1724_REG_MPU_DATA		0x0c	/* byte */
-#define VT1724_REG_MPU_CTRL		0x0d	/* byte */
-#define   VT1724_MPU_UART	0x01
-#define   VT1724_MPU_TX_EMPTY	0x02
-#define   VT1724_MPU_TX_FULL	0x04
-#define   VT1724_MPU_RX_EMPTY	0x08
-#define   VT1724_MPU_RX_FULL	0x10
+//are these 2 the wrong way around? they don't seem to be used yet anyway
+#define VT1724_REG_MPU_CTRL		0x0c	/* byte */
+#define VT1724_REG_MPU_DATA		0x0d	/* byte */
 
 #define VT1724_REG_MPU_FIFO_WM	0x0e	/*byte set the high/low watermarks for RX/TX fifos*/
 #define   VT1724_MPU_RX_FIFO	0x20	//1=rx fifo watermark 0=tx fifo watermark
@@ -200,7 +209,7 @@ enum {
 #define VT1724_MT_PDMA1_COUNT		0x76	/* word */
 
 
-unsigned char snd_vt1724_read_i2c(struct snd_ice1712 *ice, unsigned char dev, unsigned char addr);
-void snd_vt1724_write_i2c(struct snd_ice1712 *ice, unsigned char dev, unsigned char addr, unsigned char data);
+unsigned char snd_vt1724_read_i2c(ice1712_t *ice, unsigned char dev, unsigned char addr);
+void snd_vt1724_write_i2c(ice1712_t *ice, unsigned char dev, unsigned char addr, unsigned char data);
 
 #endif /* __SOUND_VT1724_H */

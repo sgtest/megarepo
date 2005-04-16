@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Device driver for the SYMBIOS/LSILOGIC 53C8XX and 53C1010 family 
  * of PCI-SCSI IO processors.
@@ -22,9 +21,27 @@
  * Copyright (C) 1997 Richard Waltham <dormouse@farsrobt.demon.co.uk>
  *
  *-----------------------------------------------------------------------------
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
+#ifdef __FreeBSD__
+#include <dev/sym/sym_glue.h>
+#else
 #include "sym_glue.h"
+#endif
 
 /*
  *  Macros used for all firmwares.
@@ -43,12 +60,19 @@
 #define	SYM_FWA_SCR		sym_fw1a_scr
 #define	SYM_FWB_SCR		sym_fw1b_scr
 #define	SYM_FWZ_SCR		sym_fw1z_scr
+#ifdef __FreeBSD__
+#include <dev/sym/sym_fw1.h>
+#else
 #include "sym_fw1.h"
+#endif
 static struct sym_fwa_ofs sym_fw1a_ofs = {
 	SYM_GEN_FW_A(struct SYM_FWA_SCR)
 };
 static struct sym_fwb_ofs sym_fw1b_ofs = {
 	SYM_GEN_FW_B(struct SYM_FWB_SCR)
+#ifdef SYM_OPT_HANDLE_DIR_UNKNOWN
+	SYM_GEN_B(struct SYM_FWB_SCR, data_io)
+#endif
 };
 static struct sym_fwz_ofs sym_fw1z_ofs = {
 	SYM_GEN_FW_Z(struct SYM_FWZ_SCR)
@@ -64,12 +88,19 @@ static struct sym_fwz_ofs sym_fw1z_ofs = {
 #define	SYM_FWA_SCR		sym_fw2a_scr
 #define	SYM_FWB_SCR		sym_fw2b_scr
 #define	SYM_FWZ_SCR		sym_fw2z_scr
+#ifdef __FreeBSD__
+#include <dev/sym/sym_fw2.h>
+#else
 #include "sym_fw2.h"
+#endif
 static struct sym_fwa_ofs sym_fw2a_ofs = {
 	SYM_GEN_FW_A(struct SYM_FWA_SCR)
 };
 static struct sym_fwb_ofs sym_fw2b_ofs = {
 	SYM_GEN_FW_B(struct SYM_FWB_SCR)
+#ifdef SYM_OPT_HANDLE_DIR_UNKNOWN
+	SYM_GEN_B(struct SYM_FWB_SCR, data_io)
+#endif
 	SYM_GEN_B(struct SYM_FWB_SCR, start64)
 	SYM_GEN_B(struct SYM_FWB_SCR, pm_handle)
 };
@@ -91,9 +122,8 @@ static struct sym_fwz_ofs sym_fw2z_ofs = {
  *  Patch routine for firmware #1.
  */
 static void
-sym_fw1_patch(struct Scsi_Host *shost)
+sym_fw1_patch(struct sym_hcb *np)
 {
-	struct sym_hcb *np = sym_get_hcb(shost);
 	struct sym_fw1a_scr *scripta0;
 	struct sym_fw1b_scr *scriptb0;
 
@@ -133,11 +163,8 @@ sym_fw1_patch(struct Scsi_Host *shost)
  *  Patch routine for firmware #2.
  */
 static void
-sym_fw2_patch(struct Scsi_Host *shost)
+sym_fw2_patch(struct sym_hcb *np)
 {
-	struct sym_data *sym_data = shost_priv(shost);
-	struct pci_dev *pdev = sym_data->pdev;
-	struct sym_hcb *np = sym_data->ncb;
 	struct sym_fw2a_scr *scripta0;
 	struct sym_fw2b_scr *scriptb0;
 
@@ -158,7 +185,7 @@ sym_fw2_patch(struct Scsi_Host *shost)
 	 *  Remove useless 64 bit DMA specific SCRIPTS, 
 	 *  when this feature is not available.
 	 */
-	if (!use_dac(np)) {
+	if (!np->use_dac) {
 		scripta0->is_dmap_dirty[0] = cpu_to_scr(SCR_NO_OP);
 		scripta0->is_dmap_dirty[1] = 0;
 		scripta0->is_dmap_dirty[2] = cpu_to_scr(SCR_NO_OP);
@@ -196,14 +223,14 @@ sym_fw2_patch(struct Scsi_Host *shost)
 	 *  Remove a couple of work-arounds specific to C1010 if 
 	 *  they are not desirable. See `sym_fw2.h' for more details.
 	 */
-	if (!(pdev->device == PCI_DEVICE_ID_LSI_53C1010_66 &&
-	      pdev->revision < 0x1 &&
+	if (!(np->device_id == PCI_DEVICE_ID_LSI_53C1010_66 &&
+	      np->revision_id < 0x1 &&
 	      np->pciclk_khz < 60000)) {
 		scripta0->datao_phase[0] = cpu_to_scr(SCR_NO_OP);
 		scripta0->datao_phase[1] = cpu_to_scr(0);
 	}
-	if (!(pdev->device == PCI_DEVICE_ID_LSI_53C1010_33 /* &&
-	      pdev->revision < 0xff */)) {
+	if (!(np->device_id == PCI_DEVICE_ID_LSI_53C1010_33 &&
+	      /* np->revision_id < 0xff */ 1)) {
 		scripta0->sel_done[0] = cpu_to_scr(SCR_NO_OP);
 		scripta0->sel_done[1] = cpu_to_scr(0);
 	}
@@ -282,8 +309,10 @@ static void
 sym_fw1_setup(struct sym_hcb *np, struct sym_fw *fw)
 {
 	struct sym_fw1a_scr *scripta0;
+	struct sym_fw1b_scr *scriptb0;
 
 	scripta0 = (struct sym_fw1a_scr *) np->scripta0;
+	scriptb0 = (struct sym_fw1b_scr *) np->scriptb0;
 
 	/*
 	 *  Fill variable parts in scripts.
@@ -304,8 +333,10 @@ static void
 sym_fw2_setup(struct sym_hcb *np, struct sym_fw *fw)
 {
 	struct sym_fw2a_scr *scripta0;
+	struct sym_fw2b_scr *scriptb0;
 
 	scripta0 = (struct sym_fw2a_scr *) np->scripta0;
+	scriptb0 = (struct sym_fw2b_scr *) np->scriptb0;
 
 	/*
 	 *  Fill variable parts in scripts.
@@ -369,7 +400,7 @@ void sym_fw_bind_script(struct sym_hcb *np, u32 *start, int len)
 				sym_name(np), (int) (cur-start));
 			++cur;
 			continue;
-		}
+		};
 
 		/*
 		 *  We use the bogus value 0xf00ff00f ;-)
@@ -477,7 +508,7 @@ void sym_fw_bind_script(struct sym_hcb *np, u32 *start, int len)
 		default:
 			relocs = 0;
 			break;
-		}
+		};
 
 		/*
 		 *  Scriptify:) the opcode.
@@ -523,7 +554,7 @@ void sym_fw_bind_script(struct sym_hcb *np, u32 *start, int len)
 					new = old;
 					break;
 				}
-				fallthrough;
+				/* fall through */
 			default:
 				new = 0;
 				panic("sym_fw_bind_script: "
@@ -533,5 +564,5 @@ void sym_fw_bind_script(struct sym_hcb *np, u32 *start, int len)
 
 			*cur++ = cpu_to_scr(new);
 		}
-	}
+	};
 }

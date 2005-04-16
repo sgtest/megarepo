@@ -1,10 +1,15 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  *	inet6 interface/address list definitions
  *	Linux INET6 implementation 
  *
  *	Authors:
  *	Pedro Roque		<roque@di.fc.ul.pt>	
+ *
+ *
+ *	This program is free software; you can redistribute it and/or
+ *      modify it under the terms of the GNU General Public License
+ *      as published by the Free Software Foundation; either version
+ *      2 of the License, or (at your option) any later version.
  */
 
 #ifndef _NET_IF_INET6_H
@@ -12,7 +17,6 @@
 
 #include <net/snmp.h>
 #include <linux/ipv6.h>
-#include <linux/refcount.h>
 
 /* inet6_dev.if_flags */
 
@@ -20,97 +24,76 @@
 #define IF_RA_MANAGED	0x40
 #define IF_RA_RCVD	0x20
 #define IF_RS_SENT	0x10
-#define IF_READY	0x80000000
 
 /* prefix flags */
 #define IF_PREFIX_ONLINK	0x01
 #define IF_PREFIX_AUTOCONF	0x02
 
-enum {
-	INET6_IFADDR_STATE_PREDAD,
-	INET6_IFADDR_STATE_DAD,
-	INET6_IFADDR_STATE_POSTDAD,
-	INET6_IFADDR_STATE_ERRDAD,
-	INET6_IFADDR_STATE_DEAD,
-};
+#ifdef __KERNEL__
 
-struct inet6_ifaddr {
+struct inet6_ifaddr 
+{
 	struct in6_addr		addr;
 	__u32			prefix_len;
-	__u32			rt_priority;
-
-	/* In seconds, relative to tstamp. Expiry is at tstamp + HZ * lft. */
+	
 	__u32			valid_lft;
 	__u32			prefered_lft;
-	refcount_t		refcnt;
-	spinlock_t		lock;
-
-	int			state;
-
-	__u32			flags;
-	__u8			dad_probes;
-	__u8			stable_privacy_retry;
-
-	__u16			scope;
-	__u64			dad_nonce;
-
 	unsigned long		cstamp;	/* created timestamp */
 	unsigned long		tstamp; /* updated timestamp */
+	atomic_t		refcnt;
+	spinlock_t		lock;
 
-	struct delayed_work	dad_work;
+	__u8			probes;
+	__u8			flags;
+
+	__u16			scope;
+
+	struct timer_list	timer;
 
 	struct inet6_dev	*idev;
-	struct fib6_info	*rt;
+	struct rt6_info		*rt;
 
-	struct hlist_node	addr_lst;
-	struct list_head	if_list;
-	/*
-	 * Used to safely traverse idev->addr_list in process context
-	 * if the idev->lock needed to protect idev->addr_list cannot be held.
-	 * In that case, add the items to this list temporarily and iterate
-	 * without holding idev->lock.
-	 * See addrconf_ifdown and dev_forward_change.
-	 */
-	struct list_head	if_list_aux;
+	struct inet6_ifaddr	*lst_next;      /* next addr in addr_lst */
+	struct inet6_ifaddr	*if_next;       /* next addr in inet6_dev */
 
-	struct list_head	tmp_list;
+#ifdef CONFIG_IPV6_PRIVACY
+	struct inet6_ifaddr	*tmp_next;	/* next addr in tempaddr_lst */
 	struct inet6_ifaddr	*ifpub;
 	int			regen_count;
+#endif
 
-	bool			tokenized;
-
-	u8			ifa_proto;
-
-	struct rcu_head		rcu;
-	struct in6_addr		peer_addr;
+	int			dead;
 };
 
-struct ip6_sf_socklist {
+struct ip6_sf_socklist
+{
 	unsigned int		sl_max;
 	unsigned int		sl_count;
-	struct rcu_head		rcu;
-	struct in6_addr		sl_addr[];
+	struct in6_addr		sl_addr[0];
 };
+
+#define IP6_SFLSIZE(count)	(sizeof(struct ip6_sf_socklist) + \
+	(count) * sizeof(struct in6_addr))
 
 #define IP6_SFBLOCK	10	/* allocate this many at once */
 
-struct ipv6_mc_socklist {
+struct ipv6_mc_socklist
+{
 	struct in6_addr		addr;
 	int			ifindex;
+	struct ipv6_mc_socklist *next;
 	unsigned int		sfmode;		/* MCAST_{INCLUDE,EXCLUDE} */
-	struct ipv6_mc_socklist __rcu *next;
-	struct ip6_sf_socklist	__rcu *sflist;
-	struct rcu_head		rcu;
+	struct ip6_sf_socklist	*sflist;
 };
 
-struct ip6_sf_list {
-	struct ip6_sf_list __rcu *sf_next;
+struct ip6_sf_list
+{
+	struct ip6_sf_list	*sf_next;
 	struct in6_addr		sf_addr;
 	unsigned long		sf_count[2];	/* include/exclude counts */
 	unsigned char		sf_gsresp;	/* include in g & s response? */
 	unsigned char		sf_oldin;	/* change state */
 	unsigned char		sf_crcount;	/* retrans. left to send */
-	struct rcu_head		rcu;
 };
 
 #define MAF_TIMER_RUNNING	0x01
@@ -119,113 +102,99 @@ struct ip6_sf_list {
 #define MAF_NOREPORT		0x08
 #define MAF_GSQUERY		0x10
 
-struct ifmcaddr6 {
+struct ifmcaddr6
+{
 	struct in6_addr		mca_addr;
 	struct inet6_dev	*idev;
-	struct ifmcaddr6	__rcu *next;
-	struct ip6_sf_list	__rcu *mca_sources;
-	struct ip6_sf_list	__rcu *mca_tomb;
+	struct ifmcaddr6	*next;
+	struct ip6_sf_list	*mca_sources;
+	struct ip6_sf_list	*mca_tomb;
 	unsigned int		mca_sfmode;
-	unsigned char		mca_crcount;
 	unsigned long		mca_sfcount[2];
-	struct delayed_work	mca_work;
-	unsigned int		mca_flags;
+	struct timer_list	mca_timer;
+	unsigned		mca_flags;
 	int			mca_users;
-	refcount_t		mca_refcnt;
+	atomic_t		mca_refcnt;
+	spinlock_t		mca_lock;
+	unsigned char		mca_crcount;
 	unsigned long		mca_cstamp;
 	unsigned long		mca_tstamp;
-	struct rcu_head		rcu;
 };
 
 /* Anycast stuff */
 
-struct ipv6_ac_socklist {
+struct ipv6_ac_socklist
+{
 	struct in6_addr		acl_addr;
 	int			acl_ifindex;
 	struct ipv6_ac_socklist *acl_next;
 };
 
-struct ifacaddr6 {
+struct ifacaddr6
+{
 	struct in6_addr		aca_addr;
-	struct fib6_info	*aca_rt;
+	struct inet6_dev	*aca_idev;
+	struct rt6_info		*aca_rt;
 	struct ifacaddr6	*aca_next;
-	struct hlist_node	aca_addr_lst;
 	int			aca_users;
-	refcount_t		aca_refcnt;
+	atomic_t		aca_refcnt;
+	spinlock_t		aca_lock;
 	unsigned long		aca_cstamp;
 	unsigned long		aca_tstamp;
-	struct rcu_head		rcu;
 };
 
 #define	IFA_HOST	IPV6_ADDR_LOOPBACK
 #define	IFA_LINK	IPV6_ADDR_LINKLOCAL
 #define	IFA_SITE	IPV6_ADDR_SITELOCAL
+#define	IFA_GLOBAL	0x0000U
 
 struct ipv6_devstat {
 	struct proc_dir_entry	*proc_dir_entry;
-	DEFINE_SNMP_STAT(struct ipstats_mib, ipv6);
-	DEFINE_SNMP_STAT_ATOMIC(struct icmpv6_mib_device, icmpv6dev);
-	DEFINE_SNMP_STAT_ATOMIC(struct icmpv6msg_mib_device, icmpv6msgdev);
+	DEFINE_SNMP_STAT(struct icmpv6_mib, icmpv6);
 };
 
-struct inet6_dev {
-	struct net_device	*dev;
-	netdevice_tracker	dev_tracker;
+struct inet6_dev 
+{
+	struct net_device		*dev;
 
-	struct list_head	addr_list;
+	struct inet6_ifaddr	*addr_list;
 
-	struct ifmcaddr6	__rcu *mc_list;
-	struct ifmcaddr6	__rcu *mc_tomb;
-
-	unsigned char		mc_qrv;		/* Query Robustness Variable */
+	struct ifmcaddr6	*mc_list;
+	struct ifmcaddr6	*mc_tomb;
+	rwlock_t		mc_lock;
+	unsigned long		mc_v1_seen;
+	unsigned long		mc_maxdelay;
+	unsigned char		mc_qrv;
 	unsigned char		mc_gq_running;
 	unsigned char		mc_ifc_count;
-	unsigned char		mc_dad_count;
-
-	unsigned long		mc_v1_seen;	/* Max time we stay in MLDv1 mode */
-	unsigned long		mc_qi;		/* Query Interval */
-	unsigned long		mc_qri;		/* Query Response Interval */
-	unsigned long		mc_maxdelay;
-
-	struct delayed_work	mc_gq_work;	/* general query work */
-	struct delayed_work	mc_ifc_work;	/* interface change work */
-	struct delayed_work	mc_dad_work;	/* dad complete mc work */
-	struct delayed_work	mc_query_work;	/* mld query work */
-	struct delayed_work	mc_report_work;	/* mld report work */
-
-	struct sk_buff_head	mc_query_queue;		/* mld query queue */
-	struct sk_buff_head	mc_report_queue;	/* mld report queue */
-
-	spinlock_t		mc_query_lock;	/* mld query queue lock */
-	spinlock_t		mc_report_lock;	/* mld query report lock */
-	struct mutex		mc_lock;	/* mld global lock */
+	struct timer_list	mc_gq_timer;	/* general query timer */
+	struct timer_list	mc_ifc_timer;	/* interface change timer */
 
 	struct ifacaddr6	*ac_list;
 	rwlock_t		lock;
-	refcount_t		refcnt;
+	atomic_t		refcnt;
 	__u32			if_flags;
 	int			dead;
 
-	u32			desync_factor;
-	struct list_head	tempaddr_list;
-
-	struct in6_addr		token;
+#ifdef CONFIG_IPV6_PRIVACY
+	u8			rndid[8];
+	u8			entropy[8];
+	struct timer_list	regen_timer;
+	struct inet6_ifaddr	*tempaddr_list;
+	__u8			work_eui64[8];
+	__u8			work_digest[16];
+#endif
 
 	struct neigh_parms	*nd_parms;
+	struct inet6_dev	*next;
 	struct ipv6_devconf	cnf;
 	struct ipv6_devstat	stats;
-
-	struct timer_list	rs_timer;
-	__s32			rs_interval;	/* in jiffies */
-	__u8			rs_probes;
-
 	unsigned long		tstamp; /* ipv6InterfaceTable update timestamp */
-	struct rcu_head		rcu;
-
-	unsigned int		ra_mtu;
 };
 
-static inline void ipv6_eth_mc_map(const struct in6_addr *addr, char *buf)
+extern struct ipv6_devconf ipv6_devconf;
+
+static inline void ipv6_eth_mc_map(struct in6_addr *addr, char *buf)
 {
 	/*
 	 *	+-------+-------+-------+-------+-------+-------+
@@ -239,42 +208,78 @@ static inline void ipv6_eth_mc_map(const struct in6_addr *addr, char *buf)
 	memcpy(buf + 2, &addr->s6_addr32[3], sizeof(__u32));
 }
 
+static inline void ipv6_tr_mc_map(struct in6_addr *addr, char *buf)
+{
+	/* All nodes FF01::1, FF02::1, FF02::1:FFxx:xxxx */
+
+	if (((addr->s6_addr[0] == 0xFF) &&
+	    ((addr->s6_addr[1] == 0x01) || (addr->s6_addr[1] == 0x02)) &&
+	     (addr->s6_addr16[1] == 0) &&
+	     (addr->s6_addr32[1] == 0) &&
+	     (addr->s6_addr32[2] == 0) &&
+	     (addr->s6_addr16[6] == 0) &&
+	     (addr->s6_addr[15] == 1)) ||
+	    ((addr->s6_addr[0] == 0xFF) &&
+	     (addr->s6_addr[1] == 0x02) &&
+	     (addr->s6_addr16[1] == 0) &&
+	     (addr->s6_addr32[1] == 0) &&
+	     (addr->s6_addr16[4] == 0) &&
+	     (addr->s6_addr[10] == 0) &&
+	     (addr->s6_addr[11] == 1) &&
+	     (addr->s6_addr[12] == 0xff)))
+	{
+		buf[0]=0xC0;
+		buf[1]=0x00;
+		buf[2]=0x01;
+		buf[3]=0x00;
+		buf[4]=0x00;
+		buf[5]=0x00;
+	/* All routers FF0x::2 */
+	} else if ((addr->s6_addr[0] ==0xff) &&
+		((addr->s6_addr[1] & 0xF0) == 0) &&
+		(addr->s6_addr16[1] == 0) &&
+		(addr->s6_addr32[1] == 0) &&
+		(addr->s6_addr32[2] == 0) &&
+		(addr->s6_addr16[6] == 0) &&
+		(addr->s6_addr[15] == 2))
+	{
+		buf[0]=0xC0;
+		buf[1]=0x00;
+		buf[2]=0x02;
+		buf[3]=0x00;
+		buf[4]=0x00;
+		buf[5]=0x00;
+	} else {
+		unsigned char i ; 
+		
+		i = addr->s6_addr[15] & 7 ; 
+		buf[0]=0xC0;
+		buf[1]=0x00;
+		buf[2]=0x00;
+		buf[3]=0x01 << i ; 
+		buf[4]=0x00;
+		buf[5]=0x00;
+	}
+}
+
 static inline void ipv6_arcnet_mc_map(const struct in6_addr *addr, char *buf)
 {
 	buf[0] = 0x00;
 }
 
-static inline void ipv6_ib_mc_map(const struct in6_addr *addr,
-				  const unsigned char *broadcast, char *buf)
+static inline void ipv6_ib_mc_map(struct in6_addr *addr, char *buf)
 {
-	unsigned char scope = broadcast[5] & 0xF;
-
 	buf[0]  = 0;		/* Reserved */
 	buf[1]  = 0xff;		/* Multicast QPN */
 	buf[2]  = 0xff;
 	buf[3]  = 0xff;
 	buf[4]  = 0xff;
-	buf[5]  = 0x10 | scope;	/* scope from broadcast address */
+	buf[5]  = 0x12;		/* link local scope */
 	buf[6]  = 0x60;		/* IPv6 signature */
 	buf[7]  = 0x1b;
-	buf[8]  = broadcast[8];	/* P_Key */
-	buf[9]  = broadcast[9];
+	buf[8]  = 0;		/* P_Key */
+	buf[9]  = 0;
 	memcpy(buf + 10, addr->s6_addr + 6, 10);
 }
-
-static inline int ipv6_ipgre_mc_map(const struct in6_addr *addr,
-				    const unsigned char *broadcast, char *buf)
-{
-	if ((broadcast[0] | broadcast[1] | broadcast[2] | broadcast[3]) != 0) {
-		memcpy(buf, broadcast, 4);
-	} else {
-		/* v4mapped? */
-		if ((addr->s6_addr32[0] | addr->s6_addr32[1] |
-		     (addr->s6_addr32[2] ^ htonl(0x0000ffff))) != 0)
-			return -EINVAL;
-		memcpy(buf, &addr->s6_addr32[3], 4);
-	}
-	return 0;
-}
-
+#endif
 #endif

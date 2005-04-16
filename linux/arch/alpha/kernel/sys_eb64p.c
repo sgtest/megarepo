@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *	linux/arch/alpha/kernel/sys_eb64p.c
  *
@@ -9,6 +8,7 @@
  * Code supporting the EB64+ and EB66.
  */
 
+#include <linux/config.h>
 #include <linux/kernel.h>
 #include <linux/types.h>
 #include <linux/mm.h>
@@ -18,10 +18,12 @@
 #include <linux/bitops.h>
 
 #include <asm/ptrace.h>
+#include <asm/system.h>
 #include <asm/dma.h>
 #include <asm/irq.h>
 #include <asm/mmu_context.h>
 #include <asm/io.h>
+#include <asm/pgtable.h>
 #include <asm/core_apecs.h>
 #include <asm/core_lca.h>
 #include <asm/hwrpb.h>
@@ -43,26 +45,43 @@ eb64p_update_irq_hw(unsigned int irq, unsigned long mask)
 }
 
 static inline void
-eb64p_enable_irq(struct irq_data *d)
+eb64p_enable_irq(unsigned int irq)
 {
-	eb64p_update_irq_hw(d->irq, cached_irq_mask &= ~(1 << d->irq));
+	eb64p_update_irq_hw(irq, cached_irq_mask &= ~(1 << irq));
 }
 
 static void
-eb64p_disable_irq(struct irq_data *d)
+eb64p_disable_irq(unsigned int irq)
 {
-	eb64p_update_irq_hw(d->irq, cached_irq_mask |= 1 << d->irq);
+	eb64p_update_irq_hw(irq, cached_irq_mask |= 1 << irq);
 }
 
-static struct irq_chip eb64p_irq_type = {
-	.name		= "EB64P",
-	.irq_unmask	= eb64p_enable_irq,
-	.irq_mask	= eb64p_disable_irq,
-	.irq_mask_ack	= eb64p_disable_irq,
+static unsigned int
+eb64p_startup_irq(unsigned int irq)
+{
+	eb64p_enable_irq(irq);
+	return 0; /* never anything pending */
+}
+
+static void
+eb64p_end_irq(unsigned int irq)
+{
+	if (!(irq_desc[irq].status & (IRQ_DISABLED|IRQ_INPROGRESS)))
+		eb64p_enable_irq(irq);
+}
+
+static struct hw_interrupt_type eb64p_irq_type = {
+	.typename	= "EB64P",
+	.startup	= eb64p_startup_irq,
+	.shutdown	= eb64p_disable_irq,
+	.enable		= eb64p_enable_irq,
+	.disable	= eb64p_disable_irq,
+	.ack		= eb64p_disable_irq,
+	.end		= eb64p_end_irq,
 };
 
 static void 
-eb64p_device_interrupt(unsigned long vector)
+eb64p_device_interrupt(unsigned long vector, struct pt_regs *regs)
 {
 	unsigned long pld;
 	unsigned int i;
@@ -79,9 +98,9 @@ eb64p_device_interrupt(unsigned long vector)
 		pld &= pld - 1;	/* clear least bit set */
 
 		if (i == 5) {
-			isa_device_interrupt(vector);
+			isa_device_interrupt(vector, regs);
 		} else {
-			handle_irq(16 + i);
+			handle_irq(16 + i, regs);
 		}
 	}
 }
@@ -117,13 +136,12 @@ eb64p_init_irq(void)
 	init_i8259a_irqs();
 
 	for (i = 16; i < 32; ++i) {
-		irq_set_chip_and_handler(i, &eb64p_irq_type, handle_level_irq);
-		irq_set_status_flags(i, IRQ_LEVEL);
-	}
+		irq_desc[i].status = IRQ_DISABLED | IRQ_LEVEL;
+		irq_desc[i].handler = &eb64p_irq_type;
+	}		
 
 	common_init_isa_dma();
-	if (request_irq(16 + 5, no_action, 0, "isa-cascade", NULL))
-		pr_err("Failed to register isa-cascade interrupt\n");
+	setup_irq(16+5, &isa_cascade_irqaction);
 }
 
 /*
@@ -168,10 +186,10 @@ eb64p_init_irq(void)
  * comes in on.  This makes interrupt processing much easier.
  */
 
-static int
-eb64p_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
+static int __init
+eb64p_map_irq(struct pci_dev *dev, u8 slot, u8 pin)
 {
-	static char irq_tab[5][5] = {
+	static char irq_tab[5][5] __initdata = {
 		/*INT  INTA  INTB  INTC   INTD */
 		{16+7, 16+7, 16+7, 16+7,  16+7},  /* IdSel 5,  slot ?, ?? */
 		{16+0, 16+0, 16+2, 16+4,  16+9},  /* IdSel 6,  slot ?, ?? */

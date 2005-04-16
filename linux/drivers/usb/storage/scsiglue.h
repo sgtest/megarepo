@@ -1,7 +1,7 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
-/*
- * Driver for USB Mass Storage compliant devices
+/* Driver for USB Mass Storage compliant devices
  * SCSI Connecting Glue Header File
+ *
+ * $Id: scsiglue.h,v 1.4 2000/08/25 00:13:51 mdharm Exp $
  *
  * Current development and maintenance by:
  *   (c) 1999, 2000 Matthew Dharm (mdharm-usb@one-eyed-alien.net)
@@ -19,16 +19,31 @@
  *
  * Also, for certain devices, the interrupt endpoint is used to convey
  * status of a command.
+ *
+ * Please see http://www.one-eyed-alien.net/~mdharm/linux-usb for more
+ * information about this driver.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation; either version 2, or (at your option) any
+ * later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc.,
+ * 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
 #ifndef _SCSIGLUE_H_
 #define _SCSIGLUE_H_
 
 extern void usb_stor_report_device_reset(struct us_data *us);
-extern void usb_stor_report_bus_reset(struct us_data *us);
-extern void usb_stor_host_template_init(struct scsi_host_template *sht,
-					const char *name, struct module *owner);
 
 extern unsigned char usb_stor_sense_invalidCDB[18];
+extern struct scsi_host_template usb_stor_host_template;
 
 #endif

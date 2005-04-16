@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
 
    fp_arith.c: floating-point math routines for the Linux-m68k
@@ -9,6 +8,9 @@
    Somewhat based on the AlphaLinux floating point emulator, by David
    Mosberger-Tang.
 
+   You may copy, modify, and redistribute this file under the terms of
+   the GNU General Public License, version 2, or any later version, at
+   your convenience.
  */
 
 #include "fp_emu.h"
@@ -243,7 +245,7 @@ fp_fdiv(struct fp_ext *dest, struct fp_ext *src)
 		/* infinity / infinity = NaN (quiet, as always) */
 		if (IS_INF(src))
 			fp_set_nan(dest);
-		/* infinity / anything else = infinity (with appropriate sign) */
+		/* infinity / anything else = infinity (with approprate sign) */
 		return dest;
 	}
 	if (IS_INF(src)) {
@@ -517,7 +519,7 @@ static void fp_roundint(struct fp_ext *dest, int mode)
 				return;
 			break;
 		case 0x401e:
-			if (oldmant.m32[1] & 0x80000000)
+			if (!(oldmant.m32[1] >= 0))
 				return;
 			if (oldmant.m32[0] & 1)
 				break;

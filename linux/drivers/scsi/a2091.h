@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef A2091_H
 #define A2091_H
 
@@ -12,40 +11,47 @@
 
 #include <linux/types.h>
 
+int a2091_detect(Scsi_Host_Template *);
+int a2091_release(struct Scsi_Host *);
+const char *wd33c93_info(void);
+int wd33c93_queuecommand(Scsi_Cmnd *, void (*done)(Scsi_Cmnd *));
+int wd33c93_abort(Scsi_Cmnd *);
+int wd33c93_reset(Scsi_Cmnd *, unsigned int);
+
 #ifndef CMD_PER_LUN
-#define CMD_PER_LUN		2
+#define CMD_PER_LUN 2
 #endif
 
 #ifndef CAN_QUEUE
-#define CAN_QUEUE		16
+#define CAN_QUEUE 16
 #endif
 
 /*
  * if the transfer address ANDed with this results in a non-zero
  * result, then we can't use DMA.
  */
-#define A2091_XFER_MASK		(0xff000001)
+#define A2091_XFER_MASK  (0xff000001)
 
-struct a2091_scsiregs {
-		 unsigned char	pad1[64];
-	volatile unsigned short	ISTR;
-	volatile unsigned short	CNTR;
-		 unsigned char	pad2[60];
-	volatile unsigned int	WTC;
-	volatile unsigned long	ACR;
-		 unsigned char	pad3[6];
-	volatile unsigned short	DAWR;
-		 unsigned char	pad4;
-	volatile unsigned char	SASR;
-		 unsigned char	pad5;
-	volatile unsigned char	SCMD;
-		 unsigned char	pad6[76];
-	volatile unsigned short	ST_DMA;
-	volatile unsigned short	SP_DMA;
-	volatile unsigned short	CINT;
-		 unsigned char	pad7[2];
-	volatile unsigned short	FLUSH;
-};
+typedef struct {
+             unsigned char      pad1[64];
+    volatile unsigned short     ISTR;
+    volatile unsigned short     CNTR;
+             unsigned char      pad2[60];
+    volatile unsigned int       WTC;
+    volatile unsigned long      ACR;
+             unsigned char      pad3[6];
+    volatile unsigned short     DAWR;
+             unsigned char      pad4;
+    volatile unsigned char      SASR;
+             unsigned char      pad5;
+    volatile unsigned char      SCMD;
+             unsigned char      pad6[76];
+    volatile unsigned short     ST_DMA;
+    volatile unsigned short     SP_DMA;
+    volatile unsigned short     CINT;
+             unsigned char      pad7[2];
+    volatile unsigned short     FLUSH;
+} a2091_scsiregs;
 
 #define DAWR_A2091		(3)
 

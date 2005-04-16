@@ -1,58 +1,76 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- *  Copyright (c) by Jaroslav Kysela <perex@perex.cz>
+ *  Copyright (c) by Jaroslav Kysela <perex@suse.cz>
+ *
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ *
  */
 
+#include <sound/driver.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/time.h>
 #include <sound/core.h>
 #include <sound/gus.h>
 
-extern int snd_gf1_synth_init(struct snd_gus_card * gus);
-extern void snd_gf1_synth_done(struct snd_gus_card * gus);
+extern void snd_gf1_timers_init(snd_gus_card_t * gus);
+extern void snd_gf1_timers_done(snd_gus_card_t * gus);
+extern int snd_gf1_synth_init(snd_gus_card_t * gus);
+extern void snd_gf1_synth_done(snd_gus_card_t * gus);
 
 /*
  *  ok.. default interrupt handlers...
  */
 
-static void snd_gf1_default_interrupt_handler_midi_out(struct snd_gus_card * gus)
+static void snd_gf1_default_interrupt_handler_midi_out(snd_gus_card_t * gus)
 {
 	snd_gf1_uart_cmd(gus, gus->gf1.uart_cmd &= ~0x20);
 }
 
-static void snd_gf1_default_interrupt_handler_midi_in(struct snd_gus_card * gus)
+static void snd_gf1_default_interrupt_handler_midi_in(snd_gus_card_t * gus)
 {
 	snd_gf1_uart_cmd(gus, gus->gf1.uart_cmd &= ~0x80);
 }
 
-static void snd_gf1_default_interrupt_handler_timer1(struct snd_gus_card * gus)
+static void snd_gf1_default_interrupt_handler_timer1(snd_gus_card_t * gus)
 {
 	snd_gf1_i_write8(gus, SNDRV_GF1_GB_SOUND_BLASTER_CONTROL, gus->gf1.timer_enabled &= ~4);
 }
 
-static void snd_gf1_default_interrupt_handler_timer2(struct snd_gus_card * gus)
+static void snd_gf1_default_interrupt_handler_timer2(snd_gus_card_t * gus)
 {
 	snd_gf1_i_write8(gus, SNDRV_GF1_GB_SOUND_BLASTER_CONTROL, gus->gf1.timer_enabled &= ~8);
 }
 
-static void snd_gf1_default_interrupt_handler_wave_and_volume(struct snd_gus_card * gus, struct snd_gus_voice * voice)
+static void snd_gf1_default_interrupt_handler_wave_and_volume(snd_gus_card_t * gus, snd_gus_voice_t * voice)
 {
 	snd_gf1_i_ctrl_stop(gus, 0x00);
 	snd_gf1_i_ctrl_stop(gus, 0x0d);
 }
 
-static void snd_gf1_default_interrupt_handler_dma_write(struct snd_gus_card * gus)
+static void snd_gf1_default_interrupt_handler_dma_write(snd_gus_card_t * gus)
 {
 	snd_gf1_i_write8(gus, 0x41, 0x00);
 }
 
-static void snd_gf1_default_interrupt_handler_dma_read(struct snd_gus_card * gus)
+static void snd_gf1_default_interrupt_handler_dma_read(snd_gus_card_t * gus)
 {
 	snd_gf1_i_write8(gus, 0x49, 0x00);
 }
 
-void snd_gf1_set_default_handlers(struct snd_gus_card * gus, unsigned int what)
+void snd_gf1_set_default_handlers(snd_gus_card_t * gus, unsigned int what)
 {
 	if (what & SNDRV_GF1_HANDLER_MIDI_OUT)
 		gus->gf1.interrupt_handler_midi_out = snd_gf1_default_interrupt_handler_midi_out;
@@ -63,7 +81,7 @@ void snd_gf1_set_default_handlers(struct snd_gus_card * gus, unsigned int what)
 	if (what & SNDRV_GF1_HANDLER_TIMER2)
 		gus->gf1.interrupt_handler_timer2 = snd_gf1_default_interrupt_handler_timer2;
 	if (what & SNDRV_GF1_HANDLER_VOICE) {
-		struct snd_gus_voice *voice;
+		snd_gus_voice_t *voice;
 		
 		voice = &gus->gf1.voices[what & 0xffff];
 		voice->handler_wave =
@@ -81,7 +99,7 @@ void snd_gf1_set_default_handlers(struct snd_gus_card * gus, unsigned int what)
 
  */
 
-static void snd_gf1_clear_regs(struct snd_gus_card * gus)
+static void snd_gf1_clear_regs(snd_gus_card_t * gus)
 {
 	unsigned long flags;
 
@@ -93,7 +111,7 @@ static void snd_gf1_clear_regs(struct snd_gus_card * gus)
 	spin_unlock_irqrestore(&gus->reg_lock, flags);
 }
 
-static void snd_gf1_look_regs(struct snd_gus_card * gus)
+static void snd_gf1_look_regs(snd_gus_card_t * gus)
 {
 	unsigned long flags;
 
@@ -109,28 +127,28 @@ static void snd_gf1_look_regs(struct snd_gus_card * gus)
  *  put selected GF1 voices to initial stage...
  */
 
-void snd_gf1_smart_stop_voice(struct snd_gus_card * gus, unsigned short voice)
+void snd_gf1_smart_stop_voice(snd_gus_card_t * gus, unsigned short voice)
 {
 	unsigned long flags;
 
 	spin_lock_irqsave(&gus->reg_lock, flags);
 	snd_gf1_select_voice(gus, voice);
 #if 0
-	printk(KERN_DEBUG " -%i- smart stop voice - volume = 0x%x\n", voice, snd_gf1_i_read16(gus, SNDRV_GF1_VW_VOLUME));
+	printk(" -%i- smart stop voice - volume = 0x%x\n", voice, snd_gf1_i_read16(gus, SNDRV_GF1_VW_VOLUME));
 #endif
 	snd_gf1_ctrl_stop(gus, SNDRV_GF1_VB_ADDRESS_CONTROL);
 	snd_gf1_ctrl_stop(gus, SNDRV_GF1_VB_VOLUME_CONTROL);
 	spin_unlock_irqrestore(&gus->reg_lock, flags);
 }
 
-void snd_gf1_stop_voice(struct snd_gus_card * gus, unsigned short voice)
+void snd_gf1_stop_voice(snd_gus_card_t * gus, unsigned short voice)
 {
 	unsigned long flags;
 
 	spin_lock_irqsave(&gus->reg_lock, flags);
 	snd_gf1_select_voice(gus, voice);
 #if 0
-	printk(KERN_DEBUG " -%i- stop voice - volume = 0x%x\n", voice, snd_gf1_i_read16(gus, SNDRV_GF1_VW_VOLUME));
+	printk(" -%i- stop voice - volume = 0x%x\n", voice, snd_gf1_i_read16(gus, SNDRV_GF1_VW_VOLUME));
 #endif
 	snd_gf1_ctrl_stop(gus, SNDRV_GF1_VB_ADDRESS_CONTROL);
 	snd_gf1_ctrl_stop(gus, SNDRV_GF1_VB_VOLUME_CONTROL);
@@ -143,8 +161,7 @@ void snd_gf1_stop_voice(struct snd_gus_card * gus, unsigned short voice)
 #endif
 }
 
-static void snd_gf1_clear_voices(struct snd_gus_card * gus, unsigned short v_min,
-				 unsigned short v_max)
+void snd_gf1_clear_voices(snd_gus_card_t * gus, unsigned short v_min, unsigned short v_max)
 {
 	unsigned long flags;
 	unsigned int daddr;
@@ -185,7 +202,7 @@ static void snd_gf1_clear_voices(struct snd_gus_card * gus, unsigned short v_min
 	}
 }
 
-void snd_gf1_stop_voices(struct snd_gus_card * gus, unsigned short v_min, unsigned short v_max)
+void snd_gf1_stop_voices(snd_gus_card_t * gus, unsigned short v_min, unsigned short v_max)
 {
 	unsigned long flags;
 	short i, ramp_ok;
@@ -214,8 +231,8 @@ void snd_gf1_stop_voices(struct snd_gus_card * gus, unsigned short v_min, unsign
 	snd_gf1_clear_voices(gus, v_min, v_max);
 }
 
-static void snd_gf1_alloc_voice_use(struct snd_gus_card * gus, 
-				    struct snd_gus_voice * pvoice,
+static void snd_gf1_alloc_voice_use(snd_gus_card_t * gus, 
+				    snd_gus_voice_t * pvoice,
 				    int type, int client, int port)
 {
 	pvoice->use = 1;
@@ -237,9 +254,9 @@ static void snd_gf1_alloc_voice_use(struct snd_gus_card * gus,
 	}
 }
 
-struct snd_gus_voice *snd_gf1_alloc_voice(struct snd_gus_card * gus, int type, int client, int port)
+snd_gus_voice_t *snd_gf1_alloc_voice(snd_gus_card_t * gus, int type, int client, int port)
 {
-	struct snd_gus_voice *pvoice;
+	snd_gus_voice_t *pvoice;
 	unsigned long flags;
 	int idx;
 
@@ -271,10 +288,11 @@ struct snd_gus_voice *snd_gf1_alloc_voice(struct snd_gus_card * gus, int type, i
 	return NULL;
 }
 
-void snd_gf1_free_voice(struct snd_gus_card * gus, struct snd_gus_voice *voice)
+void snd_gf1_free_voice(snd_gus_card_t * gus, snd_gus_voice_t *voice)
 {
 	unsigned long flags;
-	void (*private_free)(struct snd_gus_voice *voice);
+	void (*private_free)(snd_gus_voice_t *voice);
+	void *private_data;
 
 	if (voice == NULL || !voice->use)
 		return;
@@ -282,6 +300,7 @@ void snd_gf1_free_voice(struct snd_gus_card * gus, struct snd_gus_voice *voice)
 	snd_gf1_clear_voices(gus, voice->number, voice->number);
 	spin_lock_irqsave(&gus->voice_alloc, flags);
 	private_free = voice->private_free;
+	private_data = voice->private_data;
 	voice->private_free = NULL;
 	voice->private_data = NULL;
 	if (voice->pcm)
@@ -297,7 +316,7 @@ void snd_gf1_free_voice(struct snd_gus_card * gus, struct snd_gus_voice *voice)
  *  call this function only by start of driver
  */
 
-int snd_gf1_start(struct snd_gus_card * gus)
+int snd_gf1_start(snd_gus_card_t * gus)
 {
 	unsigned long flags;
 	unsigned int i;
@@ -380,7 +399,7 @@ int snd_gf1_start(struct snd_gus_card * gus)
  *  call this function only by shutdown of driver
  */
 
-int snd_gf1_stop(struct snd_gus_card * gus)
+int snd_gf1_stop(snd_gus_card_t * gus)
 {
 	snd_gf1_i_write8(gus, SNDRV_GF1_GB_SOUND_BLASTER_CONTROL, 0); /* stop all timers */
 	snd_gf1_stop_voices(gus, 0, 31);		/* stop all voices */

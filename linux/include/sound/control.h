@@ -1,148 +1,121 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef __SOUND_CONTROL_H
 #define __SOUND_CONTROL_H
 
 /*
  *  Header file for control interface
- *  Copyright (c) by Jaroslav Kysela <perex@perex.cz>
+ *  Copyright (c) by Jaroslav Kysela <perex@suse.cz>
+ *
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ *
  */
 
-#include <linux/wait.h>
-#include <linux/nospec.h>
 #include <sound/asound.h>
+
+typedef struct sndrv_aes_iec958 snd_aes_iec958_t;
+typedef struct sndrv_ctl_card_info snd_ctl_card_info_t;
+typedef enum sndrv_ctl_elem_type snd_ctl_elem_type_t;
+typedef enum sndrv_ctl_elem_iface snd_ctl_elem_iface_t;
+typedef struct sndrv_ctl_elem_id snd_ctl_elem_id_t;
+typedef struct sndrv_ctl_elem_list snd_ctl_elem_list_t;
+typedef struct sndrv_ctl_elem_info snd_ctl_elem_info_t;
+typedef struct sndrv_ctl_elem_value snd_ctl_elem_value_t;
+typedef enum sndrv_ctl_event_type snd_ctl_event_type_t;
+typedef struct sndrv_ctl_event snd_ctl_event_t;
 
 #define snd_kcontrol_chip(kcontrol) ((kcontrol)->private_data)
 
-struct snd_kcontrol;
-typedef int (snd_kcontrol_info_t) (struct snd_kcontrol * kcontrol, struct snd_ctl_elem_info * uinfo);
-typedef int (snd_kcontrol_get_t) (struct snd_kcontrol * kcontrol, struct snd_ctl_elem_value * ucontrol);
-typedef int (snd_kcontrol_put_t) (struct snd_kcontrol * kcontrol, struct snd_ctl_elem_value * ucontrol);
-typedef int (snd_kcontrol_tlv_rw_t)(struct snd_kcontrol *kcontrol,
-				    int op_flag, /* SNDRV_CTL_TLV_OP_XXX */
-				    unsigned int size,
-				    unsigned int __user *tlv);
+typedef int (snd_kcontrol_info_t) (snd_kcontrol_t * kcontrol, snd_ctl_elem_info_t * uinfo);
+typedef int (snd_kcontrol_get_t) (snd_kcontrol_t * kcontrol, snd_ctl_elem_value_t * ucontrol);
+typedef int (snd_kcontrol_put_t) (snd_kcontrol_t * kcontrol, snd_ctl_elem_value_t * ucontrol);
 
-/* internal flag for skipping validations */
-#ifdef CONFIG_SND_CTL_DEBUG
-#define SNDRV_CTL_ELEM_ACCESS_SKIP_CHECK	(1 << 24)
-#define snd_ctl_skip_validation(info) \
-	((info)->access & SNDRV_CTL_ELEM_ACCESS_SKIP_CHECK)
-#else
-#define SNDRV_CTL_ELEM_ACCESS_SKIP_CHECK	0
-#define snd_ctl_skip_validation(info)		true
-#endif
-
-/* kernel only - LED bits */
-#define SNDRV_CTL_ELEM_ACCESS_LED_SHIFT		25
-#define SNDRV_CTL_ELEM_ACCESS_LED_MASK		(7<<25) /* kernel three bits - LED group */
-#define SNDRV_CTL_ELEM_ACCESS_SPK_LED		(1<<25) /* kernel speaker (output) LED flag */
-#define SNDRV_CTL_ELEM_ACCESS_MIC_LED		(2<<25) /* kernel microphone (input) LED flag */
-
-enum {
-	SNDRV_CTL_TLV_OP_READ = 0,
-	SNDRV_CTL_TLV_OP_WRITE = 1,
-	SNDRV_CTL_TLV_OP_CMD = -1,
-};
-
-struct snd_kcontrol_new {
+typedef struct _snd_kcontrol_new {
 	snd_ctl_elem_iface_t iface;	/* interface identifier */
 	unsigned int device;		/* device/client number */
 	unsigned int subdevice;		/* subdevice (substream) number */
-	const char *name;		/* ASCII name of item */
+	unsigned char *name;		/* ASCII name of item */
 	unsigned int index;		/* index of item */
 	unsigned int access;		/* access rights */
 	unsigned int count;		/* count of same elements */
 	snd_kcontrol_info_t *info;
 	snd_kcontrol_get_t *get;
 	snd_kcontrol_put_t *put;
-	union {
-		snd_kcontrol_tlv_rw_t *c;
-		const unsigned int *p;
-	} tlv;
 	unsigned long private_value;
-};
+} snd_kcontrol_new_t;
 
-struct snd_kcontrol_volatile {
-	struct snd_ctl_file *owner;	/* locked */
+typedef struct _snd_kcontrol_volatile {
+	snd_ctl_file_t *owner;	/* locked */
+	pid_t owner_pid;
 	unsigned int access;	/* access rights */
-};
+} snd_kcontrol_volatile_t;
 
-struct snd_kcontrol {
+struct _snd_kcontrol {
 	struct list_head list;		/* list of controls */
-	struct snd_ctl_elem_id id;
+	snd_ctl_elem_id_t id;
 	unsigned int count;		/* count of same elements */
 	snd_kcontrol_info_t *info;
 	snd_kcontrol_get_t *get;
 	snd_kcontrol_put_t *put;
-	union {
-		snd_kcontrol_tlv_rw_t *c;
-		const unsigned int *p;
-	} tlv;
 	unsigned long private_value;
 	void *private_data;
-	void (*private_free)(struct snd_kcontrol *kcontrol);
-	struct snd_kcontrol_volatile vd[];	/* volatile data */
+	void (*private_free)(snd_kcontrol_t *kcontrol);
+	snd_kcontrol_volatile_t vd[0];	/* volatile data */
 };
 
-#define snd_kcontrol(n) list_entry(n, struct snd_kcontrol, list)
+#define snd_kcontrol(n) list_entry(n, snd_kcontrol_t, list)
 
-struct snd_kctl_event {
+typedef struct _snd_kctl_event {
 	struct list_head list;	/* list of events */
-	struct snd_ctl_elem_id id;
+	snd_ctl_elem_id_t id;
 	unsigned int mask;
-};
+} snd_kctl_event_t;
 
-#define snd_kctl_event(n) list_entry(n, struct snd_kctl_event, list)
+#define snd_kctl_event(n) list_entry(n, snd_kctl_event_t, list)
 
-struct pid;
-
-enum {
-	SND_CTL_SUBDEV_PCM,
-	SND_CTL_SUBDEV_RAWMIDI,
-	SND_CTL_SUBDEV_ITEMS,
-};
-
-struct snd_ctl_file {
+struct _snd_ctl_file {
 	struct list_head list;		/* list of all control files */
-	struct snd_card *card;
-	struct pid *pid;
-	int preferred_subdevice[SND_CTL_SUBDEV_ITEMS];
+	snd_card_t *card;
+	pid_t pid;
+	int prefer_pcm_subdevice;
+	int prefer_rawmidi_subdevice;
 	wait_queue_head_t change_sleep;
 	spinlock_t read_lock;
-	struct snd_fasync *fasync;
+	struct fasync_struct *fasync;
 	int subscribed;			/* read interface is activated */
 	struct list_head events;	/* waiting events for read */
 };
 
-struct snd_ctl_layer_ops {
-	struct snd_ctl_layer_ops *next;
-	const char *module_name;
-	void (*lregister)(struct snd_card *card);
-	void (*ldisconnect)(struct snd_card *card);
-	void (*lnotify)(struct snd_card *card, unsigned int mask, struct snd_kcontrol *kctl, unsigned int ioff);
-};
+#define snd_ctl_file(n) list_entry(n, snd_ctl_file_t, list)
 
-#define snd_ctl_file(n) list_entry(n, struct snd_ctl_file, list)
+typedef int (*snd_kctl_ioctl_func_t) (snd_card_t * card,
+				 snd_ctl_file_t * control,
+				 unsigned int cmd, unsigned long arg);
 
-typedef int (*snd_kctl_ioctl_func_t) (struct snd_card * card,
-				      struct snd_ctl_file * control,
-				      unsigned int cmd, unsigned long arg);
+void snd_ctl_notify(snd_card_t * card, unsigned int mask, snd_ctl_elem_id_t * id);
 
-void snd_ctl_notify(struct snd_card * card, unsigned int mask, struct snd_ctl_elem_id * id);
-void snd_ctl_notify_one(struct snd_card * card, unsigned int mask, struct snd_kcontrol * kctl, unsigned int ioff);
+snd_kcontrol_t *snd_ctl_new(snd_kcontrol_t * kcontrol, unsigned int access);
+snd_kcontrol_t *snd_ctl_new1(snd_kcontrol_new_t * kcontrolnew, void * private_data);
+void snd_ctl_free_one(snd_kcontrol_t * kcontrol);
+int snd_ctl_add(snd_card_t * card, snd_kcontrol_t * kcontrol);
+int snd_ctl_remove(snd_card_t * card, snd_kcontrol_t * kcontrol);
+int snd_ctl_remove_id(snd_card_t * card, snd_ctl_elem_id_t *id);
+int snd_ctl_rename_id(snd_card_t * card, snd_ctl_elem_id_t *src_id, snd_ctl_elem_id_t *dst_id);
+snd_kcontrol_t *snd_ctl_find_numid(snd_card_t * card, unsigned int numid);
+snd_kcontrol_t *snd_ctl_find_id(snd_card_t * card, snd_ctl_elem_id_t *id);
 
-struct snd_kcontrol *snd_ctl_new1(const struct snd_kcontrol_new * kcontrolnew, void * private_data);
-void snd_ctl_free_one(struct snd_kcontrol * kcontrol);
-int snd_ctl_add(struct snd_card * card, struct snd_kcontrol * kcontrol);
-int snd_ctl_remove(struct snd_card * card, struct snd_kcontrol * kcontrol);
-int snd_ctl_replace(struct snd_card *card, struct snd_kcontrol *kcontrol, bool add_on_replace);
-int snd_ctl_remove_id(struct snd_card * card, struct snd_ctl_elem_id *id);
-int snd_ctl_rename_id(struct snd_card * card, struct snd_ctl_elem_id *src_id, struct snd_ctl_elem_id *dst_id);
-int snd_ctl_activate_id(struct snd_card *card, struct snd_ctl_elem_id *id, int active);
-struct snd_kcontrol *snd_ctl_find_numid(struct snd_card * card, unsigned int numid);
-struct snd_kcontrol *snd_ctl_find_id(struct snd_card * card, struct snd_ctl_elem_id *id);
-
-int snd_ctl_create(struct snd_card *card);
+int snd_ctl_create(snd_card_t *card);
 
 int snd_ctl_register_ioctl(snd_kctl_ioctl_func_t fcn);
 int snd_ctl_unregister_ioctl(snd_kctl_ioctl_func_t fcn);
@@ -154,25 +127,20 @@ int snd_ctl_unregister_ioctl_compat(snd_kctl_ioctl_func_t fcn);
 #define snd_ctl_unregister_ioctl_compat(fcn)
 #endif
 
-int snd_ctl_request_layer(const char *module_name);
-void snd_ctl_register_layer(struct snd_ctl_layer_ops *lops);
-void snd_ctl_disconnect_layer(struct snd_ctl_layer_ops *lops);
+int snd_ctl_elem_read(snd_card_t *card, snd_ctl_elem_value_t *control);
+int snd_ctl_elem_write(snd_card_t *card, snd_ctl_file_t *file, snd_ctl_elem_value_t *control);
 
-int snd_ctl_get_preferred_subdevice(struct snd_card *card, int type);
-
-static inline unsigned int snd_ctl_get_ioffnum(struct snd_kcontrol *kctl, struct snd_ctl_elem_id *id)
+static inline unsigned int snd_ctl_get_ioffnum(snd_kcontrol_t *kctl, snd_ctl_elem_id_t *id)
 {
-	unsigned int ioff = id->numid - kctl->id.numid;
-	return array_index_nospec(ioff, kctl->count);
+	return id->numid - kctl->id.numid;
 }
 
-static inline unsigned int snd_ctl_get_ioffidx(struct snd_kcontrol *kctl, struct snd_ctl_elem_id *id)
+static inline unsigned int snd_ctl_get_ioffidx(snd_kcontrol_t *kctl, snd_ctl_elem_id_t *id)
 {
-	unsigned int ioff = id->index - kctl->id.index;
-	return array_index_nospec(ioff, kctl->count);
+	return id->index - kctl->id.index;
 }
 
-static inline unsigned int snd_ctl_get_ioff(struct snd_kcontrol *kctl, struct snd_ctl_elem_id *id)
+static inline unsigned int snd_ctl_get_ioff(snd_kcontrol_t *kctl, snd_ctl_elem_id_t *id)
 {
 	if (id->numid) {
 		return snd_ctl_get_ioffnum(kctl, id);
@@ -181,8 +149,8 @@ static inline unsigned int snd_ctl_get_ioff(struct snd_kcontrol *kctl, struct sn
 	}
 }
 
-static inline struct snd_ctl_elem_id *snd_ctl_build_ioff(struct snd_ctl_elem_id *dst_id,
-						    struct snd_kcontrol *src_kctl,
+static inline snd_ctl_elem_id_t *snd_ctl_build_ioff(snd_ctl_elem_id_t *dst_id,
+						    snd_kcontrol_t *src_kctl,
 						    unsigned int offset)
 {
 	*dst_id = src_kctl->id;
@@ -190,104 +158,5 @@ static inline struct snd_ctl_elem_id *snd_ctl_build_ioff(struct snd_ctl_elem_id 
 	dst_id->numid += offset;
 	return dst_id;
 }
-
-/*
- * Frequently used control callbacks/helpers
- */
-int snd_ctl_boolean_mono_info(struct snd_kcontrol *kcontrol,
-			      struct snd_ctl_elem_info *uinfo);
-int snd_ctl_boolean_stereo_info(struct snd_kcontrol *kcontrol,
-				struct snd_ctl_elem_info *uinfo);
-int snd_ctl_enum_info(struct snd_ctl_elem_info *info, unsigned int channels,
-		      unsigned int items, const char *const names[]);
-
-/*
- * virtual master control
- */
-struct snd_kcontrol *snd_ctl_make_virtual_master(char *name,
-						 const unsigned int *tlv);
-int _snd_ctl_add_follower(struct snd_kcontrol *master,
-			  struct snd_kcontrol *follower,
-			  unsigned int flags);
-/* optional flags for follower */
-#define SND_CTL_FOLLOWER_NEED_UPDATE	(1 << 0)
-
-/**
- * snd_ctl_add_follower - Add a virtual follower control
- * @master: vmaster element
- * @follower: follower element to add
- *
- * Add a virtual follower control to the given master element created via
- * snd_ctl_create_virtual_master() beforehand.
- *
- * All followers must be the same type (returning the same information
- * via info callback).  The function doesn't check it, so it's your
- * responsibility.
- *
- * Also, some additional limitations:
- * at most two channels,
- * logarithmic volume control (dB level) thus no linear volume,
- * master can only attenuate the volume without gain
- *
- * Return: Zero if successful or a negative error code.
- */
-static inline int
-snd_ctl_add_follower(struct snd_kcontrol *master, struct snd_kcontrol *follower)
-{
-	return _snd_ctl_add_follower(master, follower, 0);
-}
-
-/**
- * snd_ctl_add_follower_uncached - Add a virtual follower control
- * @master: vmaster element
- * @follower: follower element to add
- *
- * Add a virtual follower control to the given master.
- * Unlike snd_ctl_add_follower(), the element added via this function
- * is supposed to have volatile values, and get callback is called
- * at each time queried from the master.
- *
- * When the control peeks the hardware values directly and the value
- * can be changed by other means than the put callback of the element,
- * this function should be used to keep the value always up-to-date.
- *
- * Return: Zero if successful or a negative error code.
- */
-static inline int
-snd_ctl_add_follower_uncached(struct snd_kcontrol *master,
-			      struct snd_kcontrol *follower)
-{
-	return _snd_ctl_add_follower(master, follower, SND_CTL_FOLLOWER_NEED_UPDATE);
-}
-
-int snd_ctl_add_vmaster_hook(struct snd_kcontrol *kctl,
-			     void (*hook)(void *private_data, int),
-			     void *private_data);
-void snd_ctl_sync_vmaster(struct snd_kcontrol *kctl, bool hook_only);
-#define snd_ctl_sync_vmaster_hook(kctl)	snd_ctl_sync_vmaster(kctl, true)
-int snd_ctl_apply_vmaster_followers(struct snd_kcontrol *kctl,
-				    int (*func)(struct snd_kcontrol *vfollower,
-						struct snd_kcontrol *follower,
-						void *arg),
-				    void *arg);
-
-/*
- * Control LED trigger layer
- */
-#define SND_CTL_LAYER_MODULE_LED	"snd-ctl-led"
-
-#if IS_MODULE(CONFIG_SND_CTL_LED)
-static inline int snd_ctl_led_request(void) { return snd_ctl_request_layer(SND_CTL_LAYER_MODULE_LED); }
-#else
-static inline int snd_ctl_led_request(void) { return 0; }
-#endif
-
-/*
- * Helper functions for jack-detection controls
- */
-struct snd_kcontrol *
-snd_kctl_jack_new(const char *name, struct snd_card *card);
-void snd_kctl_jack_report(struct snd_card *card,
-			  struct snd_kcontrol *kctl, bool status);
 
 #endif	/* __SOUND_CONTROL_H */

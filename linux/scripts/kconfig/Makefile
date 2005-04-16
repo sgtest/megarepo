@@ -1,214 +1,208 @@
-# SPDX-License-Identifier: GPL-2.0
 # ===========================================================================
 # Kernel configuration targets
 # These targets are used from top-level makefile
 
-ifdef KBUILD_KCONFIG
-Kconfig := $(KBUILD_KCONFIG)
-else
-Kconfig := Kconfig
-endif
+.PHONY: oldconfig xconfig gconfig menuconfig config silentoldconfig
 
-ifndef KBUILD_DEFCONFIG
-KBUILD_DEFCONFIG := defconfig
-endif
+xconfig: $(obj)/qconf
+	$< arch/$(ARCH)/Kconfig
 
-ifeq ($(quiet),silent_)
-silent := -s
-endif
+gconfig: $(obj)/gconf
+	$< arch/$(ARCH)/Kconfig
 
-export KCONFIG_DEFCONFIG_LIST :=
-ifndef cross_compiling
-kernel-release := $(shell uname -r)
-KCONFIG_DEFCONFIG_LIST += \
-	/lib/modules/$(kernel-release)/.config \
-	/etc/kernel-config \
-	/boot/config-$(kernel-release)
-endif
-KCONFIG_DEFCONFIG_LIST += arch/$(SRCARCH)/configs/$(KBUILD_DEFCONFIG)
+menuconfig: $(obj)/mconf
+	$(Q)$(MAKE) $(build)=scripts/lxdialog
+	$< arch/$(ARCH)/Kconfig
 
-# We need this, in case the user has it in its environment
-unexport CONFIG_
+config: $(obj)/conf
+	$< arch/$(ARCH)/Kconfig
 
-config-prog	:= conf
-menuconfig-prog	:= mconf
-nconfig-prog	:= nconf
-gconfig-prog	:= gconf
-xconfig-prog	:= qconf
+oldconfig: $(obj)/conf
+	$< -o arch/$(ARCH)/Kconfig
 
-define config_rule
-PHONY += $(1)
-$(1): $(obj)/$($(1)-prog)
-	$(Q)$$< $(silent) $(Kconfig)
+silentoldconfig: $(obj)/conf
+	$< -s arch/$(ARCH)/Kconfig
 
-PHONY += build_$(1)
-build_$(1): $(obj)/$($(1)-prog)
-endef
+.PHONY: randconfig allyesconfig allnoconfig allmodconfig defconfig
 
-$(foreach c, config menuconfig nconfig gconfig xconfig, $(eval $(call config_rule,$(c))))
+randconfig: $(obj)/conf
+	$< -r arch/$(ARCH)/Kconfig
 
-PHONY += localmodconfig localyesconfig
-localyesconfig localmodconfig: $(obj)/conf
-	$(Q)$(PERL) $(srctree)/$(src)/streamline_config.pl --$@ $(srctree) $(Kconfig) > .tmp.config
-	$(Q)if [ -f .config ]; then 				\
-		cmp -s .tmp.config .config ||			\
-		(mv -f .config .config.old.1;			\
-		 mv -f .tmp.config .config;			\
-		 $< $(silent) --oldconfig $(Kconfig);		\
-		 mv -f .config.old.1 .config.old)		\
-	else							\
-		mv -f .tmp.config .config;			\
-		$< $(silent) --oldconfig $(Kconfig);		\
-	fi
-	$(Q)rm -f .tmp.config
+allyesconfig: $(obj)/conf
+	$< -y arch/$(ARCH)/Kconfig
 
-# These targets map 1:1 to the commandline options of 'conf'
-#
-# Note:
-#  syncconfig has become an internal implementation detail and is now
-#  deprecated for external use
-simple-targets := oldconfig allnoconfig allyesconfig allmodconfig \
-	alldefconfig randconfig listnewconfig olddefconfig syncconfig \
-	helpnewconfig yes2modconfig mod2yesconfig mod2noconfig
+allnoconfig: $(obj)/conf
+	$< -n arch/$(ARCH)/Kconfig
 
-PHONY += $(simple-targets)
-
-$(simple-targets): $(obj)/conf
-	$(Q)$< $(silent) --$@ $(Kconfig)
-
-PHONY += savedefconfig defconfig
-
-savedefconfig: $(obj)/conf
-	$(Q)$< $(silent) --$@=defconfig $(Kconfig)
+allmodconfig: $(obj)/conf
+	$< -m arch/$(ARCH)/Kconfig
 
 defconfig: $(obj)/conf
-ifneq ($(wildcard $(srctree)/arch/$(SRCARCH)/configs/$(KBUILD_DEFCONFIG)),)
-	@$(kecho) "*** Default configuration is based on '$(KBUILD_DEFCONFIG)'"
-	$(Q)$< $(silent) --defconfig=arch/$(SRCARCH)/configs/$(KBUILD_DEFCONFIG) $(Kconfig)
+ifeq ($(KBUILD_DEFCONFIG),)
+	$< -d arch/$(ARCH)/Kconfig
 else
-	@$(kecho) "*** Default configuration is based on target '$(KBUILD_DEFCONFIG)'"
-	$(Q)$(MAKE) -f $(srctree)/Makefile $(KBUILD_DEFCONFIG)
+	@echo *** Default configuration is based on '$(KBUILD_DEFCONFIG)'
+	$(Q)$< -D arch/$(ARCH)/configs/$(KBUILD_DEFCONFIG) arch/$(ARCH)/Kconfig
 endif
 
 %_defconfig: $(obj)/conf
-	$(Q)$< $(silent) --defconfig=arch/$(SRCARCH)/configs/$@ $(Kconfig)
-
-configfiles=$(wildcard $(srctree)/kernel/configs/$@ $(srctree)/arch/$(SRCARCH)/configs/$@)
-
-%.config: $(obj)/conf
-	$(if $(call configfiles),, $(error No configuration exists for this target on this architecture))
-	$(Q)$(CONFIG_SHELL) $(srctree)/scripts/kconfig/merge_config.sh -m .config $(configfiles)
-	$(Q)$(MAKE) -f $(srctree)/Makefile olddefconfig
-
-PHONY += tinyconfig
-tinyconfig:
-	$(Q)KCONFIG_ALLCONFIG=kernel/configs/tiny-base.config $(MAKE) -f $(srctree)/Makefile allnoconfig
-	$(Q)$(MAKE) -f $(srctree)/Makefile tiny.config
-
-# CHECK: -o cache_dir=<path> working?
-PHONY += testconfig
-testconfig: $(obj)/conf
-	$(Q)$(PYTHON3) -B -m pytest $(srctree)/$(src)/tests \
-	-o cache_dir=$(abspath $(obj)/tests/.cache) \
-	$(if $(findstring 1,$(KBUILD_VERBOSE)),--capture=no)
-clean-files += tests/.cache
+	$(Q)$< -D arch/$(ARCH)/configs/$@ arch/$(ARCH)/Kconfig
 
 # Help text used by make help
 help:
 	@echo  '  config	  - Update current config utilising a line-oriented program'
-	@echo  '  nconfig         - Update current config utilising a ncurses menu based program'
 	@echo  '  menuconfig	  - Update current config utilising a menu based program'
-	@echo  '  xconfig	  - Update current config utilising a Qt based front-end'
-	@echo  '  gconfig	  - Update current config utilising a GTK+ based front-end'
+	@echo  '  xconfig	  - Update current config utilising a QT based front-end'
+	@echo  '  gconfig	  - Update current config utilising a GTK based front-end'
 	@echo  '  oldconfig	  - Update current config utilising a provided .config as base'
-	@echo  '  localmodconfig  - Update current config disabling modules not loaded'
-	@echo  '                    except those preserved by LMC_KEEP environment variable'
-	@echo  '  localyesconfig  - Update current config converting local mods to core'
-	@echo  '                    except those preserved by LMC_KEEP environment variable'
-	@echo  '  defconfig	  - New config with default from ARCH supplied defconfig'
-	@echo  '  savedefconfig   - Save current config as ./defconfig (minimal config)'
-	@echo  '  allnoconfig	  - New config where all options are answered with no'
-	@echo  '  allyesconfig	  - New config where all options are accepted with yes'
-	@echo  '  allmodconfig	  - New config selecting modules when possible'
-	@echo  '  alldefconfig    - New config with all symbols set to default'
 	@echo  '  randconfig	  - New config with random answer to all options'
-	@echo  '  yes2modconfig	  - Change answers from yes to mod if possible'
-	@echo  '  mod2yesconfig	  - Change answers from mod to yes if possible'
-	@echo  '  mod2noconfig	  - Change answers from mod to no if possible'
-	@echo  '  listnewconfig   - List new options'
-	@echo  '  helpnewconfig   - List new options and help text'
-	@echo  '  olddefconfig	  - Same as oldconfig but sets new symbols to their'
-	@echo  '                    default value without prompting'
-	@echo  '  tinyconfig	  - Configure the tiniest possible kernel'
-	@echo  '  testconfig	  - Run Kconfig unit tests (requires python3 and pytest)'
+	@echo  '  defconfig	  - New config with default answer to all options'
+	@echo  '  allmodconfig	  - New config selecting modules when possible'
+	@echo  '  allyesconfig	  - New config where all options are accepted with yes'
+	@echo  '  allnoconfig	  - New minimal config'
 
 # ===========================================================================
+# Shared Makefile for the various kconfig executables:
+# conf:	  Used for defconfig, oldconfig and related targets
+# mconf:  Used for the mconfig target.
+#         Utilizes the lxdialog package
+# qconf:  Used for the xconfig target
+#         Based on QT which needs to be installed to compile it
+# gconf:  Used for the gconfig target
+#         Based on GTK which needs to be installed to compile it
 # object files used by all kconfig flavours
-common-objs	:= confdata.o expr.o lexer.lex.o menu.o parser.tab.o \
-		   preprocess.o symbol.o util.o
 
-$(obj)/lexer.lex.o: $(obj)/parser.tab.h
-HOSTCFLAGS_lexer.lex.o	:= -I $(srctree)/$(src)
-HOSTCFLAGS_parser.tab.o	:= -I $(srctree)/$(src)
+hostprogs-y	:= conf mconf qconf gconf
+conf-objs	:= conf.o  zconf.tab.o
+mconf-objs	:= mconf.o zconf.tab.o
 
-# conf: Used for defconfig, oldconfig and related targets
-hostprogs	+= conf
-conf-objs	:= conf.o $(common-objs)
+ifeq ($(MAKECMDGOALS),xconfig)
+	qconf-target := 1
+endif
+ifeq ($(MAKECMDGOALS),gconfig)
+	gconf-target := 1
+endif
 
-# nconf: Used for the nconfig target based on ncurses
-hostprogs	+= nconf
-nconf-objs	:= nconf.o nconf.gui.o $(common-objs)
 
-HOSTLDLIBS_nconf	= $(shell . $(obj)/nconf-cfg && echo $$libs)
-HOSTCFLAGS_nconf.o	= $(shell . $(obj)/nconf-cfg && echo $$cflags)
-HOSTCFLAGS_nconf.gui.o	= $(shell . $(obj)/nconf-cfg && echo $$cflags)
+ifeq ($(qconf-target),1)
+qconf-cxxobjs	:= qconf.o
+qconf-objs	:= kconfig_load.o zconf.tab.o
+endif
 
-$(obj)/nconf.o $(obj)/nconf.gui.o: $(obj)/nconf-cfg
+ifeq ($(gconf-target),1)
+gconf-objs	:= gconf.o kconfig_load.o zconf.tab.o
+endif
 
-# mconf: Used for the menuconfig target based on lxdialog
-hostprogs	+= mconf
-lxdialog	:= $(addprefix lxdialog/, \
-		     checklist.o inputbox.o menubox.o textbox.o util.o yesno.o)
-mconf-objs	:= mconf.o $(lxdialog) $(common-objs)
+clean-files	:= lkc_defs.h qconf.moc .tmp_qtcheck \
+		   .tmp_gtkcheck zconf.tab.c zconf.tab.h lex.zconf.c
 
-HOSTLDLIBS_mconf = $(shell . $(obj)/mconf-cfg && echo $$libs)
-$(foreach f, mconf.o $(lxdialog), \
-  $(eval HOSTCFLAGS_$f = $$(shell . $(obj)/mconf-cfg && echo $$$$cflags)))
+# generated files seem to need this to find local include files
+HOSTCFLAGS_lex.zconf.o	:= -I$(src)
+HOSTCFLAGS_zconf.tab.o	:= -I$(src)
 
-$(addprefix $(obj)/, mconf.o $(lxdialog)): $(obj)/mconf-cfg
+HOSTLOADLIBES_qconf	= -L$(QTLIBPATH) -Wl,-rpath,$(QTLIBPATH) -l$(QTLIB) -ldl
+HOSTCXXFLAGS_qconf.o	= -I$(QTDIR)/include -D LKC_DIRECT_LINK
 
-# qconf: Used for the xconfig target based on Qt
-hostprogs	+= qconf
-qconf-cxxobjs	:= qconf.o qconf-moc.o
-qconf-objs	:= images.o $(common-objs)
+HOSTLOADLIBES_gconf	= `pkg-config gtk+-2.0 gmodule-2.0 libglade-2.0 --libs`
+HOSTCFLAGS_gconf.o	= `pkg-config gtk+-2.0 gmodule-2.0 libglade-2.0 --cflags` \
+                          -D LKC_DIRECT_LINK
 
-HOSTLDLIBS_qconf	= $(shell . $(obj)/qconf-cfg && echo $$libs)
-HOSTCXXFLAGS_qconf.o	= $(shell . $(obj)/qconf-cfg && echo $$cflags)
-HOSTCXXFLAGS_qconf-moc.o = $(shell . $(obj)/qconf-cfg && echo $$cflags)
+$(obj)/conf.o $(obj)/mconf.o $(obj)/qconf.o $(obj)/gconf.o: $(obj)/zconf.tab.h
 
-$(obj)/qconf.o: $(obj)/qconf-cfg
+$(obj)/zconf.tab.h: $(src)/zconf.tab.h_shipped
+$(obj)/zconf.tab.c: $(src)/zconf.tab.c_shipped
+$(obj)/lex.zconf.c: $(src)/lex.zconf.c_shipped
 
-quiet_cmd_moc = MOC     $@
-      cmd_moc = $(shell . $(obj)/qconf-cfg && echo $$moc) $< -o $@
+$(obj)/qconf.o: $(obj)/.tmp_qtcheck
 
-$(obj)/qconf-moc.cc: $(src)/qconf.h $(obj)/qconf-cfg FORCE
-	$(call if_changed,moc)
+ifeq ($(qconf-target),1)
+MOC = $(QTDIR)/bin/moc
+QTLIBPATH = $(QTDIR)/lib
+-include $(obj)/.tmp_qtcheck
 
-targets += qconf-moc.cc
+# QT needs some extra effort...
+$(obj)/.tmp_qtcheck:
+	@set -e; for d in $$QTDIR /usr/share/qt* /usr/lib/qt*; do \
+	  if [ -f $$d/include/qconfig.h ]; then DIR=$$d; break; fi; \
+	done; \
+	if [ -z "$$DIR" ]; then \
+	  echo "*"; \
+	  echo "* Unable to find the QT installation. Please make sure that the"; \
+	  echo "* QT development package is correctly installed and the QTDIR"; \
+	  echo "* environment variable is set to the correct location."; \
+	  echo "*"; \
+	  false; \
+	fi; \
+	LIBPATH=$$DIR/lib; LIB=qt; \
+	$(HOSTCXX) -print-multi-os-directory > /dev/null 2>&1 && \
+	  LIBPATH=$$DIR/lib/$$($(HOSTCXX) -print-multi-os-directory); \
+	if [ -f $$LIBPATH/libqt-mt.so ]; then LIB=qt-mt; fi; \
+	echo "QTDIR=$$DIR" > $@; echo "QTLIBPATH=$$LIBPATH" >> $@; \
+	echo "QTLIB=$$LIB" >> $@; \
+	if [ ! -x $$DIR/bin/moc -a -x /usr/bin/moc ]; then \
+	  echo "*"; \
+	  echo "* Unable to find $$DIR/bin/moc, using /usr/bin/moc instead."; \
+	  echo "*"; \
+	  echo "MOC=/usr/bin/moc" >> $@; \
+	fi
+endif
 
-# gconf: Used for the gconfig target based on GTK+
-hostprogs	+= gconf
-gconf-objs	:= gconf.o images.o $(common-objs)
+$(obj)/gconf.o: $(obj)/.tmp_gtkcheck
 
-HOSTLDLIBS_gconf    = $(shell . $(obj)/gconf-cfg && echo $$libs)
-HOSTCFLAGS_gconf.o  = $(shell . $(obj)/gconf-cfg && echo $$cflags)
+ifeq ($(gconf-target),1)
+-include $(obj)/.tmp_gtkcheck
 
-$(obj)/gconf.o: $(obj)/gconf-cfg
+# GTK needs some extra effort, too...
+$(obj)/.tmp_gtkcheck:
+	@if `pkg-config gtk+-2.0 gmodule-2.0 libglade-2.0 --exists`; then		\
+		if `pkg-config gtk+-2.0 --atleast-version=2.0.0`; then			\
+			touch $@;								\
+		else									\
+			echo "*"; 							\
+			echo "* GTK+ is present but version >= 2.0.0 is required.";	\
+			echo "*";							\
+			false;								\
+		fi									\
+	else										\
+		echo "*"; 								\
+		echo "* Unable to find the GTK+ installation. Please make sure that"; 	\
+		echo "* the GTK+ 2.0 development package is correctly installed..."; 	\
+		echo "* You need gtk+-2.0, glib-2.0 and libglade-2.0."; 		\
+		echo "*"; 								\
+		false;									\
+	fi
+endif
 
-# check if necessary packages are available, and configure build flags
-filechk_conf_cfg = $(CONFIG_SHELL) $<
+$(obj)/zconf.tab.o: $(obj)/lex.zconf.c
 
-$(obj)/%conf-cfg: $(src)/%conf-cfg.sh FORCE
-	$(call filechk,conf_cfg)
+$(obj)/kconfig_load.o: $(obj)/lkc_defs.h
 
-clean-files += *conf-cfg
+$(obj)/qconf.o: $(obj)/qconf.moc $(obj)/lkc_defs.h
+
+$(obj)/gconf.o: $(obj)/lkc_defs.h
+
+$(obj)/%.moc: $(src)/%.h
+	$(MOC) -i $< -o $@
+
+$(obj)/lkc_defs.h: $(src)/lkc_proto.h
+	sed < $< > $@ 's/P(\([^,]*\),.*/#define \1 (\*\1_p)/'
+
+
+###
+# The following requires flex/bison
+# By default we use the _shipped versions, uncomment the following line if
+# you are modifying the flex/bison src.
+# LKC_GENPARSER := 1
+
+ifdef LKC_GENPARSER
+
+$(obj)/zconf.tab.c: $(obj)/zconf.y 
+$(obj)/zconf.tab.h: $(obj)/zconf.tab.c
+
+%.tab.c: %.y
+	bison -t -d -v -b $* -p $(notdir $*) $<
+
+lex.%.c: %.l
+	flex -P$(notdir $*) -o$@ $<
+
+endif

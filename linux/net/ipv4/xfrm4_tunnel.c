@@ -1,30 +1,92 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /* xfrm4_tunnel.c: Generic IP tunnel transformer.
  *
  * Copyright (C) 2003 David S. Miller (davem@redhat.com)
  */
 
-#define pr_fmt(fmt) "IPsec: " fmt
-
 #include <linux/skbuff.h>
 #include <linux/module.h>
 #include <net/xfrm.h>
+#include <net/ip.h>
 #include <net/protocol.h>
 
 static int ipip_output(struct xfrm_state *x, struct sk_buff *skb)
 {
-	skb_push(skb, -skb_network_offset(skb));
+	struct iphdr *iph;
+	
+	iph = skb->nh.iph;
+	iph->tot_len = htons(skb->len);
+	ip_send_check(iph);
+
 	return 0;
 }
 
-static int ipip_xfrm_rcv(struct xfrm_state *x, struct sk_buff *skb)
+static int ipip_xfrm_rcv(struct xfrm_state *x, struct xfrm_decap_state *decap, struct sk_buff *skb)
 {
-	return ip_hdr(skb)->protocol;
+	return 0;
 }
 
-static int ipip_init_state(struct xfrm_state *x)
+static struct xfrm_tunnel *ipip_handler;
+static DECLARE_MUTEX(xfrm4_tunnel_sem);
+
+int xfrm4_tunnel_register(struct xfrm_tunnel *handler)
 {
-	if (x->props.mode != XFRM_MODE_TUNNEL)
+	int ret;
+
+	down(&xfrm4_tunnel_sem);
+	ret = 0;
+	if (ipip_handler != NULL)
+		ret = -EINVAL;
+	if (!ret)
+		ipip_handler = handler;
+	up(&xfrm4_tunnel_sem);
+
+	return ret;
+}
+
+EXPORT_SYMBOL(xfrm4_tunnel_register);
+
+int xfrm4_tunnel_deregister(struct xfrm_tunnel *handler)
+{
+	int ret;
+
+	down(&xfrm4_tunnel_sem);
+	ret = 0;
+	if (ipip_handler != handler)
+		ret = -EINVAL;
+	if (!ret)
+		ipip_handler = NULL;
+	up(&xfrm4_tunnel_sem);
+
+	synchronize_net();
+
+	return ret;
+}
+
+EXPORT_SYMBOL(xfrm4_tunnel_deregister);
+
+static int ipip_rcv(struct sk_buff *skb)
+{
+	struct xfrm_tunnel *handler = ipip_handler;
+
+	/* Tunnel devices take precedence.  */
+	if (handler && handler->handler(skb) == 0)
+		return 0;
+
+	return xfrm4_rcv(skb);
+}
+
+static void ipip_err(struct sk_buff *skb, u32 info)
+{
+	struct xfrm_tunnel *handler = ipip_handler;
+	u32 arg = info;
+
+	if (handler)
+		handler->err_handler(skb, &arg);
+}
+
+static int ipip_init_state(struct xfrm_state *x, void *args)
+{
+	if (!x->props.mode)
 		return -EINVAL;
 
 	if (x->encap)
@@ -39,7 +101,8 @@ static void ipip_destroy(struct xfrm_state *x)
 {
 }
 
-static const struct xfrm_type ipip_type = {
+static struct xfrm_type ipip_type = {
+	.description	= "IPIP",
 	.owner		= THIS_MODULE,
 	.proto	     	= IPPROTO_IPIP,
 	.init_state	= ipip_init_state,
@@ -48,67 +111,34 @@ static const struct xfrm_type ipip_type = {
 	.output		= ipip_output
 };
 
-static int xfrm_tunnel_rcv(struct sk_buff *skb)
-{
-	return xfrm4_rcv_spi(skb, IPPROTO_IPIP, ip_hdr(skb)->saddr);
-}
-
-static int xfrm_tunnel_err(struct sk_buff *skb, u32 info)
-{
-	return -ENOENT;
-}
-
-static struct xfrm_tunnel xfrm_tunnel_handler __read_mostly = {
-	.handler	=	xfrm_tunnel_rcv,
-	.err_handler	=	xfrm_tunnel_err,
-	.priority	=	4,
+static struct net_protocol ipip_protocol = {
+	.handler	=	ipip_rcv,
+	.err_handler	=	ipip_err,
+	.no_policy	=	1,
 };
-
-#if IS_ENABLED(CONFIG_IPV6)
-static struct xfrm_tunnel xfrm64_tunnel_handler __read_mostly = {
-	.handler	=	xfrm_tunnel_rcv,
-	.err_handler	=	xfrm_tunnel_err,
-	.priority	=	3,
-};
-#endif
 
 static int __init ipip_init(void)
 {
 	if (xfrm_register_type(&ipip_type, AF_INET) < 0) {
-		pr_info("%s: can't add xfrm type\n", __func__);
+		printk(KERN_INFO "ipip init: can't add xfrm type\n");
 		return -EAGAIN;
 	}
-
-	if (xfrm4_tunnel_register(&xfrm_tunnel_handler, AF_INET)) {
-		pr_info("%s: can't add xfrm handler for AF_INET\n", __func__);
+	if (inet_add_protocol(&ipip_protocol, IPPROTO_IPIP) < 0) {
+		printk(KERN_INFO "ipip init: can't add protocol\n");
 		xfrm_unregister_type(&ipip_type, AF_INET);
 		return -EAGAIN;
 	}
-#if IS_ENABLED(CONFIG_IPV6)
-	if (xfrm4_tunnel_register(&xfrm64_tunnel_handler, AF_INET6)) {
-		pr_info("%s: can't add xfrm handler for AF_INET6\n", __func__);
-		xfrm4_tunnel_deregister(&xfrm_tunnel_handler, AF_INET);
-		xfrm_unregister_type(&ipip_type, AF_INET);
-		return -EAGAIN;
-	}
-#endif
 	return 0;
 }
 
 static void __exit ipip_fini(void)
 {
-#if IS_ENABLED(CONFIG_IPV6)
-	if (xfrm4_tunnel_deregister(&xfrm64_tunnel_handler, AF_INET6))
-		pr_info("%s: can't remove xfrm handler for AF_INET6\n",
-			__func__);
-#endif
-	if (xfrm4_tunnel_deregister(&xfrm_tunnel_handler, AF_INET))
-		pr_info("%s: can't remove xfrm handler for AF_INET\n",
-			__func__);
-	xfrm_unregister_type(&ipip_type, AF_INET);
+	if (inet_del_protocol(&ipip_protocol, IPPROTO_IPIP) < 0)
+		printk(KERN_INFO "ipip close: can't remove protocol\n");
+	if (xfrm_unregister_type(&ipip_type, AF_INET) < 0)
+		printk(KERN_INFO "ipip close: can't remove xfrm type\n");
 }
 
 module_init(ipip_init);
 module_exit(ipip_fini);
 MODULE_LICENSE("GPL");
-MODULE_ALIAS_XFRM_TYPE(AF_INET, XFRM_PROTO_IPIP);

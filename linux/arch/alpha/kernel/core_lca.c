@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *	linux/arch/alpha/kernel/core_lca.c
  *
@@ -20,7 +19,6 @@
 #include <linux/tty.h>
 
 #include <asm/ptrace.h>
-#include <asm/irq_regs.h>
 #include <asm/smp.h>
 
 #include "proto.h"
@@ -134,7 +132,7 @@ conf_read(unsigned long addr)
 
 	local_irq_save(flags);
 
-	/* Reset status register to avoid losing errors.  */
+	/* Reset status register to avoid loosing errors.  */
 	stat0 = *(vulp)LCA_IOC_STAT0;
 	*(vulp)LCA_IOC_STAT0 = stat0;
 	mb();
@@ -171,7 +169,7 @@ conf_write(unsigned long addr, unsigned int value)
 
 	local_irq_save(flags);	/* avoid getting hit by machine check */
 
-	/* Reset status register to avoid losing errors.  */
+	/* Reset status register to avoid loosing errors.  */
 	stat0 = *(vulp)LCA_IOC_STAT0;
 	*(vulp)LCA_IOC_STAT0 = stat0;
 	mb();
@@ -275,8 +273,7 @@ lca_init_arch(void)
 	 * Note that we do not try to save any of the DMA window CSRs
 	 * before setting them, since we cannot read those CSRs on LCA.
 	 */
-	hose->sg_isa = iommu_arena_new(hose, 0x00800000, 0x00800000,
-				       SMP_CACHE_BYTES);
+	hose->sg_isa = iommu_arena_new(hose, 0x00800000, 0x00800000, 0);
 	hose->sg_pci = NULL;
 	__direct_map_base = 0x40000000;
 	__direct_map_size = 0x40000000;
@@ -389,7 +386,8 @@ ioc_error(__u32 stat0, __u32 stat1)
 }
 
 void
-lca_machine_check(unsigned long vector, unsigned long la_ptr)
+lca_machine_check(unsigned long vector, unsigned long la_ptr,
+		  struct pt_regs *regs)
 {
 	const char * reason;
 	union el_lca el;
@@ -399,7 +397,7 @@ lca_machine_check(unsigned long vector, unsigned long la_ptr)
 	wrmces(rdmces());	/* reset machine check pending flag */
 
 	printk(KERN_CRIT "LCA machine check: vector=%#lx pc=%#lx code=%#x\n",
-	       vector, get_irq_regs()->pc, (unsigned int) el.c->code);
+	       vector, regs->pc, (unsigned int) el.c->code);
 
 	/*
 	 * The first quadword after the common header always seems to

@@ -1,10 +1,14 @@
-# SPDX-License-Identifier: GPL-2.0
 #
 # PARIDE configuration
 #
 # PARIDE doesn't need PARPORT, but if PARPORT is configured as a module,
-# PARIDE must also be a module.
-# PARIDE only supports PC style parports. Tough for USB or other parports...
+# PARIDE must also be a module.  The bogus CONFIG_PARIDE_PARPORT option
+# controls the choices given to the user ...
+config PARIDE_PARPORT
+	tristate
+	depends on PARIDE!=n
+	default m if PARPORT=m
+	default y if PARPORT!=m
 
 comment "Parallel IDE high-level drivers"
 	depends on PARIDE
@@ -26,8 +30,7 @@ config PARIDE_PD
 config PARIDE_PCD
 	tristate "Parallel port ATAPI CD-ROMs"
 	depends on PARIDE
-	select CDROM
-	help
+	---help---
 	  This option enables the high-level driver for ATAPI CD-ROM devices
 	  connected through a parallel port. If you chose to build PARIDE
 	  support into your kernel, you may answer Y here to build in the
@@ -70,7 +73,7 @@ config PARIDE_PT
 config PARIDE_PG
 	tristate "Parallel port generic ATAPI devices"
 	depends on PARIDE
-	help
+	---help---
 	  This option enables a special high-level driver for generic ATAPI
 	  devices connected through a parallel port. The driver allows user
 	  programs, such as cdrtools, to send ATAPI commands directly to a
@@ -110,7 +113,7 @@ config PARIDE_ATEN
 config PARIDE_BPCK
 	tristate "MicroSolutions backpack (Series 5) protocol"
 	depends on PARIDE
-	help
+	---help---
 	  This option enables support for the Micro Solutions BACKPACK
 	  parallel port Series 5 IDE protocol.  (Most BACKPACK drives made
 	  before 1999 were Series 5) Series 5 drives will NOT always have the
@@ -128,7 +131,7 @@ config PARIDE_BPCK
 config PARIDE_BPCK6
 	tristate "MicroSolutions backpack (Series 6) protocol"
 	depends on PARIDE && !64BIT
-	help
+	---help---
 	  This option enables support for the Micro Solutions BACKPACK
 	  parallel port Series 6 IDE protocol.  (Most BACKPACK drives made
 	  after 1999 were Series 6) Series 6 drives will have the Series noted
@@ -207,8 +210,8 @@ config PARIDE_EPAT
 	  support.
 
 config PARIDE_EPATC8
-	bool "Support c7/c8 chips"
-	depends on PARIDE_EPAT
+	bool "Support c7/c8 chips (EXPERIMENTAL)"
+	depends on PARIDE_EPAT && EXPERIMENTAL
 	help
 	  This option enables support for the newer Shuttle EP1284 (aka c7 and
 	  c8) chip. You need this if you are using any recent Imation SuperDisk

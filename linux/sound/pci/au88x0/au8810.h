@@ -1,11 +1,10 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
     Aureal Advantage Soundcard driver.
  */
 
 #define CHIP_AU8810
 
-#define CARD_NAME "Aureal Advantage"
+#define CARD_NAME "Aureal Advantage 3D Sound Processor"
 #define CARD_NAME_SHORT "au8810"
 
 #define NR_ADB		0x10
@@ -179,6 +178,11 @@
 #define		EN_SPDIF	0x000c0000
 
 #define VORTEX_CODEC_CHN 	0x29080
+#define VORTEX_CODEC_WRITE	0x00800000
+#define VORTEX_CODEC_ADDSHIFT 	16
+#define VORTEX_CODEC_ADDMASK	0x7f0000	/* 0x000f0000 */
+#define VORTEX_CODEC_DATSHIFT	0
+#define VORTEX_CODEC_DATMASK	0xffff
 #define VORTEX_CODEC_IO		0x29188
 
 /* SPDIF */

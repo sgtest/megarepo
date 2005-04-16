@@ -1,11 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Ported from IRIX to Linux by Kanoj Sarcar, 06/08/00.
  * Copyright 2000 - 2001 Silicon Graphics, Inc.
  * Copyright 2000 - 2001 Kanoj Sarcar (kanoj@sgi.com)
  */
+#include <linux/config.h>
 #include <linux/init.h>
-#include <linux/mm.h>
 #include <linux/mmzone.h>
 #include <linux/kernel.h>
 #include <linux/nodemask.h>
@@ -13,39 +12,38 @@
 
 #include <asm/page.h>
 #include <asm/sections.h>
+#include <asm/smp.h>
 #include <asm/sn/types.h>
 #include <asm/sn/arch.h>
 #include <asm/sn/gda.h>
+#include <asm/sn/hub.h>
 #include <asm/sn/mapped_kernel.h>
+#include <asm/sn/sn_private.h>
 
-#include "ip27-common.h"
-
-static nodemask_t ktext_repmask;
+static cpumask_t ktext_repmask;
 
 /*
  * XXX - This needs to be much smarter about where it puts copies of the
  * kernel.  For example, we should never put a copy on a headless node,
  * and we should respect the topology of the machine.
  */
-void __init setup_replication_mask(void)
+void __init setup_replication_mask()
 {
+	cnodeid_t	cnode;
+
 	/* Set only the master cnode's bit.  The master cnode is always 0. */
-	nodes_clear(ktext_repmask);
-	node_set(0, ktext_repmask);
+	cpus_clear(ktext_repmask);
+	cpu_set(0, ktext_repmask);
 
 #ifdef CONFIG_REPLICATE_KTEXT
 #ifndef CONFIG_MAPPED_KERNEL
 #error Kernel replication works with mapped kernel support. No calias support.
 #endif
-	{
-		nasid_t nasid;
-
-		for_each_online_node(nasid) {
-			if (nasid == 0)
-				continue;
-			/* Advertise that we have a copy of the kernel */
-			node_set(nasid, ktext_repmask);
-		}
+	for_each_online_node(cnode) {
+		if (cnode == 0)
+			continue;
+		/* Advertise that we have a copy of the kernel */
+		cpu_set(cnode, ktext_repmask);
 	}
 #endif
 	/* Set up a GDA pointer to the replication mask. */
@@ -55,7 +53,10 @@ void __init setup_replication_mask(void)
 
 static __init void set_ktext_source(nasid_t client_nasid, nasid_t server_nasid)
 {
+	cnodeid_t client_cnode;
 	kern_vars_t *kvp;
+
+	client_cnode = NASID_TO_COMPACT_NODEID(client_nasid);
 
 	kvp = &hub_data(client_nasid)->kern_vars;
 
@@ -83,8 +84,9 @@ static __init void copy_kernel(nasid_t dest_nasid)
 	memcpy((void *)dest_kern_start, (void *)source_start, kern_size);
 }
 
-void __init replicate_kernel_text(void)
+void __init replicate_kernel_text()
 {
+	cnodeid_t cnode;
 	nasid_t client_nasid;
 	nasid_t server_nasid;
 
@@ -93,12 +95,13 @@ void __init replicate_kernel_text(void)
 	/* Record where the master node should get its kernel text */
 	set_ktext_source(master_nasid, master_nasid);
 
-	for_each_online_node(client_nasid) {
-		if (client_nasid == 0)
+	for_each_online_node(cnode) {
+		if (cnode == 0)
 			continue;
+		client_nasid = COMPACT_TO_NASID_NODEID(cnode);
 
 		/* Check if this node should get a copy of the kernel */
-		if (node_isset(client_nasid, ktext_repmask)) {
+		if (cpu_isset(cnode, ktext_repmask)) {
 			server_nasid = client_nasid;
 			copy_kernel(server_nasid);
 		}
@@ -113,17 +116,20 @@ void __init replicate_kernel_text(void)
  * data structures on the first couple of pages of the first slot of each
  * node. If this is the case, getfirstfree(node) > getslotstart(node, 0).
  */
-unsigned long node_getfirstfree(nasid_t nasid)
+pfn_t node_getfirstfree(cnodeid_t cnode)
 {
 	unsigned long loadbase = REP_BASE;
+	nasid_t nasid = COMPACT_TO_NASID_NODEID(cnode);
 	unsigned long offset;
 
 #ifdef CONFIG_MAPPED_KERNEL
 	loadbase += 16777216;
 #endif
 	offset = PAGE_ALIGN((unsigned long)(&_end)) - loadbase;
-	if ((nasid == 0) || (node_isset(nasid, ktext_repmask)))
-		return TO_NODE(nasid, offset) >> PAGE_SHIFT;
+	if ((cnode == 0) || (cpu_isset(cnode, ktext_repmask)))
+		return (TO_NODE(nasid, offset) >> PAGE_SHIFT);
 	else
-		return KDM_TO_PHYS(PAGE_ALIGN(SYMMON_STK_ADDR(nasid, 0))) >> PAGE_SHIFT;
+		return (KDM_TO_PHYS(PAGE_ALIGN(SYMMON_STK_ADDR(nasid, 0))) >>
+								PAGE_SHIFT);
 }
+

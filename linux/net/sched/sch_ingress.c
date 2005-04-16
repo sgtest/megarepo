@@ -1,307 +1,436 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
-/* net/sched/sch_ingress.c - Ingress and clsact qdisc
+/* net/sched/sch_ingress.c - Ingress qdisc 
+ *              This program is free software; you can redistribute it and/or
+ *              modify it under the terms of the GNU General Public License
+ *              as published by the Free Software Foundation; either version
+ *              2 of the License, or (at your option) any later version.
  *
  * Authors:     Jamal Hadi Salim 1999
  */
 
+#include <linux/config.h>
 #include <linux/module.h>
 #include <linux/types.h>
-#include <linux/list.h>
 #include <linux/skbuff.h>
+#include <linux/netdevice.h>
 #include <linux/rtnetlink.h>
-
-#include <net/netlink.h>
+#include <linux/netfilter_ipv4.h>
+#include <linux/netfilter_ipv6.h>
+#include <linux/netfilter.h>
+#include <linux/smp.h>
 #include <net/pkt_sched.h>
-#include <net/pkt_cls.h>
+#include <asm/byteorder.h>
+#include <asm/uaccess.h>
+#include <linux/kmod.h>
+#include <linux/stat.h>
+#include <linux/interrupt.h>
+#include <linux/list.h>
 
-struct ingress_sched_data {
-	struct tcf_block *block;
-	struct tcf_block_ext_info block_info;
-	struct mini_Qdisc_pair miniqp;
+
+#undef DEBUG_INGRESS
+
+#ifdef DEBUG_INGRESS  /* control */
+#define DPRINTK(format,args...) printk(KERN_DEBUG format,##args)
+#else
+#define DPRINTK(format,args...)
+#endif
+
+#if 0  /* data */
+#define D2PRINTK(format,args...) printk(KERN_DEBUG format,##args)
+#else
+#define D2PRINTK(format,args...)
+#endif
+
+
+#define PRIV(sch) qdisc_priv(sch)
+
+
+/* Thanks to Doron Oz for this hack
+*/
+#ifndef CONFIG_NET_CLS_ACT
+#ifdef CONFIG_NETFILTER
+static int nf_registered; 
+#endif
+#endif
+
+struct ingress_qdisc_data {
+	struct Qdisc		*q;
+	struct tcf_proto	*filter_list;
 };
+
+
+/* ------------------------- Class/flow operations ------------------------- */
+
+
+static int ingress_graft(struct Qdisc *sch,unsigned long arg,
+    struct Qdisc *new,struct Qdisc **old)
+{
+#ifdef DEBUG_INGRESS
+	struct ingress_qdisc_data *p = PRIV(sch);
+#endif
+
+	DPRINTK("ingress_graft(sch %p,[qdisc %p],new %p,old %p)\n",
+		sch, p, new, old);
+	DPRINTK("\n ingress_graft: You cannot add qdiscs to classes");
+        return 1;
+}
+
 
 static struct Qdisc *ingress_leaf(struct Qdisc *sch, unsigned long arg)
 {
 	return NULL;
 }
 
-static unsigned long ingress_find(struct Qdisc *sch, u32 classid)
+
+static unsigned long ingress_get(struct Qdisc *sch,u32 classid)
 {
+#ifdef DEBUG_INGRESS
+	struct ingress_qdisc_data *p = PRIV(sch);
+#endif
+	DPRINTK("ingress_get(sch %p,[qdisc %p],classid %x)\n", sch, p, classid);
 	return TC_H_MIN(classid) + 1;
 }
 
+
 static unsigned long ingress_bind_filter(struct Qdisc *sch,
-					 unsigned long parent, u32 classid)
+    unsigned long parent, u32 classid)
 {
-	return ingress_find(sch, classid);
+	return ingress_get(sch, classid);
 }
 
-static void ingress_unbind_filter(struct Qdisc *sch, unsigned long cl)
-{
-}
 
-static void ingress_walk(struct Qdisc *sch, struct qdisc_walker *walker)
+static void ingress_put(struct Qdisc *sch, unsigned long cl)
 {
 }
 
-static struct tcf_block *ingress_tcf_block(struct Qdisc *sch, unsigned long cl,
-					   struct netlink_ext_ack *extack)
+
+static int ingress_change(struct Qdisc *sch, u32 classid, u32 parent,
+    struct rtattr **tca, unsigned long *arg)
 {
-	struct ingress_sched_data *q = qdisc_priv(sch);
-
-	return q->block;
-}
-
-static void clsact_chain_head_change(struct tcf_proto *tp_head, void *priv)
-{
-	struct mini_Qdisc_pair *miniqp = priv;
-
-	mini_qdisc_pair_swap(miniqp, tp_head);
-};
-
-static void ingress_ingress_block_set(struct Qdisc *sch, u32 block_index)
-{
-	struct ingress_sched_data *q = qdisc_priv(sch);
-
-	q->block_info.block_index = block_index;
-}
-
-static u32 ingress_ingress_block_get(struct Qdisc *sch)
-{
-	struct ingress_sched_data *q = qdisc_priv(sch);
-
-	return q->block_info.block_index;
-}
-
-static int ingress_init(struct Qdisc *sch, struct nlattr *opt,
-			struct netlink_ext_ack *extack)
-{
-	struct ingress_sched_data *q = qdisc_priv(sch);
-	struct net_device *dev = qdisc_dev(sch);
-	int err;
-
-	net_inc_ingress_queue();
-
-	mini_qdisc_pair_init(&q->miniqp, sch, &dev->miniq_ingress);
-
-	q->block_info.binder_type = FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS;
-	q->block_info.chain_head_change = clsact_chain_head_change;
-	q->block_info.chain_head_change_priv = &q->miniqp;
-
-	err = tcf_block_get_ext(&q->block, sch, &q->block_info, extack);
-	if (err)
-		return err;
-
-	mini_qdisc_pair_block_init(&q->miniqp, q->block);
-
+#ifdef DEBUG_INGRESS
+	struct ingress_qdisc_data *p = PRIV(sch);
+#endif
+	DPRINTK("ingress_change(sch %p,[qdisc %p],classid %x,parent %x),"
+		"arg 0x%lx\n", sch, p, classid, parent, *arg);
+	DPRINTK("No effect. sch_ingress doesn't maintain classes at the moment");
 	return 0;
 }
 
+
+
+static void ingress_walk(struct Qdisc *sch,struct qdisc_walker *walker)
+{
+#ifdef DEBUG_INGRESS
+	struct ingress_qdisc_data *p = PRIV(sch);
+#endif
+	DPRINTK("ingress_walk(sch %p,[qdisc %p],walker %p)\n", sch, p, walker);
+	DPRINTK("No effect. sch_ingress doesn't maintain classes at the moment");
+}
+
+
+static struct tcf_proto **ingress_find_tcf(struct Qdisc *sch,unsigned long cl)
+{
+	struct ingress_qdisc_data *p = PRIV(sch);
+
+	return &p->filter_list;
+}
+
+
+/* --------------------------- Qdisc operations ---------------------------- */
+
+
+static int ingress_enqueue(struct sk_buff *skb,struct Qdisc *sch)
+{
+	struct ingress_qdisc_data *p = PRIV(sch);
+	struct tcf_result res;
+	int result;
+
+	D2PRINTK("ingress_enqueue(skb %p,sch %p,[qdisc %p])\n", skb, sch, p);
+	result = tc_classify(skb, p->filter_list, &res);
+	D2PRINTK("result %d class 0x%04x\n", result, res.classid);
+	/*
+	 * Unlike normal "enqueue" functions, ingress_enqueue returns a
+	 * firewall FW_* code.
+	 */
+#ifdef CONFIG_NET_CLS_ACT
+	sch->bstats.packets++;
+	sch->bstats.bytes += skb->len;
+	switch (result) {
+		case TC_ACT_SHOT:
+			result = TC_ACT_SHOT;
+			sch->qstats.drops++;
+			break;
+		case TC_ACT_STOLEN:
+		case TC_ACT_QUEUED:
+			result = TC_ACT_STOLEN;
+			break;
+		case TC_ACT_RECLASSIFY: 
+		case TC_ACT_OK:
+		case TC_ACT_UNSPEC:
+		default:
+			skb->tc_index = TC_H_MIN(res.classid);
+			result = TC_ACT_OK;
+			break;
+	};
+/* backward compat */
+#else
+#ifdef	CONFIG_NET_CLS_POLICE  
+	switch (result) {
+		case TC_POLICE_SHOT:
+		result = NF_DROP;
+		sch->qstats.drops++;
+		break;
+		case TC_POLICE_RECLASSIFY: /* DSCP remarking here ? */
+		case TC_POLICE_OK:
+		case TC_POLICE_UNSPEC:
+		default:
+		sch->bstats.packets++;
+		sch->bstats.bytes += skb->len;
+		result = NF_ACCEPT;
+		break;
+	};
+
+#else
+	D2PRINTK("Overriding result to ACCEPT\n");
+	result = NF_ACCEPT;
+	sch->bstats.packets++;
+	sch->bstats.bytes += skb->len;
+#endif
+#endif
+
+	return result;
+}
+
+
+static struct sk_buff *ingress_dequeue(struct Qdisc *sch)
+{
+/*
+	struct ingress_qdisc_data *p = PRIV(sch);
+	D2PRINTK("ingress_dequeue(sch %p,[qdisc %p])\n",sch,PRIV(p));
+*/
+	return NULL;
+}
+
+
+static int ingress_requeue(struct sk_buff *skb,struct Qdisc *sch)
+{
+/*
+	struct ingress_qdisc_data *p = PRIV(sch);
+	D2PRINTK("ingress_requeue(skb %p,sch %p,[qdisc %p])\n",skb,sch,PRIV(p));
+*/
+	return 0;
+}
+
+static unsigned int ingress_drop(struct Qdisc *sch)
+{
+#ifdef DEBUG_INGRESS
+	struct ingress_qdisc_data *p = PRIV(sch);
+#endif
+	DPRINTK("ingress_drop(sch %p,[qdisc %p])\n", sch, p);
+	return 0;
+}
+
+#ifndef CONFIG_NET_CLS_ACT
+#ifdef CONFIG_NETFILTER
+static unsigned int
+ing_hook(unsigned int hook, struct sk_buff **pskb,
+                             const struct net_device *indev,
+                             const struct net_device *outdev,
+	                     int (*okfn)(struct sk_buff *))
+{
+	
+	struct Qdisc *q;
+	struct sk_buff *skb = *pskb;
+        struct net_device *dev = skb->dev;
+	int fwres=NF_ACCEPT;
+
+	DPRINTK("ing_hook: skb %s dev=%s len=%u\n",
+		skb->sk ? "(owned)" : "(unowned)",
+		skb->dev ? (*pskb)->dev->name : "(no dev)",
+		skb->len);
+
+/* 
+revisit later: Use a private since lock dev->queue_lock is also
+used on the egress (might slow things for an iota)
+*/
+
+	if (dev->qdisc_ingress) {
+		spin_lock(&dev->queue_lock);
+		if ((q = dev->qdisc_ingress) != NULL)
+			fwres = q->enqueue(skb, q);
+		spin_unlock(&dev->queue_lock);
+        }
+			
+	return fwres;
+}
+
+/* after ipt_filter */
+static struct nf_hook_ops ing_ops = {
+	.hook           = ing_hook,
+	.owner		= THIS_MODULE,
+	.pf             = PF_INET,
+	.hooknum        = NF_IP_PRE_ROUTING,
+	.priority       = NF_IP_PRI_FILTER + 1,
+};
+
+static struct nf_hook_ops ing6_ops = {
+	.hook           = ing_hook,
+	.owner		= THIS_MODULE,
+	.pf             = PF_INET6,
+	.hooknum        = NF_IP6_PRE_ROUTING,
+	.priority       = NF_IP6_PRI_FILTER + 1,
+};
+
+#endif
+#endif
+
+static int ingress_init(struct Qdisc *sch,struct rtattr *opt)
+{
+	struct ingress_qdisc_data *p = PRIV(sch);
+
+/* Make sure either netfilter or preferably CLS_ACT is
+* compiled in */
+#ifndef CONFIG_NET_CLS_ACT
+#ifndef CONFIG_NETFILTER
+	printk("You MUST compile classifier actions into the kernel\n");
+	return -EINVAL;
+#else
+	printk("Ingress scheduler: Classifier actions prefered over netfilter\n");
+#endif
+#endif
+                                                                                
+#ifndef CONFIG_NET_CLS_ACT
+#ifdef CONFIG_NETFILTER
+	if (!nf_registered) {
+		if (nf_register_hook(&ing_ops) < 0) {
+			printk("ingress qdisc registration error \n");
+			return -EINVAL;
+		}
+		nf_registered++;
+
+		if (nf_register_hook(&ing6_ops) < 0) {
+			printk("IPv6 ingress qdisc registration error, " \
+			    "disabling IPv6 support.\n");
+		} else
+			nf_registered++;
+	}
+#endif
+#endif
+
+	DPRINTK("ingress_init(sch %p,[qdisc %p],opt %p)\n",sch,p,opt);
+	p->q = &noop_qdisc;
+	return 0;
+}
+
+
+static void ingress_reset(struct Qdisc *sch)
+{
+	struct ingress_qdisc_data *p = PRIV(sch);
+
+	DPRINTK("ingress_reset(sch %p,[qdisc %p])\n", sch, p);
+
+/*
+#if 0
+*/
+/* for future use */
+	qdisc_reset(p->q);
+/*
+#endif
+*/
+}
+
+/* ------------------------------------------------------------- */
+
+
+/* ------------------------------------------------------------- */
+
 static void ingress_destroy(struct Qdisc *sch)
 {
-	struct ingress_sched_data *q = qdisc_priv(sch);
+	struct ingress_qdisc_data *p = PRIV(sch);
+	struct tcf_proto *tp;
 
-	tcf_block_put_ext(q->block, sch, &q->block_info);
-	net_dec_ingress_queue();
+	DPRINTK("ingress_destroy(sch %p,[qdisc %p])\n", sch, p);
+	while (p->filter_list) {
+		tp = p->filter_list;
+		p->filter_list = tp->next;
+		tcf_destroy(tp);
+	}
+#if 0
+/* for future use */
+	qdisc_destroy(p->q);
+#endif
 }
+
 
 static int ingress_dump(struct Qdisc *sch, struct sk_buff *skb)
 {
-	struct nlattr *nest;
+	unsigned char *b = skb->tail;
+	struct rtattr *rta;
 
-	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
-	if (nest == NULL)
-		goto nla_put_failure;
+	rta = (struct rtattr *) b;
+	RTA_PUT(skb, TCA_OPTIONS, 0, NULL);
+	rta->rta_len = skb->tail - b;
+	return skb->len;
 
-	return nla_nest_end(skb, nest);
-
-nla_put_failure:
-	nla_nest_cancel(skb, nest);
+rtattr_failure:
+	skb_trim(skb, b - skb->data);
 	return -1;
 }
 
-static const struct Qdisc_class_ops ingress_class_ops = {
-	.flags		=	QDISC_CLASS_OPS_DOIT_UNLOCKED,
+static struct Qdisc_class_ops ingress_class_ops = {
+	.graft		=	ingress_graft,
 	.leaf		=	ingress_leaf,
-	.find		=	ingress_find,
+	.get		=	ingress_get,
+	.put		=	ingress_put,
+	.change		=	ingress_change,
+	.delete		=	NULL,
 	.walk		=	ingress_walk,
-	.tcf_block	=	ingress_tcf_block,
+	.tcf_chain	=	ingress_find_tcf,
 	.bind_tcf	=	ingress_bind_filter,
-	.unbind_tcf	=	ingress_unbind_filter,
+	.unbind_tcf	=	ingress_put,
+	.dump		=	NULL,
 };
 
-static struct Qdisc_ops ingress_qdisc_ops __read_mostly = {
-	.cl_ops			=	&ingress_class_ops,
-	.id			=	"ingress",
-	.priv_size		=	sizeof(struct ingress_sched_data),
-	.static_flags		=	TCQ_F_CPUSTATS,
-	.init			=	ingress_init,
-	.destroy		=	ingress_destroy,
-	.dump			=	ingress_dump,
-	.ingress_block_set	=	ingress_ingress_block_set,
-	.ingress_block_get	=	ingress_ingress_block_get,
-	.owner			=	THIS_MODULE,
-};
-
-struct clsact_sched_data {
-	struct tcf_block *ingress_block;
-	struct tcf_block *egress_block;
-	struct tcf_block_ext_info ingress_block_info;
-	struct tcf_block_ext_info egress_block_info;
-	struct mini_Qdisc_pair miniqp_ingress;
-	struct mini_Qdisc_pair miniqp_egress;
-};
-
-static unsigned long clsact_find(struct Qdisc *sch, u32 classid)
-{
-	switch (TC_H_MIN(classid)) {
-	case TC_H_MIN(TC_H_MIN_INGRESS):
-	case TC_H_MIN(TC_H_MIN_EGRESS):
-		return TC_H_MIN(classid);
-	default:
-		return 0;
-	}
-}
-
-static unsigned long clsact_bind_filter(struct Qdisc *sch,
-					unsigned long parent, u32 classid)
-{
-	return clsact_find(sch, classid);
-}
-
-static struct tcf_block *clsact_tcf_block(struct Qdisc *sch, unsigned long cl,
-					  struct netlink_ext_ack *extack)
-{
-	struct clsact_sched_data *q = qdisc_priv(sch);
-
-	switch (cl) {
-	case TC_H_MIN(TC_H_MIN_INGRESS):
-		return q->ingress_block;
-	case TC_H_MIN(TC_H_MIN_EGRESS):
-		return q->egress_block;
-	default:
-		return NULL;
-	}
-}
-
-static void clsact_ingress_block_set(struct Qdisc *sch, u32 block_index)
-{
-	struct clsact_sched_data *q = qdisc_priv(sch);
-
-	q->ingress_block_info.block_index = block_index;
-}
-
-static void clsact_egress_block_set(struct Qdisc *sch, u32 block_index)
-{
-	struct clsact_sched_data *q = qdisc_priv(sch);
-
-	q->egress_block_info.block_index = block_index;
-}
-
-static u32 clsact_ingress_block_get(struct Qdisc *sch)
-{
-	struct clsact_sched_data *q = qdisc_priv(sch);
-
-	return q->ingress_block_info.block_index;
-}
-
-static u32 clsact_egress_block_get(struct Qdisc *sch)
-{
-	struct clsact_sched_data *q = qdisc_priv(sch);
-
-	return q->egress_block_info.block_index;
-}
-
-static int clsact_init(struct Qdisc *sch, struct nlattr *opt,
-		       struct netlink_ext_ack *extack)
-{
-	struct clsact_sched_data *q = qdisc_priv(sch);
-	struct net_device *dev = qdisc_dev(sch);
-	int err;
-
-	net_inc_ingress_queue();
-	net_inc_egress_queue();
-
-	mini_qdisc_pair_init(&q->miniqp_ingress, sch, &dev->miniq_ingress);
-
-	q->ingress_block_info.binder_type = FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS;
-	q->ingress_block_info.chain_head_change = clsact_chain_head_change;
-	q->ingress_block_info.chain_head_change_priv = &q->miniqp_ingress;
-
-	err = tcf_block_get_ext(&q->ingress_block, sch, &q->ingress_block_info,
-				extack);
-	if (err)
-		return err;
-
-	mini_qdisc_pair_block_init(&q->miniqp_ingress, q->ingress_block);
-
-	mini_qdisc_pair_init(&q->miniqp_egress, sch, &dev->miniq_egress);
-
-	q->egress_block_info.binder_type = FLOW_BLOCK_BINDER_TYPE_CLSACT_EGRESS;
-	q->egress_block_info.chain_head_change = clsact_chain_head_change;
-	q->egress_block_info.chain_head_change_priv = &q->miniqp_egress;
-
-	return tcf_block_get_ext(&q->egress_block, sch, &q->egress_block_info, extack);
-}
-
-static void clsact_destroy(struct Qdisc *sch)
-{
-	struct clsact_sched_data *q = qdisc_priv(sch);
-
-	tcf_block_put_ext(q->egress_block, sch, &q->egress_block_info);
-	tcf_block_put_ext(q->ingress_block, sch, &q->ingress_block_info);
-
-	net_dec_ingress_queue();
-	net_dec_egress_queue();
-}
-
-static const struct Qdisc_class_ops clsact_class_ops = {
-	.flags		=	QDISC_CLASS_OPS_DOIT_UNLOCKED,
-	.leaf		=	ingress_leaf,
-	.find		=	clsact_find,
-	.walk		=	ingress_walk,
-	.tcf_block	=	clsact_tcf_block,
-	.bind_tcf	=	clsact_bind_filter,
-	.unbind_tcf	=	ingress_unbind_filter,
-};
-
-static struct Qdisc_ops clsact_qdisc_ops __read_mostly = {
-	.cl_ops			=	&clsact_class_ops,
-	.id			=	"clsact",
-	.priv_size		=	sizeof(struct clsact_sched_data),
-	.static_flags		=	TCQ_F_CPUSTATS,
-	.init			=	clsact_init,
-	.destroy		=	clsact_destroy,
-	.dump			=	ingress_dump,
-	.ingress_block_set	=	clsact_ingress_block_set,
-	.egress_block_set	=	clsact_egress_block_set,
-	.ingress_block_get	=	clsact_ingress_block_get,
-	.egress_block_get	=	clsact_egress_block_get,
-	.owner			=	THIS_MODULE,
+static struct Qdisc_ops ingress_qdisc_ops = {
+	.next		=	NULL,
+	.cl_ops		=	&ingress_class_ops,
+	.id		=	"ingress",
+	.priv_size	=	sizeof(struct ingress_qdisc_data),
+	.enqueue	=	ingress_enqueue,
+	.dequeue	=	ingress_dequeue,
+	.requeue	=	ingress_requeue,
+	.drop		=	ingress_drop,
+	.init		=	ingress_init,
+	.reset		=	ingress_reset,
+	.destroy	=	ingress_destroy,
+	.change		=	NULL,
+	.dump		=	ingress_dump,
+	.owner		=	THIS_MODULE,
 };
 
 static int __init ingress_module_init(void)
 {
-	int ret;
+	int ret = 0;
 
-	ret = register_qdisc(&ingress_qdisc_ops);
-	if (!ret) {
-		ret = register_qdisc(&clsact_qdisc_ops);
-		if (ret)
-			unregister_qdisc(&ingress_qdisc_ops);
+	if ((ret = register_qdisc(&ingress_qdisc_ops)) < 0) {
+		printk("Unable to register Ingress qdisc\n");
+		return ret;
 	}
 
 	return ret;
 }
-
-static void __exit ingress_module_exit(void)
+static void __exit ingress_module_exit(void) 
 {
 	unregister_qdisc(&ingress_qdisc_ops);
-	unregister_qdisc(&clsact_qdisc_ops);
+#ifndef CONFIG_NET_CLS_ACT
+#ifdef CONFIG_NETFILTER
+	if (nf_registered) {
+		nf_unregister_hook(&ing_ops);
+		if (nf_registered > 1)
+			nf_unregister_hook(&ing6_ops);
+	}
+#endif
+#endif
 }
-
-module_init(ingress_module_init);
-module_exit(ingress_module_exit);
-
-MODULE_ALIAS("sch_clsact");
+module_init(ingress_module_init)
+module_exit(ingress_module_exit)
 MODULE_LICENSE("GPL");

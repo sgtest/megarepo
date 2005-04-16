@@ -283,21 +283,13 @@ static struct pi_protocol k971 = {
 
 static int __init kbic_init(void)
 {
-	int rv;
-
-	rv = paride_register(&k951);
-	if (rv < 0)
-		return rv;
-	rv = paride_register(&k971);
-	if (rv < 0)
-		paride_unregister(&k951);
-	return rv;
+	return (pi_register(&k951)||pi_register(&k971))-1;
 }
 
 static void __exit kbic_exit(void)
 {
-	paride_unregister(&k951);
-	paride_unregister(&k971);
+	pi_unregister(&k951);
+	pi_unregister(&k971);
 }
 
 MODULE_LICENSE("GPL");

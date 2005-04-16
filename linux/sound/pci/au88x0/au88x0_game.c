@@ -1,10 +1,25 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * $Id: au88x0_game.c,v 1.9 2003/09/22 03:51:28 mjander Exp $
+ *
  *  Manuel Jander.
  *
  *  Based on the work of:
  *  Vojtech Pavlik
  *  Raymond Ingles
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
  *
  * Should you need to contact me, the author, you can do so either by
  * e-mail - mail your message to <vojtech@suse.cz>, or by paper mail:
@@ -15,15 +30,15 @@
  * driver. (email: mjander@embedded.cl).
  */
 
+#include <sound/driver.h>
 #include <linux/time.h>
 #include <linux/delay.h>
 #include <linux/init.h>
 #include <sound/core.h>
 #include "au88x0.h"
 #include <linux/gameport.h>
-#include <linux/export.h>
 
-#if IS_REACHABLE(CONFIG_GAMEPORT)
+#if defined(CONFIG_GAMEPORT) || (defined(MODULE) && defined(CONFIG_GAMEPORT_MODULE))
 
 #define VORTEX_GAME_DWAIT	20	/* 20 ms */
 
@@ -79,16 +94,15 @@ static int vortex_game_open(struct gameport *gameport, int mode)
 	return 0;
 }
 
-static int vortex_gameport_register(vortex_t *vortex)
+static int __devinit vortex_gameport_register(vortex_t * vortex)
 {
 	struct gameport *gp;
 
 	vortex->gameport = gp = gameport_allocate_port();
 	if (!gp) {
-		dev_err(vortex->card->dev,
-			"cannot allocate memory for gameport\n");
+		printk(KERN_ERR "vortex: cannot allocate memory for gameport\n");
 		return -ENOMEM;
-	}
+	};
 
 	gameport_set_name(gp, "AU88x0 Gameport");
 	gameport_set_phys(gp, "pci%s/gameport0", pci_name(vortex->pci_dev));

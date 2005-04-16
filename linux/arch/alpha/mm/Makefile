@@ -1,8 +1,9 @@
-# SPDX-License-Identifier: GPL-2.0-only
 #
 # Makefile for the linux alpha-specific parts of the memory manager.
 #
 
-ccflags-y := -Werror
+EXTRA_CFLAGS := -Werror
 
-obj-y	:= init.o fault.o
+obj-y	:= init.o fault.o extable.o remap.o
+
+obj-$(CONFIG_DISCONTIGMEM) += numa.o

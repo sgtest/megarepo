@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * ATI Mach64 Register Definitions
  *
@@ -6,6 +5,11 @@
  *  written with much help from Jon Howell
  *
  * Updated for 3D RAGE PRO and 3D RAGE Mobility by Geert Uytterhoeven
+ *	
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version
+ * 2 of the License, or (at your option) any later version.
  */
 
 /*
@@ -99,7 +103,7 @@
 #define CUR_HORZ_VERT_OFF	0x0070	/* Dword offset 0_1C */
 #define CUR2_HORZ_VERT_OFF	0x0070	/* Dword offset 0_1C */
 
-#define CNFG_PANEL_LG		0x0074	/* Dword offset 0_1D (LG) */
+#define CONFIG_PANEL_LG		0x0074	/* Dword offset 0_1D (LG) */
 
 /* General I/O Control */
 #define GP_IO			0x0078	/* Dword offset 0_1E */
@@ -142,8 +146,8 @@
 #define CLOCK_SEL_CNTL		0x0090	/* Dword offset 0_24 */
 
 /* Configuration */
-#define CNFG_STAT1		0x0094	/* Dword offset 0_25 */
-#define CNFG_STAT2		0x0098	/* Dword offset 0_26 */
+#define CONFIG_STAT1		0x0094	/* Dword offset 0_25 */
+#define CONFIG_STAT2		0x0098	/* Dword offset 0_26 */
 
 /* Bus Control */
 #define BUS_CNTL		0x00A0	/* Dword offset 0_28 */
@@ -186,9 +190,9 @@
 #define POWER_MANAGEMENT_LG	0x00D8	/* Dword offset 0_36 (LG) */
 
 /* Configuration */
-#define CNFG_CNTL		0x00DC	/* Dword offset 0_37 (CT, ET, VT) */
-#define CNFG_CHIP_ID		0x00E0	/* Dword offset 0_38 */
-#define CNFG_STAT0		0x00E4	/* Dword offset 0_39 */
+#define CONFIG_CNTL		0x00DC	/* Dword offset 0_37 (CT, ET, VT) */
+#define CONFIG_CHIP_ID		0x00E0	/* Dword offset 0_38 */
+#define CONFIG_STAT0		0x00E4	/* Dword offset 0_39 */
 
 /* Test and Debug */
 #define CRC_SIG			0x00E8	/* Dword offset 0_3A */
@@ -847,17 +851,17 @@
 #define PLL_YCLK_CNTL		0x29
 #define PM_DYN_CLK_CNTL		0x2A
 
-/* CNFG_CNTL register constants */
+/* CONFIG_CNTL register constants */
 #define APERTURE_4M_ENABLE	1
 #define APERTURE_8M_ENABLE	2
 #define VGA_APERTURE_ENABLE	4
 
-/* CNFG_STAT0 register constants (GX, CX) */
+/* CONFIG_STAT0 register constants (GX, CX) */
 #define CFG_BUS_TYPE		0x00000007
 #define CFG_MEM_TYPE		0x00000038
 #define CFG_INIT_DAC_TYPE	0x00000e00
 
-/* CNFG_STAT0 register constants (CT, ET, VT) */
+/* CONFIG_STAT0 register constants (CT, ET, VT) */
 #define CFG_MEM_TYPE_xT		0x00000007
 
 #define ISA			0
@@ -881,7 +885,6 @@
 #define SDRAM			4
 #define SGRAM			5
 #define WRAM			6
-#define SDRAM32			6
 
 #define DAC_INTERNAL		0x00
 #define DAC_IBMRGB514		0x01
@@ -938,7 +941,7 @@
 #define PCI_ATI_VENDOR_ID	0x1002
 
 
-/* CNFG_CHIP_ID register constants */
+/* CONFIG_CHIP_ID register constants */
 #define CFG_CHIP_TYPE		0x0000FFFF
 #define CFG_CHIP_CLASS		0x00FF0000
 #define CFG_CHIP_REV		0xFF000000
@@ -947,7 +950,7 @@
 #define CFG_CHIP_MINOR		0xC0000000
 
 
-/* Chip IDs read from CNFG_CHIP_ID */
+/* Chip IDs read from CONFIG_CHIP_ID */
 
 /* mach64GX family */
 #define GX_CHIP_ID	0xD7	/* mach64GX (ATI888GX00) */
@@ -1250,7 +1253,7 @@
 #define CRTC2_DISPLAY_DIS	0x00000400
 
 /* LCD register indices */
-#define CNFG_PANEL		0x00
+#define CONFIG_PANEL		0x00
 #define LCD_GEN_CNTL		0x01
 #define DSTN_CONTROL		0x02
 #define HFB_PITCH_ADDR		0x03

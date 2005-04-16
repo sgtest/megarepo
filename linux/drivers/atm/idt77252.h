@@ -1,4 +1,8 @@
 /******************************************************************* 
+ * ident "$Id: idt77252.h,v 1.2 2001/11/11 08:13:54 ecd Exp $"
+ *
+ * $Author: ecd $
+ * $Date: 2001/11/11 08:13:54 $
  *
  * Copyright (c) 2000 ATecoM GmbH 
  *
@@ -33,7 +37,7 @@
 #include <linux/ptrace.h>
 #include <linux/skbuff.h>
 #include <linux/workqueue.h>
-#include <linux/mutex.h>
+
 
 /*****************************************************************************/
 /*                                                                           */
@@ -173,8 +177,10 @@ struct scq_info
 };
 
 struct rx_pool {
-	struct sk_buff_head	queue;
+	struct sk_buff		*first;
+	struct sk_buff		**last;
 	unsigned int		len;
+	unsigned int		count;
 };
 
 struct aal1 {
@@ -183,8 +189,6 @@ struct aal1 {
 	struct sk_buff		*data;
 	unsigned char		sequence;
 };
-
-struct vc_map;
 
 struct rate_estimator {
 	struct timer_list	timer;
@@ -195,7 +199,6 @@ struct rate_estimator {
 	long			avcps;
 	u32			cps;
 	u32			maxcps;
-	struct vc_map		*vc;
 };
 
 struct vc_map {
@@ -356,7 +359,7 @@ struct idt77252_dev
 	unsigned long		srambase;	/* SAR's sram  base address */
 	void __iomem		*fbq[4];	/* FBQ fill addresses */
 
-	struct mutex		mutex;
+	struct semaphore	mutex;
 	spinlock_t		cmd_lock;	/* for r/w utility/sram */
 
 	unsigned long		softstat;
@@ -575,7 +578,7 @@ struct idt77252_dev
 #define SAR_STAT_TSQF       0x00001000 /* Transmit Status Queue full      */
 #define SAR_STAT_TMROF      0x00000800 /* Timer overflow                  */
 #define SAR_STAT_PHYI       0x00000400 /* PHY device Interrupt flag       */
-#define SAR_STAT_CMDBZ      0x00000200 /* ABR SAR Command Busy Flag       */
+#define SAR_STAT_CMDBZ      0x00000200 /* ABR SAR Comand Busy Flag        */
 #define SAR_STAT_FBQ3A      0x00000100 /* Free Buffer Queue 3 Attention   */
 #define SAR_STAT_FBQ2A      0x00000080 /* Free Buffer Queue 2 Attention   */
 #define SAR_STAT_RSQF       0x00000040 /* Receive Status Queue full       */
@@ -769,7 +772,7 @@ struct idt77252_dev
 #define SAR_RCTE_BUFFSTAT_MASK 0x00003000  /* buffer status                  */
 #define SAR_RCTE_EFCI          0x00000800  /* EFCI Congestion flag           */
 #define SAR_RCTE_CLP           0x00000400  /* Cell Loss Priority flag        */
-#define SAR_RCTE_CRC           0x00000200  /* Received CRC Error             */
+#define SAR_RCTE_CRC           0x00000200  /* Recieved CRC Error             */
 #define SAR_RCTE_CELLCNT_MASK  0x000001FF  /* cell Count                     */
 
 #define SAR_RCTE_AAL0          0x00000000  /* AAL types for ALL field        */
@@ -789,7 +792,7 @@ struct idt77252_skb_prv {
 	struct scqe	tbd;	/* Transmit Buffer Descriptor */
 	dma_addr_t	paddr;	/* DMA handle */
 	u32		pool;	/* sb_pool handle */
-} __packed;
+};
 
 #define IDT77252_PRV_TBD(skb)	\
 	(((struct idt77252_skb_prv *)(ATM_SKB(skb)+1))->tbd)

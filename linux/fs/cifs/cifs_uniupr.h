@@ -1,8 +1,22 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  *   Copyright (c) International Business Machines  Corp., 2000,2002
  *
+ *   This program is free software;  you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or 
+ *   (at your option) any later version.
+ * 
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY;  without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See
+ *   the GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program;  if not, write to the Free Software 
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ *
  * uniupr.h - Unicode compressed case ranges
+ *
 */
 
 #ifndef UNIUPR_NOUPPER
@@ -39,7 +53,7 @@ signed char CifsUniUpperTable[512] = {
 	0, -1, 0, -1, 0, -1, 0, 0, -1, 0, 0, 0, 0, -1, 0, 0,	/* 1a0-1af */
 	-1, 0, 0, 0, -1, 0, -1, 0, 0, -1, 0, 0, 0, -1, 0, 0,	/* 1b0-1bf */
 	0, 0, 0, 0, 0, -1, -2, 0, -1, -2, 0, -1, -2, 0, -1, 0,	/* 1c0-1cf */
-	-1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, -79, 0, -1, /* 1d0-1df */
+	-1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, -79, 0, -1,	/* 1d0-1df */
 	0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1, 0, -1,	/* 1e0-1ef */
 	0, 0, -1, -2, 0, -1, 0, 0, 0, -1, 0, -1, 0, -1, 0, -1,	/* 1f0-1ff */
 };
@@ -126,7 +140,7 @@ const struct UniCaseRange CifsUniUpperRange[] = {
 /*
  * Latin lower case
  */
-signed char CifsUniLowerTable[512] = {
+static signed char CifsUniLowerTable[512] = {
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 000-00f */
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 010-01f */
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,	/* 020-02f */
@@ -228,12 +242,12 @@ static signed char UniCaseRangeLff20[27] = {
 /*
  * Lower Case Range
  */
-const struct UniCaseRange CifsUniLowerRange[] = {
-	{0x0380, 0x03ab, UniCaseRangeL0380},
-	{0x0400, 0x042f, UniCaseRangeL0400},
-	{0x0490, 0x04cb, UniCaseRangeL0490},
-	{0x1e00, 0x1ff7, UniCaseRangeL1e00},
-	{0xff20, 0xff3a, UniCaseRangeLff20},
-	{0}
+const static struct UniCaseRange CifsUniLowerRange[] = {
+	0x0380, 0x03ab, UniCaseRangeL0380,
+	0x0400, 0x042f, UniCaseRangeL0400,
+	0x0490, 0x04cb, UniCaseRangeL0490,
+	0x1e00, 0x1ff7, UniCaseRangeL1e00,
+	0xff20, 0xff3a, UniCaseRangeLff20,
+	0, 0, 0
 };
 #endif

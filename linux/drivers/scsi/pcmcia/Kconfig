@@ -1,18 +1,13 @@
-# SPDX-License-Identifier: GPL-2.0-only
 #
 # PCMCIA SCSI adapter configuration
 #
 
-menuconfig SCSI_LOWLEVEL_PCMCIA
-	bool "PCMCIA SCSI adapter support"
-	depends on SCSI!=n && PCMCIA!=n
-
-# drivers have problems when build in, so require modules
-if SCSI_LOWLEVEL_PCMCIA && SCSI && PCMCIA && m
+menu "PCMCIA SCSI adapter support"
+	depends on SCSI!=n && PCMCIA!=n && MODULES
 
 config PCMCIA_AHA152X
 	tristate "Adaptec AHA152X PCMCIA support"
-	select SCSI_SPI_ATTRS
+	depends on m && !64BIT
 	help
 	  Say Y here if you intend to attach this type of PCMCIA SCSI host
 	  adapter to your computer.
@@ -22,7 +17,7 @@ config PCMCIA_AHA152X
 
 config PCMCIA_FDOMAIN
 	tristate "Future Domain PCMCIA support"
-	select SCSI_FDOMAIN
+	depends on m
 	help
 	  Say Y here if you intend to attach this type of PCMCIA SCSI host
 	  adapter to your computer.
@@ -32,11 +27,11 @@ config PCMCIA_FDOMAIN
 
 config PCMCIA_NINJA_SCSI
 	tristate "NinjaSCSI-3 / NinjaSCSI-32Bi (16bit) PCMCIA support"
-	depends on !64BIT || COMPILE_TEST
+	depends on m && !64BIT
 	help
 	  If you intend to attach this type of PCMCIA SCSI host adapter to
 	  your computer, say Y here and read
-	  <file:Documentation/scsi/NinjaSCSI.rst>.
+	  <file:Documentation/scsi/NinjaSCSI.txt>.
 
 	  Supported cards:
 
@@ -66,6 +61,7 @@ config PCMCIA_NINJA_SCSI
 
 config PCMCIA_QLOGIC
 	tristate "Qlogic PCMCIA support"
+	depends on m
 	help
 	  Say Y here if you intend to attach this type of PCMCIA SCSI host
 	  adapter to your computer.
@@ -75,6 +71,7 @@ config PCMCIA_QLOGIC
 
 config PCMCIA_SYM53C500
 	tristate "Symbios 53c500 PCMCIA support"
+	depends on m
 	help
 	  Say Y here if you have a New Media Bus Toaster or other PCMCIA
 	  SCSI adapter based on the Symbios 53c500 controller.
@@ -82,4 +79,4 @@ config PCMCIA_SYM53C500
 	  To compile this driver as a module, choose M here: the
 	  module will be called sym53c500_cs.
 
-endif # SCSI_LOWLEVEL_PCMCIA
+endmenu

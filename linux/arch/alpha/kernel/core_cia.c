@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *	linux/arch/alpha/kernel/core_cia.c
  *
@@ -21,10 +20,9 @@
 #include <linux/pci.h>
 #include <linux/sched.h>
 #include <linux/init.h>
-#include <linux/memblock.h>
+#include <linux/bootmem.h>
 
 #include <asm/ptrace.h>
-#include <asm/mce.h>
 
 #include "proto.h"
 #include "pci_impl.h"
@@ -331,10 +329,7 @@ cia_prepare_tbia_workaround(int window)
 	long i;
 
 	/* Use minimal 1K map. */
-	ppte = memblock_alloc(CIA_BROKEN_TBIA_SIZE, 32768);
-	if (!ppte)
-		panic("%s: Failed to allocate %u bytes align=0x%x\n",
-		      __func__, CIA_BROKEN_TBIA_SIZE, 32768);
+	ppte = __alloc_bootmem(CIA_BROKEN_TBIA_SIZE, 32768, 0);
 	pte = (virt_to_phys(ppte) >> (PAGE_SHIFT - 1)) | 1;
 
 	for (i = 0; i < CIA_BROKEN_TBIA_SIZE / sizeof(unsigned long); ++i)
@@ -1197,7 +1192,8 @@ cia_decode_mchk(unsigned long la_ptr)
 }
 
 void
-cia_machine_check(unsigned long vector, unsigned long la_ptr)
+cia_machine_check(unsigned long vector, unsigned long la_ptr,
+		  struct pt_regs * regs)
 {
 	int expected;
 
@@ -1212,5 +1208,5 @@ cia_machine_check(unsigned long vector, unsigned long la_ptr)
 	expected = mcheck_expected(0);
 	if (!expected && vector == 0x660)
 		expected = cia_decode_mchk(la_ptr);
-	process_mcheck_info(vector, la_ptr, "CIA", expected);
+	process_mcheck_info(vector, la_ptr, regs, "CIA", expected);
 }

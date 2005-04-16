@@ -6,6 +6,7 @@
  * Copyright (C) 2000, 2001 Keith M Wesolowski
  * Copyright (C) 2004 by Ralf Baechle (ralf@linux-mips.org)
  */
+#include <linux/config.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
@@ -18,11 +19,11 @@
 
 /*
  * Handle errors from the bridge.  This includes master and target aborts,
- * various command and address errors, and the interrupt test.	This gets
- * registered on the bridge error irq.	It's conceivable that some of these
- * conditions warrant a panic.	Anybody care to say which ones?
+ * various command and address errors, and the interrupt test.  This gets
+ * registered on the bridge error irq.  It's conceivable that some of these
+ * conditions warrant a panic.  Anybody care to say which ones?
  */
-static irqreturn_t macepci_error(int irq, void *dev)
+static irqreturn_t macepci_error(int irq, void *dev, struct pt_regs *regs)
 {
 	char s;
 	unsigned int flags = mace->pci.error;
@@ -83,7 +84,7 @@ static irqreturn_t macepci_error(int irq, void *dev)
 
 
 extern struct pci_ops mace_pci_ops;
-#ifdef CONFIG_64BIT
+#ifdef CONFIG_MIPS64
 static struct resource mace_pci_mem_resource = {
 	.name	= "SGI O2 PCI MEM",
 	.start	= MACEPCI_HI_MEMORY,
@@ -116,9 +117,9 @@ static struct pci_controller mace_pci_controller = {
 	.pci_ops	= &mace_pci_ops,
 	.mem_resource	= &mace_pci_mem_resource,
 	.io_resource	= &mace_pci_io_resource,
+	.iommu		= 0,
 	.mem_offset	= MACE_PCI_MEM_OFFSET,
 	.io_offset	= 0,
-	.io_map_base	= CKSEG1ADDR(MACEPCI_LOW_IO),
 };
 
 static int __init mace_init(void)
@@ -135,10 +136,7 @@ static int __init mace_init(void)
 	BUG_ON(request_irq(MACE_PCI_BRIDGE_IRQ, macepci_error, 0,
 			   "MACE PCI error", NULL));
 
-	/* extend memory resources */
-	iomem_resource.end = mace_pci_mem_resource.end;
-	ioport_resource = mace_pci_io_resource;
-
+	ioport_resource.end = mace_pci_io_resource.end;
 	register_pci_controller(&mace_pci_controller);
 
 	return 0;

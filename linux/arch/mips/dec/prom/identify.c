@@ -1,19 +1,17 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * identify.c: machine identification code.
  *
  * Copyright (C) 1998 Harald Koerfgen and Paul M. Antoine
- * Copyright (C) 2002, 2003, 2004, 2005  Maciej W. Rozycki
+ * Copyright (C) 2002, 2003, 2004  Maciej W. Rozycki
  */
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/mc146818rtc.h>
-#include <linux/export.h>
+#include <linux/module.h>
 #include <linux/string.h>
 #include <linux/types.h>
 
 #include <asm/bootinfo.h>
-
 #include <asm/dec/ioasic.h>
 #include <asm/dec/ioasic_addrs.h>
 #include <asm/dec/kn01.h>
@@ -23,9 +21,11 @@
 #include <asm/dec/kn03.h>
 #include <asm/dec/kn230.h>
 #include <asm/dec/prom.h>
-#include <asm/dec/system.h>
 
 #include "dectypes.h"
+
+extern unsigned long mips_machgroup;
+extern unsigned long mips_machtype;
 
 static const char *dec_system_strings[] = {
 	[MACH_DSUNKNOWN]	"unknown DECstation",
@@ -68,47 +68,34 @@ EXPORT_SYMBOL(dec_rtc_base);
 
 static inline void prom_init_kn01(void)
 {
-	dec_kn_slot_base = KN01_SLOT_BASE;
+	dec_rtc_base = (void *)KN01_RTC_BASE;
 	dec_kn_slot_size = KN01_SLOT_SIZE;
-
-	dec_rtc_base = (void *)CKSEG1ADDR(dec_kn_slot_base + KN01_RTC);
 }
 
 static inline void prom_init_kn230(void)
 {
-	dec_kn_slot_base = KN01_SLOT_BASE;
+	dec_rtc_base = (void *)KN01_RTC_BASE;
 	dec_kn_slot_size = KN01_SLOT_SIZE;
-
-	dec_rtc_base = (void *)CKSEG1ADDR(dec_kn_slot_base + KN01_RTC);
 }
 
 static inline void prom_init_kn02(void)
 {
-	dec_kn_slot_base = KN02_SLOT_BASE;
+	dec_rtc_base = (void *)KN02_RTC_BASE;
 	dec_kn_slot_size = KN02_SLOT_SIZE;
-	dec_tc_bus = 1;
-
-	dec_rtc_base = (void *)CKSEG1ADDR(dec_kn_slot_base + KN02_RTC);
 }
 
 static inline void prom_init_kn02xa(void)
 {
-	dec_kn_slot_base = KN02XA_SLOT_BASE;
+	ioasic_base = (void *)KN02XA_IOASIC_BASE;
+	dec_rtc_base = (void *)KN02XA_RTC_BASE;
 	dec_kn_slot_size = IOASIC_SLOT_SIZE;
-	dec_tc_bus = 1;
-
-	ioasic_base = (void *)CKSEG1ADDR(dec_kn_slot_base + IOASIC_IOCTL);
-	dec_rtc_base = (void *)CKSEG1ADDR(dec_kn_slot_base + IOASIC_TOY);
 }
 
 static inline void prom_init_kn03(void)
 {
-	dec_kn_slot_base = KN03_SLOT_BASE;
+	ioasic_base = (void *)KN03_IOASIC_BASE;
+	dec_rtc_base = (void *)KN03_RTC_BASE;
 	dec_kn_slot_size = IOASIC_SLOT_SIZE;
-	dec_tc_bus = 1;
-
-	ioasic_base = (void *)CKSEG1ADDR(dec_kn_slot_base + IOASIC_IOCTL);
-	dec_rtc_base = (void *)CKSEG1ADDR(dec_kn_slot_base + IOASIC_TOY);
 }
 
 
@@ -133,6 +120,9 @@ void __init prom_identify_arch(u32 magic)
 	dec_systype = (dec_sysid & 0xff0000) >> 16;
 	dec_firmrev = (dec_sysid & 0xff00) >> 8;
 	dec_etc = dec_sysid & 0xff;
+
+	/* We're obviously one of the DEC machines */
+	mips_machgroup = MACH_GROUP_DEC;
 
 	/*
 	 * FIXME: This may not be an exhaustive list of DECStations/Servers!

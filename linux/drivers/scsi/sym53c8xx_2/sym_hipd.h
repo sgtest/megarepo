@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Device driver for the SYMBIOS/LSILOGIC 53C8XX and 53C1010 family 
  * of PCI-SCSI IO processors.
@@ -22,9 +21,21 @@
  * Copyright (C) 1997 Richard Waltham <dormouse@farsrobt.demon.co.uk>
  *
  *-----------------------------------------------------------------------------
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
-
-#include <linux/gfp.h>
 
 #ifndef SYM_HIPD_H
 #define SYM_HIPD_H
@@ -35,16 +46,23 @@
  *  They may be defined in platform specific headers, if they 
  *  are useful.
  *
+ *    SYM_OPT_HANDLE_DIR_UNKNOWN
+ *        When this option is set, the SCRIPTS used by the driver 
+ *        are able to handle SCSI transfers with direction not 
+ *        supplied by user.
+ *        (set for Linux-2.0.X)
+ *
  *    SYM_OPT_HANDLE_DEVICE_QUEUEING
  *        When this option is set, the driver will use a queue per 
  *        device and handle QUEUE FULL status requeuing internally.
  *
  *    SYM_OPT_LIMIT_COMMAND_REORDERING
  *        When this option is set, the driver tries to limit tagged 
- *        command reordering to some reasonable value.
+ *        command reordering to some reasonnable value.
  *        (set for Linux)
  */
 #if 0
+#define SYM_OPT_HANDLE_DIR_UNKNOWN
 #define SYM_OPT_HANDLE_DEVICE_QUEUEING
 #define SYM_OPT_LIMIT_COMMAND_REORDERING
 #endif
@@ -133,16 +151,6 @@
  */
 #define	SYM_CONF_MIN_ASYNC (40)
 
-
-/*
- * MEMORY ALLOCATOR.
- */
-
-#define SYM_MEM_WARN	1	/* Warn on failed operations */
-
-#define SYM_MEM_PAGE_ORDER 0	/* 1 PAGE  maximum */
-#define SYM_MEM_CLUSTER_SHIFT	(PAGE_SHIFT+SYM_MEM_PAGE_ORDER)
-#define SYM_MEM_FREE_UNUSED	/* Free unused pages immediately */
 /*
  *  Shortest memory chunk is (1<<SYM_MEM_SHIFT), currently 16.
  *  Actual allocations happen as SYM_MEM_CLUSTER_SIZE sized.
@@ -341,7 +349,6 @@ struct sym_trans {
 	unsigned int dt:1;
 	unsigned int qas:1;
 	unsigned int check_nego:1;
-	unsigned int renego:2;
 };
 
 /*
@@ -388,7 +395,6 @@ struct sym_tcb {
 	 *  An array of bus addresses is used on reselection.
 	 */
 	u32	*luntbl;	/* LCBs bus address table	*/
-	int	nlcb;		/* Number of valid LCBs (including LUN #0) */
 
 	/*
 	 *  LUN table used by the C code.
@@ -397,6 +403,19 @@ struct sym_tcb {
 #if SYM_CONF_MAX_LUN > 1
 	struct sym_lcb **lunmp;		/* Other LCBs [1..MAX_LUN]	*/
 #endif
+
+	/*
+	 *  Bitmap that tells about LUNs that succeeded at least 
+	 *  1 IO and therefore assumed to be a real device.
+	 *  Avoid useless allocation of the LCB structure.
+	 */
+	u32	lun_map[(SYM_CONF_MAX_LUN+31)/32];
+
+	/*
+	 *  Bitmap that tells about LUNs that haven't yet an LCB 
+	 *  allocated (not discovered or LCB allocation failed).
+	 */
+	u32	busy0_map[(SYM_CONF_MAX_LUN+31)/32];
 
 #ifdef	SYM_HAVE_STCB
 	/*
@@ -407,9 +426,6 @@ struct sym_tcb {
 
 	/* Transfer goal */
 	struct sym_trans tgoal;
-
-	/* Last printed transfer speed */
-	struct sym_trans tprint;
 
 	/*
 	 * Keep track of the CCB used for the negotiation in order
@@ -426,11 +442,9 @@ struct sym_tcb {
 	 *  Other user settable limits and options.
 	 *  These limits are read from the NVRAM if present.
 	 */
-	unsigned char	usrflags;
-	unsigned char	usr_period;
-	unsigned char	usr_width;
-	unsigned short	usrtags;
-	struct scsi_target *starget;
+	u_char	usrflags;
+	u_short	usrtags;
+	struct scsi_device *sdev;
 };
 
 /*
@@ -568,7 +582,7 @@ struct sym_pmc {
 #define sym_lp(tp, lun) (!lun) ? (tp)->lun0p : NULL
 #else
 #define sym_lp(tp, lun) \
-	(!lun) ? (tp)->lun0p : (tp)->lunmp ? (tp)->lunmp[((u8)lun)] : NULL
+	(!lun) ? (tp)->lun0p : (tp)->lunmp ? (tp)->lunmp[(lun)] : NULL
 #endif
 
 /*
@@ -646,6 +660,9 @@ struct sym_ccbh {
 	 */
 	u32	savep;		/* Jump address to saved data pointer	*/
 	u32	lastp;		/* SCRIPTS address at end of data	*/
+#ifdef	SYM_OPT_HANDLE_DIR_UNKNOWN
+	u32	wlastp;
+#endif
 
 	/*
 	 *  Status fields.
@@ -737,8 +754,10 @@ struct sym_ccb {
 	int	segments;	/* Number of SG segments	*/
 
 	u8	order;		/* Tag type (if tagged command)	*/
-	unsigned char odd_byte_adjustment;	/* odd-sized req on wide bus */
 
+	/*
+	 *  Miscellaneous status'.
+	 */
 	u_char	nego_status;	/* Negotiation status		*/
 	u_char	xerr_status;	/* Extended error flags		*/
 	u32	extra_bytes;	/* Extraneous bytes transferred	*/
@@ -775,6 +794,9 @@ struct sym_ccb {
 	SYM_QUEHEAD link_ccbq;	/* Link to free/busy CCB queue	*/
 	u32	startp;		/* Initial data pointer		*/
 	u32	goalp;		/* Expected last data pointer	*/
+#ifdef	SYM_OPT_HANDLE_DIR_UNKNOWN
+	u32	wgoalp;
+#endif
 	int	ext_sg;		/* Extreme data pointer, used	*/
 	int	ext_ofs;	/*  to calculate the residual.	*/
 #ifdef SYM_OPT_HANDLE_DEVICE_QUEUEING
@@ -787,7 +809,13 @@ struct sym_ccb {
 #endif
 };
 
-#define CCB_BA(cp,lbl)	cpu_to_scr(cp->ccb_ba + offsetof(struct sym_ccb, lbl))
+#define CCB_BA(cp,lbl)	(cp->ccb_ba + offsetof(struct sym_ccb, lbl))
+
+#ifdef	SYM_OPT_HANDLE_DIR_UNKNOWN
+#define	sym_goalp(cp) ((cp->host_flags & HF_DATA_IN) ? cp->goalp : cp->wgoalp)
+#else
+#define	sym_goalp(cp) (cp->goalp)
+#endif
 
 typedef struct device *m_pool_ident_t;
 
@@ -875,7 +903,10 @@ struct sym_hcb {
 	 *  Physical bus addresses of the chip.
 	 */
 	u32		mmio_ba;	/* MMIO 32 bit BUS address	*/
+	int		mmio_ws;	/* MMIO Window size		*/
+
 	u32		ram_ba;		/* RAM 32 bit BUS address	*/
+	int		ram_ws;		/* RAM window size		*/
 
 	/*
 	 *  SCRIPTS virtual and physical bus addresses.
@@ -901,12 +932,14 @@ struct sym_hcb {
 	struct sym_fwb_ba fwb_bas;	/* Useful SCRIPTB bus addresses	*/
 	struct sym_fwz_ba fwz_bas;	/* Useful SCRIPTZ bus addresses	*/
 	void		(*fw_setup)(struct sym_hcb *np, struct sym_fw *fw);
-	void		(*fw_patch)(struct Scsi_Host *);
+	void		(*fw_patch)(struct sym_hcb *np);
 	char		*fw_name;
 
 	/*
 	 *  General controller parameters and configuration.
 	 */
+	u_short	device_id;	/* PCI device id		*/
+	u_char	revision_id;	/* PCI device revision id	*/
 	u_int	features;	/* Chip features map		*/
 	u_char	myaddr;		/* SCSI id of the adapter	*/
 	u_char	maxburst;	/* log base 2 of dwords burst	*/
@@ -1018,14 +1051,6 @@ struct sym_hcb {
 #endif
 };
 
-#if SYM_CONF_DMA_ADDRESSING_MODE == 0
-#define use_dac(np)	0
-#define set_dac(np)	do { } while (0)
-#else
-#define use_dac(np)	(np)->use_dac
-#define set_dac(np)	(np)->use_dac = 1
-#endif
-
 #define HCB_BA(np, lbl)	(np->hcb_ba + offsetof(struct sym_hcb, lbl))
 
 
@@ -1042,18 +1067,16 @@ char *sym_driver_name(void);
 void sym_print_xerr(struct scsi_cmnd *cmd, int x_status);
 int sym_reset_scsi_bus(struct sym_hcb *np, int enab_int);
 struct sym_chip *sym_lookup_chip_table(u_short device_id, u_char revision);
+void sym_put_start_queue(struct sym_hcb *np, struct sym_ccb *cp);
 #ifdef SYM_OPT_HANDLE_DEVICE_QUEUEING
 void sym_start_next_ccbs(struct sym_hcb *np, struct sym_lcb *lp, int maxn);
-#else
-void sym_put_start_queue(struct sym_hcb *np, struct sym_ccb *cp);
 #endif
-void sym_start_up(struct Scsi_Host *, int reason);
-irqreturn_t sym_interrupt(struct Scsi_Host *);
+void sym_start_up(struct sym_hcb *np, int reason);
+void sym_interrupt(struct sym_hcb *np);
 int sym_clear_tasks(struct sym_hcb *np, int cam_status, int target, int lun, int task);
 struct sym_ccb *sym_get_ccb(struct sym_hcb *np, struct scsi_cmnd *cmd, u_char tag_order);
 void sym_free_ccb(struct sym_hcb *np, struct sym_ccb *cp);
 struct sym_lcb *sym_alloc_lcb(struct sym_hcb *np, u_char tn, u_char ln);
-int sym_free_lcb(struct sym_hcb *np, u_char tn, u_char ln);
 int sym_queue_scsiio(struct sym_hcb *np, struct scsi_cmnd *csio, struct sym_ccb *cp);
 int sym_abort_scsiio(struct sym_hcb *np, struct scsi_cmnd *ccb, int timed_out);
 int sym_reset_scsi_target(struct sym_hcb *np, int target);
@@ -1069,23 +1092,20 @@ int sym_hcb_attach(struct Scsi_Host *shost, struct sym_fw *fw, struct sym_nvram 
  */
 
 #if   SYM_CONF_DMA_ADDRESSING_MODE == 0
-#define DMA_DAC_MASK	DMA_BIT_MASK(32)
 #define sym_build_sge(np, data, badd, len)	\
 do {						\
 	(data)->addr = cpu_to_scr(badd);	\
 	(data)->size = cpu_to_scr(len);		\
 } while (0)
 #elif SYM_CONF_DMA_ADDRESSING_MODE == 1
-#define DMA_DAC_MASK	DMA_BIT_MASK(40)
 #define sym_build_sge(np, data, badd, len)				\
 do {									\
 	(data)->addr = cpu_to_scr(badd);				\
 	(data)->size = cpu_to_scr((((badd) >> 8) & 0xff000000) + len);	\
 } while (0)
 #elif SYM_CONF_DMA_ADDRESSING_MODE == 2
-#define DMA_DAC_MASK	DMA_BIT_MASK(64)
 int sym_lookup_dmap(struct sym_hcb *np, u32 h, int s);
-static inline void
+static __inline void 
 sym_build_sge(struct sym_hcb *np, struct sym_tblmove *data, u64 badd, int len)
 {
 	u32 h = (badd>>32);
@@ -1106,8 +1126,79 @@ bad:
 #endif
 
 /*
+ *  Set up data pointers used by SCRIPTS.
+ *  Called from O/S specific code.
+ */
+static inline void sym_setup_data_pointers(struct sym_hcb *np,
+		struct sym_ccb *cp, int dir)
+{
+	u32 lastp, goalp;
+
+	/*
+	 *  No segments means no data.
+	 */
+	if (!cp->segments)
+		dir = CAM_DIR_NONE;
+
+	/*
+	 *  Set the data pointer.
+	 */
+	switch(dir) {
+#ifdef	SYM_OPT_HANDLE_DIR_UNKNOWN
+	case CAM_DIR_UNKNOWN:
+#endif
+	case CAM_DIR_OUT:
+		goalp = SCRIPTA_BA(np, data_out2) + 8;
+		lastp = goalp - 8 - (cp->segments * (2*4));
+#ifdef	SYM_OPT_HANDLE_DIR_UNKNOWN
+		cp->wgoalp = cpu_to_scr(goalp);
+		if (dir != CAM_DIR_UNKNOWN)
+			break;
+		cp->phys.head.wlastp = cpu_to_scr(lastp);
+		/* fall through */
+#else
+		break;
+#endif
+	case CAM_DIR_IN:
+		cp->host_flags |= HF_DATA_IN;
+		goalp = SCRIPTA_BA(np, data_in2) + 8;
+		lastp = goalp - 8 - (cp->segments * (2*4));
+		break;
+	case CAM_DIR_NONE:
+	default:
+#ifdef	SYM_OPT_HANDLE_DIR_UNKNOWN
+		cp->host_flags |= HF_DATA_IN;
+#endif
+		lastp = goalp = SCRIPTB_BA(np, no_data);
+		break;
+	}
+
+	/*
+	 *  Set all pointers values needed by SCRIPTS.
+	 */
+	cp->phys.head.lastp = cpu_to_scr(lastp);
+	cp->phys.head.savep = cpu_to_scr(lastp);
+	cp->startp	    = cp->phys.head.savep;
+	cp->goalp	    = cpu_to_scr(goalp);
+
+#ifdef	SYM_OPT_HANDLE_DIR_UNKNOWN
+	/*
+	 *  If direction is unknown, start at data_io.
+	 */
+	if (dir == CAM_DIR_UNKNOWN)
+		cp->phys.head.savep = cpu_to_scr(SCRIPTB_BA(np, data_io));
+#endif
+}
+
+/*
  *  MEMORY ALLOCATOR.
  */
+
+#define SYM_MEM_PAGE_ORDER 0	/* 1 PAGE  maximum */
+#define SYM_MEM_CLUSTER_SHIFT	(PAGE_SHIFT+SYM_MEM_PAGE_ORDER)
+#define SYM_MEM_FREE_UNUSED	/* Free unused pages immediately */
+
+#define SYM_MEM_WARN	1	/* Warn on failed operations */
 
 #define sym_get_mem_cluster()	\
 	(void *) __get_free_pages(GFP_ATOMIC, SYM_MEM_PAGE_ORDER)
@@ -1190,7 +1281,7 @@ dma_addr_t __vtobus(m_pool_ident_t dev_dmat, void *m);
 
 #define sym_m_pool_match(mp_id1, mp_id2)	(mp_id1 == mp_id2)
 
-static inline void *sym_m_get_dma_mem_cluster(m_pool_p mp, m_vtob_p vbp)
+static __inline void *sym_m_get_dma_mem_cluster(m_pool_p mp, m_vtob_p vbp)
 {
 	void *vaddr = NULL;
 	dma_addr_t baddr = 0;
@@ -1204,7 +1295,7 @@ static inline void *sym_m_get_dma_mem_cluster(m_pool_p mp, m_vtob_p vbp)
 	return vaddr;
 }
 
-static inline void sym_m_free_dma_mem_cluster(m_pool_p mp, m_vtob_p vbp)
+static __inline void sym_m_free_dma_mem_cluster(m_pool_p mp, m_vtob_p vbp)
 {
 	dma_free_coherent(mp->dev_dmat, SYM_MEM_CLUSTER_SIZE, vbp->vaddr,
 			vbp->baddr);

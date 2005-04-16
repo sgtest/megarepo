@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * High memory handling common code and variables.
  *
@@ -18,17 +17,30 @@
  */
 
 #include <linux/mm.h>
-#include <linux/export.h>
+#include <linux/module.h>
 #include <linux/swap.h>
 #include <linux/bio.h>
 #include <linux/pagemap.h>
 #include <linux/mempool.h>
+#include <linux/blkdev.h>
 #include <linux/init.h>
 #include <linux/hash.h>
 #include <linux/highmem.h>
-#include <linux/kgdb.h>
 #include <asm/tlbflush.h>
-#include <linux/vmalloc.h>
+
+static mempool_t *page_pool, *isa_page_pool;
+
+static void *page_pool_alloc(unsigned int __nocast gfp_mask, void *data)
+{
+	unsigned int gfp = gfp_mask | (unsigned int) (long) data;
+
+	return alloc_page(gfp);
+}
+
+static void page_pool_free(void *page, void *data)
+{
+	__free_page(page);
+}
 
 /*
  * Virtual_count is not a pure "count".
@@ -39,125 +51,17 @@
  *  n means that there are (n-1) current users of it.
  */
 #ifdef CONFIG_HIGHMEM
-
-/*
- * Architecture with aliasing data cache may define the following family of
- * helper functions in its asm/highmem.h to control cache color of virtual
- * addresses where physical memory pages are mapped by kmap.
- */
-#ifndef get_pkmap_color
-
-/*
- * Determine color of virtual address where the page should be mapped.
- */
-static inline unsigned int get_pkmap_color(struct page *page)
-{
-	return 0;
-}
-#define get_pkmap_color get_pkmap_color
-
-/*
- * Get next index for mapping inside PKMAP region for page with given color.
- */
-static inline unsigned int get_next_pkmap_nr(unsigned int color)
-{
-	static unsigned int last_pkmap_nr;
-
-	last_pkmap_nr = (last_pkmap_nr + 1) & LAST_PKMAP_MASK;
-	return last_pkmap_nr;
-}
-
-/*
- * Determine if page index inside PKMAP region (pkmap_nr) of given color
- * has wrapped around PKMAP region end. When this happens an attempt to
- * flush all unused PKMAP slots is made.
- */
-static inline int no_more_pkmaps(unsigned int pkmap_nr, unsigned int color)
-{
-	return pkmap_nr == 0;
-}
-
-/*
- * Get the number of PKMAP entries of the given color. If no free slot is
- * found after checking that many entries, kmap will sleep waiting for
- * someone to call kunmap and free PKMAP slot.
- */
-static inline int get_pkmap_entries_count(unsigned int color)
-{
-	return LAST_PKMAP;
-}
-
-/*
- * Get head of a wait queue for PKMAP entries of the given color.
- * Wait queues for different mapping colors should be independent to avoid
- * unnecessary wakeups caused by freeing of slots of other colors.
- */
-static inline wait_queue_head_t *get_pkmap_wait_queue_head(unsigned int color)
-{
-	static DECLARE_WAIT_QUEUE_HEAD(pkmap_map_wait);
-
-	return &pkmap_map_wait;
-}
-#endif
-
-atomic_long_t _totalhigh_pages __read_mostly;
-EXPORT_SYMBOL(_totalhigh_pages);
-
-unsigned int __nr_free_highpages(void)
-{
-	struct zone *zone;
-	unsigned int pages = 0;
-
-	for_each_populated_zone(zone) {
-		if (is_highmem(zone))
-			pages += zone_page_state(zone, NR_FREE_PAGES);
-	}
-
-	return pages;
-}
-
 static int pkmap_count[LAST_PKMAP];
+static unsigned int last_pkmap_nr;
 static  __cacheline_aligned_in_smp DEFINE_SPINLOCK(kmap_lock);
 
-pte_t *pkmap_page_table;
+pte_t * pkmap_page_table;
 
-/*
- * Most architectures have no use for kmap_high_get(), so let's abstract
- * the disabling of IRQ out of the locking in that case to save on a
- * potential useless overhead.
- */
-#ifdef ARCH_NEEDS_KMAP_HIGH_GET
-#define lock_kmap()             spin_lock_irq(&kmap_lock)
-#define unlock_kmap()           spin_unlock_irq(&kmap_lock)
-#define lock_kmap_any(flags)    spin_lock_irqsave(&kmap_lock, flags)
-#define unlock_kmap_any(flags)  spin_unlock_irqrestore(&kmap_lock, flags)
-#else
-#define lock_kmap()             spin_lock(&kmap_lock)
-#define unlock_kmap()           spin_unlock(&kmap_lock)
-#define lock_kmap_any(flags)    \
-		do { spin_lock(&kmap_lock); (void)(flags); } while (0)
-#define unlock_kmap_any(flags)  \
-		do { spin_unlock(&kmap_lock); (void)(flags); } while (0)
-#endif
-
-struct page *__kmap_to_page(void *vaddr)
-{
-	unsigned long addr = (unsigned long)vaddr;
-
-	if (addr >= PKMAP_ADDR(0) && addr < PKMAP_ADDR(LAST_PKMAP)) {
-		int i = PKMAP_NR(addr);
-
-		return pte_page(pkmap_page_table[i]);
-	}
-
-	return virt_to_page(vaddr);
-}
-EXPORT_SYMBOL(__kmap_to_page);
+static DECLARE_WAIT_QUEUE_HEAD(pkmap_map_wait);
 
 static void flush_all_zero_pkmaps(void)
 {
 	int i;
-	int need_flush = 0;
 
 	flush_cache_kmaps();
 
@@ -175,7 +79,8 @@ static void flush_all_zero_pkmaps(void)
 		pkmap_count[i] = 0;
 
 		/* sanity check */
-		BUG_ON(pte_none(pkmap_page_table[i]));
+		if (pte_none(pkmap_page_table[i]))
+			BUG();
 
 		/*
 		 * Don't need an atomic fetch-and-clear op here;
@@ -185,37 +90,27 @@ static void flush_all_zero_pkmaps(void)
 		 * So no dangers, even with speculative execution.
 		 */
 		page = pte_page(pkmap_page_table[i]);
-		pte_clear(&init_mm, PKMAP_ADDR(i), &pkmap_page_table[i]);
+		pte_clear(&init_mm, (unsigned long)page_address(page),
+			  &pkmap_page_table[i]);
 
 		set_page_address(page, NULL);
-		need_flush = 1;
 	}
-	if (need_flush)
-		flush_tlb_kernel_range(PKMAP_ADDR(0), PKMAP_ADDR(LAST_PKMAP));
-}
-
-void __kmap_flush_unused(void)
-{
-	lock_kmap();
-	flush_all_zero_pkmaps();
-	unlock_kmap();
+	flush_tlb_kernel_range(PKMAP_ADDR(0), PKMAP_ADDR(LAST_PKMAP));
 }
 
 static inline unsigned long map_new_virtual(struct page *page)
 {
 	unsigned long vaddr;
 	int count;
-	unsigned int last_pkmap_nr;
-	unsigned int color = get_pkmap_color(page);
 
 start:
-	count = get_pkmap_entries_count(color);
+	count = LAST_PKMAP;
 	/* Find an empty entry */
 	for (;;) {
-		last_pkmap_nr = get_next_pkmap_nr(color);
-		if (no_more_pkmaps(last_pkmap_nr, color)) {
+		last_pkmap_nr = (last_pkmap_nr + 1) & LAST_PKMAP_MASK;
+		if (!last_pkmap_nr) {
 			flush_all_zero_pkmaps();
-			count = get_pkmap_entries_count(color);
+			count = LAST_PKMAP;
 		}
 		if (!pkmap_count[last_pkmap_nr])
 			break;	/* Found a usable entry */
@@ -227,15 +122,13 @@ start:
 		 */
 		{
 			DECLARE_WAITQUEUE(wait, current);
-			wait_queue_head_t *pkmap_map_wait =
-				get_pkmap_wait_queue_head(color);
 
 			__set_current_state(TASK_UNINTERRUPTIBLE);
-			add_wait_queue(pkmap_map_wait, &wait);
-			unlock_kmap();
+			add_wait_queue(&pkmap_map_wait, &wait);
+			spin_unlock(&kmap_lock);
 			schedule();
-			remove_wait_queue(pkmap_map_wait, &wait);
-			lock_kmap();
+			remove_wait_queue(&pkmap_map_wait, &wait);
+			spin_lock(&kmap_lock);
 
 			/* Somebody else might have mapped it while we slept */
 			if (page_address(page))
@@ -255,78 +148,39 @@ start:
 	return vaddr;
 }
 
-/**
- * kmap_high - map a highmem page into memory
- * @page: &struct page to map
- *
- * Returns the page's virtual memory address.
- *
- * We cannot call this from interrupts, as it may block.
- */
-void *kmap_high(struct page *page)
+void fastcall *kmap_high(struct page *page)
 {
 	unsigned long vaddr;
 
 	/*
 	 * For highmem pages, we can't trust "virtual" until
 	 * after we have the lock.
+	 *
+	 * We cannot call this from interrupts, as it may block
 	 */
-	lock_kmap();
+	spin_lock(&kmap_lock);
 	vaddr = (unsigned long)page_address(page);
 	if (!vaddr)
 		vaddr = map_new_virtual(page);
 	pkmap_count[PKMAP_NR(vaddr)]++;
-	BUG_ON(pkmap_count[PKMAP_NR(vaddr)] < 2);
-	unlock_kmap();
-	return (void *) vaddr;
+	if (pkmap_count[PKMAP_NR(vaddr)] < 2)
+		BUG();
+	spin_unlock(&kmap_lock);
+	return (void*) vaddr;
 }
+
 EXPORT_SYMBOL(kmap_high);
 
-#ifdef ARCH_NEEDS_KMAP_HIGH_GET
-/**
- * kmap_high_get - pin a highmem page into memory
- * @page: &struct page to pin
- *
- * Returns the page's current virtual memory address, or NULL if no mapping
- * exists.  If and only if a non null address is returned then a
- * matching call to kunmap_high() is necessary.
- *
- * This can be called from any context.
- */
-void *kmap_high_get(struct page *page)
-{
-	unsigned long vaddr, flags;
-
-	lock_kmap_any(flags);
-	vaddr = (unsigned long)page_address(page);
-	if (vaddr) {
-		BUG_ON(pkmap_count[PKMAP_NR(vaddr)] < 1);
-		pkmap_count[PKMAP_NR(vaddr)]++;
-	}
-	unlock_kmap_any(flags);
-	return (void *) vaddr;
-}
-#endif
-
-/**
- * kunmap_high - unmap a highmem page into memory
- * @page: &struct page to unmap
- *
- * If ARCH_NEEDS_KMAP_HIGH_GET is not defined then this may be called
- * only from user context.
- */
-void kunmap_high(struct page *page)
+void fastcall kunmap_high(struct page *page)
 {
 	unsigned long vaddr;
 	unsigned long nr;
-	unsigned long flags;
 	int need_wakeup;
-	unsigned int color = get_pkmap_color(page);
-	wait_queue_head_t *pkmap_map_wait;
 
-	lock_kmap_any(flags);
+	spin_lock(&kmap_lock);
 	vaddr = (unsigned long)page_address(page);
-	BUG_ON(!vaddr);
+	if (!vaddr)
+		BUG();
 	nr = PKMAP_NR(vaddr);
 
 	/*
@@ -348,341 +202,288 @@ void kunmap_high(struct page *page)
 		 * no need for the wait-queue-head's lock.  Simply
 		 * test if the queue is empty.
 		 */
-		pkmap_map_wait = get_pkmap_wait_queue_head(color);
-		need_wakeup = waitqueue_active(pkmap_map_wait);
+		need_wakeup = waitqueue_active(&pkmap_map_wait);
 	}
-	unlock_kmap_any(flags);
+	spin_unlock(&kmap_lock);
 
 	/* do wake-up, if needed, race-free outside of the spin lock */
 	if (need_wakeup)
-		wake_up(pkmap_map_wait);
+		wake_up(&pkmap_map_wait);
 }
+
 EXPORT_SYMBOL(kunmap_high);
 
-void zero_user_segments(struct page *page, unsigned start1, unsigned end1,
-		unsigned start2, unsigned end2)
+#define POOL_SIZE	64
+
+static __init int init_emergency_pool(void)
 {
-	unsigned int i;
+	struct sysinfo i;
+	si_meminfo(&i);
+	si_swapinfo(&i);
+        
+	if (!i.totalhigh)
+		return 0;
 
-	BUG_ON(end1 > page_size(page) || end2 > page_size(page));
+	page_pool = mempool_create(POOL_SIZE, page_pool_alloc, page_pool_free, NULL);
+	if (!page_pool)
+		BUG();
+	printk("highmem bounce pool size: %d pages\n", POOL_SIZE);
 
-	if (start1 >= end1)
-		start1 = end1 = 0;
-	if (start2 >= end2)
-		start2 = end2 = 0;
-
-	for (i = 0; i < compound_nr(page); i++) {
-		void *kaddr = NULL;
-
-		if (start1 >= PAGE_SIZE) {
-			start1 -= PAGE_SIZE;
-			end1 -= PAGE_SIZE;
-		} else {
-			unsigned this_end = min_t(unsigned, end1, PAGE_SIZE);
-
-			if (end1 > start1) {
-				kaddr = kmap_local_page(page + i);
-				memset(kaddr + start1, 0, this_end - start1);
-			}
-			end1 -= this_end;
-			start1 = 0;
-		}
-
-		if (start2 >= PAGE_SIZE) {
-			start2 -= PAGE_SIZE;
-			end2 -= PAGE_SIZE;
-		} else {
-			unsigned this_end = min_t(unsigned, end2, PAGE_SIZE);
-
-			if (end2 > start2) {
-				if (!kaddr)
-					kaddr = kmap_local_page(page + i);
-				memset(kaddr + start2, 0, this_end - start2);
-			}
-			end2 -= this_end;
-			start2 = 0;
-		}
-
-		if (kaddr) {
-			kunmap_local(kaddr);
-			flush_dcache_page(page + i);
-		}
-
-		if (!end1 && !end2)
-			break;
-	}
-
-	BUG_ON((start1 | start2 | end1 | end2) != 0);
+	return 0;
 }
-EXPORT_SYMBOL(zero_user_segments);
-#endif /* CONFIG_HIGHMEM */
 
-#ifdef CONFIG_KMAP_LOCAL
-
-#include <asm/kmap_size.h>
+__initcall(init_emergency_pool);
 
 /*
- * With DEBUG_KMAP_LOCAL the stack depth is doubled and every second
- * slot is unused which acts as a guard page
+ * highmem version, map in to vec
  */
-#ifdef CONFIG_DEBUG_KMAP_LOCAL
-# define KM_INCR	2
-#else
-# define KM_INCR	1
-#endif
-
-static inline int kmap_local_idx_push(void)
+static void bounce_copy_vec(struct bio_vec *to, unsigned char *vfrom)
 {
-	WARN_ON_ONCE(in_hardirq() && !irqs_disabled());
-	current->kmap_ctrl.idx += KM_INCR;
-	BUG_ON(current->kmap_ctrl.idx >= KM_MAX_IDX);
-	return current->kmap_ctrl.idx - 1;
+	unsigned long flags;
+	unsigned char *vto;
+
+	local_irq_save(flags);
+	vto = kmap_atomic(to->bv_page, KM_BOUNCE_READ);
+	memcpy(vto + to->bv_offset, vfrom, to->bv_len);
+	kunmap_atomic(vto, KM_BOUNCE_READ);
+	local_irq_restore(flags);
 }
 
-static inline int kmap_local_idx(void)
+#else /* CONFIG_HIGHMEM */
+
+#define bounce_copy_vec(to, vfrom)	\
+	memcpy(page_address((to)->bv_page) + (to)->bv_offset, vfrom, (to)->bv_len)
+
+#endif
+
+#define ISA_POOL_SIZE	16
+
+/*
+ * gets called "every" time someone init's a queue with BLK_BOUNCE_ISA
+ * as the max address, so check if the pool has already been created.
+ */
+int init_emergency_isa_pool(void)
 {
-	return current->kmap_ctrl.idx - 1;
+	if (isa_page_pool)
+		return 0;
+
+	isa_page_pool = mempool_create(ISA_POOL_SIZE, page_pool_alloc, page_pool_free, (void *) __GFP_DMA);
+	if (!isa_page_pool)
+		BUG();
+
+	printk("isa bounce pool size: %d pages\n", ISA_POOL_SIZE);
+	return 0;
 }
 
-static inline void kmap_local_idx_pop(void)
+/*
+ * Simple bounce buffer support for highmem pages. Depending on the
+ * queue gfp mask set, *to may or may not be a highmem page. kmap it
+ * always, it will do the Right Thing
+ */
+static void copy_to_high_bio_irq(struct bio *to, struct bio *from)
 {
-	current->kmap_ctrl.idx -= KM_INCR;
-	BUG_ON(current->kmap_ctrl.idx < 0);
-}
+	unsigned char *vfrom;
+	struct bio_vec *tovec, *fromvec;
+	int i;
 
-#ifndef arch_kmap_local_post_map
-# define arch_kmap_local_post_map(vaddr, pteval)	do { } while (0)
-#endif
+	__bio_for_each_segment(tovec, to, i, 0) {
+		fromvec = from->bi_io_vec + i;
 
-#ifndef arch_kmap_local_pre_unmap
-# define arch_kmap_local_pre_unmap(vaddr)		do { } while (0)
-#endif
+		/*
+		 * not bounced
+		 */
+		if (tovec->bv_page == fromvec->bv_page)
+			continue;
 
-#ifndef arch_kmap_local_post_unmap
-# define arch_kmap_local_post_unmap(vaddr)		do { } while (0)
-#endif
+		/*
+		 * fromvec->bv_offset and fromvec->bv_len might have been
+		 * modified by the block layer, so use the original copy,
+		 * bounce_copy_vec already uses tovec->bv_len
+		 */
+		vfrom = page_address(fromvec->bv_page) + tovec->bv_offset;
 
-#ifndef arch_kmap_local_map_idx
-#define arch_kmap_local_map_idx(idx, pfn)	kmap_local_calc_idx(idx)
-#endif
-
-#ifndef arch_kmap_local_unmap_idx
-#define arch_kmap_local_unmap_idx(idx, vaddr)	kmap_local_calc_idx(idx)
-#endif
-
-#ifndef arch_kmap_local_high_get
-static inline void *arch_kmap_local_high_get(struct page *page)
-{
-	return NULL;
-}
-#endif
-
-#ifndef arch_kmap_local_set_pte
-#define arch_kmap_local_set_pte(mm, vaddr, ptep, ptev)	\
-	set_pte_at(mm, vaddr, ptep, ptev)
-#endif
-
-/* Unmap a local mapping which was obtained by kmap_high_get() */
-static inline bool kmap_high_unmap_local(unsigned long vaddr)
-{
-#ifdef ARCH_NEEDS_KMAP_HIGH_GET
-	if (vaddr >= PKMAP_ADDR(0) && vaddr < PKMAP_ADDR(LAST_PKMAP)) {
-		kunmap_high(pte_page(pkmap_page_table[PKMAP_NR(vaddr)]));
-		return true;
+		flush_dcache_page(tovec->bv_page);
+		bounce_copy_vec(tovec, vfrom);
 	}
-#endif
-	return false;
 }
 
-static inline int kmap_local_calc_idx(int idx)
+static void bounce_end_io(struct bio *bio, mempool_t *pool, int err)
 {
-	return idx + KM_MAX_IDX * smp_processor_id();
+	struct bio *bio_orig = bio->bi_private;
+	struct bio_vec *bvec, *org_vec;
+	int i;
+
+	if (test_bit(BIO_EOPNOTSUPP, &bio->bi_flags))
+		set_bit(BIO_EOPNOTSUPP, &bio_orig->bi_flags);
+
+	/*
+	 * free up bounce indirect pages used
+	 */
+	__bio_for_each_segment(bvec, bio, i, 0) {
+		org_vec = bio_orig->bi_io_vec + i;
+		if (bvec->bv_page == org_vec->bv_page)
+			continue;
+
+		mempool_free(bvec->bv_page, pool);	
+	}
+
+	bio_endio(bio_orig, bio_orig->bi_size, err);
+	bio_put(bio);
 }
 
-static pte_t *__kmap_pte;
-
-static pte_t *kmap_get_pte(unsigned long vaddr, int idx)
+static int bounce_end_io_write(struct bio *bio, unsigned int bytes_done,int err)
 {
-	if (IS_ENABLED(CONFIG_KMAP_LOCAL_NON_LINEAR_PTE_ARRAY))
+	if (bio->bi_size)
+		return 1;
+
+	bounce_end_io(bio, page_pool, err);
+	return 0;
+}
+
+static int bounce_end_io_write_isa(struct bio *bio, unsigned int bytes_done, int err)
+{
+	if (bio->bi_size)
+		return 1;
+
+	bounce_end_io(bio, isa_page_pool, err);
+	return 0;
+}
+
+static void __bounce_end_io_read(struct bio *bio, mempool_t *pool, int err)
+{
+	struct bio *bio_orig = bio->bi_private;
+
+	if (test_bit(BIO_UPTODATE, &bio->bi_flags))
+		copy_to_high_bio_irq(bio_orig, bio);
+
+	bounce_end_io(bio, pool, err);
+}
+
+static int bounce_end_io_read(struct bio *bio, unsigned int bytes_done, int err)
+{
+	if (bio->bi_size)
+		return 1;
+
+	__bounce_end_io_read(bio, page_pool, err);
+	return 0;
+}
+
+static int bounce_end_io_read_isa(struct bio *bio, unsigned int bytes_done, int err)
+{
+	if (bio->bi_size)
+		return 1;
+
+	__bounce_end_io_read(bio, isa_page_pool, err);
+	return 0;
+}
+
+static void __blk_queue_bounce(request_queue_t *q, struct bio **bio_orig,
+			mempool_t *pool)
+{
+	struct page *page;
+	struct bio *bio = NULL;
+	int i, rw = bio_data_dir(*bio_orig);
+	struct bio_vec *to, *from;
+
+	bio_for_each_segment(from, *bio_orig, i) {
+		page = from->bv_page;
+
 		/*
-		 * Set by the arch if __kmap_pte[-idx] does not produce
-		 * the correct entry.
+		 * is destination page below bounce pfn?
 		 */
-		return virt_to_kpte(vaddr);
-	if (!__kmap_pte)
-		__kmap_pte = virt_to_kpte(__fix_to_virt(FIX_KMAP_BEGIN));
-	return &__kmap_pte[-idx];
-}
+		if (page_to_pfn(page) < q->bounce_pfn)
+			continue;
 
-void *__kmap_local_pfn_prot(unsigned long pfn, pgprot_t prot)
-{
-	pte_t pteval, *kmap_pte;
-	unsigned long vaddr;
-	int idx;
+		/*
+		 * irk, bounce it
+		 */
+		if (!bio)
+			bio = bio_alloc(GFP_NOIO, (*bio_orig)->bi_vcnt);
 
-	/*
-	 * Disable migration so resulting virtual address is stable
-	 * across preemption.
-	 */
-	migrate_disable();
-	preempt_disable();
-	idx = arch_kmap_local_map_idx(kmap_local_idx_push(), pfn);
-	vaddr = __fix_to_virt(FIX_KMAP_BEGIN + idx);
-	kmap_pte = kmap_get_pte(vaddr, idx);
-	BUG_ON(!pte_none(*kmap_pte));
-	pteval = pfn_pte(pfn, prot);
-	arch_kmap_local_set_pte(&init_mm, vaddr, kmap_pte, pteval);
-	arch_kmap_local_post_map(vaddr, pteval);
-	current->kmap_ctrl.pteval[kmap_local_idx()] = pteval;
-	preempt_enable();
+		to = bio->bi_io_vec + i;
 
-	return (void *)vaddr;
-}
-EXPORT_SYMBOL_GPL(__kmap_local_pfn_prot);
+		to->bv_page = mempool_alloc(pool, q->bounce_gfp);
+		to->bv_len = from->bv_len;
+		to->bv_offset = from->bv_offset;
 
-void *__kmap_local_page_prot(struct page *page, pgprot_t prot)
-{
-	void *kmap;
+		if (rw == WRITE) {
+			char *vto, *vfrom;
 
-	/*
-	 * To broaden the usage of the actual kmap_local() machinery always map
-	 * pages when debugging is enabled and the architecture has no problems
-	 * with alias mappings.
-	 */
-	if (!IS_ENABLED(CONFIG_DEBUG_KMAP_LOCAL_FORCE_MAP) && !PageHighMem(page))
-		return page_address(page);
-
-	/* Try kmap_high_get() if architecture has it enabled */
-	kmap = arch_kmap_local_high_get(page);
-	if (kmap)
-		return kmap;
-
-	return __kmap_local_pfn_prot(page_to_pfn(page), prot);
-}
-EXPORT_SYMBOL(__kmap_local_page_prot);
-
-void kunmap_local_indexed(const void *vaddr)
-{
-	unsigned long addr = (unsigned long) vaddr & PAGE_MASK;
-	pte_t *kmap_pte;
-	int idx;
-
-	if (addr < __fix_to_virt(FIX_KMAP_END) ||
-	    addr > __fix_to_virt(FIX_KMAP_BEGIN)) {
-		if (IS_ENABLED(CONFIG_DEBUG_KMAP_LOCAL_FORCE_MAP)) {
-			/* This _should_ never happen! See above. */
-			WARN_ON_ONCE(1);
-			return;
+			flush_dcache_page(from->bv_page);
+			vto = page_address(to->bv_page) + to->bv_offset;
+			vfrom = kmap(from->bv_page) + from->bv_offset;
+			memcpy(vto, vfrom, to->bv_len);
+			kunmap(from->bv_page);
 		}
-		/*
-		 * Handle mappings which were obtained by kmap_high_get()
-		 * first as the virtual address of such mappings is below
-		 * PAGE_OFFSET. Warn for all other addresses which are in
-		 * the user space part of the virtual address space.
-		 */
-		if (!kmap_high_unmap_local(addr))
-			WARN_ON_ONCE(addr < PAGE_OFFSET);
+	}
+
+	/*
+	 * no pages bounced
+	 */
+	if (!bio)
 		return;
-	}
 
-	preempt_disable();
-	idx = arch_kmap_local_unmap_idx(kmap_local_idx(), addr);
-	WARN_ON_ONCE(addr != __fix_to_virt(FIX_KMAP_BEGIN + idx));
-
-	kmap_pte = kmap_get_pte(addr, idx);
-	arch_kmap_local_pre_unmap(addr);
-	pte_clear(&init_mm, addr, kmap_pte);
-	arch_kmap_local_post_unmap(addr);
-	current->kmap_ctrl.pteval[kmap_local_idx()] = __pte(0);
-	kmap_local_idx_pop();
-	preempt_enable();
-	migrate_enable();
-}
-EXPORT_SYMBOL(kunmap_local_indexed);
-
-/*
- * Invoked before switch_to(). This is safe even when during or after
- * clearing the maps an interrupt which needs a kmap_local happens because
- * the task::kmap_ctrl.idx is not modified by the unmapping code so a
- * nested kmap_local will use the next unused index and restore the index
- * on unmap. The already cleared kmaps of the outgoing task are irrelevant
- * because the interrupt context does not know about them. The same applies
- * when scheduling back in for an interrupt which happens before the
- * restore is complete.
- */
-void __kmap_local_sched_out(void)
-{
-	struct task_struct *tsk = current;
-	pte_t *kmap_pte;
-	int i;
-
-	/* Clear kmaps */
-	for (i = 0; i < tsk->kmap_ctrl.idx; i++) {
-		pte_t pteval = tsk->kmap_ctrl.pteval[i];
-		unsigned long addr;
-		int idx;
-
-		/* With debug all even slots are unmapped and act as guard */
-		if (IS_ENABLED(CONFIG_DEBUG_KMAP_LOCAL) && !(i & 0x01)) {
-			WARN_ON_ONCE(pte_val(pteval) != 0);
-			continue;
+	/*
+	 * at least one page was bounced, fill in possible non-highmem
+	 * pages
+	 */
+	__bio_for_each_segment(from, *bio_orig, i, 0) {
+		to = bio_iovec_idx(bio, i);
+		if (!to->bv_page) {
+			to->bv_page = from->bv_page;
+			to->bv_len = from->bv_len;
+			to->bv_offset = from->bv_offset;
 		}
-		if (WARN_ON_ONCE(pte_none(pteval)))
-			continue;
-
-		/*
-		 * This is a horrible hack for XTENSA to calculate the
-		 * coloured PTE index. Uses the PFN encoded into the pteval
-		 * and the map index calculation because the actual mapped
-		 * virtual address is not stored in task::kmap_ctrl.
-		 * For any sane architecture this is optimized out.
-		 */
-		idx = arch_kmap_local_map_idx(i, pte_pfn(pteval));
-
-		addr = __fix_to_virt(FIX_KMAP_BEGIN + idx);
-		kmap_pte = kmap_get_pte(addr, idx);
-		arch_kmap_local_pre_unmap(addr);
-		pte_clear(&init_mm, addr, kmap_pte);
-		arch_kmap_local_post_unmap(addr);
 	}
-}
 
-void __kmap_local_sched_in(void)
-{
-	struct task_struct *tsk = current;
-	pte_t *kmap_pte;
-	int i;
+	bio->bi_bdev = (*bio_orig)->bi_bdev;
+	bio->bi_flags |= (1 << BIO_BOUNCED);
+	bio->bi_sector = (*bio_orig)->bi_sector;
+	bio->bi_rw = (*bio_orig)->bi_rw;
 
-	/* Restore kmaps */
-	for (i = 0; i < tsk->kmap_ctrl.idx; i++) {
-		pte_t pteval = tsk->kmap_ctrl.pteval[i];
-		unsigned long addr;
-		int idx;
+	bio->bi_vcnt = (*bio_orig)->bi_vcnt;
+	bio->bi_idx = (*bio_orig)->bi_idx;
+	bio->bi_size = (*bio_orig)->bi_size;
 
-		/* With debug all even slots are unmapped and act as guard */
-		if (IS_ENABLED(CONFIG_DEBUG_KMAP_LOCAL) && !(i & 0x01)) {
-			WARN_ON_ONCE(pte_val(pteval) != 0);
-			continue;
-		}
-		if (WARN_ON_ONCE(pte_none(pteval)))
-			continue;
-
-		/* See comment in __kmap_local_sched_out() */
-		idx = arch_kmap_local_map_idx(i, pte_pfn(pteval));
-		addr = __fix_to_virt(FIX_KMAP_BEGIN + idx);
-		kmap_pte = kmap_get_pte(addr, idx);
-		set_pte_at(&init_mm, addr, kmap_pte, pteval);
-		arch_kmap_local_post_map(addr, pteval);
+	if (pool == page_pool) {
+		bio->bi_end_io = bounce_end_io_write;
+		if (rw == READ)
+			bio->bi_end_io = bounce_end_io_read;
+	} else {
+		bio->bi_end_io = bounce_end_io_write_isa;
+		if (rw == READ)
+			bio->bi_end_io = bounce_end_io_read_isa;
 	}
+
+	bio->bi_private = *bio_orig;
+	*bio_orig = bio;
 }
 
-void kmap_local_fork(struct task_struct *tsk)
+void blk_queue_bounce(request_queue_t *q, struct bio **bio_orig)
 {
-	if (WARN_ON_ONCE(tsk->kmap_ctrl.idx))
-		memset(&tsk->kmap_ctrl, 0, sizeof(tsk->kmap_ctrl));
+	mempool_t *pool;
+
+	/*
+	 * for non-isa bounce case, just check if the bounce pfn is equal
+	 * to or bigger than the highest pfn in the system -- in that case,
+	 * don't waste time iterating over bio segments
+	 */
+	if (!(q->bounce_gfp & GFP_DMA)) {
+		if (q->bounce_pfn >= blk_max_pfn)
+			return;
+		pool = page_pool;
+	} else {
+		BUG_ON(!isa_page_pool);
+		pool = isa_page_pool;
+	}
+
+	/*
+	 * slow path
+	 */
+	__blk_queue_bounce(q, bio_orig, pool);
 }
 
-#endif
+EXPORT_SYMBOL(blk_queue_bounce);
 
 #if defined(HASHED_PAGE_VIRTUAL)
 
@@ -697,7 +498,11 @@ struct page_address_map {
 	struct list_head list;
 };
 
-static struct page_address_map page_address_maps[LAST_PKMAP];
+/*
+ * page_address_map freelist, allocated from page_address_maps.
+ */
+static struct list_head page_address_pool;	/* freelist */
+static spinlock_t pool_lock;			/* protects page_address_pool */
 
 /*
  * Hash table bucket
@@ -707,18 +512,12 @@ static struct page_address_slot {
 	spinlock_t lock;			/* Protect this bucket's list */
 } ____cacheline_aligned_in_smp page_address_htable[1<<PA_HASH_ORDER];
 
-static struct page_address_slot *page_slot(const struct page *page)
+static struct page_address_slot *page_slot(struct page *page)
 {
 	return &page_address_htable[hash_ptr(page, PA_HASH_ORDER)];
 }
 
-/**
- * page_address - get the mapped virtual address of a page
- * @page: &struct page to get the virtual address of
- *
- * Returns the page's virtual address.
- */
-void *page_address(const struct page *page)
+void *page_address(struct page *page)
 {
 	unsigned long flags;
 	void *ret;
@@ -736,21 +535,17 @@ void *page_address(const struct page *page)
 		list_for_each_entry(pam, &pas->lh, list) {
 			if (pam->page == page) {
 				ret = pam->virtual;
-				break;
+				goto done;
 			}
 		}
 	}
-
+done:
 	spin_unlock_irqrestore(&pas->lock, flags);
 	return ret;
 }
+
 EXPORT_SYMBOL(page_address);
 
-/**
- * set_page_address - set a page's virtual address
- * @page: &struct page to set
- * @virtual: virtual address to use
- */
 void set_page_address(struct page *page, void *virtual)
 {
 	unsigned long flags;
@@ -761,7 +556,14 @@ void set_page_address(struct page *page, void *virtual)
 
 	pas = page_slot(page);
 	if (virtual) {		/* Add */
-		pam = &page_address_maps[PKMAP_NR((unsigned long)virtual)];
+		BUG_ON(list_empty(&page_address_pool));
+
+		spin_lock_irqsave(&pool_lock, flags);
+		pam = list_entry(page_address_pool.next,
+				struct page_address_map, list);
+		list_del(&pam->list);
+		spin_unlock_irqrestore(&pool_lock, flags);
+
 		pam->page = page;
 		pam->virtual = virtual;
 
@@ -773,23 +575,33 @@ void set_page_address(struct page *page, void *virtual)
 		list_for_each_entry(pam, &pas->lh, list) {
 			if (pam->page == page) {
 				list_del(&pam->list);
-				break;
+				spin_unlock_irqrestore(&pas->lock, flags);
+				spin_lock_irqsave(&pool_lock, flags);
+				list_add_tail(&pam->list, &page_address_pool);
+				spin_unlock_irqrestore(&pool_lock, flags);
+				goto done;
 			}
 		}
 		spin_unlock_irqrestore(&pas->lock, flags);
 	}
-
+done:
 	return;
 }
+
+static struct page_address_map page_address_maps[LAST_PKMAP];
 
 void __init page_address_init(void)
 {
 	int i;
 
+	INIT_LIST_HEAD(&page_address_pool);
+	for (i = 0; i < ARRAY_SIZE(page_address_maps); i++)
+		list_add(&page_address_maps[i].list, &page_address_pool);
 	for (i = 0; i < ARRAY_SIZE(page_address_htable); i++) {
 		INIT_LIST_HEAD(&page_address_htable[i].lh);
 		spin_lock_init(&page_address_htable[i].lock);
 	}
+	spin_lock_init(&pool_lock);
 }
 
-#endif	/* defined(HASHED_PAGE_VIRTUAL) */
+#endif	/* defined(CONFIG_HIGHMEM) && !defined(WANT_PAGE_VIRTUAL) */

@@ -1,8 +1,21 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Driver for Digigram VXpocket soundcards
  *
  * Copyright (c) 2002 by Takashi Iwai <tiwai@suse.de>
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  */
 
 #ifndef __VXPOCKET_H
@@ -10,12 +23,32 @@
 
 #include <sound/vx_core.h>
 
+#include <pcmcia/cs_types.h>
+#include <pcmcia/cs.h>
 #include <pcmcia/cistpl.h>
 #include <pcmcia/ds.h>
 
+struct snd_vxp_entry {
+	dev_info_t *dev_info;
+
+	/* module parameters */
+	int *index_table;
+	char **id_table;
+	int *enable_table;
+	int *ibl;
+
+	/* h/w config */
+	struct snd_vx_hardware *hardware;
+	struct snd_vx_ops *ops;
+
+	/* slots */
+	vx_core_t *card_list[SNDRV_CARDS];
+	dev_link_t *dev_list;		/* Linked list of devices */
+};
+
 struct snd_vxpocket {
 
-	struct vx_core core;
+	vx_core_t core;
 
 	unsigned long port;
 
@@ -24,20 +57,26 @@ struct snd_vxpocket {
 	unsigned int regCDSP;	/* current CDSP register */
 	unsigned int regDIALOG;	/* current DIALOG register */
 
-	int index;	/* card index */
+	int index;
+	struct snd_vxp_entry *hw_entry;
 
 	/* pcmcia stuff */
-	struct pcmcia_device	*p_dev;
+	dev_link_t link;
+	dev_node_t node;
 };
 
-#define to_vxpocket(x)	container_of(x, struct snd_vxpocket, core)
+extern struct snd_vx_ops snd_vxpocket_ops;
 
-extern const struct snd_vx_ops snd_vxpocket_ops;
+void vx_set_mic_boost(vx_core_t *chip, int boost);
+void vx_set_mic_level(vx_core_t *chip, int level);
 
-void vx_set_mic_boost(struct vx_core *chip, int boost);
-void vx_set_mic_level(struct vx_core *chip, int level);
+/*
+ * pcmcia stuff
+ */
+dev_link_t *snd_vxpocket_attach(struct snd_vxp_entry *hw);
+void snd_vxpocket_detach(struct snd_vxp_entry *hw, dev_link_t *link);
 
-int vxp_add_mic_controls(struct vx_core *chip);
+int vxp_add_mic_controls(vx_core_t *chip);
 
 /* Constants used to access the CDSP register (0x08). */
 #define CDSP_MAGIC	0xA7	/* magic value (for read) */

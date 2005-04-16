@@ -131,8 +131,9 @@
 |		Copyright (C) Motorola, Inc. 1990
 |			All Rights Reserved
 |
-|       For details on the license for this file, please see the
-|       file, README, in this same directory.
+|	THIS IS UNPUBLISHED PROPRIETARY SOURCE CODE OF MOTOROLA
+|	The copyright notice above does not evidence any
+|	actual or intended publication of such source code.
 
 |BINDEC    idnt    2,1 | Motorola 040 Floating Point Software Package
 
@@ -609,7 +610,7 @@ do_fint:
 |      A6.  This test occurs only on the first pass.  If the
 |      result is exactly 10^LEN, decrement ILOG and divide
 |      the mantissa by 10.  The calculation of 10^LEN cannot
-|      be inexact, since all powers of ten up to 10^27 are exact
+|      be inexact, since all powers of ten upto 10^27 are exact
 |      in extended precision, so the use of a previous power-of-ten
 |      table will introduce no error.
 |

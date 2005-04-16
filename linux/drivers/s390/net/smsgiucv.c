@@ -1,92 +1,97 @@
-// SPDX-License-Identifier: GPL-2.0+
 /*
  * IUCV special message driver
  *
- * Copyright IBM Corp. 2003, 2009
- *
+ * Copyright (C) 2003 IBM Deutschland Entwicklung GmbH, IBM Corporation
  * Author(s): Martin Schwidefsky (schwidefsky@de.ibm.com)
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/errno.h>
 #include <linux/device.h>
-#include <linux/slab.h>
-#include <net/iucv/iucv.h>
 #include <asm/cpcmd.h>
 #include <asm/ebcdic.h>
-#include "smsgiucv.h"
+
+#include "iucv.h"
 
 struct smsg_callback {
 	struct list_head list;
-	const char *prefix;
+	char *prefix;
 	int len;
-	void (*callback)(const char *from, char *str);
+	void (*callback)(char *str);
 };
 
 MODULE_AUTHOR
    ("(C) 2003 IBM Corporation by Martin Schwidefsky (schwidefsky@de.ibm.com)");
 MODULE_DESCRIPTION ("Linux for S/390 IUCV special message driver");
 
-static struct iucv_path *smsg_path;
-
+static iucv_handle_t smsg_handle;
+static unsigned short smsg_pathid;
 static DEFINE_SPINLOCK(smsg_list_lock);
-static LIST_HEAD(smsg_list);
+static struct list_head smsg_list = LIST_HEAD_INIT(smsg_list);
 
-static int smsg_path_pending(struct iucv_path *, u8 *, u8 *);
-static void smsg_message_pending(struct iucv_path *, struct iucv_message *);
-
-static struct iucv_handler smsg_handler = {
-	.path_pending	 = smsg_path_pending,
-	.message_pending = smsg_message_pending,
-};
-
-static int smsg_path_pending(struct iucv_path *path, u8 *ipvmid, u8 *ipuser)
+static void
+smsg_connection_complete(iucv_ConnectionComplete *eib, void *pgm_data)
 {
-	if (strncmp(ipvmid, "*MSG    ", 8) != 0)
-		return -EINVAL;
-	/* Path pending from *MSG. */
-	return iucv_path_accept(path, &smsg_handler, "SMSGIUCV        ", NULL);
 }
 
-static void smsg_message_pending(struct iucv_path *path,
-				 struct iucv_message *msg)
+
+static void
+smsg_message_pending(iucv_MessagePending *eib, void *pgm_data)
 {
 	struct smsg_callback *cb;
-	unsigned char *buffer;
-	unsigned char sender[9];
-	int rc, i;
+	unsigned char *msg;
+	unsigned short len;
+	int rc;
 
-	buffer = kmalloc(msg->length + 1, GFP_ATOMIC | GFP_DMA);
-	if (!buffer) {
-		iucv_message_reject(path, msg);
+	len = eib->ln1msg2.ipbfln1f;
+	msg = kmalloc(len + 1, GFP_ATOMIC|GFP_DMA);
+	if (!msg) {
+		iucv_reject(eib->ippathid, eib->ipmsgid, eib->iptrgcls);
 		return;
 	}
-	rc = iucv_message_receive(path, msg, 0, buffer, msg->length, NULL);
+	rc = iucv_receive(eib->ippathid, eib->ipmsgid, eib->iptrgcls,
+			  msg, len, 0, 0, 0);
 	if (rc == 0) {
-		buffer[msg->length] = 0;
-		EBCASC(buffer, msg->length);
-		memcpy(sender, buffer, 8);
-		sender[8] = 0;
-		/* Remove trailing whitespace from the sender name. */
-		for (i = 7; i >= 0; i--) {
-			if (sender[i] != ' ' && sender[i] != '\t')
-				break;
-			sender[i] = 0;
-		}
+		msg[len] = 0;
+		EBCASC(msg, len);
 		spin_lock(&smsg_list_lock);
 		list_for_each_entry(cb, &smsg_list, list)
-			if (strncmp(buffer + 8, cb->prefix, cb->len) == 0) {
-				cb->callback(sender, buffer + 8);
+			if (strncmp(msg + 8, cb->prefix, cb->len) == 0) {
+				cb->callback(msg + 8);
 				break;
 			}
 		spin_unlock(&smsg_list_lock);
 	}
-	kfree(buffer);
+	kfree(msg);
 }
 
-int smsg_register_callback(const char *prefix,
-			   void (*callback)(const char *from, char *str))
+static iucv_interrupt_ops_t smsg_ops = {
+	.ConnectionComplete = smsg_connection_complete,
+	.MessagePending     = smsg_message_pending,
+};
+
+static struct device_driver smsg_driver = {
+	.name = "SMSGIUCV",
+	.bus  = &iucv_bus,
+};
+
+int
+smsg_register_callback(char *prefix, void (*callback)(char *str))
 {
 	struct smsg_callback *cb;
 
@@ -96,20 +101,19 @@ int smsg_register_callback(const char *prefix,
 	cb->prefix = prefix;
 	cb->len = strlen(prefix);
 	cb->callback = callback;
-	spin_lock_bh(&smsg_list_lock);
+	spin_lock(&smsg_list_lock);
 	list_add_tail(&cb->list, &smsg_list);
-	spin_unlock_bh(&smsg_list_lock);
+	spin_unlock(&smsg_list_lock);
 	return 0;
 }
 
-void smsg_unregister_callback(const char *prefix,
-			      void (*callback)(const char *from,
-					       char *str))
+void
+smsg_unregister_callback(char *prefix, void (*callback)(char *str))
 {
 	struct smsg_callback *cb, *tmp;
 
-	spin_lock_bh(&smsg_list_lock);
-	cb = NULL;
+	spin_lock(&smsg_list_lock);
+	cb = 0;
 	list_for_each_entry(tmp, &smsg_list, list)
 		if (tmp->callback == callback &&
 		    strcmp(tmp->prefix, prefix) == 0) {
@@ -117,59 +121,55 @@ void smsg_unregister_callback(const char *prefix,
 			list_del(&cb->list);
 			break;
 		}
-	spin_unlock_bh(&smsg_list_lock);
+	spin_unlock(&smsg_list_lock);
 	kfree(cb);
 }
 
-static struct device_driver smsg_driver = {
-	.owner = THIS_MODULE,
-	.name = SMSGIUCV_DRV_NAME,
-	.bus  = &iucv_bus,
-};
-
-static void __exit smsg_exit(void)
+static void __exit
+smsg_exit(void)
 {
-	cpcmd("SET SMSG OFF", NULL, 0, NULL);
-	iucv_unregister(&smsg_handler, 1);
-	driver_unregister(&smsg_driver);
+	if (smsg_handle > 0) {
+		cpcmd("SET SMSG OFF", 0, 0);
+		iucv_sever(smsg_pathid, 0);
+		iucv_unregister_program(smsg_handle);
+		driver_unregister(&smsg_driver);
+	}
+	return;
 }
 
-static int __init smsg_init(void)
+static int __init
+smsg_init(void)
 {
+	static unsigned char pgmmask[24] = {
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+	};
 	int rc;
 
-	if (!MACHINE_IS_VM) {
-		rc = -EPROTONOSUPPORT;
-		goto out;
-	}
 	rc = driver_register(&smsg_driver);
-	if (rc != 0)
-		goto out;
-	rc = iucv_register(&smsg_handler, 1);
-	if (rc)
-		goto out_driver;
-	smsg_path = iucv_path_alloc(255, 0, GFP_KERNEL);
-	if (!smsg_path) {
-		rc = -ENOMEM;
-		goto out_register;
+	if (rc != 0) {
+		printk(KERN_ERR "SMSGIUCV: failed to register driver.\n");
+		return rc;
 	}
-	rc = iucv_path_connect(smsg_path, &smsg_handler, "*MSG    ",
-			       NULL, NULL, NULL);
-	if (rc)
-		goto out_free_path;
-
-	cpcmd("SET SMSG IUCV", NULL, 0, NULL);
+	smsg_handle = iucv_register_program("SMSGIUCV        ", "*MSG    ",
+					    pgmmask, &smsg_ops, 0);
+	if (!smsg_handle) {
+		printk(KERN_ERR "SMSGIUCV: failed to register to iucv");
+		driver_unregister(&smsg_driver);
+		return -EIO;	/* better errno ? */
+	}
+	rc = iucv_connect (&smsg_pathid, 1, 0, "*MSG    ", 0, 0, 0, 0,
+			   smsg_handle, 0);
+	if (rc) {
+		printk(KERN_ERR "SMSGIUCV: failed to connect to *MSG");
+		iucv_unregister_program(smsg_handle);
+		driver_unregister(&smsg_driver);
+		smsg_handle = 0;
+		return -EIO;
+	}
+	cpcmd("SET SMSG IUCV", 0, 0);
 	return 0;
-
-out_free_path:
-	iucv_path_free(smsg_path);
-	smsg_path = NULL;
-out_register:
-	iucv_unregister(&smsg_handler, 1);
-out_driver:
-	driver_unregister(&smsg_driver);
-out:
-	return rc;
 }
 
 module_init(smsg_init);

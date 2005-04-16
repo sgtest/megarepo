@@ -1,26 +1,42 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- *  acpi_ac.c - ACPI AC Adapter Driver (Revision: 27)
+ *  acpi_ac.c - ACPI AC Adapter Driver ($Revision: 27 $)
  *
  *  Copyright (C) 2001, 2002 Andy Grover <andrew.grover@intel.com>
  *  Copyright (C) 2001, 2002 Paul Diefenbaugh <paul.s.diefenbaugh@intel.com>
+ *
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or (at
+ *  your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful, but
+ *  WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ *  General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License along
+ *  with this program; if not, write to the Free Software Foundation, Inc.,
+ *  59 Temple Place, Suite 330, Boston, MA 02111-1307 USA.
+ *
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  */
-
-#define pr_fmt(fmt) "ACPI: AC: " fmt
 
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/types.h>
-#include <linux/dmi.h>
-#include <linux/delay.h>
-#include <linux/platform_device.h>
-#include <linux/power_supply.h>
-#include <linux/acpi.h>
-#include <acpi/battery.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <acpi/acpi_bus.h>
+#include <acpi/acpi_drivers.h>
 
+
+#define ACPI_AC_COMPONENT		0x00020000
 #define ACPI_AC_CLASS			"ac_adapter"
+#define ACPI_AC_HID 			"ACPI0003"
+#define ACPI_AC_DRIVER_NAME		"ACPI AC Adapter Driver"
 #define ACPI_AC_DEVICE_NAME		"AC Adapter"
 #define ACPI_AC_FILE_STATE		"state"
 #define ACPI_AC_NOTIFY_STATUS		0x80
@@ -28,310 +44,311 @@
 #define ACPI_AC_STATUS_ONLINE		0x01
 #define ACPI_AC_STATUS_UNKNOWN		0xFF
 
+#define _COMPONENT		ACPI_AC_COMPONENT
+ACPI_MODULE_NAME		("acpi_ac")
+
 MODULE_AUTHOR("Paul Diefenbaugh");
-MODULE_DESCRIPTION("ACPI AC Adapter Driver");
+MODULE_DESCRIPTION(ACPI_AC_DRIVER_NAME);
 MODULE_LICENSE("GPL");
 
-static int acpi_ac_add(struct acpi_device *device);
-static int acpi_ac_remove(struct acpi_device *device);
-static void acpi_ac_notify(struct acpi_device *device, u32 event);
-
-struct acpi_ac_bl {
-	const char *hid;
-	int hrv;
-};
-
-static const struct acpi_device_id ac_device_ids[] = {
-	{"ACPI0003", 0},
-	{"", 0},
-};
-MODULE_DEVICE_TABLE(acpi, ac_device_ids);
-
-#ifdef CONFIG_PM_SLEEP
-static int acpi_ac_resume(struct device *dev);
-#endif
-static SIMPLE_DEV_PM_OPS(acpi_ac_pm, NULL, acpi_ac_resume);
-
-static int ac_sleep_before_get_state_ms;
-static int ac_only;
+static int acpi_ac_add (struct acpi_device *device);
+static int acpi_ac_remove (struct acpi_device *device, int type);
+static int acpi_ac_open_fs(struct inode *inode, struct file *file);
 
 static struct acpi_driver acpi_ac_driver = {
-	.name = "ac",
-	.class = ACPI_AC_CLASS,
-	.ids = ac_device_ids,
-	.flags = ACPI_DRIVER_ALL_NOTIFY_EVENTS,
-	.ops = {
-		.add = acpi_ac_add,
-		.remove = acpi_ac_remove,
-		.notify = acpi_ac_notify,
-		},
-	.drv.pm = &acpi_ac_pm,
+	.name =		ACPI_AC_DRIVER_NAME,
+	.class =	ACPI_AC_CLASS,
+	.ids =		ACPI_AC_HID,
+	.ops =		{
+				.add =		acpi_ac_add,
+				.remove =	acpi_ac_remove,
+			},
 };
 
 struct acpi_ac {
-	struct power_supply *charger;
-	struct power_supply_desc charger_desc;
-	struct acpi_device *device;
-	unsigned long long state;
-	struct notifier_block battery_nb;
+	acpi_handle		handle;
+	unsigned long		state;
 };
 
-#define to_acpi_ac(x) power_supply_get_drvdata(x)
+static struct file_operations acpi_ac_fops = {
+	.open		= acpi_ac_open_fs,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
 
-/* AC Adapter Management */
-static int acpi_ac_get_state(struct acpi_ac *ac)
+/* --------------------------------------------------------------------------
+                               AC Adapter Management
+   -------------------------------------------------------------------------- */
+
+static int
+acpi_ac_get_state (
+	struct acpi_ac		*ac)
 {
-	acpi_status status = AE_OK;
+	acpi_status		status = AE_OK;
+
+	ACPI_FUNCTION_TRACE("acpi_ac_get_state");
 
 	if (!ac)
-		return -EINVAL;
+		return_VALUE(-EINVAL);
 
-	if (ac_only) {
-		ac->state = 1;
-		return 0;
-	}
-
-	status = acpi_evaluate_integer(ac->device->handle, "_PSR", NULL,
-				       &ac->state);
+	status = acpi_evaluate_integer(ac->handle, "_PSR", NULL, &ac->state);
 	if (ACPI_FAILURE(status)) {
-		acpi_handle_info(ac->device->handle,
-				"Error reading AC Adapter state: %s\n",
-				acpi_format_exception(status));
+		ACPI_DEBUG_PRINT((ACPI_DB_ERROR,
+			"Error reading AC Adapter state\n"));
 		ac->state = ACPI_AC_STATUS_UNKNOWN;
-		return -ENODEV;
+		return_VALUE(-ENODEV);
 	}
-
-	return 0;
+	
+	return_VALUE(0);
 }
 
-/* sysfs I/F */
-static int get_ac_property(struct power_supply *psy,
-			   enum power_supply_property psp,
-			   union power_supply_propval *val)
+
+/* --------------------------------------------------------------------------
+                              FS Interface (/proc)
+   -------------------------------------------------------------------------- */
+
+static struct proc_dir_entry	*acpi_ac_dir;
+
+static int acpi_ac_seq_show(struct seq_file *seq, void *offset)
 {
-	struct acpi_ac *ac = to_acpi_ac(psy);
+	struct acpi_ac		*ac = (struct acpi_ac *) seq->private;
+
+	ACPI_FUNCTION_TRACE("acpi_ac_seq_show");
 
 	if (!ac)
-		return -ENODEV;
+		return_VALUE(0);
 
-	if (acpi_ac_get_state(ac))
-		return -ENODEV;
+	if (acpi_ac_get_state(ac)) {
+		seq_puts(seq, "ERROR: Unable to read AC Adapter state\n");
+		return_VALUE(0);
+	}
 
-	switch (psp) {
-	case POWER_SUPPLY_PROP_ONLINE:
-		val->intval = ac->state;
+	seq_puts(seq, "state:                   ");
+	switch (ac->state) {
+	case ACPI_AC_STATUS_OFFLINE:
+		seq_puts(seq, "off-line\n");
+		break;
+	case ACPI_AC_STATUS_ONLINE:
+		seq_puts(seq, "on-line\n");
 		break;
 	default:
-		return -EINVAL;
+		seq_puts(seq, "unknown\n");
+		break;
 	}
 
-	return 0;
+	return_VALUE(0);
+}
+	
+static int acpi_ac_open_fs(struct inode *inode, struct file *file)
+{
+	return single_open(file, acpi_ac_seq_show, PDE(inode)->data);
 }
 
-static enum power_supply_property ac_props[] = {
-	POWER_SUPPLY_PROP_ONLINE,
-};
-
-/* Driver Model */
-static void acpi_ac_notify(struct acpi_device *device, u32 event)
+static int
+acpi_ac_add_fs (
+	struct acpi_device	*device)
 {
-	struct acpi_ac *ac = acpi_driver_data(device);
+	struct proc_dir_entry	*entry = NULL;
+
+	ACPI_FUNCTION_TRACE("acpi_ac_add_fs");
+
+	if (!acpi_device_dir(device)) {
+		acpi_device_dir(device) = proc_mkdir(acpi_device_bid(device),
+			acpi_ac_dir);
+		if (!acpi_device_dir(device))
+			return_VALUE(-ENODEV);
+		acpi_device_dir(device)->owner = THIS_MODULE;
+	}
+
+	/* 'state' [R] */
+	entry = create_proc_entry(ACPI_AC_FILE_STATE,
+		S_IRUGO, acpi_device_dir(device));
+	if (!entry)
+		ACPI_DEBUG_PRINT((ACPI_DB_ERROR,
+			"Unable to create '%s' fs entry\n",
+			ACPI_AC_FILE_STATE));
+	else {
+		entry->proc_fops = &acpi_ac_fops;
+		entry->data = acpi_driver_data(device);
+		entry->owner = THIS_MODULE;
+	}
+
+	return_VALUE(0);
+}
+
+
+static int
+acpi_ac_remove_fs (
+	struct acpi_device	*device)
+{
+	ACPI_FUNCTION_TRACE("acpi_ac_remove_fs");
+
+	if (acpi_device_dir(device)) {
+		remove_proc_entry(ACPI_AC_FILE_STATE,
+				  acpi_device_dir(device));
+
+		remove_proc_entry(acpi_device_bid(device), acpi_ac_dir);
+		acpi_device_dir(device) = NULL;
+	}
+
+	return_VALUE(0);
+}
+
+
+/* --------------------------------------------------------------------------
+                                   Driver Model
+   -------------------------------------------------------------------------- */
+
+static void
+acpi_ac_notify (
+	acpi_handle		handle,
+	u32			event,
+	void			*data)
+{
+	struct acpi_ac		*ac = (struct acpi_ac *) data;
+	struct acpi_device	*device = NULL;
+
+	ACPI_FUNCTION_TRACE("acpi_ac_notify");
 
 	if (!ac)
-		return;
+		return_VOID;
+
+	if (acpi_bus_get_device(ac->handle, &device))
+		return_VOID;
 
 	switch (event) {
-	default:
-		acpi_handle_debug(device->handle, "Unsupported event [0x%x]\n",
-				  event);
-		fallthrough;
 	case ACPI_AC_NOTIFY_STATUS:
-	case ACPI_NOTIFY_BUS_CHECK:
-	case ACPI_NOTIFY_DEVICE_CHECK:
-		/*
-		 * A buggy BIOS may notify AC first and then sleep for
-		 * a specific time before doing actual operations in the
-		 * EC event handler (_Qxx). This will cause the AC state
-		 * reported by the ACPI event to be incorrect, so wait for a
-		 * specific time for the EC event handler to make progress.
-		 */
-		if (ac_sleep_before_get_state_ms > 0)
-			msleep(ac_sleep_before_get_state_ms);
-
 		acpi_ac_get_state(ac);
-		acpi_bus_generate_netlink_event(device->pnp.device_class,
-						  dev_name(&device->dev), event,
-						  (u32) ac->state);
-		acpi_notifier_call_chain(device, event, (u32) ac->state);
-		kobject_uevent(&ac->charger->dev.kobj, KOBJ_CHANGE);
+		acpi_bus_generate_event(device, event, (u32) ac->state);
+		break;
+	default:
+		ACPI_DEBUG_PRINT((ACPI_DB_INFO,
+			"Unsupported event [0x%x]\n", event));
+		break;
 	}
+
+	return_VOID;
 }
 
-static int acpi_ac_battery_notify(struct notifier_block *nb,
-				  unsigned long action, void *data)
+
+static int
+acpi_ac_add (
+	struct acpi_device	*device)
 {
-	struct acpi_ac *ac = container_of(nb, struct acpi_ac, battery_nb);
-	struct acpi_bus_event *event = (struct acpi_bus_event *)data;
+	int			result = 0;
+	acpi_status		status = AE_OK;
+	struct acpi_ac		*ac = NULL;
 
-	/*
-	 * On HP Pavilion dv6-6179er AC status notifications aren't triggered
-	 * when adapter is plugged/unplugged. However, battery status
-	 * notifications are triggered when battery starts charging or
-	 * discharging. Re-reading AC status triggers lost AC notifications,
-	 * if AC status has changed.
-	 */
-	if (strcmp(event->device_class, ACPI_BATTERY_CLASS) == 0 &&
-	    event->type == ACPI_BATTERY_NOTIFY_STATUS)
-		acpi_ac_get_state(ac);
-
-	return NOTIFY_OK;
-}
-
-static int __init thinkpad_e530_quirk(const struct dmi_system_id *d)
-{
-	ac_sleep_before_get_state_ms = 1000;
-	return 0;
-}
-
-static int __init ac_only_quirk(const struct dmi_system_id *d)
-{
-	ac_only = 1;
-	return 0;
-}
-
-/* Please keep this list alphabetically sorted */
-static const struct dmi_system_id ac_dmi_table[]  __initconst = {
-	{
-		/* Kodlix GK45 returning incorrect state */
-		.callback = ac_only_quirk,
-		.matches = {
-			DMI_MATCH(DMI_PRODUCT_NAME, "GK45"),
-		},
-	},
-	{
-		/* Lenovo Thinkpad e530, see comment in acpi_ac_notify() */
-		.callback = thinkpad_e530_quirk,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-			DMI_MATCH(DMI_PRODUCT_NAME, "32597CG"),
-		},
-	},
-	{},
-};
-
-static int acpi_ac_add(struct acpi_device *device)
-{
-	struct power_supply_config psy_cfg = {};
-	int result = 0;
-	struct acpi_ac *ac = NULL;
-
+	ACPI_FUNCTION_TRACE("acpi_ac_add");
 
 	if (!device)
-		return -EINVAL;
+		return_VALUE(-EINVAL);
 
-	ac = kzalloc(sizeof(struct acpi_ac), GFP_KERNEL);
+	ac = kmalloc(sizeof(struct acpi_ac), GFP_KERNEL);
 	if (!ac)
-		return -ENOMEM;
+		return_VALUE(-ENOMEM);
+	memset(ac, 0, sizeof(struct acpi_ac));
 
-	ac->device = device;
+	ac->handle = device->handle;
 	strcpy(acpi_device_name(device), ACPI_AC_DEVICE_NAME);
 	strcpy(acpi_device_class(device), ACPI_AC_CLASS);
-	device->driver_data = ac;
+	acpi_driver_data(device) = ac;
 
 	result = acpi_ac_get_state(ac);
 	if (result)
 		goto end;
 
-	psy_cfg.drv_data = ac;
+	result = acpi_ac_add_fs(device);
+	if (result)
+		goto end;
 
-	ac->charger_desc.name = acpi_device_bid(device);
-	ac->charger_desc.type = POWER_SUPPLY_TYPE_MAINS;
-	ac->charger_desc.properties = ac_props;
-	ac->charger_desc.num_properties = ARRAY_SIZE(ac_props);
-	ac->charger_desc.get_property = get_ac_property;
-	ac->charger = power_supply_register(&ac->device->dev,
-					    &ac->charger_desc, &psy_cfg);
-	if (IS_ERR(ac->charger)) {
-		result = PTR_ERR(ac->charger);
+	status = acpi_install_notify_handler(ac->handle,
+		ACPI_DEVICE_NOTIFY, acpi_ac_notify, ac);
+	if (ACPI_FAILURE(status)) {
+		ACPI_DEBUG_PRINT((ACPI_DB_ERROR,
+			"Error installing notify handler\n"));
+		result = -ENODEV;
 		goto end;
 	}
 
-	pr_info("%s [%s] (%s)\n", acpi_device_name(device),
-		acpi_device_bid(device), ac->state ? "on-line" : "off-line");
+	printk(KERN_INFO PREFIX "%s [%s] (%s)\n", 
+		acpi_device_name(device), acpi_device_bid(device), 
+		ac->state?"on-line":"off-line");
 
-	ac->battery_nb.notifier_call = acpi_ac_battery_notify;
-	register_acpi_notifier(&ac->battery_nb);
 end:
-	if (result)
+	if (result) {
+		acpi_ac_remove_fs(device);
 		kfree(ac);
+	}
 
-	return result;
+	return_VALUE(result);
 }
 
-#ifdef CONFIG_PM_SLEEP
-static int acpi_ac_resume(struct device *dev)
+
+static int
+acpi_ac_remove (
+	struct acpi_device	*device,
+	int			type)
 {
-	struct acpi_ac *ac;
-	unsigned int old_state;
+	acpi_status		status = AE_OK;
+	struct acpi_ac		*ac = NULL;
 
-	if (!dev)
-		return -EINVAL;
-
-	ac = acpi_driver_data(to_acpi_device(dev));
-	if (!ac)
-		return -EINVAL;
-
-	old_state = ac->state;
-	if (acpi_ac_get_state(ac))
-		return 0;
-	if (old_state != ac->state)
-		kobject_uevent(&ac->charger->dev.kobj, KOBJ_CHANGE);
-
-	return 0;
-}
-#else
-#define acpi_ac_resume NULL
-#endif
-
-static int acpi_ac_remove(struct acpi_device *device)
-{
-	struct acpi_ac *ac = NULL;
+	ACPI_FUNCTION_TRACE("acpi_ac_remove");
 
 	if (!device || !acpi_driver_data(device))
-		return -EINVAL;
+		return_VALUE(-EINVAL);
 
-	ac = acpi_driver_data(device);
+	ac = (struct acpi_ac *) acpi_driver_data(device);
 
-	power_supply_unregister(ac->charger);
-	unregister_acpi_notifier(&ac->battery_nb);
+	status = acpi_remove_notify_handler(ac->handle,
+		ACPI_DEVICE_NOTIFY, acpi_ac_notify);
+	if (ACPI_FAILURE(status))
+		ACPI_DEBUG_PRINT((ACPI_DB_ERROR,
+			"Error removing notify handler\n"));
+
+	acpi_ac_remove_fs(device);
 
 	kfree(ac);
 
-	return 0;
+	return_VALUE(0);
 }
 
-static int __init acpi_ac_init(void)
+
+static int __init
+acpi_ac_init (void)
 {
-	int result;
+	int			result = 0;
 
-	if (acpi_disabled)
-		return -ENODEV;
+	ACPI_FUNCTION_TRACE("acpi_ac_init");
 
-	if (acpi_quirk_skip_acpi_ac_and_battery())
-		return -ENODEV;
-
-	dmi_check_system(ac_dmi_table);
+	acpi_ac_dir = proc_mkdir(ACPI_AC_CLASS, acpi_root_dir);
+	if (!acpi_ac_dir)
+		return_VALUE(-ENODEV);
+	acpi_ac_dir->owner = THIS_MODULE;
 
 	result = acpi_bus_register_driver(&acpi_ac_driver);
-	if (result < 0)
-		return -ENODEV;
+	if (result < 0) {
+		remove_proc_entry(ACPI_AC_CLASS, acpi_root_dir);
+		return_VALUE(-ENODEV);
+	}
 
-	return 0;
+	return_VALUE(0);
 }
 
-static void __exit acpi_ac_exit(void)
+
+static void __exit
+acpi_ac_exit (void)
 {
+	ACPI_FUNCTION_TRACE("acpi_ac_exit");
+
 	acpi_bus_unregister_driver(&acpi_ac_driver);
+
+	remove_proc_entry(ACPI_AC_CLASS, acpi_root_dir);
+
+	return_VOID;
 }
+
+
 module_init(acpi_ac_init);
 module_exit(acpi_ac_exit);

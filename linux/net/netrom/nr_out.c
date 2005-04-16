@@ -1,5 +1,8 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  *
  * Copyright Jonathan Naylor G4KLX (g4klx@g4klx.demon.co.uk)
  * Copyright Darryl Miles G7LED (dlm@g7led.demon.co.uk)
@@ -9,17 +12,18 @@
 #include <linux/socket.h>
 #include <linux/in.h>
 #include <linux/kernel.h>
+#include <linux/sched.h>
 #include <linux/timer.h>
 #include <linux/string.h>
 #include <linux/sockios.h>
 #include <linux/net.h>
-#include <linux/slab.h>
 #include <net/ax25.h>
 #include <linux/inet.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
 #include <net/sock.h>
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
+#include <asm/system.h>
 #include <linux/fcntl.h>
 #include <linux/mm.h>
 #include <linux/interrupt.h>
@@ -37,7 +41,7 @@ void nr_output(struct sock *sk, struct sk_buff *skb)
 
 	if (skb->len - NR_TRANSPORT_LEN > NR_MAX_PACKET_SIZE) {
 		/* Save a copy of the Transport Header */
-		skb_copy_from_linear_data(skb, transport, NR_TRANSPORT_LEN);
+		memcpy(transport, skb->data, NR_TRANSPORT_LEN);
 		skb_pull(skb, NR_TRANSPORT_LEN);
 
 		frontlen = skb_headroom(skb);
@@ -51,13 +55,13 @@ void nr_output(struct sock *sk, struct sk_buff *skb)
 			len = (NR_MAX_PACKET_SIZE > skb->len) ? skb->len : NR_MAX_PACKET_SIZE;
 
 			/* Copy the user data */
-			skb_copy_from_linear_data(skb, skb_put(skbn, len), len);
+			memcpy(skb_put(skbn, len), skb->data, len);
 			skb_pull(skb, len);
 
 			/* Duplicate the Transport Header */
 			skb_push(skbn, NR_TRANSPORT_LEN);
-			skb_copy_to_linear_data(skbn, transport,
-						NR_TRANSPORT_LEN);
+			memcpy(skbn->data, transport, NR_TRANSPORT_LEN);
+
 			if (skb->len > 0)
 				skbn->data[4] |= NR_MORE_FLAG;
 

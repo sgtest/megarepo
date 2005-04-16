@@ -1,15 +1,49 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *  Interface for hwdep device
  *
  *  Copyright (C) 2004 Takashi Iwai <tiwai@suse.de>
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ *
  */
 
+#include <sound/driver.h>
 #include <sound/core.h>
 #include <sound/hwdep.h>
-#include <linux/uaccess.h>
-#include <linux/nospec.h>
+#include <asm/uaccess.h>
 #include "emux_voice.h"
+
+/*
+ * open the hwdep device
+ */
+static int
+snd_emux_hwdep_open(snd_hwdep_t *hw, struct file *file)
+{
+	return 0;
+}
+
+
+/*
+ * close the device
+ */
+static int
+snd_emux_hwdep_release(snd_hwdep_t *hw, struct file *file)
+{
+	return 0;
+}
+
 
 #define TMP_CLIENT_ID	0x1001
 
@@ -17,18 +51,13 @@
  * load patch
  */
 static int
-snd_emux_hwdep_load_patch(struct snd_emux *emu, void __user *arg)
+snd_emux_hwdep_load_patch(snd_emux_t *emu, void __user *arg)
 {
 	int err;
-	struct soundfont_patch_info patch;
+	soundfont_patch_info_t patch;
 
 	if (copy_from_user(&patch, arg, sizeof(patch)))
 		return -EFAULT;
-
-	if (patch.key == GUS_PATCH)
-		return snd_soundfont_load_guspatch(emu->sflist, arg,
-						   patch.len + sizeof(patch),
-						   TMP_CLIENT_ID);
 
 	if (patch.type >= SNDRV_SFNT_LOAD_INFO &&
 	    patch.type <= SNDRV_SFNT_PROBE_DATA) {
@@ -48,25 +77,22 @@ snd_emux_hwdep_load_patch(struct snd_emux *emu, void __user *arg)
  * set misc mode
  */
 static int
-snd_emux_hwdep_misc_mode(struct snd_emux *emu, void __user *arg)
+snd_emux_hwdep_misc_mode(snd_emux_t *emu, void __user *arg)
 {
-	struct snd_emux_misc_mode info;
+	struct sndrv_emux_misc_mode info;
 	int i;
 
 	if (copy_from_user(&info, arg, sizeof(info)))
 		return -EFAULT;
 	if (info.mode < 0 || info.mode >= EMUX_MD_END)
 		return -EINVAL;
-	info.mode = array_index_nospec(info.mode, EMUX_MD_END);
 
 	if (info.port < 0) {
 		for (i = 0; i < emu->num_ports; i++)
 			emu->portptrs[i]->ctrls[info.mode] = info.value;
 	} else {
-		if (info.port < emu->num_ports) {
-			info.port = array_index_nospec(info.port, emu->num_ports);
+		if (info.port < emu->num_ports)
 			emu->portptrs[info.port]->ctrls[info.mode] = info.value;
-		}
 	}
 	return 0;
 }
@@ -76,10 +102,9 @@ snd_emux_hwdep_misc_mode(struct snd_emux *emu, void __user *arg)
  * ioctl
  */
 static int
-snd_emux_hwdep_ioctl(struct snd_hwdep * hw, struct file *file,
-		     unsigned int cmd, unsigned long arg)
+snd_emux_hwdep_ioctl(snd_hwdep_t * hw, struct file *file, unsigned int cmd, unsigned long arg)
 {
-	struct snd_emux *emu = hw->private_data;
+	snd_emux_t *emu = hw->private_data;
 
 	switch (cmd) {
 	case SNDRV_EMUX_IOCTL_VERSION:
@@ -111,25 +136,22 @@ snd_emux_hwdep_ioctl(struct snd_hwdep * hw, struct file *file,
  */
 
 int
-snd_emux_init_hwdep(struct snd_emux *emu)
+snd_emux_init_hwdep(snd_emux_t *emu)
 {
-	struct snd_hwdep *hw;
+	snd_hwdep_t *hw;
 	int err;
 
-	err = snd_hwdep_new(emu->card, SNDRV_EMUX_HWDEP_NAME, emu->hwdep_idx, &hw);
-	if (err < 0)
+	if ((err = snd_hwdep_new(emu->card, SNDRV_EMUX_HWDEP_NAME, emu->hwdep_idx, &hw)) < 0)
 		return err;
 	emu->hwdep = hw;
 	strcpy(hw->name, SNDRV_EMUX_HWDEP_NAME);
 	hw->iface = SNDRV_HWDEP_IFACE_EMUX_WAVETABLE;
+	hw->ops.open = snd_emux_hwdep_open;
+	hw->ops.release = snd_emux_hwdep_release;
 	hw->ops.ioctl = snd_emux_hwdep_ioctl;
-	/* The ioctl parameter types are compatible between 32- and
-	 * 64-bit architectures, so use the same function. */
-	hw->ops.ioctl_compat = snd_emux_hwdep_ioctl;
 	hw->exclusive = 1;
 	hw->private_data = emu;
-	err = snd_card_register(emu->card);
-	if (err < 0)
+	if ((err = snd_card_register(emu->card)) < 0)
 		return err;
 
 	return 0;
@@ -140,7 +162,7 @@ snd_emux_init_hwdep(struct snd_emux *emu)
  * unregister
  */
 void
-snd_emux_delete_hwdep(struct snd_emux *emu)
+snd_emux_delete_hwdep(snd_emux_t *emu)
 {
 	if (emu->hwdep) {
 		snd_device_free(emu->card, emu->hwdep);

@@ -1,6 +1,6 @@
 /*
  *  PCM I/O Plug-In Interface
- *  Copyright (c) 1999 by Jaroslav Kysela <perex@perex.cz>
+ *  Copyright (c) 1999 by Jaroslav Kysela <perex@suse.cz>
  *
  *
  *   This library is free software; you can redistribute it and/or modify
@@ -19,6 +19,7 @@
  *
  */
   
+#include <sound/driver.h>
 #include <linux/time.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
@@ -26,30 +27,27 @@
 #include "pcm_plugin.h"
 
 #define pcm_write(plug,buf,count) snd_pcm_oss_write3(plug,buf,count,1)
-#define pcm_writev(plug,vec,count) snd_pcm_oss_writev3(plug,vec,count)
+#define pcm_writev(plug,vec,count) snd_pcm_oss_writev3(plug,vec,count,1)
 #define pcm_read(plug,buf,count) snd_pcm_oss_read3(plug,buf,count,1)
-#define pcm_readv(plug,vec,count) snd_pcm_oss_readv3(plug,vec,count)
+#define pcm_readv(plug,vec,count) snd_pcm_oss_readv3(plug,vec,count,1)
 
 /*
  *  Basic io plugin
  */
  
-static snd_pcm_sframes_t io_playback_transfer(struct snd_pcm_plugin *plugin,
-				    const struct snd_pcm_plugin_channel *src_channels,
-				    struct snd_pcm_plugin_channel *dst_channels,
+static snd_pcm_sframes_t io_playback_transfer(snd_pcm_plugin_t *plugin,
+				    const snd_pcm_plugin_channel_t *src_channels,
+				    snd_pcm_plugin_channel_t *dst_channels ATTRIBUTE_UNUSED,
 				    snd_pcm_uframes_t frames)
 {
-	if (snd_BUG_ON(!plugin))
-		return -ENXIO;
-	if (snd_BUG_ON(!src_channels))
-		return -ENXIO;
+	snd_assert(plugin != NULL, return -ENXIO);
+	snd_assert(src_channels != NULL, return -ENXIO);
 	if (plugin->access == SNDRV_PCM_ACCESS_RW_INTERLEAVED) {
 		return pcm_write(plugin->plug, src_channels->area.addr, frames);
 	} else {
 		int channel, channels = plugin->dst_format.channels;
 		void **bufs = (void**)plugin->extra_data;
-		if (snd_BUG_ON(!bufs))
-			return -ENXIO;
+		snd_assert(bufs != NULL, return -ENXIO);
 		for (channel = 0; channel < channels; channel++) {
 			if (src_channels[channel].enabled)
 				bufs[channel] = src_channels[channel].area.addr;
@@ -60,22 +58,19 @@ static snd_pcm_sframes_t io_playback_transfer(struct snd_pcm_plugin *plugin,
 	}
 }
  
-static snd_pcm_sframes_t io_capture_transfer(struct snd_pcm_plugin *plugin,
-				   const struct snd_pcm_plugin_channel *src_channels,
-				   struct snd_pcm_plugin_channel *dst_channels,
+static snd_pcm_sframes_t io_capture_transfer(snd_pcm_plugin_t *plugin,
+				   const snd_pcm_plugin_channel_t *src_channels ATTRIBUTE_UNUSED,
+				   snd_pcm_plugin_channel_t *dst_channels,
 				   snd_pcm_uframes_t frames)
 {
-	if (snd_BUG_ON(!plugin))
-		return -ENXIO;
-	if (snd_BUG_ON(!dst_channels))
-		return -ENXIO;
+	snd_assert(plugin != NULL, return -ENXIO);
+	snd_assert(dst_channels != NULL, return -ENXIO);
 	if (plugin->access == SNDRV_PCM_ACCESS_RW_INTERLEAVED) {
 		return pcm_read(plugin->plug, dst_channels->area.addr, frames);
 	} else {
 		int channel, channels = plugin->dst_format.channels;
 		void **bufs = (void**)plugin->extra_data;
-		if (snd_BUG_ON(!bufs))
-			return -ENXIO;
+		snd_assert(bufs != NULL, return -ENXIO);
 		for (channel = 0; channel < channels; channel++) {
 			if (dst_channels[channel].enabled)
 				bufs[channel] = dst_channels[channel].area.addr;
@@ -87,13 +82,13 @@ static snd_pcm_sframes_t io_capture_transfer(struct snd_pcm_plugin *plugin,
 	return 0;
 }
  
-static snd_pcm_sframes_t io_src_channels(struct snd_pcm_plugin *plugin,
+static snd_pcm_sframes_t io_src_channels(snd_pcm_plugin_t *plugin,
 			     snd_pcm_uframes_t frames,
-			     struct snd_pcm_plugin_channel **channels)
+			     snd_pcm_plugin_channel_t **channels)
 {
 	int err;
 	unsigned int channel;
-	struct snd_pcm_plugin_channel *v;
+	snd_pcm_plugin_channel_t *v;
 	err = snd_pcm_plugin_client_channels(plugin, frames, &v);
 	if (err < 0)
 		return err;
@@ -105,19 +100,17 @@ static snd_pcm_sframes_t io_src_channels(struct snd_pcm_plugin *plugin,
 	return frames;
 }
 
-int snd_pcm_plugin_build_io(struct snd_pcm_substream *plug,
-			    struct snd_pcm_hw_params *params,
-			    struct snd_pcm_plugin **r_plugin)
+int snd_pcm_plugin_build_io(snd_pcm_plug_t *plug,
+			    snd_pcm_hw_params_t *params,
+			    snd_pcm_plugin_t **r_plugin)
 {
 	int err;
-	struct snd_pcm_plugin_format format;
-	struct snd_pcm_plugin *plugin;
+	snd_pcm_plugin_format_t format;
+	snd_pcm_plugin_t *plugin;
 
-	if (snd_BUG_ON(!r_plugin))
-		return -ENXIO;
+	snd_assert(r_plugin != NULL, return -ENXIO);
 	*r_plugin = NULL;
-	if (snd_BUG_ON(!plug || !params))
-		return -ENXIO;
+	snd_assert(plug != NULL && params != NULL, return -ENXIO);
 	format.format = params_format(params);
 	format.rate = params_rate(params);
 	format.channels = params_channels(params);

@@ -3,60 +3,92 @@
  * License.  See the file "COPYING" in the main directory of this archive
  * for more details.
  *
- * Copyright (C) 1996 David S. Miller (davem@davemloft.net)
+ * Copyright (C) 1996 David S. Miller (dm@engr.sgi.com)
  * Copyright (C) 1999 Andrew R. Baker (andrewb@uab.edu)
  * Copyright (C) 2001 Florian Lohoff (flo@rfc822.org)
- * Copyright (C) 2003, 07 Ralf Baechle (ralf@linux-mips.org)
+ * Copyright (C) 2003 Ralf Baechle (ralf@linux-mips.org)
  * 
  * (In all truth, Jed Schimmel wrote all this code.)
  */
-
-#undef DEBUG
-
+#include <linux/init.h>
+#include <linux/interrupt.h>
+#include <linux/types.h>
+#include <linux/mm.h>
+#include <linux/blkdev.h>
+#include <linux/version.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
-#include <linux/gfp.h>
-#include <linux/interrupt.h>
-#include <linux/init.h>
-#include <linux/kernel.h>
-#include <linux/types.h>
-#include <linux/module.h>
-#include <linux/platform_device.h>
 #include <linux/spinlock.h>
 
+#include <asm/page.h>
+#include <asm/pgtable.h>
+#include <asm/sgialib.h>
+#include <asm/sgi/sgi.h>
+#include <asm/sgi/mc.h>
 #include <asm/sgi/hpc3.h>
 #include <asm/sgi/ip22.h>
-#include <asm/sgi/wd.h>
+#include <asm/irq.h>
+#include <asm/io.h>
 
-#include <scsi/scsi.h>
-#include <scsi/scsi_cmnd.h>
-#include <scsi/scsi_device.h>
-#include <scsi/scsi_eh.h>
-#include <scsi/scsi_tcq.h>
+#include "scsi.h"
+#include <scsi/scsi_host.h>
 #include "wd33c93.h"
+#include "sgiwd93.h"
+
+#include <linux/stat.h>
+
+#if 0
+#define DPRINTK(args...)	printk(args)
+#else
+#define DPRINTK(args...)
+#endif
+
+#define HDATA(ptr) ((struct ip22_hostdata *)((ptr)->hostdata))
 
 struct ip22_hostdata {
 	struct WD33C93_hostdata wh;
-	dma_addr_t dma;
-	void *cpu;
-	struct device *dev;
+	struct hpc_data {
+		dma_addr_t      dma;
+		void            * cpu;
+	} hd;
 };
-
-#define host_to_hostdata(host) ((struct ip22_hostdata *)((host)->hostdata))
 
 struct hpc_chunk {
 	struct hpc_dma_desc desc;
 	u32 _padding;	/* align to quadword boundary */
 };
 
-/* space for hpc dma descriptors */
-#define HPC_DMA_SIZE   PAGE_SIZE
+struct Scsi_Host *sgiwd93_host;
+struct Scsi_Host *sgiwd93_host1;
 
-#define DMA_DIR(d)   ((d == DATA_OUT_DIR) ? DMA_TO_DEVICE : DMA_FROM_DEVICE)
-
-static irqreturn_t sgiwd93_intr(int irq, void *dev_id)
+/* Wuff wuff, wuff, wd33c93.c, wuff wuff, object oriented, bow wow. */
+static inline void write_wd33c93_count(const wd33c93_regs regs,
+                                      unsigned long value)
 {
-	struct Scsi_Host * host = dev_id;
+	*regs.SASR = WD_TRANSFER_COUNT_MSB;
+	mb();
+	*regs.SCMD = ((value >> 16) & 0xff);
+	*regs.SCMD = ((value >>  8) & 0xff);
+	*regs.SCMD = ((value >>  0) & 0xff);
+	mb();
+}
+
+static inline unsigned long read_wd33c93_count(const wd33c93_regs regs)
+{
+	unsigned long value;
+
+	*regs.SASR = WD_TRANSFER_COUNT_MSB;
+	mb();
+	value =  ((*regs.SCMD & 0xff) << 16);
+	value |= ((*regs.SCMD & 0xff) <<  8);
+	value |= ((*regs.SCMD & 0xff) <<  0);
+	mb();
+	return value;
+}
+
+static irqreturn_t sgiwd93_intr(int irq, void *dev_id, struct pt_regs *regs)
+{
+	struct Scsi_Host * host = (struct Scsi_Host *) dev_id;
 	unsigned long flags;
 
 	spin_lock_irqsave(host->host_lock, flags);
@@ -67,18 +99,15 @@ static irqreturn_t sgiwd93_intr(int irq, void *dev_id)
 }
 
 static inline
-void fill_hpc_entries(struct ip22_hostdata *hd, struct scsi_cmnd *cmd, int din)
+void fill_hpc_entries(struct hpc_chunk *hcp, Scsi_Cmnd *cmd, int datainp)
 {
-	struct scsi_pointer *scsi_pointer = WD33C93_scsi_pointer(cmd);
-	unsigned long len = scsi_pointer->this_residual;
-	void *addr = scsi_pointer->ptr;
+	unsigned long len = cmd->SCp.this_residual;
+	void *addr = cmd->SCp.ptr;
 	dma_addr_t physaddr;
 	unsigned long count;
-	struct hpc_chunk *hcp;
 
-	physaddr = dma_map_single(hd->dev, addr, len, DMA_DIR(din));
-	scsi_pointer->dma_handle = physaddr;
-	hcp = hd->cpu;
+	physaddr = dma_map_single(NULL, addr, len, cmd->sc_data_direction);
+	cmd->SCp.dma_handle = physaddr;
 
 	while (len) {
 		/*
@@ -100,19 +129,16 @@ void fill_hpc_entries(struct ip22_hostdata *hd, struct scsi_cmnd *cmd, int din)
 	 */
 	hcp->desc.pbuf = 0;
 	hcp->desc.cntinfo = HPCDMA_EOX;
-	dma_sync_single_for_device(hd->dev, hd->dma,
-		       (unsigned long)(hcp + 1) - (unsigned long)hd->cpu,
-		       DMA_TO_DEVICE);
 }
 
-static int dma_setup(struct scsi_cmnd *cmd, int datainp)
+static int dma_setup(Scsi_Cmnd *cmd, int datainp)
 {
-	struct scsi_pointer *scsi_pointer = WD33C93_scsi_pointer(cmd);
-	struct ip22_hostdata *hdata = host_to_hostdata(cmd->device->host);
+	struct ip22_hostdata *hdata = HDATA(cmd->device->host);
 	struct hpc3_scsiregs *hregs =
 		(struct hpc3_scsiregs *) cmd->device->host->base;
+	struct hpc_chunk *hcp = (struct hpc_chunk *) hdata->hd.cpu;
 
-	pr_debug("dma_setup: datainp<%d> hcp<%p> ", datainp, hdata->cpu);
+	DPRINTK("dma_setup: datainp<%d> hcp<%p> ", datainp, hcp);
 
 	hdata->wh.dma_dir = datainp;
 
@@ -122,15 +148,15 @@ static int dma_setup(struct scsi_cmnd *cmd, int datainp)
 	 * obvious).  IMHO a better fix would be, not to do these dma setups
 	 * in the first place.
 	 */
-	if (scsi_pointer->ptr == NULL || scsi_pointer->this_residual == 0)
+	if (cmd->SCp.ptr == NULL || cmd->SCp.this_residual == 0)
 		return 1;
 
-	fill_hpc_entries(hdata, cmd, datainp);
+	fill_hpc_entries(hcp, cmd, datainp);
 
-	pr_debug(" HPCGO\n");
+	DPRINTK(" HPCGO\n");
 
 	/* Start up the HPC. */
-	hregs->ndptr = hdata->dma;
+	hregs->ndptr = hdata->hd.dma;
 	if (datainp)
 		hregs->ctrl = HPC3_SCTRL_ACTIVE;
 	else
@@ -139,22 +165,18 @@ static int dma_setup(struct scsi_cmnd *cmd, int datainp)
 	return 0;
 }
 
-static void dma_stop(struct Scsi_Host *instance, struct scsi_cmnd *SCpnt,
+static void dma_stop(struct Scsi_Host *instance, Scsi_Cmnd *SCpnt,
 		     int status)
 {
-	struct scsi_pointer *scsi_pointer = WD33C93_scsi_pointer(SCpnt);
-	struct ip22_hostdata *hdata = host_to_hostdata(instance);
+	struct ip22_hostdata *hdata = HDATA(instance);
 	struct hpc3_scsiregs *hregs;
 
 	if (!SCpnt)
 		return;
 
-	if (scsi_pointer->ptr == NULL || scsi_pointer->this_residual == 0)
-		return;
-
 	hregs = (struct hpc3_scsiregs *) SCpnt->device->host->base;
 
-	pr_debug("dma_stop: status<%d> ", status);
+	DPRINTK("dma_stop: status<%d> ", status);
 
 	/* First stop the HPC and flush it's FIFO. */
 	if (hdata->wh.dma_dir) {
@@ -163,11 +185,10 @@ static void dma_stop(struct Scsi_Host *instance, struct scsi_cmnd *SCpnt,
 			barrier();
 	}
 	hregs->ctrl = 0;
-	dma_unmap_single(hdata->dev, scsi_pointer->dma_handle,
-			 scsi_pointer->this_residual,
-			 DMA_DIR(hdata->wh.dma_dir));
+	dma_unmap_single(NULL, SCpnt->SCp.dma_handle, SCpnt->SCp.this_residual,
+	                 SCpnt->sc_data_direction);
 
-	pr_debug("\n");
+	DPRINTK("\n");
 }
 
 void sgiwd93_reset(unsigned long base)
@@ -178,25 +199,119 @@ void sgiwd93_reset(unsigned long base)
 	udelay(50);
 	hregs->ctrl = 0;
 }
-EXPORT_SYMBOL_GPL(sgiwd93_reset);
 
-static inline void init_hpc_chain(struct ip22_hostdata *hdata)
+static inline void init_hpc_chain(struct hpc_data *hd)
 {
-	struct hpc_chunk *hcp = (struct hpc_chunk *)hdata->cpu;
-	dma_addr_t dma = hdata->dma;
+	struct hpc_chunk *hcp = (struct hpc_chunk *) hd->cpu;
+	struct hpc_chunk *dma = (struct hpc_chunk *) hd->dma;
 	unsigned long start, end;
 
 	start = (unsigned long) hcp;
-	end = start + HPC_DMA_SIZE;
+	end = start + PAGE_SIZE;
 	while (start < end) {
-		hcp->desc.pnext = (u32) (dma + sizeof(struct hpc_chunk));
+		hcp->desc.pnext = (u32) (dma + 1);
 		hcp->desc.cntinfo = HPCDMA_EOX;
-		hcp++;
-		dma += sizeof(struct hpc_chunk);
+		hcp++; dma++;
 		start += sizeof(struct hpc_chunk);
-	}
+	};
 	hcp--;
-	hcp->desc.pnext = hdata->dma;
+	hcp->desc.pnext = hd->dma;
+}
+
+static struct Scsi_Host * __init sgiwd93_setup_scsi(
+	Scsi_Host_Template *SGIblows, int unit, int irq,
+	struct hpc3_scsiregs *hregs, unsigned char *wdregs)
+{
+	struct ip22_hostdata *hdata;
+	struct Scsi_Host *host;
+	wd33c93_regs regs;
+
+	host = scsi_register(SGIblows, sizeof(struct ip22_hostdata));
+	if (!host)
+		return NULL;
+
+	host->base = (unsigned long) hregs;
+	host->irq = irq;
+
+	hdata = HDATA(host);
+	hdata->hd.cpu = dma_alloc_coherent(NULL, PAGE_SIZE, &hdata->hd.dma,
+	                                   GFP_KERNEL);
+	if (!hdata->hd.cpu) {
+		printk(KERN_WARNING "sgiwd93: Could not allocate memory for "
+		       "host %d buffer.\n", unit);
+		goto out_unregister;
+	}
+	init_hpc_chain(&hdata->hd);
+
+	regs.SASR = wdregs + 3;
+	regs.SCMD = wdregs + 7;
+
+	wd33c93_init(host, regs, dma_setup, dma_stop, WD33C93_FS_16_20);
+
+	hdata->wh.no_sync = 0;
+
+	if (request_irq(irq, sgiwd93_intr, 0, "SGI WD93", (void *) host)) {
+		printk(KERN_WARNING "sgiwd93: Could not register irq %d "
+		       "for host %d.\n", irq, unit);
+		goto out_free;
+	}
+	return host;
+
+out_free:
+	dma_free_coherent(NULL, PAGE_SIZE, hdata->hd.cpu, hdata->hd.dma);
+	wd33c93_release();
+
+out_unregister:
+	scsi_unregister(host);
+
+	return NULL;
+}
+
+int __init sgiwd93_detect(Scsi_Host_Template *SGIblows)
+{
+	int found = 0;
+
+	SGIblows->proc_name = "SGIWD93";
+	sgiwd93_host = sgiwd93_setup_scsi(SGIblows, 0, SGI_WD93_0_IRQ,
+	                                  &hpc3c0->scsi_chan0,
+	                                  (unsigned char *)hpc3c0->scsi0_ext);
+	if (sgiwd93_host)
+		found++;
+
+	/* Set up second controller on the Indigo2 */
+	if (ip22_is_fullhouse()) {
+		sgiwd93_host1 = sgiwd93_setup_scsi(SGIblows, 1, SGI_WD93_1_IRQ,
+		                          &hpc3c0->scsi_chan1,
+		                          (unsigned char *)hpc3c0->scsi1_ext);
+		if (sgiwd93_host1)
+			found++;
+	}
+
+	return found;
+}
+
+int sgiwd93_release(struct Scsi_Host *instance)
+{
+	struct ip22_hostdata *hdata = HDATA(instance);
+	int irq = 0;
+
+	if (sgiwd93_host && sgiwd93_host == instance)
+		irq = SGI_WD93_0_IRQ;
+	else if (sgiwd93_host1 && sgiwd93_host1 == instance)
+		irq = SGI_WD93_1_IRQ;
+
+	free_irq(irq, sgiwd93_intr);
+	dma_free_coherent(NULL, PAGE_SIZE, hdata->hd.cpu, hdata->hd.dma);
+	wd33c93_release();
+
+	return 1;
+}
+
+static int sgiwd93_bus_reset(Scsi_Cmnd *cmd)
+{
+	/* FIXME perform bus-specific reset */
+	wd33c93_host_reset(cmd);
+	return SUCCESS;
 }
 
 /*
@@ -204,129 +319,19 @@ static inline void init_hpc_chain(struct ip22_hostdata *hdata)
  * arguments not with pointers.  So this is going to blow up beautyfully
  * on 64-bit systems with memory outside the compat address spaces.
  */
-static struct scsi_host_template sgiwd93_template = {
-	.module			= THIS_MODULE,
+static Scsi_Host_Template driver_template = {
 	.proc_name		= "SGIWD93",
 	.name			= "SGI WD93",
+	.detect			= sgiwd93_detect,
+	.release		= sgiwd93_release,
 	.queuecommand		= wd33c93_queuecommand,
 	.eh_abort_handler	= wd33c93_abort,
+	.eh_bus_reset_handler	= sgiwd93_bus_reset,
 	.eh_host_reset_handler	= wd33c93_host_reset,
-	.can_queue		= 16,
+	.can_queue		= CAN_QUEUE,
 	.this_id		= 7,
 	.sg_tablesize		= SG_ALL,
-	.cmd_per_lun		= 8,
-	.dma_boundary		= PAGE_SIZE - 1,
-	.cmd_size		= sizeof(struct scsi_pointer),
+	.cmd_per_lun		= CMD_PER_LUN,
+	.use_clustering		= DISABLE_CLUSTERING,
 };
-
-static int sgiwd93_probe(struct platform_device *pdev)
-{
-	struct sgiwd93_platform_data *pd = pdev->dev.platform_data;
-	unsigned char *wdregs = pd->wdregs;
-	struct hpc3_scsiregs *hregs = pd->hregs;
-	struct ip22_hostdata *hdata;
-	struct Scsi_Host *host;
-	wd33c93_regs regs;
-	unsigned int unit = pd->unit;
-	unsigned int irq = pd->irq;
-	int err;
-
-	host = scsi_host_alloc(&sgiwd93_template, sizeof(struct ip22_hostdata));
-	if (!host) {
-		err = -ENOMEM;
-		goto out;
-	}
-
-	host->base = (unsigned long) hregs;
-	host->irq = irq;
-
-	hdata = host_to_hostdata(host);
-	hdata->dev = &pdev->dev;
-	hdata->cpu = dma_alloc_noncoherent(&pdev->dev, HPC_DMA_SIZE,
-				&hdata->dma, DMA_TO_DEVICE, GFP_KERNEL);
-	if (!hdata->cpu) {
-		printk(KERN_WARNING "sgiwd93: Could not allocate memory for "
-		       "host %d buffer.\n", unit);
-		err = -ENOMEM;
-		goto out_put;
-	}
-
-	init_hpc_chain(hdata);
-
-	regs.SASR = wdregs + 3;
-	regs.SCMD = wdregs + 7;
-
-	hdata->wh.no_sync = 0;
-	hdata->wh.fast = 1;
-	hdata->wh.dma_mode = CTRL_BURST;
-
-	wd33c93_init(host, regs, dma_setup, dma_stop, WD33C93_FS_MHZ(20));
-
-	err = request_irq(irq, sgiwd93_intr, 0, "SGI WD93", host);
-	if (err) {
-		printk(KERN_WARNING "sgiwd93: Could not register irq %d "
-		       "for host %d.\n", irq, unit);
-		goto out_free;
-	}
-
-	platform_set_drvdata(pdev, host);
-
-	err = scsi_add_host(host, NULL);
-	if (err)
-		goto out_irq;
-
-	scsi_scan_host(host);
-
-	return 0;
-
-out_irq:
-	free_irq(irq, host);
-out_free:
-	dma_free_noncoherent(&pdev->dev, HPC_DMA_SIZE, hdata->cpu, hdata->dma,
-			DMA_TO_DEVICE);
-out_put:
-	scsi_host_put(host);
-out:
-
-	return err;
-}
-
-static int sgiwd93_remove(struct platform_device *pdev)
-{
-	struct Scsi_Host *host = platform_get_drvdata(pdev);
-	struct ip22_hostdata *hdata = (struct ip22_hostdata *) host->hostdata;
-	struct sgiwd93_platform_data *pd = pdev->dev.platform_data;
-
-	scsi_remove_host(host);
-	free_irq(pd->irq, host);
-	dma_free_noncoherent(&pdev->dev, HPC_DMA_SIZE, hdata->cpu, hdata->dma,
-			DMA_TO_DEVICE);
-	scsi_host_put(host);
-	return 0;
-}
-
-static struct platform_driver sgiwd93_driver = {
-	.probe  = sgiwd93_probe,
-	.remove = sgiwd93_remove,
-	.driver = {
-		.name   = "sgiwd93",
-	}
-};
-
-static int __init sgiwd93_module_init(void)
-{
-	return platform_driver_register(&sgiwd93_driver);
-}
-
-static void __exit sgiwd93_module_exit(void)
-{
-	return platform_driver_unregister(&sgiwd93_driver);
-}
-
-module_init(sgiwd93_module_init);
-module_exit(sgiwd93_module_exit);
-
-MODULE_DESCRIPTION("SGI WD33C93 driver");
-MODULE_AUTHOR("Ralf Baechle <ralf@linux-mips.org>");
-MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:sgiwd93");
+#include "scsi_module.c"

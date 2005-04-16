@@ -1,9 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * $Id: spaceorb.c,v 1.15 2002/01/22 20:29:19 vojtech Exp $
+ *
  *  Copyright (c) 1999-2001 Vojtech Pavlik
  *
  *  Based on the work of:
- *	David Thompson
+ *  	David Thompson
  */
 
 /*
@@ -11,11 +12,29 @@
  */
 
 /*
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ *
+ *  Should you need to contact me, the author, you can do so either by
+ * e-mail - mail your message to <vojtech@ucw.cz>, or by paper mail:
+ * Vojtech Pavlik, Simunkova 1594, Prague 8, 182 00 Czech Republic
  */
 
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/module.h>
+#include <linux/init.h>
 #include <linux/input.h>
 #include <linux/serio.h>
 
@@ -33,13 +52,15 @@ MODULE_LICENSE("GPL");
 
 static int spaceorb_buttons[] = { BTN_TL, BTN_TR, BTN_Y, BTN_X, BTN_B, BTN_A };
 static int spaceorb_axes[] = { ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ };
+static char *spaceorb_name = "SpaceTec SpaceOrb 360 / Avenger";
 
 /*
  * Per-Orb data.
  */
 
 struct spaceorb {
-	struct input_dev *dev;
+	struct input_dev dev;
+	struct serio *serio;
 	int idx;
 	unsigned char data[SPACEORB_MAX_LENGTH];
 	char phys[32];
@@ -55,9 +76,9 @@ static unsigned char *spaceorb_errors[] = { "EEPROM storing 0 failed", "Receive 
  * SpaceOrb.
  */
 
-static void spaceorb_process_packet(struct spaceorb *spaceorb)
+static void spaceorb_process_packet(struct spaceorb *spaceorb, struct pt_regs *regs)
 {
-	struct input_dev *dev = spaceorb->dev;
+	struct input_dev *dev = &spaceorb->dev;
 	unsigned char *data = spaceorb->data;
 	unsigned char c = 0;
 	int axes[6];
@@ -67,13 +88,15 @@ static void spaceorb_process_packet(struct spaceorb *spaceorb)
 	for (i = 0; i < spaceorb->idx; i++) c ^= data[i];
 	if (c) return;
 
+	input_regs(dev, regs);
+
 	switch (data[0]) {
 
 		case 'R':				/* Reset packet */
 			spaceorb->data[spaceorb->idx - 1] = 0;
 			for (i = 1; i < spaceorb->idx && spaceorb->data[i] == ' '; i++);
-			printk(KERN_INFO "input: %s [%s] is %s\n",
-				 dev->name, spaceorb->data + i, spaceorb->phys);
+			printk(KERN_INFO "input: %s [%s] on %s\n",
+				 spaceorb_name, spaceorb->data + i, spaceorb->serio->phys);
 			break;
 
 		case 'D':				/* Ball + button data */
@@ -93,14 +116,14 @@ static void spaceorb_process_packet(struct spaceorb *spaceorb)
 
 		case 'K':				/* Button data */
 			if (spaceorb->idx != 5) return;
-			for (i = 0; i < 6; i++)
+			for (i = 0; i < 7; i++)
 				input_report_key(dev, spaceorb_buttons[i], (data[2] >> i) & 1);
 
 			break;
 
 		case 'E':				/* Error packet */
 			if (spaceorb->idx != 4) return;
-			printk(KERN_ERR "spaceorb: Device error. [ ");
+			printk(KERN_ERR "joy-spaceorb: Device error. [ ");
 			for (i = 0; i < 7; i++) if (data[1] & (1 << i)) printk("%s ", spaceorb_errors[i]);
 			printk("]\n");
 			break;
@@ -110,12 +133,12 @@ static void spaceorb_process_packet(struct spaceorb *spaceorb)
 }
 
 static irqreturn_t spaceorb_interrupt(struct serio *serio,
-		unsigned char data, unsigned int flags)
+		unsigned char data, unsigned int flags, struct pt_regs *regs)
 {
 	struct spaceorb* spaceorb = serio_get_drvdata(serio);
 
 	if (~data & 0x80) {
-		if (spaceorb->idx) spaceorb_process_packet(spaceorb);
+		if (spaceorb->idx) spaceorb_process_packet(spaceorb, regs);
 		spaceorb->idx = 0;
 	}
 	if (spaceorb->idx < SPACEORB_MAX_LENGTH)
@@ -131,9 +154,9 @@ static void spaceorb_disconnect(struct serio *serio)
 {
 	struct spaceorb* spaceorb = serio_get_drvdata(serio);
 
+	input_unregister_device(&spaceorb->dev);
 	serio_close(serio);
 	serio_set_drvdata(serio, NULL);
-	input_unregister_device(spaceorb->dev);
 	kfree(spaceorb);
 }
 
@@ -146,58 +169,59 @@ static void spaceorb_disconnect(struct serio *serio)
 static int spaceorb_connect(struct serio *serio, struct serio_driver *drv)
 {
 	struct spaceorb *spaceorb;
-	struct input_dev *input_dev;
-	int err = -ENOMEM;
-	int i;
+	int i, t;
+	int err;
 
-	spaceorb = kzalloc(sizeof(struct spaceorb), GFP_KERNEL);
-	input_dev = input_allocate_device();
-	if (!spaceorb || !input_dev)
-		goto fail1;
+	if (!(spaceorb = kmalloc(sizeof(struct spaceorb), GFP_KERNEL)))
+		return -ENOMEM;
 
-	spaceorb->dev = input_dev;
-	snprintf(spaceorb->phys, sizeof(spaceorb->phys), "%s/input0", serio->phys);
+	memset(spaceorb, 0, sizeof(struct spaceorb));
 
-	input_dev->name = "SpaceTec SpaceOrb 360 / Avenger";
-	input_dev->phys = spaceorb->phys;
-	input_dev->id.bustype = BUS_RS232;
-	input_dev->id.vendor = SERIO_SPACEORB;
-	input_dev->id.product = 0x0001;
-	input_dev->id.version = 0x0100;
-	input_dev->dev.parent = &serio->dev;
-
-	input_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_ABS);
+	spaceorb->dev.evbit[0] = BIT(EV_KEY) | BIT(EV_ABS);
 
 	for (i = 0; i < 6; i++)
-		set_bit(spaceorb_buttons[i], input_dev->keybit);
+		set_bit(spaceorb_buttons[i], spaceorb->dev.keybit);
 
-	for (i = 0; i < 6; i++)
-		input_set_abs_params(input_dev, spaceorb_axes[i], -508, 508, 0, 0);
+	for (i = 0; i < 6; i++) {
+		t = spaceorb_axes[i];
+		set_bit(t, spaceorb->dev.absbit);
+		spaceorb->dev.absmin[t] = -508;
+		spaceorb->dev.absmax[t] =  508;
+	}
+
+	spaceorb->serio = serio;
+	spaceorb->dev.private = spaceorb;
+
+	sprintf(spaceorb->phys, "%s/input0", serio->phys);
+
+	init_input_dev(&spaceorb->dev);
+	spaceorb->dev.name = spaceorb_name;
+	spaceorb->dev.phys = spaceorb->phys;
+	spaceorb->dev.id.bustype = BUS_RS232;
+	spaceorb->dev.id.vendor = SERIO_SPACEORB;
+	spaceorb->dev.id.product = 0x0001;
+	spaceorb->dev.id.version = 0x0100;
+	spaceorb->dev.dev = &serio->dev;
 
 	serio_set_drvdata(serio, spaceorb);
 
 	err = serio_open(serio, drv);
-	if (err)
-		goto fail2;
+	if (err) {
+		serio_set_drvdata(serio, NULL);
+		kfree(spaceorb);
+		return err;
+	}
 
-	err = input_register_device(spaceorb->dev);
-	if (err)
-		goto fail3;
+	input_register_device(&spaceorb->dev);
 
 	return 0;
-
- fail3:	serio_close(serio);
- fail2:	serio_set_drvdata(serio, NULL);
- fail1:	input_free_device(input_dev);
-	kfree(spaceorb);
-	return err;
 }
 
 /*
  * The serio driver structure.
  */
 
-static const struct serio_device_id spaceorb_serio_ids[] = {
+static struct serio_device_id spaceorb_serio_ids[] = {
 	{
 		.type	= SERIO_RS232,
 		.proto	= SERIO_SPACEORB,
@@ -220,4 +244,20 @@ static struct serio_driver spaceorb_drv = {
 	.disconnect	= spaceorb_disconnect,
 };
 
-module_serio_driver(spaceorb_drv);
+/*
+ * The functions for inserting/removing us as a module.
+ */
+
+static int __init spaceorb_init(void)
+{
+	serio_register_driver(&spaceorb_drv);
+	return 0;
+}
+
+static void __exit spaceorb_exit(void)
+{
+	serio_unregister_driver(&spaceorb_drv);
+}
+
+module_init(spaceorb_init);
+module_exit(spaceorb_exit);

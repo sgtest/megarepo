@@ -1,15 +1,15 @@
-// SPDX-License-Identifier: GPL-2.0
+#include <linux/kallsyms.h>
 #include <linux/kernel.h>
 #include <linux/mmzone.h>
 #include <linux/nodemask.h>
 #include <linux/spinlock.h>
 #include <linux/smp.h>
-#include <linux/atomic.h>
+#include <asm/atomic.h>
 #include <asm/sn/types.h>
 #include <asm/sn/addrs.h>
 #include <asm/sn/nmi.h>
 #include <asm/sn/arch.h>
-#include <asm/sn/agent.h>
+#include <asm/sn/sn0/hub.h>
 
 #if 0
 #define NODE_NUM_CPUS(n)	CNODE_NUM_CPUS(n)
@@ -17,15 +17,15 @@
 #define NODE_NUM_CPUS(n)	CPUS_PER_NODE
 #endif
 
-#define SEND_NMI(_nasid, _slice)	\
-	REMOTE_HUB_S((_nasid),  (PI_NMI_A + ((_slice) * PI_NMI_OFFSET)), 1)
+#define CNODEID_NONE (cnodeid_t)-1
+#define enter_panic_mode()	spin_lock(&nmi_lock)
 
 typedef unsigned long machreg_t;
 
-static arch_spinlock_t nmi_lock = __ARCH_SPIN_LOCK_UNLOCKED;
+DEFINE_SPINLOCK(nmi_lock);
 
 /*
- * Let's see what else we need to do here. Set up sp, gp?
+ * Lets see what else we need to do here. Set up sp, gp?
  */
 void nmi_dump(void)
 {
@@ -56,82 +56,85 @@ void install_cpu_nmi_handler(int slice)
 void nmi_cpu_eframe_save(nasid_t nasid, int slice)
 {
 	struct reg_struct *nr;
-	int		i;
+	int 		i;
 
 	/* Get the pointer to the current cpu's register set. */
 	nr = (struct reg_struct *)
 		(TO_UNCAC(TO_NODE(nasid, IP27_NMI_KREGS_OFFSET)) +
 		slice * IP27_NMI_KREGS_CPU_SIZE);
 
-	pr_emerg("NMI nasid %d: slice %d\n", nasid, slice);
+	printk("NMI nasid %d: slice %d\n", nasid, slice);
 
 	/*
 	 * Saved main processor registers
 	 */
 	for (i = 0; i < 32; ) {
 		if ((i % 4) == 0)
-			pr_emerg("$%2d   :", i);
-		pr_cont(" %016lx", nr->gpr[i]);
+			printk("$%2d   :", i);
+		printk(" %016lx", nr->gpr[i]);
 
 		i++;
 		if ((i % 4) == 0)
-			pr_cont("\n");
+			printk("\n");
 	}
 
-	pr_emerg("Hi    : (value lost)\n");
-	pr_emerg("Lo    : (value lost)\n");
+	printk("Hi    : (value lost)\n");
+	printk("Lo    : (value lost)\n");
 
 	/*
 	 * Saved cp0 registers
 	 */
-	pr_emerg("epc   : %016lx %pS\n", nr->epc, (void *)nr->epc);
-	pr_emerg("%s\n", print_tainted());
-	pr_emerg("ErrEPC: %016lx %pS\n", nr->error_epc, (void *)nr->error_epc);
-	pr_emerg("ra    : %016lx %pS\n", nr->gpr[31], (void *)nr->gpr[31]);
-	pr_emerg("Status: %08lx	      ", nr->sr);
+	printk("epc   : %016lx ", nr->epc);
+	print_symbol("%s ", nr->epc);
+	printk("%s\n", print_tainted());
+	printk("ErrEPC: %016lx ", nr->error_epc);
+	print_symbol("%s\n", nr->error_epc);
+	printk("ra    : %016lx ", nr->gpr[31]);
+	print_symbol("%s\n", nr->gpr[31]);
+	printk("Status: %08lx         ", nr->sr);
 
 	if (nr->sr & ST0_KX)
-		pr_cont("KX ");
+		printk("KX ");
 	if (nr->sr & ST0_SX)
-		pr_cont("SX ");
+		printk("SX 	");
 	if (nr->sr & ST0_UX)
-		pr_cont("UX ");
+		printk("UX ");
 
 	switch (nr->sr & ST0_KSU) {
 	case KSU_USER:
-		pr_cont("USER ");
+		printk("USER ");
 		break;
 	case KSU_SUPERVISOR:
-		pr_cont("SUPERVISOR ");
+		printk("SUPERVISOR ");
 		break;
 	case KSU_KERNEL:
-		pr_cont("KERNEL ");
+		printk("KERNEL ");
 		break;
 	default:
-		pr_cont("BAD_MODE ");
+		printk("BAD_MODE ");
 		break;
 	}
 
 	if (nr->sr & ST0_ERL)
-		pr_cont("ERL ");
+		printk("ERL ");
 	if (nr->sr & ST0_EXL)
-		pr_cont("EXL ");
+		printk("EXL ");
 	if (nr->sr & ST0_IE)
-		pr_cont("IE ");
-	pr_cont("\n");
+		printk("IE ");
+	printk("\n");
 
-	pr_emerg("Cause : %08lx\n", nr->cause);
-	pr_emerg("PrId  : %08x\n", read_c0_prid());
-	pr_emerg("BadVA : %016lx\n", nr->badva);
-	pr_emerg("CErr  : %016lx\n", nr->cache_err);
-	pr_emerg("NMI_SR: %016lx\n", nr->nmi_sr);
+	printk("Cause : %08lx\n", nr->cause);
+	printk("PrId  : %08x\n", read_c0_prid());
+	printk("BadVA : %016lx\n", nr->badva);
+	printk("CErr  : %016lx\n", nr->cache_err);
+	printk("NMI_SR: %016lx\n", nr->nmi_sr);
 
-	pr_emerg("\n");
+	printk("\n");
 }
 
 void nmi_dump_hub_irq(nasid_t nasid, int slice)
 {
-	u64 mask0, mask1, pend0, pend1;
+	hubreg_t mask0, mask1, pend0, pend1;
 
 	if (slice == 0) {				/* Slice A */
 		mask0 = REMOTE_HUB_L(nasid, PI_INT_MASK0_A);
@@ -144,19 +147,25 @@ void nmi_dump_hub_irq(nasid_t nasid, int slice)
 	pend0 = REMOTE_HUB_L(nasid, PI_INT_PEND0);
 	pend1 = REMOTE_HUB_L(nasid, PI_INT_PEND1);
 
-	pr_emerg("PI_INT_MASK0: %16llx PI_INT_MASK1: %16llx\n", mask0, mask1);
-	pr_emerg("PI_INT_PEND0: %16llx PI_INT_PEND1: %16llx\n", pend0, pend1);
-	pr_emerg("\n\n");
+	printk("PI_INT_MASK0: %16lx PI_INT_MASK1: %16lx\n", mask0, mask1);
+	printk("PI_INT_PEND0: %16lx PI_INT_PEND1: %16lx\n", pend0, pend1);
+	printk("\n\n");
 }
 
 /*
  * Copy the cpu registers which have been saved in the IP27prom format
  * into the eframe format for the node under consideration.
  */
-void nmi_node_eframe_save(nasid_t nasid)
+void nmi_node_eframe_save(cnodeid_t  cnode)
 {
+	nasid_t nasid;
 	int slice;
 
+	/* Make sure that we have a valid node */
+	if (cnode == CNODEID_NONE)
+		return;
+
+	nasid = COMPACT_TO_NASID_NODEID(cnode);
 	if (nasid == INVALID_NASID)
 		return;
 
@@ -173,10 +182,10 @@ void nmi_node_eframe_save(nasid_t nasid)
 void
 nmi_eframes_save(void)
 {
-	nasid_t nasid;
+	cnodeid_t	cnode;
 
-	for_each_online_node(nasid)
-		nmi_node_eframe_save(nasid);
+	for_each_online_node(cnode)
+		nmi_node_eframe_save(cnode);
 }
 
 void
@@ -188,9 +197,9 @@ cont_nmi_dump(void)
 	atomic_inc(&nmied_cpus);
 #endif
 	/*
-	 * Only allow 1 cpu to proceed
+	 * Use enter_panic_mode to allow only 1 cpu to proceed
 	 */
-	arch_spin_lock(&nmi_lock);
+	enter_panic_mode();
 
 #ifdef REAL_NMI_SIGNAL
 	/*
@@ -214,7 +223,7 @@ cont_nmi_dump(void)
 		if (i == 1000) {
 			for_each_online_node(node)
 				if (NODEPDA(node)->dump_count == 0) {
-					cpu = cpumask_first(cpumask_of_node(node));
+					cpu = node_to_first_cpu(node);
 					for (n=0; n < CNODE_NUM_CPUS(node); cpu++, n++) {
 						CPUMASK_SETB(nmied_cpus, cpu);
 						/*

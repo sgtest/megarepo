@@ -1,11 +1,9 @@
-# SPDX-License-Identifier: GPL-2.0-only
 #
 # DECnet netfilter configuration
 #
 
 menu "DECnet: Netfilter Configuration"
-	depends on DECNET && NETFILTER
-	depends on NETFILTER_ADVANCED
+	depends on DECNET && NETFILTER && EXPERIMENTAL
 
 config DECNET_NF_GRABULATOR
 	tristate "Routing message grabulator (for userland routing daemon)"

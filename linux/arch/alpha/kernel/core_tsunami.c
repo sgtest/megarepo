@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *	linux/arch/alpha/kernel/core_tsunami.c
  *
@@ -12,16 +11,14 @@
 #include <asm/core_tsunami.h>
 #undef __EXTERN_INLINE
 
-#include <linux/module.h>
 #include <linux/types.h>
 #include <linux/pci.h>
 #include <linux/sched.h>
 #include <linux/init.h>
-#include <linux/memblock.h>
+#include <linux/bootmem.h>
 
 #include <asm/ptrace.h>
 #include <asm/smp.h>
-#include <asm/vga.h>
 
 #include "proto.h"
 #include "pci_impl.h"
@@ -243,6 +240,8 @@ tsunami_probe_write(volatile unsigned long *vaddr)
 #define tsunami_probe_read(ADDR) 1
 #endif /* NXM_MACHINE_CHECKS_ON_TSUNAMI */
 
+#define FN __FUNCTION__
+
 static void __init
 tsunami_init_one_pchip(tsunami_pchip *pchip, int index)
 {
@@ -319,14 +318,12 @@ tsunami_init_one_pchip(tsunami_pchip *pchip, int index)
 	 * NOTE: we need the align_entry settings for Acer devices on ES40,
 	 * specifically floppy and IDE when memory is larger than 2GB.
 	 */
-	hose->sg_isa = iommu_arena_new(hose, 0x00800000, 0x00800000,
-				       SMP_CACHE_BYTES);
+	hose->sg_isa = iommu_arena_new(hose, 0x00800000, 0x00800000, 0);
 	/* Initially set for 4 PTEs, but will be overridden to 64K for ISA. */
         hose->sg_isa->align_entry = 4;
 
 	hose->sg_pci = iommu_arena_new(hose, 0x40000000,
-				       size_for_memory(0x40000000),
-				       SMP_CACHE_BYTES);
+				       size_for_memory(0x40000000), 0);
         hose->sg_pci->align_entry = 4; /* Tsunami caches 4 PTEs at a time */
 
 	__direct_map_base = 0x80000000;
@@ -352,26 +349,6 @@ tsunami_init_one_pchip(tsunami_pchip *pchip, int index)
 	tsunami_pci_tbi(hose, 0, -1);
 }
 
-
-void __iomem *
-tsunami_ioportmap(unsigned long addr)
-{
-	FIXUP_IOADDR_VGA(addr);
-	return (void __iomem *)(addr + TSUNAMI_IO_BIAS);
-}
-
-void __iomem *
-tsunami_ioremap(unsigned long addr, unsigned long size)
-{
-	FIXUP_MEMADDR_VGA(addr);
-	return (void __iomem *)(addr + TSUNAMI_MEM_BIAS);
-}
-
-#ifndef CONFIG_ALPHA_GENERIC
-EXPORT_SYMBOL(tsunami_ioportmap);
-EXPORT_SYMBOL(tsunami_ioremap);
-#endif
-
 void __init
 tsunami_init_arch(void)
 {
@@ -385,27 +362,27 @@ tsunami_init_arch(void)
 	/* NXMs just don't matter to Tsunami--unless they make it
 	   choke completely. */
 	tmp = (unsigned long)(TSUNAMI_cchip - 1);
-	printk("%s: probing bogus address:  0x%016lx\n", __func__, bogus_addr);
+	printk("%s: probing bogus address:  0x%016lx\n", FN, bogus_addr);
 	printk("\tprobe %s\n",
 	       tsunami_probe_write((unsigned long *)bogus_addr)
 	       ? "succeeded" : "failed");
 #endif /* NXM_MACHINE_CHECKS_ON_TSUNAMI */
 
 #if 0
-	printk("%s: CChip registers:\n", __func__);
-	printk("%s: CSR_CSC 0x%lx\n", __func__, TSUNAMI_cchip->csc.csr);
-	printk("%s: CSR_MTR 0x%lx\n", __func__, TSUNAMI_cchip.mtr.csr);
-	printk("%s: CSR_MISC 0x%lx\n", __func__, TSUNAMI_cchip->misc.csr);
-	printk("%s: CSR_DIM0 0x%lx\n", __func__, TSUNAMI_cchip->dim0.csr);
-	printk("%s: CSR_DIM1 0x%lx\n", __func__, TSUNAMI_cchip->dim1.csr);
-	printk("%s: CSR_DIR0 0x%lx\n", __func__, TSUNAMI_cchip->dir0.csr);
-	printk("%s: CSR_DIR1 0x%lx\n", __func__, TSUNAMI_cchip->dir1.csr);
-	printk("%s: CSR_DRIR 0x%lx\n", __func__, TSUNAMI_cchip->drir.csr);
+	printk("%s: CChip registers:\n", FN);
+	printk("%s: CSR_CSC 0x%lx\n", FN, TSUNAMI_cchip->csc.csr);
+	printk("%s: CSR_MTR 0x%lx\n", FN, TSUNAMI_cchip.mtr.csr);
+	printk("%s: CSR_MISC 0x%lx\n", FN, TSUNAMI_cchip->misc.csr);
+	printk("%s: CSR_DIM0 0x%lx\n", FN, TSUNAMI_cchip->dim0.csr);
+	printk("%s: CSR_DIM1 0x%lx\n", FN, TSUNAMI_cchip->dim1.csr);
+	printk("%s: CSR_DIR0 0x%lx\n", FN, TSUNAMI_cchip->dir0.csr);
+	printk("%s: CSR_DIR1 0x%lx\n", FN, TSUNAMI_cchip->dir1.csr);
+	printk("%s: CSR_DRIR 0x%lx\n", FN, TSUNAMI_cchip->drir.csr);
 
 	printk("%s: DChip registers:\n");
-	printk("%s: CSR_DSC 0x%lx\n", __func__, TSUNAMI_dchip->dsc.csr);
-	printk("%s: CSR_STR 0x%lx\n", __func__, TSUNAMI_dchip->str.csr);
-	printk("%s: CSR_DREV 0x%lx\n", __func__, TSUNAMI_dchip->drev.csr);
+	printk("%s: CSR_DSC 0x%lx\n", FN, TSUNAMI_dchip->dsc.csr);
+	printk("%s: CSR_STR 0x%lx\n", FN, TSUNAMI_dchip->str.csr);
+	printk("%s: CSR_DREV 0x%lx\n", FN, TSUNAMI_dchip->drev.csr);
 #endif
 	/* With multiple PCI busses, we play with I/O as physical addrs.  */
 	ioport_resource.end = ~0UL;
@@ -416,9 +393,6 @@ tsunami_init_arch(void)
 	tsunami_init_one_pchip(TSUNAMI_pchip0, 0);
 	if (TSUNAMI_cchip->csc.csr & 1L<<14)
 		tsunami_init_one_pchip(TSUNAMI_pchip1, 1);
-
-	/* Check for graphic console location (if any).  */
-	find_console_vga_hose();
 }
 
 static void
@@ -469,7 +443,8 @@ tsunami_pci_clr_err(void)
 }
 
 void
-tsunami_machine_check(unsigned long vector, unsigned long la_ptr)
+tsunami_machine_check(unsigned long vector, unsigned long la_ptr,
+		      struct pt_regs * regs)
 {
 	/* Clear error before any reporting.  */
 	mb();
@@ -479,6 +454,6 @@ tsunami_machine_check(unsigned long vector, unsigned long la_ptr)
 	wrmces(0x7);
 	mb();
 
-	process_mcheck_info(vector, la_ptr, "TSUNAMI",
+	process_mcheck_info(vector, la_ptr, regs, "TSUNAMI",
 			    mcheck_expected(smp_processor_id()));
 }

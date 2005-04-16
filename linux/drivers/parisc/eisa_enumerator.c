@@ -1,8 +1,13 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * eisa_enumerator.c - provide support for EISA adapters in PA-RISC machines
  *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version
+ * 2 of the License, or (at your option) any later version.
+ *
  * Copyright (c) 2002 Daniel Engstrom <5116@telia.com>
+ *
  */
 
 #include <linux/ioport.h>
@@ -10,7 +15,7 @@
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <asm/io.h>
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
 #include <asm/byteorder.h>
 
 #include <asm/eisa_bus.h>
@@ -86,17 +91,17 @@ static int configure_memory(const unsigned char *buf,
 	for (i=0;i<HPEE_MEMORY_MAX_ENT;i++) {
 		c = get_8(buf+len);
 		
-		if (NULL != (res = kzalloc(sizeof(struct resource), GFP_KERNEL))) {
+		if (NULL != (res = kmalloc(sizeof(struct resource), GFP_KERNEL))) {
 			int result;
 			
 			res->name = name;
 			res->start = mem_parent->start + get_24(buf+len+2);
 			res->end = res->start + get_16(buf+len+5)*1024;
 			res->flags = IORESOURCE_MEM;
-			pr_cont("memory %pR ", res);
+			printk("memory %lx-%lx ", res->start, res->end);
 			result = request_resource(mem_parent, res);
 			if (result < 0) {
-				printk(KERN_ERR "EISA Enumerator: failed to claim EISA Bus address space!\n");
+				printk("\n" KERN_ERR "EISA Enumerator: failed to claim EISA Bus address space!\n");
 				return result;
 			}
 		}
@@ -123,7 +128,7 @@ static int configure_irq(const unsigned char *buf)
 	for (i=0;i<HPEE_IRQ_MAX_ENT;i++) {
 		c = get_8(buf+len);
 		
-		pr_cont("IRQ %d ", c & HPEE_IRQ_CHANNEL_MASK);
+		printk("IRQ %d ", c & HPEE_IRQ_CHANNEL_MASK);
 		if (c & HPEE_IRQ_TRIG_LEVEL) {
 			eisa_make_irq_level(c & HPEE_IRQ_CHANNEL_MASK);
 		} else {
@@ -153,7 +158,7 @@ static int configure_dma(const unsigned char *buf)
 	
 	for (i=0;i<HPEE_DMA_MAX_ENT;i++) {
 		c = get_8(buf+len);
-		pr_cont("DMA %d ", c&HPEE_DMA_CHANNEL_MASK);
+		printk("DMA %d ", c&HPEE_DMA_CHANNEL_MASK);
 		/* fixme: maybe initialize the dma channel withthe timing ? */
 		len+=2;      
 		if (!(c & HPEE_DMA_MORE)) {
@@ -178,15 +183,15 @@ static int configure_port(const unsigned char *buf, struct resource *io_parent,
 	for (i=0;i<HPEE_PORT_MAX_ENT;i++) {
 		c = get_8(buf+len);
 		
-		if (NULL != (res = kzalloc(sizeof(struct resource), GFP_KERNEL))) {
+		if (NULL != (res = kmalloc(sizeof(struct resource), GFP_KERNEL))) {
 			res->name = board;
 			res->start = get_16(buf+len+1);
 			res->end = get_16(buf+len+1)+(c&HPEE_PORT_SIZE_MASK)+1;
 			res->flags = IORESOURCE_IO;
-			pr_cont("ioports %pR ", res);
+			printk("ioports %lx-%lx ", res->start, res->end);
 			result = request_resource(io_parent, res);
 			if (result < 0) {
-				printk(KERN_ERR "EISA Enumerator: failed to claim EISA Bus address space!\n");
+				printk("\n" KERN_ERR "EISA Enumerator: failed to claim EISA Bus address space!\n");
 				return result;
 			}
 		}
@@ -219,7 +224,7 @@ static int configure_port_init(const unsigned char *buf)
 		 case HPEE_PORT_INIT_WIDTH_BYTE:
 			s=1;
 			if (c & HPEE_PORT_INIT_MASK) {
-				printk(KERN_WARNING "port_init: unverified mask attribute\n");
+				printk("\n" KERN_WARNING "port_init: unverified mask attribute\n");
 				outb((inb(get_16(buf+len+1) & 
 					  get_8(buf+len+3)) | 
 				      get_8(buf+len+4)), get_16(buf+len+1));
@@ -244,7 +249,7 @@ static int configure_port_init(const unsigned char *buf)
 		 case HPEE_PORT_INIT_WIDTH_DWORD:
 			s=4;
 			if (c & HPEE_PORT_INIT_MASK) {
- 				printk(KERN_WARNING "port_init: unverified mask attribute\n");
+ 				printk("\n" KERN_WARNING "port_init: unverified mask attribute\n");
 				outl((inl(get_16(buf+len+1) &
 					  get_32(buf+len+3)) |
 				      get_32(buf+len+7)), get_16(buf+len+1));
@@ -254,7 +259,7 @@ static int configure_port_init(const unsigned char *buf)
 
 			break;
 		 default:
-			printk(KERN_ERR "Invalid port init word %02x\n", c);
+			printk("\n" KERN_ERR "Invalid port init word %02x\n", c);
 			return 0;
 		}
 		
@@ -292,7 +297,7 @@ static int configure_type_string(const unsigned char *buf)
 	/* just skip past the type field */
 	len = get_8(buf);
 	if (len > 80) {
-		printk(KERN_ERR "eisa_enumerator: type info field too long (%d, max is 80)\n", len);
+		printk("\n" KERN_ERR "eisa_enumerator: type info field too long (%d, max is 80)\n", len);
 	}
 	
 	return 1+len;
@@ -352,7 +357,7 @@ static int parse_slot_config(int slot,
 		}
 		if (flags & HPEE_FUNCTION_INFO_CFG_FREE_FORM) {
 			/* I have no idea how to handle this */
-			printk("function %d have free-form configuration, skipping ",
+			printk("function %d have free-form confgiuration, skipping ",
 				num_func);
 			pos = p0 + function_len;
 			continue;
@@ -393,7 +398,7 @@ static int parse_slot_config(int slot,
 		}
 		
 		if (p0 + function_len < pos) {
-			printk(KERN_ERR "eisa_enumerator: function %d length mis-match "
+			printk("\n" KERN_ERR "eisa_enumerator: function %d length mis-match "
 			       "got %d, expected %d\n",
 			       num_func, pos-p0, function_len);
 			res=-1;
@@ -401,7 +406,7 @@ static int parse_slot_config(int slot,
 		}
 		pos = p0 + function_len;
 	}
-	pr_cont("\n");
+	printk("\n");
 	if (!id_string_used) {
 		kfree(board);
 	}
@@ -455,7 +460,7 @@ static int init_slot(int slot, struct eeprom_eisa_slot_info *es)
 			       slot, id_string);
 			
 			print_eisa_id(id_string, es->eisa_slot_id);
-			printk(" expected %s\n", id_string);
+			printk(" expected %s \n", id_string);
 		
 			return -1;	
 			

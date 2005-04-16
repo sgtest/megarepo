@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *  linux/arch/m68k/kernel/process.c
  *
@@ -11,44 +10,100 @@
  * This file handles the architecture-dependent parts of process handling..
  */
 
+#include <linux/config.h>
 #include <linux/errno.h>
 #include <linux/module.h>
 #include <linux/sched.h>
-#include <linux/sched/debug.h>
-#include <linux/sched/task.h>
-#include <linux/sched/task_stack.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
-#include <linux/slab.h>
-#include <linux/fs.h>
 #include <linux/smp.h>
+#include <linux/smp_lock.h>
 #include <linux/stddef.h>
 #include <linux/unistd.h>
 #include <linux/ptrace.h>
+#include <linux/slab.h>
 #include <linux/user.h>
+#include <linux/a.out.h>
 #include <linux/reboot.h>
 #include <linux/init_task.h>
 #include <linux/mqueue.h>
-#include <linux/rcupdate.h>
-#include <linux/syscalls.h>
-#include <linux/uaccess.h>
 
+#include <asm/uaccess.h>
+#include <asm/system.h>
 #include <asm/traps.h>
 #include <asm/machdep.h>
 #include <asm/setup.h>
+#include <asm/pgtable.h>
 
+/*
+ * Initial task/thread structure. Make this a per-architecture thing,
+ * because different architectures tend to have different
+ * alignment requirements and potentially different initial
+ * setup.
+ */
+static struct fs_struct init_fs = INIT_FS;
+static struct files_struct init_files = INIT_FILES;
+static struct signal_struct init_signals = INIT_SIGNALS(init_signals);
+static struct sighand_struct init_sighand = INIT_SIGHAND(init_sighand);
+struct mm_struct init_mm = INIT_MM(init_mm);
+
+EXPORT_SYMBOL(init_mm);
+
+union thread_union init_thread_union
+__attribute__((section(".data.init_task"), aligned(THREAD_SIZE)))
+       = { INIT_THREAD_INFO(init_task) };
+
+/* initial task structure */
+struct task_struct init_task = INIT_TASK(init_task);
+
+EXPORT_SYMBOL(init_task);
 
 asmlinkage void ret_from_fork(void);
-asmlinkage void ret_from_kernel_thread(void);
 
-void arch_cpu_idle(void)
+
+/*
+ * Return saved PC from a blocked thread
+ */
+unsigned long thread_saved_pc(struct task_struct *tsk)
 {
-#if defined(MACH_ATARI_ONLY)
-	/* block out HSYNC on the atari (falcon) */
-	__asm__("stop #0x2200" : : : "cc");
+	struct switch_stack *sw = (struct switch_stack *)tsk->thread.ksp;
+	/* Check whether the thread is blocked in resume() */
+	if (in_sched_functions(sw->retpc))
+		return ((unsigned long *)sw->a6)[1];
+	else
+		return sw->retpc;
+}
+
+/*
+ * The idle loop on an m68k..
+ */
+void default_idle(void)
+{
+	if (!need_resched())
+#if defined(MACH_ATARI_ONLY) && !defined(CONFIG_HADES)
+		/* block out HSYNC on the atari (falcon) */
+		__asm__("stop #0x2200" : : : "cc");
 #else
-	__asm__("stop #0x2000" : : : "cc");
+		__asm__("stop #0x2000" : : : "cc");
 #endif
+}
+
+void (*idle)(void) = default_idle;
+
+/*
+ * The idle thread. There's no useful work to be
+ * done, so just try to conserve power and have a
+ * low exit latency (ie sit in a loop waiting for
+ * somebody to say that they'd like to reschedule)
+ */
+void cpu_idle(void)
+{
+	/* endless idle loop with no priority at all */
+	while (1) {
+		while (!need_resched())
+			idle();
+		schedule();
+	}
 }
 
 void machine_restart(char * __unused)
@@ -58,6 +113,8 @@ void machine_restart(char * __unused)
 	for (;;);
 }
 
+EXPORT_SYMBOL(machine_restart);
+
 void machine_halt(void)
 {
 	if (mach_halt)
@@ -65,156 +122,171 @@ void machine_halt(void)
 	for (;;);
 }
 
+EXPORT_SYMBOL(machine_halt);
+
 void machine_power_off(void)
 {
-	do_kernel_power_off();
+	if (mach_power_off)
+		mach_power_off();
 	for (;;);
 }
 
-void (*pm_power_off)(void);
-EXPORT_SYMBOL(pm_power_off);
+EXPORT_SYMBOL(machine_power_off);
 
 void show_regs(struct pt_regs * regs)
 {
-	pr_info("Format %02x  Vector: %04x  PC: %08lx  Status: %04x    %s\n",
-		regs->format, regs->vector, regs->pc, regs->sr,
-		print_tainted());
-	pr_info("ORIG_D0: %08lx  D0: %08lx  A2: %08lx  A1: %08lx\n",
-		regs->orig_d0, regs->d0, regs->a2, regs->a1);
-	pr_info("A0: %08lx  D5: %08lx  D4: %08lx\n", regs->a0, regs->d5,
-		regs->d4);
-	pr_info("D3: %08lx  D2: %08lx  D1: %08lx\n", regs->d3, regs->d2,
-		regs->d1);
+	printk("\n");
+	printk("Format %02x  Vector: %04x  PC: %08lx  Status: %04x    %s\n",
+	       regs->format, regs->vector, regs->pc, regs->sr, print_tainted());
+	printk("ORIG_D0: %08lx  D0: %08lx  A2: %08lx  A1: %08lx\n",
+	       regs->orig_d0, regs->d0, regs->a2, regs->a1);
+	printk("A0: %08lx  D5: %08lx  D4: %08lx\n",
+	       regs->a0, regs->d5, regs->d4);
+	printk("D3: %08lx  D2: %08lx  D1: %08lx\n",
+	       regs->d3, regs->d2, regs->d1);
 	if (!(regs->sr & PS_S))
-		pr_info("USP: %08lx\n", rdusp());
+		printk("USP: %08lx\n", rdusp());
+}
+
+/*
+ * Create a kernel thread
+ */
+int kernel_thread(int (*fn)(void *), void * arg, unsigned long flags)
+{
+	int pid;
+	mm_segment_t fs;
+
+	fs = get_fs();
+	set_fs (KERNEL_DS);
+
+	{
+	register long retval __asm__ ("d0");
+	register long clone_arg __asm__ ("d1") = flags | CLONE_VM | CLONE_UNTRACED;
+
+	retval = __NR_clone;
+	__asm__ __volatile__
+	  ("clrl %%d2\n\t"
+	   "trap #0\n\t"		/* Linux/m68k system call */
+	   "tstl %0\n\t"		/* child or parent */
+	   "jne 1f\n\t"			/* parent - jump */
+	   "lea %%sp@(%c7),%6\n\t"	/* reload current */
+	   "movel %6@,%6\n\t"
+	   "movel %3,%%sp@-\n\t"	/* push argument */
+	   "jsr %4@\n\t"		/* call fn */
+	   "movel %0,%%d1\n\t"		/* pass exit value */
+	   "movel %2,%%d0\n\t"		/* exit */
+	   "trap #0\n"
+	   "1:"
+	   : "+d" (retval)
+	   : "i" (__NR_clone), "i" (__NR_exit),
+	     "r" (arg), "a" (fn), "d" (clone_arg), "r" (current),
+	     "i" (-THREAD_SIZE)
+	   : "d2");
+
+	pid = retval;
+	}
+
+	set_fs (fs);
+	return pid;
 }
 
 void flush_thread(void)
 {
-	current->thread.fc = USER_DATA;
-#ifdef CONFIG_FPU
-	if (!FPU_IS_EMU) {
-		unsigned long zero = 0;
-		asm volatile("frestore %0": :"m" (zero));
-	}
-#endif
+	unsigned long zero = 0;
+	set_fs(USER_DS);
+	current->thread.fs = __USER_DS;
+	if (!FPU_IS_EMU)
+		asm volatile (".chip 68k/68881\n\t"
+			      "frestore %0@\n\t"
+			      ".chip 68k" : : "a" (&zero));
 }
 
 /*
- * Why not generic sys_clone, you ask?  m68k passes all arguments on stack.
- * And we need all registers saved, which means a bunch of stuff pushed
- * on top of pt_regs, which means that sys_clone() arguments would be
- * buried.  We could, of course, copy them, but it's too costly for no
- * good reason - generic clone() would have to copy them *again* for
- * kernel_clone() anyway.  So in this case it's actually better to pass pt_regs *
- * and extract arguments for kernel_clone() from there.  Eventually we might
- * go for calling kernel_clone() directly from the wrapper, but only after we
- * are finished with kernel_clone() prototype conversion.
+ * "m68k_fork()".. By the time we get here, the
+ * non-volatile registers have also been saved on the
+ * stack. We do some ugly pointer stuff here.. (see
+ * also copy_thread)
  */
+
+asmlinkage int m68k_fork(struct pt_regs *regs)
+{
+	return do_fork(SIGCHLD, rdusp(), regs, 0, NULL, NULL);
+}
+
+asmlinkage int m68k_vfork(struct pt_regs *regs)
+{
+	return do_fork(CLONE_VFORK | CLONE_VM | SIGCHLD, rdusp(), regs, 0,
+		       NULL, NULL);
+}
+
 asmlinkage int m68k_clone(struct pt_regs *regs)
 {
-	/* regs will be equal to current_pt_regs() */
-	struct kernel_clone_args args = {
-		.flags		= regs->d1 & ~CSIGNAL,
-		.pidfd		= (int __user *)regs->d3,
-		.child_tid	= (int __user *)regs->d4,
-		.parent_tid	= (int __user *)regs->d3,
-		.exit_signal	= regs->d1 & CSIGNAL,
-		.stack		= regs->d2,
-		.tls		= regs->d5,
-	};
+	unsigned long clone_flags;
+	unsigned long newsp;
+	int *parent_tidptr, *child_tidptr;
 
-	return kernel_clone(&args);
+	/* syscall2 puts clone_flags in d1 and usp in d2 */
+	clone_flags = regs->d1;
+	newsp = regs->d2;
+	parent_tidptr = (int *)regs->d3;
+	child_tidptr = (int *)regs->d4;
+	if (!newsp)
+		newsp = rdusp();
+	return do_fork(clone_flags, newsp, regs, 0,
+		       parent_tidptr, child_tidptr);
 }
 
-/*
- * Because extra registers are saved on the stack after the sys_clone3()
- * arguments, this C wrapper extracts them from pt_regs * and then calls the
- * generic sys_clone3() implementation.
- */
-asmlinkage int m68k_clone3(struct pt_regs *regs)
+int copy_thread(int nr, unsigned long clone_flags, unsigned long usp,
+		 unsigned long unused,
+		 struct task_struct * p, struct pt_regs * regs)
 {
-	return sys_clone3((struct clone_args __user *)regs->d1, regs->d2);
-}
+	struct pt_regs * childregs;
+	struct switch_stack * childstack, *stack;
+	unsigned long stack_offset, *retp;
 
-int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
-{
-	unsigned long clone_flags = args->flags;
-	unsigned long usp = args->stack;
-	unsigned long tls = args->tls;
-	struct fork_frame {
-		struct switch_stack sw;
-		struct pt_regs regs;
-	} *frame;
+	stack_offset = THREAD_SIZE - sizeof(struct pt_regs);
+	childregs = (struct pt_regs *) ((unsigned long) (p->thread_info) + stack_offset);
 
-	frame = (struct fork_frame *) (task_stack_page(p) + THREAD_SIZE) - 1;
+	*childregs = *regs;
+	childregs->d0 = 0;
 
-	p->thread.ksp = (unsigned long)frame;
-	p->thread.esp0 = (unsigned long)&frame->regs;
+	retp = ((unsigned long *) regs);
+	stack = ((struct switch_stack *) retp) - 1;
 
+	childstack = ((struct switch_stack *) childregs) - 1;
+	*childstack = *stack;
+	childstack->retpc = (unsigned long)ret_from_fork;
+
+	p->thread.usp = usp;
+	p->thread.ksp = (unsigned long)childstack;
 	/*
 	 * Must save the current SFC/DFC value, NOT the value when
 	 * the parent was last descheduled - RGH  10-08-96
 	 */
-	p->thread.fc = USER_DATA;
+	p->thread.fs = get_fs().seg;
 
-	if (unlikely(args->fn)) {
-		/* kernel thread */
-		memset(frame, 0, sizeof(struct fork_frame));
-		frame->regs.sr = PS_S;
-		frame->sw.a3 = (unsigned long)args->fn;
-		frame->sw.d7 = (unsigned long)args->fn_arg;
-		frame->sw.retpc = (unsigned long)ret_from_kernel_thread;
-		p->thread.usp = 0;
-		return 0;
-	}
-	memcpy(frame, container_of(current_pt_regs(), struct fork_frame, regs),
-		sizeof(struct fork_frame));
-	frame->regs.d0 = 0;
-	frame->sw.retpc = (unsigned long)ret_from_fork;
-	p->thread.usp = usp ?: rdusp();
-
-	if (clone_flags & CLONE_SETTLS)
-		task_thread_info(p)->tp_value = tls;
-
-#ifdef CONFIG_FPU
 	if (!FPU_IS_EMU) {
 		/* Copy the current fpu state */
 		asm volatile ("fsave %0" : : "m" (p->thread.fpstate[0]) : "memory");
 
-		if (!CPU_IS_060 ? p->thread.fpstate[0] : p->thread.fpstate[2]) {
-			if (CPU_IS_COLDFIRE) {
-				asm volatile ("fmovemd %/fp0-%/fp7,%0\n\t"
-					      "fmovel %/fpiar,%1\n\t"
-					      "fmovel %/fpcr,%2\n\t"
-					      "fmovel %/fpsr,%3"
-					      :
-					      : "m" (p->thread.fp[0]),
-						"m" (p->thread.fpcntl[0]),
-						"m" (p->thread.fpcntl[1]),
-						"m" (p->thread.fpcntl[2])
-					      : "memory");
-			} else {
-				asm volatile ("fmovemx %/fp0-%/fp7,%0\n\t"
-					      "fmoveml %/fpiar/%/fpcr/%/fpsr,%1"
-					      :
-					      : "m" (p->thread.fp[0]),
-						"m" (p->thread.fpcntl[0])
-					      : "memory");
-			}
-		}
-
+		if (!CPU_IS_060 ? p->thread.fpstate[0] : p->thread.fpstate[2])
+		  asm volatile ("fmovemx %/fp0-%/fp7,%0\n\t"
+				"fmoveml %/fpiar/%/fpcr/%/fpsr,%1"
+				: : "m" (p->thread.fp[0]), "m" (p->thread.fpcntl[0])
+				: "memory");
 		/* Restore the state in case the fpu was busy */
 		asm volatile ("frestore %0" : : "m" (p->thread.fpstate[0]));
 	}
-#endif /* CONFIG_FPU */
 
 	return 0;
 }
 
 /* Fill in the fpu structure for a core dump.  */
+
 int dump_fpu (struct pt_regs *regs, struct user_m68kfp_struct *fpu)
 {
+	char fpustate[216];
+
 	if (FPU_IS_EMU) {
 		int i;
 
@@ -229,48 +301,96 @@ int dump_fpu (struct pt_regs *regs, struct user_m68kfp_struct *fpu)
 		return 1;
 	}
 
-	if (IS_ENABLED(CONFIG_FPU)) {
-		char fpustate[216];
+	/* First dump the fpu context to avoid protocol violation.  */
+	asm volatile ("fsave %0" :: "m" (fpustate[0]) : "memory");
+	if (!CPU_IS_060 ? !fpustate[0] : !fpustate[2])
+		return 0;
 
-		/* First dump the fpu context to avoid protocol violation.  */
-		asm volatile ("fsave %0" :: "m" (fpustate[0]) : "memory");
-		if (!CPU_IS_060 ? !fpustate[0] : !fpustate[2])
-			return 0;
-
-		if (CPU_IS_COLDFIRE) {
-			asm volatile ("fmovel %/fpiar,%0\n\t"
-				      "fmovel %/fpcr,%1\n\t"
-				      "fmovel %/fpsr,%2\n\t"
-				      "fmovemd %/fp0-%/fp7,%3"
-				      :
-				      : "m" (fpu->fpcntl[0]),
-					"m" (fpu->fpcntl[1]),
-					"m" (fpu->fpcntl[2]),
-					"m" (fpu->fpregs[0])
-				      : "memory");
-		} else {
-			asm volatile ("fmovem %/fpiar/%/fpcr/%/fpsr,%0"
-				      :
-				      : "m" (fpu->fpcntl[0])
-				      : "memory");
-			asm volatile ("fmovemx %/fp0-%/fp7,%0"
-				      :
-				      : "m" (fpu->fpregs[0])
-				      : "memory");
-		}
-	}
-
+	asm volatile ("fmovem %/fpiar/%/fpcr/%/fpsr,%0"
+		:: "m" (fpu->fpcntl[0])
+		: "memory");
+	asm volatile ("fmovemx %/fp0-%/fp7,%0"
+		:: "m" (fpu->fpregs[0])
+		: "memory");
 	return 1;
 }
-EXPORT_SYMBOL(dump_fpu);
 
-unsigned long __get_wchan(struct task_struct *p)
+/*
+ * fill in the user structure for a core dump..
+ */
+void dump_thread(struct pt_regs * regs, struct user * dump)
+{
+	struct switch_stack *sw;
+
+/* changed the size calculations - should hopefully work better. lbt */
+	dump->magic = CMAGIC;
+	dump->start_code = 0;
+	dump->start_stack = rdusp() & ~(PAGE_SIZE - 1);
+	dump->u_tsize = ((unsigned long) current->mm->end_code) >> PAGE_SHIFT;
+	dump->u_dsize = ((unsigned long) (current->mm->brk +
+					  (PAGE_SIZE-1))) >> PAGE_SHIFT;
+	dump->u_dsize -= dump->u_tsize;
+	dump->u_ssize = 0;
+
+	if (dump->start_stack < TASK_SIZE)
+		dump->u_ssize = ((unsigned long) (TASK_SIZE - dump->start_stack)) >> PAGE_SHIFT;
+
+	dump->u_ar0 = (struct user_regs_struct *)((int)&dump->regs - (int)dump);
+	sw = ((struct switch_stack *)regs) - 1;
+	dump->regs.d1 = regs->d1;
+	dump->regs.d2 = regs->d2;
+	dump->regs.d3 = regs->d3;
+	dump->regs.d4 = regs->d4;
+	dump->regs.d5 = regs->d5;
+	dump->regs.d6 = sw->d6;
+	dump->regs.d7 = sw->d7;
+	dump->regs.a0 = regs->a0;
+	dump->regs.a1 = regs->a1;
+	dump->regs.a2 = regs->a2;
+	dump->regs.a3 = sw->a3;
+	dump->regs.a4 = sw->a4;
+	dump->regs.a5 = sw->a5;
+	dump->regs.a6 = sw->a6;
+	dump->regs.d0 = regs->d0;
+	dump->regs.orig_d0 = regs->orig_d0;
+	dump->regs.stkadj = regs->stkadj;
+	dump->regs.sr = regs->sr;
+	dump->regs.pc = regs->pc;
+	dump->regs.fmtvec = (regs->format << 12) | regs->vector;
+	/* dump floating point stuff */
+	dump->u_fpvalid = dump_fpu (regs, &dump->m68kfp);
+}
+
+/*
+ * sys_execve() executes a new program.
+ */
+asmlinkage int sys_execve(char *name, char **argv, char **envp)
+{
+	int error;
+	char * filename;
+	struct pt_regs *regs = (struct pt_regs *) &name;
+
+	lock_kernel();
+	filename = getname(name);
+	error = PTR_ERR(filename);
+	if (IS_ERR(filename))
+		goto out;
+	error = do_execve(filename, argv, envp, regs);
+	putname(filename);
+out:
+	unlock_kernel();
+	return error;
+}
+
+unsigned long get_wchan(struct task_struct *p)
 {
 	unsigned long fp, pc;
 	unsigned long stack_page;
 	int count = 0;
+	if (!p || p == current || p->state == TASK_RUNNING)
+		return 0;
 
-	stack_page = (unsigned long)task_stack_page(p);
+	stack_page = (unsigned long)(p->thread_info);
 	fp = ((struct switch_stack *)p->thread.ksp)->a6;
 	do {
 		if (fp < stack_page+sizeof(struct thread_info) ||

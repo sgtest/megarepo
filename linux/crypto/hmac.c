@@ -1,263 +1,134 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Cryptographic API.
  *
  * HMAC: Keyed-Hashing for Message Authentication (RFC2104).
  *
  * Copyright (c) 2002 James Morris <jmorris@intercode.com.au>
- * Copyright (c) 2006 Herbert Xu <herbert@gondor.apana.org.au>
  *
  * The HMAC implementation is derived from USAGI.
  * Copyright (c) 2002 Kazunori Miyazawa <miyazawa@linux-ipv6.org> / USAGI
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option) 
+ * any later version.
+ *
  */
+#include <linux/crypto.h>
+#include <linux/mm.h>
+#include <linux/highmem.h>
+#include <linux/slab.h>
+#include <asm/scatterlist.h>
+#include "internal.h"
 
-#include <crypto/hmac.h>
-#include <crypto/internal/hash.h>
-#include <crypto/scatterwalk.h>
-#include <linux/err.h>
-#include <linux/fips.h>
-#include <linux/init.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/scatterlist.h>
-#include <linux/string.h>
-
-struct hmac_ctx {
-	struct crypto_shash *hash;
-};
-
-static inline void *align_ptr(void *p, unsigned int align)
+static void hash_key(struct crypto_tfm *tfm, u8 *key, unsigned int keylen)
 {
-	return (void *)ALIGN((unsigned long)p, align);
+	struct scatterlist tmp;
+	
+	tmp.page = virt_to_page(key);
+	tmp.offset = offset_in_page(key);
+	tmp.length = keylen;
+	crypto_digest_digest(tfm, &tmp, 1, key);
+		
 }
 
-static inline struct hmac_ctx *hmac_ctx(struct crypto_shash *tfm)
+int crypto_alloc_hmac_block(struct crypto_tfm *tfm)
 {
-	return align_ptr(crypto_shash_ctx_aligned(tfm) +
-			 crypto_shash_statesize(tfm) * 2,
-			 crypto_tfm_ctx_alignment());
+	int ret = 0;
+
+	BUG_ON(!crypto_tfm_alg_blocksize(tfm));
+	
+	tfm->crt_digest.dit_hmac_block = kmalloc(crypto_tfm_alg_blocksize(tfm),
+	                                         GFP_KERNEL);
+	if (tfm->crt_digest.dit_hmac_block == NULL)
+		ret = -ENOMEM;
+
+	return ret;
+		
 }
 
-static int hmac_setkey(struct crypto_shash *parent,
-		       const u8 *inkey, unsigned int keylen)
+void crypto_free_hmac_block(struct crypto_tfm *tfm)
 {
-	int bs = crypto_shash_blocksize(parent);
-	int ds = crypto_shash_digestsize(parent);
-	int ss = crypto_shash_statesize(parent);
-	char *ipad = crypto_shash_ctx_aligned(parent);
-	char *opad = ipad + ss;
-	struct hmac_ctx *ctx = align_ptr(opad + ss,
-					 crypto_tfm_ctx_alignment());
-	struct crypto_shash *hash = ctx->hash;
-	SHASH_DESC_ON_STACK(shash, hash);
+	if (tfm->crt_digest.dit_hmac_block)
+		kfree(tfm->crt_digest.dit_hmac_block);
+}
+
+void crypto_hmac_init(struct crypto_tfm *tfm, u8 *key, unsigned int *keylen)
+{
 	unsigned int i;
-
-	if (fips_enabled && (keylen < 112 / 8))
-		return -EINVAL;
-
-	shash->tfm = hash;
-
-	if (keylen > bs) {
-		int err;
-
-		err = crypto_shash_digest(shash, inkey, keylen, ipad);
-		if (err)
-			return err;
-
-		keylen = ds;
-	} else
-		memcpy(ipad, inkey, keylen);
-
-	memset(ipad + keylen, 0, bs - keylen);
-	memcpy(opad, ipad, bs);
-
-	for (i = 0; i < bs; i++) {
-		ipad[i] ^= HMAC_IPAD_VALUE;
-		opad[i] ^= HMAC_OPAD_VALUE;
+	struct scatterlist tmp;
+	char *ipad = tfm->crt_digest.dit_hmac_block;
+	
+	if (*keylen > crypto_tfm_alg_blocksize(tfm)) {
+		hash_key(tfm, key, *keylen);
+		*keylen = crypto_tfm_alg_digestsize(tfm);
 	}
 
-	return crypto_shash_init(shash) ?:
-	       crypto_shash_update(shash, ipad, bs) ?:
-	       crypto_shash_export(shash, ipad) ?:
-	       crypto_shash_init(shash) ?:
-	       crypto_shash_update(shash, opad, bs) ?:
-	       crypto_shash_export(shash, opad);
+	memset(ipad, 0, crypto_tfm_alg_blocksize(tfm));
+	memcpy(ipad, key, *keylen);
+
+	for (i = 0; i < crypto_tfm_alg_blocksize(tfm); i++)
+		ipad[i] ^= 0x36;
+
+	tmp.page = virt_to_page(ipad);
+	tmp.offset = offset_in_page(ipad);
+	tmp.length = crypto_tfm_alg_blocksize(tfm);
+	
+	crypto_digest_init(tfm);
+	crypto_digest_update(tfm, &tmp, 1);
 }
 
-static int hmac_export(struct shash_desc *pdesc, void *out)
+void crypto_hmac_update(struct crypto_tfm *tfm,
+                        struct scatterlist *sg, unsigned int nsg)
 {
-	struct shash_desc *desc = shash_desc_ctx(pdesc);
-
-	return crypto_shash_export(desc, out);
+	crypto_digest_update(tfm, sg, nsg);
 }
 
-static int hmac_import(struct shash_desc *pdesc, const void *in)
+void crypto_hmac_final(struct crypto_tfm *tfm, u8 *key,
+                       unsigned int *keylen, u8 *out)
 {
-	struct shash_desc *desc = shash_desc_ctx(pdesc);
-	struct hmac_ctx *ctx = hmac_ctx(pdesc->tfm);
-
-	desc->tfm = ctx->hash;
-
-	return crypto_shash_import(desc, in);
-}
-
-static int hmac_init(struct shash_desc *pdesc)
-{
-	return hmac_import(pdesc, crypto_shash_ctx_aligned(pdesc->tfm));
-}
-
-static int hmac_update(struct shash_desc *pdesc,
-		       const u8 *data, unsigned int nbytes)
-{
-	struct shash_desc *desc = shash_desc_ctx(pdesc);
-
-	return crypto_shash_update(desc, data, nbytes);
-}
-
-static int hmac_final(struct shash_desc *pdesc, u8 *out)
-{
-	struct crypto_shash *parent = pdesc->tfm;
-	int ds = crypto_shash_digestsize(parent);
-	int ss = crypto_shash_statesize(parent);
-	char *opad = crypto_shash_ctx_aligned(parent) + ss;
-	struct shash_desc *desc = shash_desc_ctx(pdesc);
-
-	return crypto_shash_final(desc, out) ?:
-	       crypto_shash_import(desc, opad) ?:
-	       crypto_shash_finup(desc, out, ds, out);
-}
-
-static int hmac_finup(struct shash_desc *pdesc, const u8 *data,
-		      unsigned int nbytes, u8 *out)
-{
-
-	struct crypto_shash *parent = pdesc->tfm;
-	int ds = crypto_shash_digestsize(parent);
-	int ss = crypto_shash_statesize(parent);
-	char *opad = crypto_shash_ctx_aligned(parent) + ss;
-	struct shash_desc *desc = shash_desc_ctx(pdesc);
-
-	return crypto_shash_finup(desc, data, nbytes, out) ?:
-	       crypto_shash_import(desc, opad) ?:
-	       crypto_shash_finup(desc, out, ds, out);
-}
-
-static int hmac_init_tfm(struct crypto_shash *parent)
-{
-	struct crypto_shash *hash;
-	struct shash_instance *inst = shash_alg_instance(parent);
-	struct crypto_shash_spawn *spawn = shash_instance_ctx(inst);
-	struct hmac_ctx *ctx = hmac_ctx(parent);
-
-	hash = crypto_spawn_shash(spawn);
-	if (IS_ERR(hash))
-		return PTR_ERR(hash);
-
-	parent->descsize = sizeof(struct shash_desc) +
-			   crypto_shash_descsize(hash);
-
-	ctx->hash = hash;
-	return 0;
-}
-
-static void hmac_exit_tfm(struct crypto_shash *parent)
-{
-	struct hmac_ctx *ctx = hmac_ctx(parent);
-	crypto_free_shash(ctx->hash);
-}
-
-static int hmac_create(struct crypto_template *tmpl, struct rtattr **tb)
-{
-	struct shash_instance *inst;
-	struct crypto_shash_spawn *spawn;
-	struct crypto_alg *alg;
-	struct shash_alg *salg;
-	u32 mask;
-	int err;
-	int ds;
-	int ss;
-
-	err = crypto_check_attr_type(tb, CRYPTO_ALG_TYPE_SHASH, &mask);
-	if (err)
-		return err;
-
-	inst = kzalloc(sizeof(*inst) + sizeof(*spawn), GFP_KERNEL);
-	if (!inst)
-		return -ENOMEM;
-	spawn = shash_instance_ctx(inst);
-
-	err = crypto_grab_shash(spawn, shash_crypto_instance(inst),
-				crypto_attr_alg_name(tb[1]), 0, mask);
-	if (err)
-		goto err_free_inst;
-	salg = crypto_spawn_shash_alg(spawn);
-	alg = &salg->base;
-
-	/* The underlying hash algorithm must not require a key */
-	err = -EINVAL;
-	if (crypto_shash_alg_needs_key(salg))
-		goto err_free_inst;
-
-	ds = salg->digestsize;
-	ss = salg->statesize;
-	if (ds > alg->cra_blocksize ||
-	    ss < alg->cra_blocksize)
-		goto err_free_inst;
-
-	err = crypto_inst_setname(shash_crypto_instance(inst), tmpl->name, alg);
-	if (err)
-		goto err_free_inst;
-
-	inst->alg.base.cra_priority = alg->cra_priority;
-	inst->alg.base.cra_blocksize = alg->cra_blocksize;
-	inst->alg.base.cra_alignmask = alg->cra_alignmask;
-
-	ss = ALIGN(ss, alg->cra_alignmask + 1);
-	inst->alg.digestsize = ds;
-	inst->alg.statesize = ss;
-
-	inst->alg.base.cra_ctxsize = sizeof(struct hmac_ctx) +
-				     ALIGN(ss * 2, crypto_tfm_ctx_alignment());
-
-	inst->alg.init = hmac_init;
-	inst->alg.update = hmac_update;
-	inst->alg.final = hmac_final;
-	inst->alg.finup = hmac_finup;
-	inst->alg.export = hmac_export;
-	inst->alg.import = hmac_import;
-	inst->alg.setkey = hmac_setkey;
-	inst->alg.init_tfm = hmac_init_tfm;
-	inst->alg.exit_tfm = hmac_exit_tfm;
-
-	inst->free = shash_free_singlespawn_instance;
-
-	err = shash_register_instance(tmpl, inst);
-	if (err) {
-err_free_inst:
-		shash_free_singlespawn_instance(inst);
+	unsigned int i;
+	struct scatterlist tmp;
+	char *opad = tfm->crt_digest.dit_hmac_block;
+	
+	if (*keylen > crypto_tfm_alg_blocksize(tfm)) {
+		hash_key(tfm, key, *keylen);
+		*keylen = crypto_tfm_alg_digestsize(tfm);
 	}
-	return err;
+
+	crypto_digest_final(tfm, out);
+
+	memset(opad, 0, crypto_tfm_alg_blocksize(tfm));
+	memcpy(opad, key, *keylen);
+		
+	for (i = 0; i < crypto_tfm_alg_blocksize(tfm); i++)
+		opad[i] ^= 0x5c;
+
+	tmp.page = virt_to_page(opad);
+	tmp.offset = offset_in_page(opad);
+	tmp.length = crypto_tfm_alg_blocksize(tfm);
+
+	crypto_digest_init(tfm);
+	crypto_digest_update(tfm, &tmp, 1);
+	
+	tmp.page = virt_to_page(out);
+	tmp.offset = offset_in_page(out);
+	tmp.length = crypto_tfm_alg_digestsize(tfm);
+	
+	crypto_digest_update(tfm, &tmp, 1);
+	crypto_digest_final(tfm, out);
 }
 
-static struct crypto_template hmac_tmpl = {
-	.name = "hmac",
-	.create = hmac_create,
-	.module = THIS_MODULE,
-};
-
-static int __init hmac_module_init(void)
+void crypto_hmac(struct crypto_tfm *tfm, u8 *key, unsigned int *keylen,
+                 struct scatterlist *sg, unsigned int nsg, u8 *out)
 {
-	return crypto_register_template(&hmac_tmpl);
+	crypto_hmac_init(tfm, key, keylen);
+	crypto_hmac_update(tfm, sg, nsg);
+	crypto_hmac_final(tfm, key, keylen, out);
 }
 
-static void __exit hmac_module_exit(void)
-{
-	crypto_unregister_template(&hmac_tmpl);
-}
+EXPORT_SYMBOL_GPL(crypto_hmac_init);
+EXPORT_SYMBOL_GPL(crypto_hmac_update);
+EXPORT_SYMBOL_GPL(crypto_hmac_final);
+EXPORT_SYMBOL_GPL(crypto_hmac);
 
-subsys_initcall(hmac_module_init);
-module_exit(hmac_module_exit);
-
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("HMAC hash algorithm");
-MODULE_ALIAS_CRYPTO("hmac");

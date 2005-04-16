@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *	linux/arch/alpha/kernel/sys_rx164.c
  *
@@ -18,10 +17,12 @@
 #include <linux/bitops.h>
 
 #include <asm/ptrace.h>
+#include <asm/system.h>
 #include <asm/dma.h>
 #include <asm/irq.h>
 #include <asm/mmu_context.h>
 #include <asm/io.h>
+#include <asm/pgtable.h>
 #include <asm/core_polaris.h>
 #include <asm/tlbflush.h>
 
@@ -46,26 +47,43 @@ rx164_update_irq_hw(unsigned long mask)
 }
 
 static inline void
-rx164_enable_irq(struct irq_data *d)
+rx164_enable_irq(unsigned int irq)
 {
-	rx164_update_irq_hw(cached_irq_mask |= 1UL << (d->irq - 16));
+	rx164_update_irq_hw(cached_irq_mask |= 1UL << (irq - 16));
 }
 
 static void
-rx164_disable_irq(struct irq_data *d)
+rx164_disable_irq(unsigned int irq)
 {
-	rx164_update_irq_hw(cached_irq_mask &= ~(1UL << (d->irq - 16)));
+	rx164_update_irq_hw(cached_irq_mask &= ~(1UL << (irq - 16)));
 }
 
-static struct irq_chip rx164_irq_type = {
-	.name		= "RX164",
-	.irq_unmask	= rx164_enable_irq,
-	.irq_mask	= rx164_disable_irq,
-	.irq_mask_ack	= rx164_disable_irq,
+static unsigned int
+rx164_startup_irq(unsigned int irq)
+{
+	rx164_enable_irq(irq);
+	return 0;
+}
+
+static void
+rx164_end_irq(unsigned int irq)
+{
+	if (!(irq_desc[irq].status & (IRQ_DISABLED|IRQ_INPROGRESS)))
+		rx164_enable_irq(irq);
+}
+
+static struct hw_interrupt_type rx164_irq_type = {
+	.typename	= "RX164",
+	.startup	= rx164_startup_irq,
+	.shutdown	= rx164_disable_irq,
+	.enable		= rx164_enable_irq,
+	.disable	= rx164_disable_irq,
+	.ack		= rx164_disable_irq,
+	.end		= rx164_end_irq,
 };
 
 static void 
-rx164_device_interrupt(unsigned long vector)
+rx164_device_interrupt(unsigned long vector, struct pt_regs *regs)
 {
 	unsigned long pld;
 	volatile unsigned int *dirr;
@@ -84,9 +102,9 @@ rx164_device_interrupt(unsigned long vector)
 		i = ffz(~pld);
 		pld &= pld - 1; /* clear least bit set */
 		if (i == 20) {
-			isa_no_iack_sc_device_interrupt(vector);
+			isa_no_iack_sc_device_interrupt(vector, regs);
 		} else {
-			handle_irq(16+i);
+			handle_irq(16+i, regs);
 		}
 	}
 }
@@ -98,15 +116,14 @@ rx164_init_irq(void)
 
 	rx164_update_irq_hw(0);
 	for (i = 16; i < 40; ++i) {
-		irq_set_chip_and_handler(i, &rx164_irq_type, handle_level_irq);
-		irq_set_status_flags(i, IRQ_LEVEL);
+		irq_desc[i].status = IRQ_DISABLED | IRQ_LEVEL;
+		irq_desc[i].handler = &rx164_irq_type;
 	}
 
 	init_i8259a_irqs();
 	common_init_isa_dma();
 
-	if (request_irq(16 + 20, no_action, 0, "isa-cascade", NULL))
-		pr_err("Failed to register isa-cascade interrupt\n");
+	setup_irq(16+20, &isa_cascade_irqaction);
 }
 
 
@@ -143,8 +160,8 @@ rx164_init_irq(void)
  * 
  */
 
-static int
-rx164_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
+static int __init
+rx164_map_irq(struct pci_dev *dev, u8 slot, u8 pin)
 {
 #if 0
 	static char irq_tab_pass1[6][5] __initdata = {
@@ -157,7 +174,7 @@ rx164_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 	  { 16+1, 16+1, 16+6, 16+11, 16+16},      /* IdSel 10, slot 4 */
 	};
 #else
-	static char irq_tab[6][5] = {
+	static char irq_tab[6][5] __initdata = {
 	  /*INT   INTA  INTB  INTC   INTD */
 	  { 16+0, 16+0, 16+6, 16+11, 16+16},      /* IdSel 5,  slot 0 */
 	  { 16+1, 16+1, 16+7, 16+12, 16+17},      /* IdSel 6,  slot 1 */

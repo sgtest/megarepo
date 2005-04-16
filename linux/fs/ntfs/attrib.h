@@ -1,10 +1,24 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * attrib.h - Defines for attribute handling in NTFS Linux kernel driver.
  *	      Part of the Linux-NTFS project.
  *
- * Copyright (c) 2001-2005 Anton Altaparmakov
+ * Copyright (c) 2001-2004 Anton Altaparmakov
  * Copyright (c) 2002 Richard Russon
+ *
+ * This program/include file is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License as published
+ * by the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program/include file is distributed in the hope that it will be
+ * useful, but WITHOUT ANY WARRANTY; without even the implied warranty
+ * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program (in the main directory of the Linux-NTFS
+ * distribution in the file COPYING); if not, write to the Free Software
+ * Foundation,Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
 #ifndef _LINUX_NTFS_ATTRIB_H
@@ -26,10 +40,10 @@
  * Structure must be initialized to zero before the first call to one of the
  * attribute search functions. Initialize @mrec to point to the mft record to
  * search, and @attr to point to the first attribute within @mrec (not necessary
- * if calling the _first() functions), and set @is_first to 'true' (not necessary
+ * if calling the _first() functions), and set @is_first to TRUE (not necessary
  * if calling the _first() functions).
  *
- * If @is_first is 'true', the search begins with @attr. If @is_first is 'false',
+ * If @is_first is TRUE, the search begins with @attr. If @is_first is FALSE,
  * the search begins after @attr. This is so that, after the first call to one
  * of the search attribute functions, we can call the function again, without
  * any modification of the search context, to automagically get the next
@@ -38,7 +52,7 @@
 typedef struct {
 	MFT_RECORD *mrec;
 	ATTR_RECORD *attr;
-	bool is_first;
+	BOOL is_first;
 	ntfs_inode *ntfs_ino;
 	ATTR_LIST_ENTRY *al_entry;
 	ntfs_inode *base_ntfs_ino;
@@ -46,15 +60,10 @@ typedef struct {
 	ATTR_RECORD *base_attr;
 } ntfs_attr_search_ctx;
 
-extern int ntfs_map_runlist_nolock(ntfs_inode *ni, VCN vcn,
-		ntfs_attr_search_ctx *ctx);
 extern int ntfs_map_runlist(ntfs_inode *ni, VCN vcn);
 
-extern LCN ntfs_attr_vcn_to_lcn_nolock(ntfs_inode *ni, const VCN vcn,
-		const bool write_locked);
-
-extern runlist_element *ntfs_attr_find_vcn_nolock(ntfs_inode *ni,
-		const VCN vcn, ntfs_attr_search_ctx *ctx);
+extern runlist_element *ntfs_find_vcn(ntfs_inode *ni, const VCN vcn,
+		const BOOL need_write);
 
 int ntfs_attr_lookup(const ATTR_TYPE type, const ntfschar *name,
 		const u32 name_len, const IGNORE_CASE_BOOL ic,
@@ -76,8 +85,6 @@ extern ntfs_attr_search_ctx *ntfs_attr_get_search_ctx(ntfs_inode *ni,
 		MFT_RECORD *mrec);
 extern void ntfs_attr_put_search_ctx(ntfs_attr_search_ctx *ctx);
 
-#ifdef NTFS_RW
-
 extern int ntfs_attr_size_bounds_check(const ntfs_volume *vol,
 		const ATTR_TYPE type, const s64 size);
 extern int ntfs_attr_can_be_non_resident(const ntfs_volume *vol,
@@ -86,17 +93,8 @@ extern int ntfs_attr_can_be_resident(const ntfs_volume *vol,
 		const ATTR_TYPE type);
 
 extern int ntfs_attr_record_resize(MFT_RECORD *m, ATTR_RECORD *a, u32 new_size);
-extern int ntfs_resident_attr_value_resize(MFT_RECORD *m, ATTR_RECORD *a,
-		const u32 new_size);
-
-extern int ntfs_attr_make_non_resident(ntfs_inode *ni, const u32 data_size);
-
-extern s64 ntfs_attr_extend_allocation(ntfs_inode *ni, s64 new_alloc_size,
-		const s64 new_data_size, const s64 data_start);
 
 extern int ntfs_attr_set(ntfs_inode *ni, const s64 ofs, const s64 cnt,
 		const u8 val);
-
-#endif /* NTFS_RW */
 
 #endif /* _LINUX_NTFS_ATTRIB_H */

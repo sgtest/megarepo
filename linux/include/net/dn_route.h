@@ -1,22 +1,25 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef _NET_DN_ROUTE_H
 #define _NET_DN_ROUTE_H
 
 /******************************************************************************
     (c) 1995-1998 E.M. Serrat		emserrat@geocities.com
     
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
 *******************************************************************************/
 
-#include <linux/types.h>
-#include <net/dst.h>
-
-struct sk_buff *dn_alloc_skb(struct sock *sk, int size, gfp_t pri);
-int dn_route_output_sock(struct dst_entry __rcu **pprt, struct flowidn *,
-			 struct sock *sk, int flags);
-int dn_cache_dump(struct sk_buff *skb, struct netlink_callback *cb);
-void dn_rt_cache_flush(int delay);
-int dn_route_rcv(struct sk_buff *skb, struct net_device *dev,
-		 struct packet_type *pt, struct net_device *orig_dev);
+extern struct sk_buff *dn_alloc_skb(struct sock *sk, int size, int pri);
+extern int dn_route_output_sock(struct dst_entry **pprt, struct flowi *, struct sock *sk, int flags);
+extern int dn_cache_dump(struct sk_buff *skb, struct netlink_callback *cb);
+extern int dn_cache_getroute(struct sk_buff *skb, struct nlmsghdr *nlh, void *arg);
+extern void dn_rt_cache_flush(int delay);
 
 /* Masks for flags field */
 #define DN_RT_F_PID 0x07 /* Mask for packet type                      */
@@ -63,36 +66,26 @@ int dn_route_rcv(struct sk_buff *skb, struct net_device *dev,
  * packets to the originating host.
  */
 struct dn_route {
-	struct dst_entry dst;
-	struct dn_route __rcu *dn_next;
+	union {
+		struct dst_entry dst;
+		struct dn_route *rt_next;
+	} u;
 
-	struct neighbour *n;
+	__u16 rt_saddr;
+	__u16 rt_daddr;
+	__u16 rt_gateway;
+	__u16 rt_local_src;	/* Source used for forwarding packets */
+	__u16 rt_src_map;
+	__u16 rt_dst_map;
 
-	struct flowidn fld;
+	unsigned rt_flags;
+	unsigned rt_type;
 
-	__le16 rt_saddr;
-	__le16 rt_daddr;
-	__le16 rt_gateway;
-	__le16 rt_local_src;	/* Source used for forwarding packets */
-	__le16 rt_src_map;
-	__le16 rt_dst_map;
-
-	unsigned int rt_flags;
-	unsigned int rt_type;
+	struct flowi fl;
 };
 
-static inline bool dn_is_input_route(struct dn_route *rt)
-{
-	return rt->fld.flowidn_iif != 0;
-}
-
-static inline bool dn_is_output_route(struct dn_route *rt)
-{
-	return rt->fld.flowidn_iif == 0;
-}
-
-void dn_route_init(void);
-void dn_route_cleanup(void);
+extern void dn_route_init(void);
+extern void dn_route_cleanup(void);
 
 #include <net/sock.h>
 #include <linux/if_arp.h>
@@ -109,7 +102,8 @@ static inline void dn_rt_finish_output(struct sk_buff *skb, char *dst, char *src
 	if ((dev->type != ARPHRD_ETHER) && (dev->type != ARPHRD_LOOPBACK))
 		dst = NULL;
 
-	if (dev_hard_header(skb, dev, ETH_P_DNA_RT, dst, src, skb->len) >= 0)
+	if (!dev->hard_header || (dev->hard_header(skb, dev, ETH_P_DNA_RT,
+			dst, src, skb->len) >= 0))
 		dn_rt_send(skb);
 	else
 		kfree_skb(skb);

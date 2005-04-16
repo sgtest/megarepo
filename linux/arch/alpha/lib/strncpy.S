@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * arch/alpha/lib/strncpy.S
  * Contributed by Richard Henderson (rth@tamu.edu)
@@ -11,7 +10,7 @@
  * version has cropped that bit o' nastiness as well as assuming that
  * __stxncpy is in range of a branch.
  */
-#include <asm/export.h>
+
 	.set noat
 	.set noreorder
 
@@ -36,7 +35,7 @@ strncpy:
 
 	or	$3, $24, $3	# clear the bits between the last
 	or	$4, $27, $4	# written byte and the last byte in COUNT
-	andnot	$3, $4, $4
+	andnot	$4, $3, $4
 	zap	$1, $4, $1
 
 	stq_u	$1, 0($16)
@@ -44,8 +43,8 @@ strncpy:
 
 	.align	4
 $multiword:
-	subq	$27, 1, $2	# clear the final bits in the prev word
-	or	$2, $27, $2
+	subq	$24, 1, $2	# clear the final bits in the prev word
+	or	$2, $24, $2
 	zapnot	$1, $2, $1
 	subq	$18, 1, $18
 
@@ -71,8 +70,8 @@ $multiword:
 	bne	$18, 0b
 
 1:	ldq_u	$1, 0($16)	# clear the leading bits in the final word
-	subq	$24, 1, $2
-	or	$2, $24, $2
+	subq	$27, 1, $2
+	or	$2, $27, $2
 
 	zap	$1, $2, $1
 	stq_u	$1, 0($16)
@@ -80,4 +79,3 @@ $zerolen:
 	ret
 
 	.end	strncpy
-	EXPORT_SYMBOL(strncpy)

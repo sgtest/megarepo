@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *	linux/arch/alpha/kernel/sys_sx164.c
  *
@@ -18,14 +17,15 @@
 #include <linux/bitops.h>
 
 #include <asm/ptrace.h>
+#include <asm/system.h>
 #include <asm/dma.h>
 #include <asm/irq.h>
 #include <asm/mmu_context.h>
 #include <asm/io.h>
+#include <asm/pgtable.h>
 #include <asm/core_cia.h>
 #include <asm/hwrpb.h>
 #include <asm/tlbflush.h>
-#include <asm/special_insns.h>
 
 #include "proto.h"
 #include "irq_impl.h"
@@ -53,8 +53,7 @@ sx164_init_irq(void)
 	else
 		init_pyxis_irqs(0xff00003f0000UL);
 
-	if (request_irq(16 + 6, no_action, 0, "timer-cascade", NULL))
-		pr_err("Failed to register timer-cascade interrupt\n");
+	setup_irq(16+6, &timer_cascade_irqaction);
 }
 
 /*
@@ -95,10 +94,10 @@ sx164_init_irq(void)
  *   9  32 bit PCI option slot 3
  */
 
-static int
-sx164_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
+static int __init
+sx164_map_irq(struct pci_dev *dev, u8 slot, u8 pin)
 {
-	static char irq_tab[5][5] = {
+	static char irq_tab[5][5] __initdata = {
 		/*INT    INTA   INTB   INTC   INTD */
 		{ 16+ 9, 16+ 9, 16+13, 16+17, 16+21}, /* IdSel 5 slot 2 J17 */
 		{ 16+11, 16+11, 16+15, 16+19, 16+23}, /* IdSel 6 slot 0 J19 */
@@ -133,7 +132,7 @@ sx164_init_arch(void)
 
 	if (amask(AMASK_MAX) != 0
 	    && alpha_using_srm
-	    && (cpu->pal_revision & 0xffff) <= 0x117) {
+	    && (cpu->pal_revision & 0xffff) == 0x117) {
 		__asm__ __volatile__(
 		"lda	$16,8($31)\n"
 		"call_pal 9\n"		/* Allow PALRES insns in kernel mode */

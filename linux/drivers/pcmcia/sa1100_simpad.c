@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * drivers/pcmcia/sa1100_simpad.c
  *
@@ -7,43 +6,57 @@
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/sched.h>
 #include <linux/device.h>
 #include <linux/init.h>
 
-#include <mach/hardware.h>
+#include <asm/hardware.h>
 #include <asm/mach-types.h>
-#include <mach/simpad.h>
+#include <asm/irq.h>
+#include <asm/arch/simpad.h>
 #include "sa1100_generic.h"
+ 
+extern long get_cs3_shadow(void);
+extern void set_cs3_bit(int value); 
+extern void clear_cs3_bit(int value);
+
+static struct pcmcia_irqs irqs[] = {
+	{ 1, IRQ_GPIO_CF_CD, "CF_CD" },
+};
 
 static int simpad_pcmcia_hw_init(struct soc_pcmcia_socket *skt)
 {
 
-	simpad_clear_cs3_bit(VCC_3V_EN|VCC_5V_EN|EN0|EN1);
+	clear_cs3_bit(VCC_3V_EN|VCC_5V_EN|EN0|EN1);
 
-	skt->stat[SOC_STAT_CD].name = "cf-detect";
-	skt->stat[SOC_STAT_RDY].name = "cf-ready";
+	skt->irq = IRQ_GPIO_CF_IRQ;
 
-	return soc_pcmcia_request_gpiods(skt);
+	return soc_pcmcia_request_irqs(skt, irqs, ARRAY_SIZE(irqs));
 }
 
 static void simpad_pcmcia_hw_shutdown(struct soc_pcmcia_socket *skt)
 {
+	soc_pcmcia_free_irqs(skt, irqs, ARRAY_SIZE(irqs));
+
 	/* Disable CF bus: */
-	/*simpad_set_cs3_bit(PCMCIA_BUFF_DIS);*/
-	simpad_clear_cs3_bit(PCMCIA_RESET);
+	//set_cs3_bit(PCMCIA_BUFF_DIS);
+	clear_cs3_bit(PCMCIA_RESET);       
 }
 
 static void
 simpad_pcmcia_socket_state(struct soc_pcmcia_socket *skt,
 			   struct pcmcia_state *state)
 {
-	long cs3reg = simpad_get_cs3_ro();
+	unsigned long levels = GPLR;
+	long cs3reg = get_cs3_shadow();
 
-	/* bvd1 might be cs3reg & PCMCIA_BVD1 */
-	/* bvd2 might be cs3reg & PCMCIA_BVD2 */
-
-	if ((cs3reg & (PCMCIA_VS1|PCMCIA_VS2)) ==
-			(PCMCIA_VS1|PCMCIA_VS2)) {
+	state->detect=((levels & GPIO_CF_CD)==0)?1:0;
+	state->ready=(levels & GPIO_CF_IRQ)?1:0;
+	state->bvd1=1; /* Not available on Simpad. */
+	state->bvd2=1; /* Not available on Simpad. */
+	state->wrprot=0; /* Not available on Simpad. */
+  
+	if((cs3reg & 0x0c) == 0x0c) {
 		state->vs_3v=0;
 		state->vs_Xv=0;
 	} else {
@@ -63,23 +76,23 @@ simpad_pcmcia_configure_socket(struct soc_pcmcia_socket *skt,
 	/* Murphy: see table of MIC2562a-1 */
 	switch (state->Vcc) {
 	case 0:
-		simpad_clear_cs3_bit(VCC_3V_EN|VCC_5V_EN|EN0|EN1);
+		clear_cs3_bit(VCC_3V_EN|VCC_5V_EN|EN0|EN1);
 		break;
 
-	case 33:
-		simpad_clear_cs3_bit(VCC_3V_EN|EN1);
-		simpad_set_cs3_bit(VCC_5V_EN|EN0);
+	case 33:  
+		clear_cs3_bit(VCC_3V_EN|EN1);
+		set_cs3_bit(VCC_5V_EN|EN0);
 		break;
 
 	case 50:
-		simpad_clear_cs3_bit(VCC_5V_EN|EN1);
-		simpad_set_cs3_bit(VCC_3V_EN|EN0);
+		clear_cs3_bit(VCC_5V_EN|EN1);
+		set_cs3_bit(VCC_3V_EN|EN0);
 		break;
 
 	default:
 		printk(KERN_ERR "%s(): unrecognized Vcc %u\n",
-			__func__, state->Vcc);
-		simpad_clear_cs3_bit(VCC_3V_EN|VCC_5V_EN|EN0|EN1);
+			__FUNCTION__, state->Vcc);
+		clear_cs3_bit(VCC_3V_EN|VCC_5V_EN|EN0|EN1);
 		local_irq_restore(flags);
 		return -1;
 	}
@@ -90,21 +103,28 @@ simpad_pcmcia_configure_socket(struct soc_pcmcia_socket *skt,
 	return 0;
 }
 
-static void simpad_pcmcia_socket_suspend(struct soc_pcmcia_socket *skt)
+static void simpad_pcmcia_socket_init(struct soc_pcmcia_socket *skt)
 {
-	simpad_set_cs3_bit(PCMCIA_RESET);
+	soc_pcmcia_enable_irqs(skt, irqs, ARRAY_SIZE(irqs));
 }
 
-static struct pcmcia_low_level simpad_pcmcia_ops = {
+static void simpad_pcmcia_socket_suspend(struct soc_pcmcia_socket *skt)
+{
+	soc_pcmcia_disable_irqs(skt, irqs, ARRAY_SIZE(irqs));
+	set_cs3_bit(PCMCIA_RESET);
+}
+
+static struct pcmcia_low_level simpad_pcmcia_ops = { 
 	.owner			= THIS_MODULE,
 	.hw_init		= simpad_pcmcia_hw_init,
 	.hw_shutdown		= simpad_pcmcia_hw_shutdown,
 	.socket_state		= simpad_pcmcia_socket_state,
 	.configure_socket	= simpad_pcmcia_configure_socket,
+	.socket_init		= simpad_pcmcia_socket_init,
 	.socket_suspend		= simpad_pcmcia_socket_suspend,
 };
 
-int pcmcia_simpad_init(struct device *dev)
+int __init pcmcia_simpad_init(struct device *dev)
 {
 	int ret = -ENODEV;
 

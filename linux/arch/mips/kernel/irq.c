@@ -8,25 +8,24 @@
  * Copyright (C) 1992 Linus Torvalds
  * Copyright (C) 1994 - 2000 Ralf Baechle
  */
+#include <linux/config.h>
 #include <linux/kernel.h>
 #include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/kernel_stat.h>
+#include <linux/module.h>
 #include <linux/proc_fs.h>
+#include <linux/slab.h>
 #include <linux/mm.h>
 #include <linux/random.h>
 #include <linux/sched.h>
 #include <linux/seq_file.h>
 #include <linux/kallsyms.h>
-#include <linux/kgdb.h>
-#include <linux/ftrace.h>
-#include <linux/irqdomain.h>
 
-#include <linux/atomic.h>
-#include <linux/uaccess.h>
-
-void *irq_stack[NR_CPUS];
+#include <asm/atomic.h>
+#include <asm/system.h>
+#include <asm/uaccess.h>
 
 /*
  * 'what should we do if we get a hw irq event on an illegal vector'.
@@ -39,81 +38,103 @@ void ack_bad_irq(unsigned int irq)
 
 atomic_t irq_err_count;
 
-int arch_show_interrupts(struct seq_file *p, int prec)
-{
-	seq_printf(p, "%*s: %10u\n", prec, "ERR", atomic_read(&irq_err_count));
-	return 0;
-}
-
-asmlinkage void spurious_interrupt(void)
-{
-	atomic_inc(&irq_err_count);
-}
-
-void __init init_IRQ(void)
-{
-	int i;
-	unsigned int order = get_order(IRQ_STACK_SIZE);
-
-	for (i = 0; i < NR_IRQS; i++)
-		irq_set_noprobe(i);
-
-	if (cpu_has_veic)
-		clear_c0_status(ST0_IM);
-
-	arch_init_irq();
-
-	for_each_possible_cpu(i) {
-		void *s = (void *)__get_free_pages(GFP_KERNEL, order);
-
-		irq_stack[i] = s;
-		pr_debug("CPU%d IRQ stack at 0x%p - 0x%p\n", i,
-			irq_stack[i], irq_stack[i] + IRQ_STACK_SIZE);
-	}
-}
-
-#ifdef CONFIG_DEBUG_STACKOVERFLOW
-static inline void check_stack_overflow(void)
-{
-	unsigned long sp;
-
-	__asm__ __volatile__("move %0, $sp" : "=r" (sp));
-	sp &= THREAD_MASK;
-
-	/*
-	 * Check for stack overflow: is there less than STACK_WARN free?
-	 * STACK_WARN is defined as 1/8 of THREAD_SIZE by default.
-	 */
-	if (unlikely(sp < (sizeof(struct thread_info) + STACK_WARN))) {
-		printk("do_IRQ: stack overflow: %ld\n",
-		       sp - sizeof(struct thread_info));
-		dump_stack();
-	}
-}
-#else
-static inline void check_stack_overflow(void) {}
-#endif
-
+#undef do_IRQ
 
 /*
  * do_IRQ handles all normal device IRQ's (the special
  * SMP cross-CPU interrupts have their own specific
  * handlers).
  */
-void __irq_entry do_IRQ(unsigned int irq)
+asmlinkage unsigned int do_IRQ(unsigned int irq, struct pt_regs *regs)
 {
 	irq_enter();
-	check_stack_overflow();
-	generic_handle_irq(irq);
+
+	__do_IRQ(irq, regs);
+
 	irq_exit();
+
+	return 1;
 }
 
-#ifdef CONFIG_IRQ_DOMAIN
-void __irq_entry do_domain_IRQ(struct irq_domain *domain, unsigned int hwirq)
+/*
+ * Generic, controller-independent functions:
+ */
+
+int show_interrupts(struct seq_file *p, void *v)
 {
-	irq_enter();
-	check_stack_overflow();
-	generic_handle_domain_irq(domain, hwirq);
-	irq_exit();
-}
+	int i = *(loff_t *) v, j;
+	struct irqaction * action;
+	unsigned long flags;
+
+	if (i == 0) {
+		seq_printf(p, "           ");
+		for (j=0; j<NR_CPUS; j++)
+			if (cpu_online(j))
+				seq_printf(p, "CPU%d       ",j);
+		seq_putc(p, '\n');
+	}
+
+	if (i < NR_IRQS) {
+		spin_lock_irqsave(&irq_desc[i].lock, flags);
+		action = irq_desc[i].action;
+		if (!action) 
+			goto skip;
+		seq_printf(p, "%3d: ",i);
+#ifndef CONFIG_SMP
+		seq_printf(p, "%10u ", kstat_irqs(i));
+#else
+		for (j = 0; j < NR_CPUS; j++)
+			if (cpu_online(j))
+				seq_printf(p, "%10u ", kstat_cpu(j).irqs[i]);
 #endif
+		seq_printf(p, " %14s", irq_desc[i].handler->typename);
+		seq_printf(p, "  %s", action->name);
+
+		for (action=action->next; action; action = action->next)
+			seq_printf(p, ", %s", action->name);
+
+		seq_putc(p, '\n');
+skip:
+		spin_unlock_irqrestore(&irq_desc[i].lock, flags);
+	} else if (i == NR_IRQS) {
+		seq_putc(p, '\n');
+		seq_printf(p, "ERR: %10u\n", atomic_read(&irq_err_count));
+	}
+	return 0;
+}
+
+#ifdef CONFIG_KGDB
+extern void breakpoint(void);
+extern void set_debug_traps(void);
+
+static int kgdb_flag = 1;
+static int __init nokgdb(char *str)
+{
+	kgdb_flag = 0;
+	return 1;
+}
+__setup("nokgdb", nokgdb);
+#endif
+
+void __init init_IRQ(void)
+{
+	int i;
+
+	for (i = 0; i < NR_IRQS; i++) {
+		irq_desc[i].status  = IRQ_DISABLED;
+		irq_desc[i].action  = NULL;
+		irq_desc[i].depth   = 1;
+		irq_desc[i].handler = &no_irq_type;
+		spin_lock_init(&irq_desc[i].lock);
+	}
+
+	arch_init_irq();
+
+#ifdef CONFIG_KGDB
+	if (kgdb_flag) {
+		printk("Wait for gdb client connection ...\n");
+		set_debug_traps();
+		breakpoint();
+	}
+#endif
+}

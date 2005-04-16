@@ -1,181 +1,166 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /* ld script to make ARM Linux kernel
  * taken from the i386 version by Russell King
  * Written by Martin Mares <mj@atrey.karlin.mff.cuni.cz>
  */
 
-#ifdef CONFIG_XIP_KERNEL
-#include "vmlinux-xip.lds.S"
-#else
-
-#include <linux/pgtable.h>
-#include <asm/vmlinux.lds.h>
-#include <asm/cache.h>
-#include <asm/thread_info.h>
-#include <asm/memory.h>
-#include <asm/mpu.h>
-#include <asm/page.h>
-
+#include <asm-generic/vmlinux.lds.h>
+#include <linux/config.h>
+	
 OUTPUT_ARCH(arm)
 ENTRY(stext)
-
 #ifndef __ARMEB__
 jiffies = jiffies_64;
 #else
 jiffies = jiffies_64 + 4;
 #endif
-
 SECTIONS
 {
-	/*
-	 * XXX: The linker does not define how output sections are
-	 * assigned to input sections when there are multiple statements
-	 * matching the same input section name.  There is no documented
-	 * order of matching.
-	 *
-	 * unwind exit sections must be discarded before the rest of the
-	 * unwind sections get included.
-	 */
-	/DISCARD/ : {
-		ARM_DISCARD
-#ifndef CONFIG_SMP_ON_UP
-		*(.alt.smp.init)
-#endif
-#ifndef CONFIG_ARM_UNWIND
-		*(.ARM.exidx) *(.ARM.exidx.*)
-		*(.ARM.extab) *(.ARM.extab.*)
+	. = TEXTADDR;
+	.init : {			/* Init code and data		*/
+		_stext = .;
+			_sinittext = .;
+			*(.init.text)
+			_einittext = .;
+		__proc_info_begin = .;
+			*(.proc.info)
+		__proc_info_end = .;
+		__arch_info_begin = .;
+			*(.arch.info)
+		__arch_info_end = .;
+		__tagtable_begin = .;
+			*(.taglist)
+		__tagtable_end = .;
+		. = ALIGN(16);
+		__setup_start = .;
+			*(.init.setup)
+		__setup_end = .;
+		__early_begin = .;
+			*(__early_param)
+		__early_end = .;
+		__initcall_start = .;
+			*(.initcall1.init)
+			*(.initcall2.init)
+			*(.initcall3.init)
+			*(.initcall4.init)
+			*(.initcall5.init)
+			*(.initcall6.init)
+			*(.initcall7.init)
+		__initcall_end = .;
+		__con_initcall_start = .;
+			*(.con_initcall.init)
+		__con_initcall_end = .;
+		__security_initcall_start = .;
+			*(.security_initcall.init)
+		__security_initcall_end = .;
+		. = ALIGN(32);
+		__initramfs_start = .;
+			usr/built-in.o(.init.ramfs)
+		__initramfs_end = .;
+		. = ALIGN(64);
+		__per_cpu_start = .;
+			*(.data.percpu)
+		__per_cpu_end = .;
+#ifndef CONFIG_XIP_KERNEL
+		__init_begin = _stext;
+		*(.init.data)
+		. = ALIGN(4096);
+		__init_end = .;
 #endif
 	}
 
-	. = KERNEL_OFFSET + TEXT_OFFSET;
-	.head.text : {
-		_text = .;
-		HEAD_TEXT
+	/DISCARD/ : {			/* Exit code and data		*/
+		*(.exit.text)
+		*(.exit.data)
+		*(.exitcall.exit)
 	}
 
-#ifdef CONFIG_STRICT_KERNEL_RWX
-	. = ALIGN(1<<SECTION_SHIFT);
-#endif
-
-#ifdef CONFIG_ARM_MPU
-	. = ALIGN(PMSAv8_MINALIGN);
-#endif
 	.text : {			/* Real text segment		*/
-		_stext = .;		/* Text and read-only data	*/
-		ARM_TEXT
+		_text = .;		/* Text and read-only data	*/
+			*(.text)
+			SCHED_TEXT
+			LOCK_TEXT
+			*(.fixup)
+			*(.gnu.warning)
+			*(.rodata)
+			*(.rodata.*)
+			*(.glue_7)
+			*(.glue_7t)
+		*(.got)			/* Global offset table		*/
 	}
 
-#ifdef CONFIG_DEBUG_ALIGN_RODATA
-	. = ALIGN(1<<SECTION_SHIFT);
-#endif
-	_etext = .;			/* End of text section */
-
-	RO_DATA(PAGE_SIZE)
-
-	. = ALIGN(4);
-	__ex_table : AT(ADDR(__ex_table) - LOAD_OFFSET) {
+	. = ALIGN(16);
+	__ex_table : {			/* Exception table		*/
 		__start___ex_table = .;
-		ARM_MMU_KEEP(*(__ex_table))
+			*(__ex_table)
 		__stop___ex_table = .;
 	}
 
-#ifdef CONFIG_ARM_UNWIND
-	ARM_UNWIND_SECTIONS
-#endif
+	RODATA
 
-#ifdef CONFIG_STRICT_KERNEL_RWX
-	. = ALIGN(1<<SECTION_SHIFT);
+	_etext = .;			/* End of text and rodata section */
+
+#ifdef CONFIG_XIP_KERNEL
+	__data_loc = ALIGN(4);		/* location in binary */
+	. = DATAADDR;
 #else
-	. = ALIGN(PAGE_SIZE);
-#endif
-	__init_begin = .;
-
-	ARM_VECTORS
-	INIT_TEXT_SECTION(8)
-	.exit.text : {
-		ARM_EXIT_KEEP(EXIT_TEXT)
-	}
-	.init.proc.info : {
-		ARM_CPU_DISCARD(PROC_INFO)
-	}
-	.init.arch.info : {
-		__arch_info_begin = .;
-		*(.arch.info.init)
-		__arch_info_end = .;
-	}
-	.init.tagtable : {
-		__tagtable_begin = .;
-		*(.taglist.init)
-		__tagtable_end = .;
-	}
-#ifdef CONFIG_SMP_ON_UP
-	.init.smpalt : {
-		__smpalt_begin = .;
-		*(.alt.smp.init)
-		__smpalt_end = .;
-	}
-#endif
-	.init.pv_table : {
-		__pv_table_begin = .;
-		*(.pv_table)
-		__pv_table_end = .;
-	}
-
-	INIT_DATA_SECTION(16)
-
-	.exit.data : {
-		ARM_EXIT_KEEP(EXIT_DATA)
-	}
-
-#ifdef CONFIG_SMP
-	PERCPU_SECTION(L1_CACHE_BYTES)
+	. = ALIGN(8192);
+	__data_loc = .;
 #endif
 
-#ifdef CONFIG_HAVE_TCM
-	ARM_TCM
+	.data : AT(__data_loc) {
+		__data_start = .;	/* address in memory */
+
+		/*
+		 * first, the init task union, aligned
+		 * to an 8192 byte boundary.
+		 */
+		*(.init.task)
+
+#ifdef CONFIG_XIP_KERNEL
+		. = ALIGN(4096);
+		__init_begin = .;
+		*(.init.data)
+		. = ALIGN(4096);
+		__init_end = .;
 #endif
 
-#ifdef CONFIG_STRICT_KERNEL_RWX
-	. = ALIGN(1<<SECTION_SHIFT);
-#else
-	. = ALIGN(THREAD_ALIGN);
-#endif
-	__init_end = .;
+		. = ALIGN(4096);
+		__nosave_begin = .;
+		*(.data.nosave)
+		. = ALIGN(4096);
+		__nosave_end = .;
 
-	_sdata = .;
-	RW_DATA(L1_CACHE_BYTES, PAGE_SIZE, THREAD_ALIGN)
-	_edata = .;
+		/*
+		 * then the cacheline aligned data
+		 */
+		. = ALIGN(32);
+		*(.data.cacheline_aligned)
 
-	BSS_SECTION(0, 0, 0)
-#ifdef CONFIG_ARM_MPU
-	. = ALIGN(PMSAv8_MINALIGN);
-#endif
-	_end = .;
+		/*
+		 * and the usual data section
+		 */
+		*(.data)
+		CONSTRUCTORS
 
-	STABS_DEBUG
-	DWARF_DEBUG
-	ARM_DETAILS
+		_edata = .;
+	}
 
-	ARM_ASSERTS
+	.bss : {
+		__bss_start = .;	/* BSS				*/
+		*(.bss)
+		*(COMMON)
+		_end = .;
+	}
+					/* Stabs debugging sections.	*/
+	.stab 0 : { *(.stab) }
+	.stabstr 0 : { *(.stabstr) }
+	.stab.excl 0 : { *(.stab.excl) }
+	.stab.exclstr 0 : { *(.stab.exclstr) }
+	.stab.index 0 : { *(.stab.index) }
+	.stab.indexstr 0 : { *(.stab.indexstr) }
+	.comment 0 : { *(.comment) }
 }
 
-#ifdef CONFIG_STRICT_KERNEL_RWX
-/*
- * Without CONFIG_DEBUG_ALIGN_RODATA, __start_rodata_section_aligned will
- * be the first section-aligned location after __start_rodata. Otherwise,
- * it will be equal to __start_rodata.
- */
-__start_rodata_section_aligned = ALIGN(__start_rodata, 1 << SECTION_SHIFT);
-#endif
-
-/*
- * These must never be empty
- * If you have to comment these two assert statements out, your
- * binutils is too old (for other reasons as well)
- */
+/* those must never be empty */
 ASSERT((__proc_info_end - __proc_info_begin), "missing CPU support")
-#ifndef CONFIG_COMPILE_TEST
 ASSERT((__arch_info_end - __arch_info_begin), "no machine record defined")
-#endif
-
-#endif /* CONFIG_XIP_KERNEL */

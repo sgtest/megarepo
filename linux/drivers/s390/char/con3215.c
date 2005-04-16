@@ -1,33 +1,34 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
- * 3215 line mode terminal driver.
+ *  drivers/s390/char/con3215.c
+ *    3215 line mode terminal driver.
  *
- * Copyright IBM Corp. 1999, 2009
- * Author(s): Martin Schwidefsky <schwidefsky@de.ibm.com>
+ *  S390 version
+ *    Copyright (C) 1999,2000 IBM Deutschland Entwicklung GmbH, IBM Corporation
+ *    Author(s): Martin Schwidefsky (schwidefsky@de.ibm.com),
  *
- * Updated:
- *  Aug-2000: Added tab support
- *	      Dan Morrison, IBM Corporation <dmorriso@cse.buffalo.edu>
+ *  Updated:
+ *   Aug-2000: Added tab support
+ *	       Dan Morrison, IBM Corporation (dmorriso@cse.buffalo.edu)
  */
 
+#include <linux/config.h>
+#include <linux/module.h>
 #include <linux/types.h>
 #include <linux/kdev_t.h>
 #include <linux/tty.h>
-#include <linux/tty_flip.h>
 #include <linux/vt_kern.h>
 #include <linux/init.h>
 #include <linux/console.h>
 #include <linux/interrupt.h>
-#include <linux/err.h>
-#include <linux/panic_notifier.h>
-#include <linux/reboot.h>
-#include <linux/serial.h> /* ASYNC_* flags */
+
 #include <linux/slab.h>
+#include <linux/bootmem.h>
+
 #include <asm/ccwdev.h>
 #include <asm/cio.h>
 #include <asm/io.h>
 #include <asm/ebcdic.h>
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
 #include <asm/delay.h>
 #include <asm/cpcmd.h>
 #include <asm/setup.h>
@@ -46,9 +47,11 @@
 #define RAW3215_TIMEOUT	    HZ/10     /* time for delayed output */
 
 #define RAW3215_FIXED	    1	      /* 3215 console device is not be freed */
+#define RAW3215_ACTIVE	    2	      /* set if the device is in use */
 #define RAW3215_WORKING	    4	      /* set if a request is being worked on */
 #define RAW3215_THROTTLED   8	      /* set if reading is disabled */
 #define RAW3215_STOPPED	    16	      /* set if writing is disabled */
+#define RAW3215_CLOSING	    32	      /* set while in close process */
 #define RAW3215_TIMER_RUNS  64	      /* set if the output delay timer is on */
 #define RAW3215_FLUSHING    128	      /* set to flush buffer (no delay) */
 
@@ -75,7 +78,6 @@ struct raw3215_req {
 } __attribute__ ((aligned(8)));
 
 struct raw3215_info {
-	struct tty_port port;
 	struct ccw_device *cdev;      /* device for tty driver */
 	spinlock_t *lock;	      /* pointer to irq lock */
 	int flags;		      /* state flags */
@@ -84,10 +86,15 @@ struct raw3215_info {
 	int head;		      /* first free byte in output buffer */
 	int count;		      /* number of bytes in output buffer */
 	int written;		      /* number of bytes in write requests */
+	struct tty_struct *tty;	      /* pointer to tty structure if present */
+	struct tasklet_struct tasklet;
 	struct raw3215_req *queued_read; /* pointer to queued read requests */
 	struct raw3215_req *queued_write;/* pointer to queued write requests */
 	wait_queue_head_t empty_wait; /* wait queue for flushing */
 	struct timer_list timer;      /* timer for delayed output */
+	char *message;		      /* pending message from raw3215_irq */
+	int msg_dstat;		      /* dstat for pending message */
+	int msg_cstat;		      /* cstat for pending message */
 	int line_pos;		      /* position on the line (for tabs) */
 	char ubuffer[80];	      /* copy_from_user buffer */
 };
@@ -99,15 +106,15 @@ static DEFINE_SPINLOCK(raw3215_device_lock);
 /* list of free request structures */
 static struct raw3215_req *raw3215_freelist;
 /* spinlock to protect free list */
-static DEFINE_SPINLOCK(raw3215_freelist_lock);
+static spinlock_t raw3215_freelist_lock;
 
 static struct tty_driver *tty3215_driver;
 
 /*
  * Get a request structure from the free list
  */
-static inline struct raw3215_req *raw3215_alloc_req(void)
-{
+static inline struct raw3215_req *
+raw3215_alloc_req(void) {
 	struct raw3215_req *req;
 	unsigned long flags;
 
@@ -121,8 +128,8 @@ static inline struct raw3215_req *raw3215_alloc_req(void)
 /*
  * Put a request structure back to the free list
  */
-static inline void raw3215_free_req(struct raw3215_req *req)
-{
+static inline void
+raw3215_free_req(struct raw3215_req *req) {
 	unsigned long flags;
 
 	if (req->type == RAW3215_FREE)
@@ -140,7 +147,8 @@ static inline void raw3215_free_req(struct raw3215_req *req)
  * because a 3215 terminal won't accept a new read before the old one is
  * completed.
  */
-static void raw3215_mk_read_req(struct raw3215_info *raw)
+static void
+raw3215_mk_read_req(struct raw3215_info *raw)
 {
 	struct raw3215_req *req;
 	struct ccw1 *ccw;
@@ -168,7 +176,8 @@ static void raw3215_mk_read_req(struct raw3215_info *raw)
  * buffer to the 3215 device. If a queued write exists it is replaced by
  * the new, probably lengthened request.
  */
-static void raw3215_mk_write_req(struct raw3215_info *raw)
+static void
+raw3215_mk_write_req(struct raw3215_info *raw)
 {
 	struct raw3215_req *req;
 	struct ccw1 *ccw;
@@ -244,7 +253,8 @@ static void raw3215_mk_write_req(struct raw3215_info *raw)
 /*
  * Start a read or a write request
  */
-static void raw3215_start_io(struct raw3215_info *raw)
+static void
+raw3215_start_io(struct raw3215_info *raw)
 {
 	struct raw3215_req *req;
 	int res;
@@ -282,23 +292,20 @@ static void raw3215_start_io(struct raw3215_info *raw)
 /*
  * Function to start a delayed output after RAW3215_TIMEOUT seconds
  */
-static void raw3215_timeout(struct timer_list *t)
+static void
+raw3215_timeout(unsigned long __data)
 {
-	struct raw3215_info *raw = from_timer(raw, t, timer);
+	struct raw3215_info *raw = (struct raw3215_info *) __data;
 	unsigned long flags;
 
-	spin_lock_irqsave(get_ccwdev_lock(raw->cdev), flags);
-	raw->flags &= ~RAW3215_TIMER_RUNS;
-	raw3215_mk_write_req(raw);
-	raw3215_start_io(raw);
-	if ((raw->queued_read || raw->queued_write) &&
-	    !(raw->flags & RAW3215_WORKING) &&
-	    !(raw->flags & RAW3215_TIMER_RUNS)) {
-		raw->timer.expires = RAW3215_TIMEOUT + jiffies;
-		add_timer(&raw->timer);
-		raw->flags |= RAW3215_TIMER_RUNS;
+	spin_lock_irqsave(raw->lock, flags);
+	if (raw->flags & RAW3215_TIMER_RUNS) {
+		del_timer(&raw->timer);
+		raw->flags &= ~RAW3215_TIMER_RUNS;
+		raw3215_mk_write_req(raw);
+		raw3215_start_io(raw);
 	}
-	spin_unlock_irqrestore(get_ccwdev_lock(raw->cdev), flags);
+	spin_unlock_irqrestore(raw->lock, flags);
 }
 
 /*
@@ -307,9 +314,10 @@ static void raw3215_timeout(struct timer_list *t)
  * amount of data is bigger than RAW3215_MIN_WRITE. If a write is not
  * done immediately a timer is started with a delay of RAW3215_TIMEOUT.
  */
-static inline void raw3215_try_io(struct raw3215_info *raw)
+static inline void
+raw3215_try_io(struct raw3215_info *raw)
 {
-	if (!tty_port_initialized(&raw->port))
+	if (!(raw->flags & RAW3215_ACTIVE))
 		return;
 	if (raw->queued_read != NULL)
 		raw3215_start_io(raw);
@@ -318,47 +326,74 @@ static inline void raw3215_try_io(struct raw3215_info *raw)
 		    (raw->flags & RAW3215_FLUSHING)) {
 			/* execute write requests bigger than minimum size */
 			raw3215_start_io(raw);
+			if (raw->flags & RAW3215_TIMER_RUNS) {
+				del_timer(&raw->timer);
+				raw->flags &= ~RAW3215_TIMER_RUNS;
+			}
+		} else if (!(raw->flags & RAW3215_TIMER_RUNS)) {
+			/* delay small writes */
+			init_timer(&raw->timer);
+			raw->timer.expires = RAW3215_TIMEOUT + jiffies;
+			raw->timer.data = (unsigned long) raw;
+			raw->timer.function = raw3215_timeout;
+			add_timer(&raw->timer);
+			raw->flags |= RAW3215_TIMER_RUNS;
 		}
-	}
-	if ((raw->queued_read || raw->queued_write) &&
-	    !(raw->flags & RAW3215_WORKING) &&
-	    !(raw->flags & RAW3215_TIMER_RUNS)) {
-		raw->timer.expires = RAW3215_TIMEOUT + jiffies;
-		add_timer(&raw->timer);
-		raw->flags |= RAW3215_TIMER_RUNS;
 	}
 }
 
 /*
- * Try to start the next IO and wake up processes waiting on the tty.
+ * The bottom half handler routine for 3215 devices. It tries to start
+ * the next IO and wakes up processes waiting on the tty.
  */
-static void raw3215_next_io(struct raw3215_info *raw, struct tty_struct *tty)
+static void
+raw3215_tasklet(void *data)
 {
+	struct raw3215_info *raw;
+	struct tty_struct *tty;
+	unsigned long flags;
+
+	raw = (struct raw3215_info *) data;
+	spin_lock_irqsave(raw->lock, flags);
 	raw3215_mk_write_req(raw);
 	raw3215_try_io(raw);
-	if (tty && RAW3215_BUFFER_SIZE - raw->count >= RAW3215_MIN_SPACE)
-		tty_wakeup(tty);
+	spin_unlock_irqrestore(raw->lock, flags);
+	/* Check for pending message from raw3215_irq */
+	if (raw->message != NULL) {
+		printk(raw->message, raw->msg_dstat, raw->msg_cstat);
+		raw->message = NULL;
+	}
+	tty = raw->tty;
+	if (tty != NULL &&
+	    RAW3215_BUFFER_SIZE - raw->count >= RAW3215_MIN_SPACE) {
+	    	tty_wakeup(tty);
+	}
 }
 
 /*
  * Interrupt routine, called from common io layer
  */
-static void raw3215_irq(struct ccw_device *cdev, unsigned long intparm,
-			struct irb *irb)
+static void
+raw3215_irq(struct ccw_device *cdev, unsigned long intparm, struct irb *irb)
 {
 	struct raw3215_info *raw;
 	struct raw3215_req *req;
 	struct tty_struct *tty;
 	int cstat, dstat;
-	int count;
+	int count, slen;
 
-	raw = dev_get_drvdata(&cdev->dev);
+	raw = cdev->dev.driver_data;
 	req = (struct raw3215_req *) intparm;
-	tty = tty_port_tty_get(&raw->port);
-	cstat = irb->scsw.cmd.cstat;
-	dstat = irb->scsw.cmd.dstat;
-	if (cstat != 0)
-		raw3215_next_io(raw, tty);
+	cstat = irb->scsw.cstat;
+	dstat = irb->scsw.dstat;
+	if (cstat != 0) {
+		raw->message = KERN_WARNING
+			"Got nonzero channel status in raw3215_irq "
+			"(dev sts 0x%2x, sch sts 0x%2x)";
+		raw->msg_dstat = dstat;
+		raw->msg_cstat = cstat;
+		tasklet_schedule(&raw->tasklet);
+	}
 	if (dstat & 0x01) { /* we got a unit exception */
 		dstat &= ~0x01;	 /* we can ignore it */
 	}
@@ -368,28 +403,37 @@ static void raw3215_irq(struct ccw_device *cdev, unsigned long intparm,
 			break;
 		/* Attention interrupt, someone hit the enter key */
 		raw3215_mk_read_req(raw);
-		raw3215_next_io(raw, tty);
+		if (MACHINE_IS_P390)
+			memset(raw->inbuf, 0, RAW3215_INBUF_SIZE);
+		tasklet_schedule(&raw->tasklet);
 		break;
 	case 0x08:
 	case 0x0C:
 		/* Channel end interrupt. */
 		if ((raw = req->info) == NULL)
-			goto put_tty;	     /* That shouldn't happen ... */
+			return;		     /* That shouldn't happen ... */
 		if (req->type == RAW3215_READ) {
 			/* store residual count, then wait for device end */
-			req->residual = irb->scsw.cmd.count;
+			req->residual = irb->scsw.count;
 		}
 		if (dstat == 0x08)
 			break;
-		fallthrough;
 	case 0x04:
 		/* Device end interrupt. */
 		if ((raw = req->info) == NULL)
-			goto put_tty;	     /* That shouldn't happen ... */
-		if (req->type == RAW3215_READ && tty != NULL) {
+			return;		     /* That shouldn't happen ... */
+		if (req->type == RAW3215_READ && raw->tty != NULL) {
 			unsigned int cchar;
 
+			tty = raw->tty;
 			count = 160 - req->residual;
+			if (MACHINE_IS_P390) {
+				slen = strnlen(raw->inbuf, RAW3215_INBUF_SIZE);
+				if (count > slen)
+					count = slen;
+			} else
+			if (count >= TTY_FLIPBUF_SIZE - tty->flip.count)
+				count = TTY_FLIPBUF_SIZE - tty->flip.count - 1;
 			EBCASC(raw->inbuf, count);
 			cchar = ctrlchar_handle(raw->inbuf, count, tty);
 			switch (cchar & CTRLCHAR_MASK) {
@@ -397,23 +441,29 @@ static void raw3215_irq(struct ccw_device *cdev, unsigned long intparm,
 				break;
 
 			case CTRLCHAR_CTRL:
-				tty_insert_flip_char(&raw->port, cchar,
-						TTY_NORMAL);
-				tty_flip_buffer_push(&raw->port);
+				tty->flip.count++;
+				*tty->flip.flag_buf_ptr++ = TTY_NORMAL;
+				*tty->flip.char_buf_ptr++ = cchar;
+				tty_flip_buffer_push(raw->tty);
 				break;
 
 			case CTRLCHAR_NONE:
+				memcpy(tty->flip.char_buf_ptr,
+				       raw->inbuf, count);
 				if (count < 2 ||
-				    (strncmp(raw->inbuf+count-2, "\252n", 2) &&
-				     strncmp(raw->inbuf+count-2, "^n", 2)) ) {
-					/* add the auto \n */
-					raw->inbuf[count] = '\n';
+				    (strncmp(raw->inbuf+count-2, "^n", 2) &&
+				    strncmp(raw->inbuf+count-2, "\252n", 2)) ) {
+					/* don't add the auto \n */
+					tty->flip.char_buf_ptr[count] = '\n';
+					memset(tty->flip.flag_buf_ptr,
+					       TTY_NORMAL, count + 1);
 					count++;
 				} else
-					count -= 2;
-				tty_insert_flip_string(&raw->port, raw->inbuf,
-						count);
-				tty_flip_buffer_push(&raw->port);
+					count-=2;
+				tty->flip.char_buf_ptr += count;
+				tty->flip.flag_buf_ptr += count;
+				tty->flip.count += count;
+				tty_flip_buffer_push(raw->tty);
 				break;
 			}
 		} else if (req->type == RAW3215_WRITE) {
@@ -428,7 +478,7 @@ static void raw3215_irq(struct ccw_device *cdev, unsigned long intparm,
 		    raw->queued_read == NULL) {
 			wake_up_interruptible(&raw->empty_wait);
 		}
-		raw3215_next_io(raw, tty);
+		tasklet_schedule(&raw->tasklet);
 		break;
 	default:
 		/* Strange interrupt, I'll do my best to clean up */
@@ -440,10 +490,14 @@ static void raw3215_irq(struct ccw_device *cdev, unsigned long intparm,
 			raw->flags &= ~RAW3215_WORKING;
 			raw3215_free_req(req);
 		}
-		raw3215_next_io(raw, tty);
+		raw->message = KERN_WARNING
+			"Spurious interrupt in in raw3215_irq "
+			"(dev sts 0x%2x, sch sts 0x%2x)";
+		raw->msg_dstat = dstat;
+		raw->msg_cstat = cstat;
+		tasklet_schedule(&raw->tasklet);
 	}
-put_tty:
-	tty_kref_put(tty);
+	return;
 }
 
 /*
@@ -451,7 +505,8 @@ put_tty:
  * Has to be called with the s390irq lock held. Can be called
  * disabled.
  */
-static void raw3215_make_room(struct raw3215_info *raw, unsigned int length)
+static void
+raw3215_make_room(struct raw3215_info *raw, unsigned int length)
 {
 	while (RAW3215_BUFFER_SIZE - raw->count < length) {
 		/* there might be a request pending */
@@ -460,29 +515,29 @@ static void raw3215_make_room(struct raw3215_info *raw, unsigned int length)
 		raw3215_try_io(raw);
 		raw->flags &= ~RAW3215_FLUSHING;
 #ifdef CONFIG_TN3215_CONSOLE
-		ccw_device_wait_idle(raw->cdev);
+		wait_cons_dev();
 #endif
 		/* Enough room freed up ? */
 		if (RAW3215_BUFFER_SIZE - raw->count >= length)
 			break;
 		/* there might be another cpu waiting for the lock */
-		spin_unlock(get_ccwdev_lock(raw->cdev));
+		spin_unlock(raw->lock);
 		udelay(100);
-		spin_lock(get_ccwdev_lock(raw->cdev));
+		spin_lock(raw->lock);
 	}
 }
 
 /*
  * String write routine for 3215 devices
  */
-static void raw3215_write(struct raw3215_info *raw, const char *str,
-			  unsigned int length)
+static void
+raw3215_write(struct raw3215_info *raw, const char *str, unsigned int length)
 {
 	unsigned long flags;
 	int c, count;
 
 	while (length > 0) {
-		spin_lock_irqsave(get_ccwdev_lock(raw->cdev), flags);
+		spin_lock_irqsave(raw->lock, flags);
 		count = (length > RAW3215_BUFFER_SIZE) ?
 					     RAW3215_BUFFER_SIZE : length;
 		length -= count;
@@ -509,19 +564,20 @@ static void raw3215_write(struct raw3215_info *raw, const char *str,
 			/* start or queue request */
 			raw3215_try_io(raw);
 		}
-		spin_unlock_irqrestore(get_ccwdev_lock(raw->cdev), flags);
+		spin_unlock_irqrestore(raw->lock, flags);
 	}
 }
 
 /*
  * Put character routine for 3215 devices
  */
-static void raw3215_putchar(struct raw3215_info *raw, unsigned char ch)
+static void
+raw3215_putchar(struct raw3215_info *raw, unsigned char ch)
 {
 	unsigned long flags;
 	unsigned int length, i;
 
-	spin_lock_irqsave(get_ccwdev_lock(raw->cdev), flags);
+	spin_lock_irqsave(raw->lock, flags);
 	if (ch == '\t') {
 		length = TAB_STOP_SIZE - (raw->line_pos%TAB_STOP_SIZE);
 		raw->line_pos += length;
@@ -545,40 +601,42 @@ static void raw3215_putchar(struct raw3215_info *raw, unsigned char ch)
 		/* start or queue request */
 		raw3215_try_io(raw);
 	}
-	spin_unlock_irqrestore(get_ccwdev_lock(raw->cdev), flags);
+	spin_unlock_irqrestore(raw->lock, flags);
 }
 
 /*
  * Flush routine, it simply sets the flush flag and tries to start
  * pending IO.
  */
-static void raw3215_flush_buffer(struct raw3215_info *raw)
+static void
+raw3215_flush_buffer(struct raw3215_info *raw)
 {
 	unsigned long flags;
 
-	spin_lock_irqsave(get_ccwdev_lock(raw->cdev), flags);
+	spin_lock_irqsave(raw->lock, flags);
 	if (raw->count > 0) {
 		raw->flags |= RAW3215_FLUSHING;
 		raw3215_try_io(raw);
 		raw->flags &= ~RAW3215_FLUSHING;
 	}
-	spin_unlock_irqrestore(get_ccwdev_lock(raw->cdev), flags);
+	spin_unlock_irqrestore(raw->lock, flags);
 }
 
 /*
  * Fire up a 3215 device.
  */
-static int raw3215_startup(struct raw3215_info *raw)
+static int
+raw3215_startup(struct raw3215_info *raw)
 {
 	unsigned long flags;
 
-	if (tty_port_initialized(&raw->port))
+	if (raw->flags & RAW3215_ACTIVE)
 		return 0;
 	raw->line_pos = 0;
-	tty_port_set_initialized(&raw->port, 1);
-	spin_lock_irqsave(get_ccwdev_lock(raw->cdev), flags);
+	raw->flags |= RAW3215_ACTIVE;
+	spin_lock_irqsave(raw->lock, flags);
 	raw3215_try_io(raw);
-	spin_unlock_irqrestore(get_ccwdev_lock(raw->cdev), flags);
+	spin_unlock_irqrestore(raw->lock, flags);
 
 	return 0;
 }
@@ -586,78 +644,42 @@ static int raw3215_startup(struct raw3215_info *raw)
 /*
  * Shutdown a 3215 device.
  */
-static void raw3215_shutdown(struct raw3215_info *raw)
+static void
+raw3215_shutdown(struct raw3215_info *raw)
 {
 	DECLARE_WAITQUEUE(wait, current);
 	unsigned long flags;
 
-	if (!tty_port_initialized(&raw->port) || (raw->flags & RAW3215_FIXED))
+	if (!(raw->flags & RAW3215_ACTIVE) || (raw->flags & RAW3215_FIXED))
 		return;
 	/* Wait for outstanding requests, then free irq */
-	spin_lock_irqsave(get_ccwdev_lock(raw->cdev), flags);
+	spin_lock_irqsave(raw->lock, flags);
 	if ((raw->flags & RAW3215_WORKING) ||
 	    raw->queued_write != NULL ||
 	    raw->queued_read != NULL) {
+		raw->flags |= RAW3215_CLOSING;
 		add_wait_queue(&raw->empty_wait, &wait);
 		set_current_state(TASK_INTERRUPTIBLE);
-		spin_unlock_irqrestore(get_ccwdev_lock(raw->cdev), flags);
+		spin_unlock_irqrestore(raw->lock, flags);
 		schedule();
-		spin_lock_irqsave(get_ccwdev_lock(raw->cdev), flags);
+		spin_lock_irqsave(raw->lock, flags);
 		remove_wait_queue(&raw->empty_wait, &wait);
 		set_current_state(TASK_RUNNING);
-		tty_port_set_initialized(&raw->port, 1);
+		raw->flags &= ~(RAW3215_ACTIVE | RAW3215_CLOSING);
 	}
-	spin_unlock_irqrestore(get_ccwdev_lock(raw->cdev), flags);
+	spin_unlock_irqrestore(raw->lock, flags);
 }
 
-static struct raw3215_info *raw3215_alloc_info(void)
-{
-	struct raw3215_info *info;
-
-	info = kzalloc(sizeof(struct raw3215_info), GFP_KERNEL | GFP_DMA);
-	if (!info)
-		return NULL;
-
-	info->buffer = kzalloc(RAW3215_BUFFER_SIZE, GFP_KERNEL | GFP_DMA);
-	info->inbuf = kzalloc(RAW3215_INBUF_SIZE, GFP_KERNEL | GFP_DMA);
-	if (!info->buffer || !info->inbuf) {
-		kfree(info->inbuf);
-		kfree(info->buffer);
-		kfree(info);
-		return NULL;
-	}
-
-	timer_setup(&info->timer, raw3215_timeout, 0);
-	init_waitqueue_head(&info->empty_wait);
-	tty_port_init(&info->port);
-
-	return info;
-}
-
-static void raw3215_free_info(struct raw3215_info *raw)
-{
-	kfree(raw->inbuf);
-	kfree(raw->buffer);
-	tty_port_destroy(&raw->port);
-	kfree(raw);
-}
-
-static int raw3215_probe (struct ccw_device *cdev)
+static int
+raw3215_probe (struct ccw_device *cdev)
 {
 	struct raw3215_info *raw;
 	int line;
 
-	/* Console is special. */
-	if (raw3215[0] && (raw3215[0] == dev_get_drvdata(&cdev->dev)))
-		return 0;
-
-	raw = raw3215_alloc_info();
+	raw = kmalloc(sizeof(struct raw3215_info) +
+		      RAW3215_INBUF_SIZE, GFP_KERNEL|GFP_DMA);
 	if (raw == NULL)
 		return -ENOMEM;
-
-	raw->cdev = cdev;
-	dev_set_drvdata(&cdev->dev, raw);
-	cdev->handler = raw3215_irq;
 
 	spin_lock(&raw3215_device_lock);
 	for (line = 0; line < NR_3215; line++) {
@@ -668,48 +690,67 @@ static int raw3215_probe (struct ccw_device *cdev)
 	}
 	spin_unlock(&raw3215_device_lock);
 	if (line == NR_3215) {
-		raw3215_free_info(raw);
+		kfree(raw);
 		return -ENODEV;
 	}
+
+	raw->cdev = cdev;
+	raw->lock = get_ccwdev_lock(cdev);
+	raw->inbuf = (char *) raw + sizeof(struct raw3215_info);
+	memset(raw, 0, sizeof(struct raw3215_info));
+	raw->buffer = (char *) kmalloc(RAW3215_BUFFER_SIZE,
+				       GFP_KERNEL|GFP_DMA);
+	if (raw->buffer == NULL) {
+		spin_lock(&raw3215_device_lock);
+		raw3215[line] = 0;
+		spin_unlock(&raw3215_device_lock);
+		kfree(raw);
+		return -ENOMEM;
+	}
+	tasklet_init(&raw->tasklet,
+		     (void (*)(unsigned long)) raw3215_tasklet,
+		     (unsigned long) raw);
+	init_waitqueue_head(&raw->empty_wait);
+
+	cdev->dev.driver_data = raw;
+	cdev->handler = raw3215_irq;
 
 	return 0;
 }
 
-static void raw3215_remove (struct ccw_device *cdev)
+static void
+raw3215_remove (struct ccw_device *cdev)
 {
 	struct raw3215_info *raw;
-	unsigned int line;
 
 	ccw_device_set_offline(cdev);
-	raw = dev_get_drvdata(&cdev->dev);
+	raw = cdev->dev.driver_data;
 	if (raw) {
-		spin_lock(&raw3215_device_lock);
-		for (line = 0; line < NR_3215; line++)
-			if (raw3215[line] == raw)
-				break;
-		raw3215[line] = NULL;
-		spin_unlock(&raw3215_device_lock);
-		dev_set_drvdata(&cdev->dev, NULL);
-		raw3215_free_info(raw);
+		cdev->dev.driver_data = NULL;
+		if (raw->buffer)
+			kfree(raw->buffer);
+		kfree(raw);
 	}
 }
 
-static int raw3215_set_online (struct ccw_device *cdev)
+static int
+raw3215_set_online (struct ccw_device *cdev)
 {
 	struct raw3215_info *raw;
 
-	raw = dev_get_drvdata(&cdev->dev);
+	raw = cdev->dev.driver_data;
 	if (!raw)
 		return -ENODEV;
 
 	return raw3215_startup(raw);
 }
 
-static int raw3215_set_offline (struct ccw_device *cdev)
+static int
+raw3215_set_offline (struct ccw_device *cdev)
 {
 	struct raw3215_info *raw;
 
-	raw = dev_get_drvdata(&cdev->dev);
+	raw = cdev->dev.driver_data;
 	if (!raw)
 		return -ENODEV;
 
@@ -724,24 +765,21 @@ static struct ccw_device_id raw3215_id[] = {
 };
 
 static struct ccw_driver raw3215_ccw_driver = {
-	.driver = {
-		.name	= "3215",
-		.owner	= THIS_MODULE,
-	},
+	.name		= "3215",
+	.owner		= THIS_MODULE,
 	.ids		= raw3215_id,
 	.probe		= &raw3215_probe,
 	.remove		= &raw3215_remove,
 	.set_online	= &raw3215_set_online,
 	.set_offline	= &raw3215_set_offline,
-	.int_class	= IRQIO_C15,
 };
 
 #ifdef CONFIG_TN3215_CONSOLE
 /*
  * Write a string to the 3215 console
  */
-static void con3215_write(struct console *co, const char *str,
-			  unsigned int count)
+static void
+con3215_write(struct console *co, const char *str, unsigned int count)
 {
 	struct raw3215_info *raw;
 	int i;
@@ -771,37 +809,26 @@ static struct tty_driver *con3215_device(struct console *c, int *index)
 }
 
 /*
- * The below function is called as a panic/reboot notifier before the
- * system enters a disabled, endless loop.
- *
- * Notice we must use the spin_trylock() alternative, to prevent lockups
- * in atomic context (panic routine runs with secondary CPUs, local IRQs
- * and preemption disabled).
+ * panic() calls console_unblank before the system enters a
+ * disabled, endless loop.
  */
-static int con3215_notify(struct notifier_block *self,
-			  unsigned long event, void *data)
+static void
+con3215_unblank(void)
 {
 	struct raw3215_info *raw;
 	unsigned long flags;
 
 	raw = raw3215[0];  /* console 3215 is the first one */
-	if (!spin_trylock_irqsave(get_ccwdev_lock(raw->cdev), flags))
-		return NOTIFY_DONE;
+	spin_lock_irqsave(raw->lock, flags);
 	raw3215_make_room(raw, RAW3215_BUFFER_SIZE);
-	spin_unlock_irqrestore(get_ccwdev_lock(raw->cdev), flags);
-
-	return NOTIFY_DONE;
+	spin_unlock_irqrestore(raw->lock, flags);
 }
 
-static struct notifier_block on_panic_nb = {
-	.notifier_call = con3215_notify,
-	.priority = INT_MIN + 1, /* run the callback late */
-};
-
-static struct notifier_block on_reboot_nb = {
-	.notifier_call = con3215_notify,
-	.priority = INT_MIN + 1, /* run the callback late */
-};
+static int __init 
+con3215_consetup(struct console *co, char *options)
+{
+	return 0;
+}
 
 /*
  *  The console structure for the 3215 console
@@ -810,13 +837,17 @@ static struct console con3215 = {
 	.name	 = "ttyS",
 	.write	 = con3215_write,
 	.device	 = con3215_device,
+	.unblank = con3215_unblank,
+	.setup	 = con3215_consetup,
 	.flags	 = CON_PRINTBUFFER,
 };
 
 /*
  * 3215 console initialization code called from console_init().
+ * NOTE: This is called before kmalloc is available.
  */
-static int __init con3215_init(void)
+static int __init
+con3215_init(void)
 {
 	struct ccw_device *cdev;
 	struct raw3215_info *raw;
@@ -829,79 +860,85 @@ static int __init con3215_init(void)
 
 	/* Set the console mode for VM */
 	if (MACHINE_IS_VM) {
-		cpcmd("TERM CONMODE 3215", NULL, 0, NULL);
-		cpcmd("TERM AUTOCR OFF", NULL, 0, NULL);
+		cpcmd("TERM CONMODE 3215", NULL, 0);
+		cpcmd("TERM AUTOCR OFF", NULL, 0);
 	}
 
 	/* allocate 3215 request structures */
 	raw3215_freelist = NULL;
+	spin_lock_init(&raw3215_freelist_lock);
 	for (i = 0; i < NR_3215_REQ; i++) {
-		req = kzalloc(sizeof(struct raw3215_req), GFP_KERNEL | GFP_DMA);
-		if (!req)
-			return -ENOMEM;
+		req = (struct raw3215_req *) alloc_bootmem_low(sizeof(struct raw3215_req));
 		req->next = raw3215_freelist;
 		raw3215_freelist = req;
 	}
 
-	cdev = ccw_device_create_console(&raw3215_ccw_driver);
-	if (IS_ERR(cdev))
+	cdev = ccw_device_probe_console();
+	if (!cdev)
 		return -ENODEV;
 
-	raw3215[0] = raw = raw3215_alloc_info();
+	raw3215[0] = raw = (struct raw3215_info *)
+		alloc_bootmem_low(sizeof(struct raw3215_info));
+	memset(raw, 0, sizeof(struct raw3215_info));
+	raw->buffer = (char *) alloc_bootmem_low(RAW3215_BUFFER_SIZE);
+	raw->inbuf = (char *) alloc_bootmem_low(RAW3215_INBUF_SIZE);
 	raw->cdev = cdev;
-	dev_set_drvdata(&cdev->dev, raw);
+	raw->lock = get_ccwdev_lock(cdev);
+	cdev->dev.driver_data = raw;
 	cdev->handler = raw3215_irq;
 
 	raw->flags |= RAW3215_FIXED;
-	if (ccw_device_enable_console(cdev)) {
-		ccw_device_destroy_console(cdev);
-		raw3215_free_info(raw);
-		raw3215[0] = NULL;
-		return -ENODEV;
-	}
+	tasklet_init(&raw->tasklet,
+		     (void (*)(unsigned long)) raw3215_tasklet,
+		     (unsigned long) raw);
+	init_waitqueue_head(&raw->empty_wait);
 
 	/* Request the console irq */
 	if (raw3215_startup(raw) != 0) {
-		raw3215_free_info(raw);
+		free_bootmem((unsigned long) raw->inbuf, RAW3215_INBUF_SIZE);
+		free_bootmem((unsigned long) raw->buffer, RAW3215_BUFFER_SIZE);
+		free_bootmem((unsigned long) raw, sizeof(struct raw3215_info));
 		raw3215[0] = NULL;
+		printk("Couldn't find a 3215 console device\n");
 		return -ENODEV;
 	}
-	atomic_notifier_chain_register(&panic_notifier_list, &on_panic_nb);
-	register_reboot_notifier(&on_reboot_nb);
 	register_console(&con3215);
 	return 0;
 }
 console_initcall(con3215_init);
 #endif
 
-static int tty3215_install(struct tty_driver *driver, struct tty_struct *tty)
-{
-	struct raw3215_info *raw;
-
-	raw = raw3215[tty->index];
-	if (raw == NULL)
-		return -ENODEV;
-
-	tty->driver_data = raw;
-
-	return tty_port_install(&raw->port, driver, tty);
-}
-
 /*
  * tty3215_open
  *
  * This routine is called whenever a 3215 tty is opened.
  */
-static int tty3215_open(struct tty_struct *tty, struct file * filp)
+static int
+tty3215_open(struct tty_struct *tty, struct file * filp)
 {
-	struct raw3215_info *raw = tty->driver_data;
+	struct raw3215_info *raw;
+	int retval, line;
 
-	tty_port_tty_set(&raw->port, tty);
+	line = tty->index;
+	if ((line < 0) || (line >= NR_3215))
+		return -ENODEV;
 
+	raw = raw3215[line];
+	if (raw == NULL)
+		return -ENODEV;
+
+	tty->driver_data = raw;
+	raw->tty = tty;
+
+	tty->low_latency = 0;  /* don't use bottom half for pushing chars */
 	/*
 	 * Start up 3215 device
 	 */
-	return raw3215_startup(raw);
+	retval = raw3215_startup(raw);
+	if (retval)
+		return retval;
+
+	return 0;
 }
 
 /*
@@ -910,25 +947,30 @@ static int tty3215_open(struct tty_struct *tty, struct file * filp)
  * This routine is called when the 3215 tty is closed. We wait
  * for the remaining request to be completed. Then we clean up.
  */
-static void tty3215_close(struct tty_struct *tty, struct file * filp)
+static void
+tty3215_close(struct tty_struct *tty, struct file * filp)
 {
-	struct raw3215_info *raw = tty->driver_data;
+	struct raw3215_info *raw;
 
+	raw = (struct raw3215_info *) tty->driver_data;
 	if (raw == NULL || tty->count > 1)
 		return;
 	tty->closing = 1;
 	/* Shutdown the terminal */
 	raw3215_shutdown(raw);
 	tty->closing = 0;
-	tty_port_tty_set(&raw->port, NULL);
+	raw->tty = NULL;
 }
 
 /*
  * Returns the amount of free space in the output buffer.
  */
-static unsigned int tty3215_write_room(struct tty_struct *tty)
+static int
+tty3215_write_room(struct tty_struct *tty)
 {
-	struct raw3215_info *raw = tty->driver_data;
+	struct raw3215_info *raw;
+
+	raw = (struct raw3215_info *) tty->driver_data;
 
 	/* Subtract TAB_STOP_SIZE to allow for a tab, 8 <<< 64K */
 	if ((RAW3215_BUFFER_SIZE - raw->count - TAB_STOP_SIZE) >= 0)
@@ -940,117 +982,138 @@ static unsigned int tty3215_write_room(struct tty_struct *tty)
 /*
  * String write routine for 3215 ttys
  */
-static int tty3215_write(struct tty_struct * tty,
-			 const unsigned char *buf, int count)
+static int
+tty3215_write(struct tty_struct * tty,
+	      const unsigned char *buf, int count)
 {
-	struct raw3215_info *raw = tty->driver_data;
-	int i, written;
+	struct raw3215_info *raw;
 
-	written = count;
-	while (count > 0) {
-		for (i = 0; i < count; i++)
-			if (buf[i] == '\t' || buf[i] == '\n')
-				break;
-		raw3215_write(raw, buf, i);
-		count -= i;
-		buf += i;
-		if (count > 0) {
-			raw3215_putchar(raw, *buf);
-			count--;
-			buf++;
-		}
-	}
-	return written;
+	if (!tty)
+		return 0;
+	raw = (struct raw3215_info *) tty->driver_data;
+	raw3215_write(raw, buf, count);
+	return count;
 }
 
 /*
  * Put character routine for 3215 ttys
  */
-static int tty3215_put_char(struct tty_struct *tty, unsigned char ch)
+static void
+tty3215_put_char(struct tty_struct *tty, unsigned char ch)
 {
-	struct raw3215_info *raw = tty->driver_data;
+	struct raw3215_info *raw;
 
+	if (!tty)
+		return;
+	raw = (struct raw3215_info *) tty->driver_data;
 	raw3215_putchar(raw, ch);
-
-	return 1;
 }
 
-static void tty3215_flush_chars(struct tty_struct *tty)
+static void
+tty3215_flush_chars(struct tty_struct *tty)
 {
 }
 
 /*
  * Returns the number of characters in the output buffer
  */
-static unsigned int tty3215_chars_in_buffer(struct tty_struct *tty)
+static int
+tty3215_chars_in_buffer(struct tty_struct *tty)
 {
-	struct raw3215_info *raw = tty->driver_data;
+	struct raw3215_info *raw;
 
+	raw = (struct raw3215_info *) tty->driver_data;
 	return raw->count;
 }
 
-static void tty3215_flush_buffer(struct tty_struct *tty)
+static void
+tty3215_flush_buffer(struct tty_struct *tty)
 {
-	struct raw3215_info *raw = tty->driver_data;
+	struct raw3215_info *raw;
 
+	raw = (struct raw3215_info *) tty->driver_data;
 	raw3215_flush_buffer(raw);
 	tty_wakeup(tty);
 }
 
 /*
+ * Currently we don't have any io controls for 3215 ttys
+ */
+static int
+tty3215_ioctl(struct tty_struct *tty, struct file * file,
+	      unsigned int cmd, unsigned long arg)
+{
+	if (tty->flags & (1 << TTY_IO_ERROR))
+		return -EIO;
+
+	switch (cmd) {
+	default:
+		return -ENOIOCTLCMD;
+	}
+	return 0;
+}
+
+/*
  * Disable reading from a 3215 tty
  */
-static void tty3215_throttle(struct tty_struct * tty)
+static void
+tty3215_throttle(struct tty_struct * tty)
 {
-	struct raw3215_info *raw = tty->driver_data;
+	struct raw3215_info *raw;
 
+	raw = (struct raw3215_info *) tty->driver_data;
 	raw->flags |= RAW3215_THROTTLED;
 }
 
 /*
  * Enable reading from a 3215 tty
  */
-static void tty3215_unthrottle(struct tty_struct * tty)
+static void
+tty3215_unthrottle(struct tty_struct * tty)
 {
-	struct raw3215_info *raw = tty->driver_data;
+	struct raw3215_info *raw;
 	unsigned long flags;
 
+	raw = (struct raw3215_info *) tty->driver_data;
 	if (raw->flags & RAW3215_THROTTLED) {
-		spin_lock_irqsave(get_ccwdev_lock(raw->cdev), flags);
+		spin_lock_irqsave(raw->lock, flags);
 		raw->flags &= ~RAW3215_THROTTLED;
 		raw3215_try_io(raw);
-		spin_unlock_irqrestore(get_ccwdev_lock(raw->cdev), flags);
+		spin_unlock_irqrestore(raw->lock, flags);
 	}
 }
 
 /*
  * Disable writing to a 3215 tty
  */
-static void tty3215_stop(struct tty_struct *tty)
+static void
+tty3215_stop(struct tty_struct *tty)
 {
-	struct raw3215_info *raw = tty->driver_data;
+	struct raw3215_info *raw;
 
+	raw = (struct raw3215_info *) tty->driver_data;
 	raw->flags |= RAW3215_STOPPED;
 }
 
 /*
  * Enable writing to a 3215 tty
  */
-static void tty3215_start(struct tty_struct *tty)
+static void
+tty3215_start(struct tty_struct *tty)
 {
-	struct raw3215_info *raw = tty->driver_data;
+	struct raw3215_info *raw;
 	unsigned long flags;
 
+	raw = (struct raw3215_info *) tty->driver_data;
 	if (raw->flags & RAW3215_STOPPED) {
-		spin_lock_irqsave(get_ccwdev_lock(raw->cdev), flags);
+		spin_lock_irqsave(raw->lock, flags);
 		raw->flags &= ~RAW3215_STOPPED;
 		raw3215_try_io(raw);
-		spin_unlock_irqrestore(get_ccwdev_lock(raw->cdev), flags);
+		spin_unlock_irqrestore(raw->lock, flags);
 	}
 }
 
-static const struct tty_operations tty3215_ops = {
-	.install = tty3215_install,
+static struct tty_operations tty3215_ops = {
 	.open = tty3215_open,
 	.close = tty3215_close,
 	.write = tty3215_write,
@@ -1059,6 +1122,7 @@ static const struct tty_operations tty3215_ops = {
 	.write_room = tty3215_write_room,
 	.chars_in_buffer = tty3215_chars_in_buffer,
 	.flush_buffer = tty3215_flush_buffer,
+	.ioctl = tty3215_ioctl,
 	.throttle = tty3215_throttle,
 	.unthrottle = tty3215_unthrottle,
 	.stop = tty3215_stop,
@@ -1069,7 +1133,8 @@ static const struct tty_operations tty3215_ops = {
  * 3215 tty registration code called from tty_init().
  * Most kernel services (incl. kmalloc) are available at this poimt.
  */
-static int __init tty3215_init(void)
+int __init
+tty3215_init(void)
 {
 	struct tty_driver *driver;
 	int ret;
@@ -1077,13 +1142,13 @@ static int __init tty3215_init(void)
 	if (!CONSOLE_IS_3215)
 		return 0;
 
-	driver = tty_alloc_driver(NR_3215, TTY_DRIVER_REAL_RAW);
-	if (IS_ERR(driver))
-		return PTR_ERR(driver);
+	driver = alloc_tty_driver(NR_3215);
+	if (!driver)
+		return -ENOMEM;
 
 	ret = ccw_driver_register(&raw3215_ccw_driver);
 	if (ret) {
-		tty_driver_kref_put(driver);
+		put_tty_driver(driver);
 		return ret;
 	}
 	/*
@@ -1092,6 +1157,7 @@ static int __init tty3215_init(void)
 	 * proc_entry, set_termios, flush_buffer, set_ldisc, write_proc
 	 */
 
+	driver->owner = THIS_MODULE;
 	driver->driver_name = "tty3215";
 	driver->name = "ttyS";
 	driver->major = TTY_MAJOR;
@@ -1100,15 +1166,27 @@ static int __init tty3215_init(void)
 	driver->subtype = SYSTEM_TYPE_TTY;
 	driver->init_termios = tty_std_termios;
 	driver->init_termios.c_iflag = IGNBRK | IGNPAR;
-	driver->init_termios.c_oflag = ONLCR;
+	driver->init_termios.c_oflag = ONLCR | XTABS;
 	driver->init_termios.c_lflag = ISIG;
+	driver->flags = TTY_DRIVER_REAL_RAW;
 	tty_set_operations(driver, &tty3215_ops);
 	ret = tty_register_driver(driver);
 	if (ret) {
-		tty_driver_kref_put(driver);
+		printk("Couldn't register tty3215 driver\n");
+		put_tty_driver(driver);
 		return ret;
 	}
 	tty3215_driver = driver;
 	return 0;
 }
-device_initcall(tty3215_init);
+
+static void __exit
+tty3215_exit(void)
+{
+	tty_unregister_driver(tty3215_driver);
+	put_tty_driver(tty3215_driver);
+	ccw_driver_unregister(&raw3215_ccw_driver);
+}
+
+module_init(tty3215_init);
+module_exit(tty3215_exit);

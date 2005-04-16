@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _KBD_KERN_H
 #define _KBD_KERN_H
 
@@ -6,7 +5,14 @@
 #include <linux/interrupt.h>
 #include <linux/keyboard.h>
 
+extern struct tasklet_struct keyboard_tasklet;
+
+extern int shift_state;
+
 extern char *func_table[MAX_NR_FUNC];
+extern char func_buf[];
+extern char *funcbufptr;
+extern int funcbufsize, funcbufleft;
 
 /*
  * kbd->xxx contains the VC-local things (flag settings etc..)
@@ -32,9 +38,10 @@ struct kbd_struct {
 #define VC_CTRLRLOCK	KG_CTRLR 	/* ctrlr lock mode */
 	unsigned char slockstate; 	/* for `sticky' Shift, Ctrl, etc. */
 
-	unsigned char ledmode:1;
+	unsigned char ledmode:2; 	/* one 2-bit value */
 #define LED_SHOW_FLAGS 0        /* traditional state */
 #define LED_SHOW_IOCTL 1        /* only change leds upon ioctl */
+#define LED_SHOW_MEM 2          /* `heartbeat': peek into memory */
 
 	unsigned char ledflagstate:4;	/* flags, not lights */
 	unsigned char default_ledflagstate:4;
@@ -43,12 +50,11 @@ struct kbd_struct {
 #define VC_CAPSLOCK	2	/* capslock mode */
 #define VC_KANALOCK	3	/* kanalock mode */
 
-	unsigned char kbdmode:3;	/* one 3-bit value */
+	unsigned char kbdmode:2;	/* one 2-bit value */
 #define VC_XLATE	0	/* translate keycodes using keymap */
 #define VC_MEDIUMRAW	1	/* medium raw (keycode) mode */
 #define VC_RAW		2	/* raw (scancode) mode */
 #define VC_UNICODE	3	/* Unicode mode */
-#define VC_OFF		4	/* disabled mode */
 
 	unsigned char modeflags:5;
 #define VC_APPLIC	0	/* application key mode */
@@ -58,16 +64,24 @@ struct kbd_struct {
 #define VC_META		4	/* 0 - meta, 1 - meta=prefix with ESC */
 };
 
+extern struct kbd_struct kbd_table[];
+
 extern int kbd_init(void);
 
+extern unsigned char getledstate(void);
 extern void setledstate(struct kbd_struct *kbd, unsigned int led);
 
 extern int do_poke_blanked_console;
 
 extern void (*kbd_ledfunc)(unsigned int led);
 
-extern int set_console(int nr);
+extern void set_console(int nr);
 extern void schedule_console_callback(void);
+
+static inline void set_leds(void)
+{
+	tasklet_schedule(&keyboard_tasklet);
+}
 
 static inline int vc_kbd_mode(struct kbd_struct * kbd, int flag)
 {
@@ -121,16 +135,23 @@ static inline void chg_vc_kbd_led(struct kbd_struct * kbd, int flag)
 
 #define U(x) ((x) ^ 0xf000)
 
-#define BRL_UC_ROW 0x2800
-
 /* keyboard.c */
 
 struct console;
 
-void vt_set_leds_compute_shiftstate(void);
+int getkeycode(unsigned int scancode);
+int setkeycode(unsigned int scancode, unsigned int keycode);
+void compute_shiftstate(void);
 
 /* defkeymap.c */
 
 extern unsigned int keymap_count;
+
+/* console.c */
+
+static inline void con_schedule_flip(struct tty_struct *t)
+{
+	schedule_work(&t->flip.work);
+}
 
 #endif

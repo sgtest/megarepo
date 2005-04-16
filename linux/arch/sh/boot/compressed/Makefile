@@ -1,66 +1,41 @@
-# SPDX-License-Identifier: GPL-2.0
 #
 # linux/arch/sh/boot/compressed/Makefile
 #
 # create a compressed vmlinux image from the original vmlinux
 #
 
-OBJECTS := head_32.o misc.o cache.o piggy.o \
-           ashiftrt.o ashldi3.o ashrsi3.o ashlsi3.o lshrsi3.o
+targets		:= vmlinux vmlinux.bin vmlinux.bin.gz head.o misc.o piggy.o
+EXTRA_AFLAGS	:= -traditional
 
-# These were previously generated files. When you are building the kernel
-# with O=, make sure to remove the stale files in the output tree. Otherwise,
-# the build system wrongly compiles the stale ones.
-ifdef building_out_of_srctree
-$(shell rm -f $(addprefix $(obj)/, ashiftrt.S ashldi3.c ashrsi3.S ashlsi3.S lshrsi3.S))
+OBJECTS = $(obj)/head.o $(obj)/misc.o
+
+ifdef CONFIG_SH_STANDARD_BIOS
+OBJECTS += $(obj)/../../kernel/sh_bios.o
 endif
-
-targets := vmlinux vmlinux.bin vmlinux.bin.gz vmlinux.bin.bz2 \
-           vmlinux.bin.lzma vmlinux.bin.xz vmlinux.bin.lzo $(OBJECTS)
-
-GCOV_PROFILE := n
 
 #
 # IMAGE_OFFSET is the load offset of the compression loader
+# Assign dummy values if these 2 variables are not defined,
+# in order to suppress error message.
 #
-ifeq ($(CONFIG_32BIT),y)
-IMAGE_OFFSET	:= $(shell /bin/bash -c 'printf "0x%08x" \
-		     $$[$(CONFIG_MEMORY_START)  + \
-			$(CONFIG_BOOT_LINK_OFFSET)]')
-else
-IMAGE_OFFSET	:= $(shell /bin/bash -c 'printf "0x%08x" \
-		     $$[$(CONFIG_PAGE_OFFSET)  + \
-			$(KERNEL_MEMORY) + \
-			$(CONFIG_BOOT_LINK_OFFSET)]')
-endif
+CONFIG_MEMORY_START     ?= 0x0c000000
+CONFIG_BOOT_LINK_OFFSET ?= 0x00800000
+IMAGE_OFFSET := $(shell printf "0x%8x" $$[0x80000000+$(CONFIG_MEMORY_START)+$(CONFIG_BOOT_LINK_OFFSET)])
 
-ccflags-remove-$(CONFIG_MCOUNT) += -pg
+LDFLAGS_vmlinux := -Ttext $(IMAGE_OFFSET) -e startup -T $(obj)/../../kernel/vmlinux.lds
 
-LDFLAGS_vmlinux := --oformat $(ld-bfd) -Ttext $(IMAGE_OFFSET) -e startup \
-		   -T $(obj)/../../kernel/vmlinux.lds
-
-KBUILD_CFLAGS += -DDISABLE_BRANCH_PROFILING
-
-$(obj)/vmlinux: $(addprefix $(obj)/, $(OBJECTS)) FORCE
+$(obj)/vmlinux: $(OBJECTS) $(obj)/piggy.o FORCE
 	$(call if_changed,ld)
+	@:
 
 $(obj)/vmlinux.bin: vmlinux FORCE
 	$(call if_changed,objcopy)
 
 $(obj)/vmlinux.bin.gz: $(obj)/vmlinux.bin FORCE
 	$(call if_changed,gzip)
-$(obj)/vmlinux.bin.bz2: $(obj)/vmlinux.bin FORCE
-	$(call if_changed,bzip2_with_size)
-$(obj)/vmlinux.bin.lzma: $(obj)/vmlinux.bin FORCE
-	$(call if_changed,lzma_with_size)
-$(obj)/vmlinux.bin.xz: $(obj)/vmlinux.bin FORCE
-	$(call if_changed,xzkern_with_size)
-$(obj)/vmlinux.bin.lzo: $(obj)/vmlinux.bin FORCE
-	$(call if_changed,lzo_with_size)
 
+LDFLAGS_piggy.o := -r --format binary --oformat elf32-sh-linux -T
 OBJCOPYFLAGS += -R .empty_zero_page
 
-LDFLAGS_piggy.o := -r --format binary --oformat $(ld-bfd) -T
-
-$(obj)/piggy.o: $(obj)/vmlinux.scr $(obj)/vmlinux.bin.$(suffix_y) FORCE
+$(obj)/piggy.o: $(obj)/vmlinux.scr $(obj)/vmlinux.bin.gz FORCE
 	$(call if_changed,ld)

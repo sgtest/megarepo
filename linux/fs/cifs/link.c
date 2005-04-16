@@ -1,13 +1,25 @@
-// SPDX-License-Identifier: LGPL-2.1
 /*
+ *   fs/cifs/link.c
  *
- *   Copyright (C) International Business Machines  Corp., 2002,2008
+ *   Copyright (C) International Business Machines  Corp., 2002,2003
  *   Author(s): Steve French (sfrench@us.ibm.com)
  *
+ *   This library is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU Lesser General Public License as published
+ *   by the Free Software Foundation; either version 2.1 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This library is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See
+ *   the GNU Lesser General Public License for more details.
+ *
+ *   You should have received a copy of the GNU Lesser General Public License
+ *   along with this library; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
  */
 #include <linux/fs.h>
 #include <linux/stat.h>
-#include <linux/slab.h>
 #include <linux/namei.h>
 #include "cifsfs.h"
 #include "cifspdu.h"
@@ -15,731 +27,302 @@
 #include "cifsproto.h"
 #include "cifs_debug.h"
 #include "cifs_fs_sb.h"
-#include "cifs_unicode.h"
-#include "smb2proto.h"
-#include "cifs_ioctl.h"
-
-/*
- * M-F Symlink Functions - Begin
- */
-
-#define CIFS_MF_SYMLINK_LEN_OFFSET (4+1)
-#define CIFS_MF_SYMLINK_MD5_OFFSET (CIFS_MF_SYMLINK_LEN_OFFSET+(4+1))
-#define CIFS_MF_SYMLINK_LINK_OFFSET (CIFS_MF_SYMLINK_MD5_OFFSET+(32+1))
-#define CIFS_MF_SYMLINK_LINK_MAXLEN (1024)
-#define CIFS_MF_SYMLINK_FILE_SIZE \
-	(CIFS_MF_SYMLINK_LINK_OFFSET + CIFS_MF_SYMLINK_LINK_MAXLEN)
-
-#define CIFS_MF_SYMLINK_LEN_FORMAT "XSym\n%04u\n"
-#define CIFS_MF_SYMLINK_MD5_FORMAT "%16phN\n"
-#define CIFS_MF_SYMLINK_MD5_ARGS(md5_hash) md5_hash
-
-static int
-symlink_hash(unsigned int link_len, const char *link_str, u8 *md5_hash)
-{
-	int rc;
-	struct crypto_shash *md5 = NULL;
-	struct sdesc *sdescmd5 = NULL;
-
-	rc = cifs_alloc_hash("md5", &md5, &sdescmd5);
-	if (rc)
-		goto symlink_hash_err;
-
-	rc = crypto_shash_init(&sdescmd5->shash);
-	if (rc) {
-		cifs_dbg(VFS, "%s: Could not init md5 shash\n", __func__);
-		goto symlink_hash_err;
-	}
-	rc = crypto_shash_update(&sdescmd5->shash, link_str, link_len);
-	if (rc) {
-		cifs_dbg(VFS, "%s: Could not update with link_str\n", __func__);
-		goto symlink_hash_err;
-	}
-	rc = crypto_shash_final(&sdescmd5->shash, md5_hash);
-	if (rc)
-		cifs_dbg(VFS, "%s: Could not generate md5 hash\n", __func__);
-
-symlink_hash_err:
-	cifs_free_hash(&md5, &sdescmd5);
-	return rc;
-}
-
-static int
-parse_mf_symlink(const u8 *buf, unsigned int buf_len, unsigned int *_link_len,
-		 char **_link_str)
-{
-	int rc;
-	unsigned int link_len;
-	const char *md5_str1;
-	const char *link_str;
-	u8 md5_hash[16];
-	char md5_str2[34];
-
-	if (buf_len != CIFS_MF_SYMLINK_FILE_SIZE)
-		return -EINVAL;
-
-	md5_str1 = (const char *)&buf[CIFS_MF_SYMLINK_MD5_OFFSET];
-	link_str = (const char *)&buf[CIFS_MF_SYMLINK_LINK_OFFSET];
-
-	rc = sscanf(buf, CIFS_MF_SYMLINK_LEN_FORMAT, &link_len);
-	if (rc != 1)
-		return -EINVAL;
-
-	if (link_len > CIFS_MF_SYMLINK_LINK_MAXLEN)
-		return -EINVAL;
-
-	rc = symlink_hash(link_len, link_str, md5_hash);
-	if (rc) {
-		cifs_dbg(FYI, "%s: MD5 hash failure: %d\n", __func__, rc);
-		return rc;
-	}
-
-	scnprintf(md5_str2, sizeof(md5_str2),
-		  CIFS_MF_SYMLINK_MD5_FORMAT,
-		  CIFS_MF_SYMLINK_MD5_ARGS(md5_hash));
-
-	if (strncmp(md5_str1, md5_str2, 17) != 0)
-		return -EINVAL;
-
-	if (_link_str) {
-		*_link_str = kstrndup(link_str, link_len, GFP_KERNEL);
-		if (!*_link_str)
-			return -ENOMEM;
-	}
-
-	*_link_len = link_len;
-	return 0;
-}
-
-static int
-format_mf_symlink(u8 *buf, unsigned int buf_len, const char *link_str)
-{
-	int rc;
-	unsigned int link_len;
-	unsigned int ofs;
-	u8 md5_hash[16];
-
-	if (buf_len != CIFS_MF_SYMLINK_FILE_SIZE)
-		return -EINVAL;
-
-	link_len = strlen(link_str);
-
-	if (link_len > CIFS_MF_SYMLINK_LINK_MAXLEN)
-		return -ENAMETOOLONG;
-
-	rc = symlink_hash(link_len, link_str, md5_hash);
-	if (rc) {
-		cifs_dbg(FYI, "%s: MD5 hash failure: %d\n", __func__, rc);
-		return rc;
-	}
-
-	scnprintf(buf, buf_len,
-		  CIFS_MF_SYMLINK_LEN_FORMAT CIFS_MF_SYMLINK_MD5_FORMAT,
-		  link_len,
-		  CIFS_MF_SYMLINK_MD5_ARGS(md5_hash));
-
-	ofs = CIFS_MF_SYMLINK_LINK_OFFSET;
-	memcpy(buf + ofs, link_str, link_len);
-
-	ofs += link_len;
-	if (ofs < CIFS_MF_SYMLINK_FILE_SIZE) {
-		buf[ofs] = '\n';
-		ofs++;
-	}
-
-	while (ofs < CIFS_MF_SYMLINK_FILE_SIZE) {
-		buf[ofs] = ' ';
-		ofs++;
-	}
-
-	return 0;
-}
-
-bool
-couldbe_mf_symlink(const struct cifs_fattr *fattr)
-{
-	if (!S_ISREG(fattr->cf_mode))
-		/* it's not a symlink */
-		return false;
-
-	if (fattr->cf_eof != CIFS_MF_SYMLINK_FILE_SIZE)
-		/* it's not a symlink */
-		return false;
-
-	return true;
-}
-
-static int
-create_mf_symlink(const unsigned int xid, struct cifs_tcon *tcon,
-		  struct cifs_sb_info *cifs_sb, const char *fromName,
-		  const char *toName)
-{
-	int rc;
-	u8 *buf;
-	unsigned int bytes_written = 0;
-
-	buf = kmalloc(CIFS_MF_SYMLINK_FILE_SIZE, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
-	rc = format_mf_symlink(buf, CIFS_MF_SYMLINK_FILE_SIZE, toName);
-	if (rc)
-		goto out;
-
-	if (tcon->ses->server->ops->create_mf_symlink)
-		rc = tcon->ses->server->ops->create_mf_symlink(xid, tcon,
-					cifs_sb, fromName, buf, &bytes_written);
-	else
-		rc = -EOPNOTSUPP;
-
-	if (rc)
-		goto out;
-
-	if (bytes_written != CIFS_MF_SYMLINK_FILE_SIZE)
-		rc = -EIO;
-out:
-	kfree(buf);
-	return rc;
-}
-
-static int
-query_mf_symlink(const unsigned int xid, struct cifs_tcon *tcon,
-		 struct cifs_sb_info *cifs_sb, const unsigned char *path,
-		 char **symlinkinfo)
-{
-	int rc;
-	u8 *buf = NULL;
-	unsigned int link_len = 0;
-	unsigned int bytes_read = 0;
-
-	buf = kmalloc(CIFS_MF_SYMLINK_FILE_SIZE, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
-	if (tcon->ses->server->ops->query_mf_symlink)
-		rc = tcon->ses->server->ops->query_mf_symlink(xid, tcon,
-					      cifs_sb, path, buf, &bytes_read);
-	else
-		rc = -ENOSYS;
-
-	if (rc)
-		goto out;
-
-	if (bytes_read == 0) { /* not a symlink */
-		rc = -EINVAL;
-		goto out;
-	}
-
-	rc = parse_mf_symlink(buf, bytes_read, &link_len, symlinkinfo);
-out:
-	kfree(buf);
-	return rc;
-}
-
-int
-check_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
-		 struct cifs_sb_info *cifs_sb, struct cifs_fattr *fattr,
-		 const unsigned char *path)
-{
-	int rc;
-	u8 *buf = NULL;
-	unsigned int link_len = 0;
-	unsigned int bytes_read = 0;
-
-	if (!couldbe_mf_symlink(fattr))
-		/* it's not a symlink */
-		return 0;
-
-	buf = kmalloc(CIFS_MF_SYMLINK_FILE_SIZE, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
-
-	if (tcon->ses->server->ops->query_mf_symlink)
-		rc = tcon->ses->server->ops->query_mf_symlink(xid, tcon,
-					      cifs_sb, path, buf, &bytes_read);
-	else
-		rc = -ENOSYS;
-
-	if (rc)
-		goto out;
-
-	if (bytes_read == 0) /* not a symlink */
-		goto out;
-
-	rc = parse_mf_symlink(buf, bytes_read, &link_len, NULL);
-	if (rc == -EINVAL) {
-		/* it's not a symlink */
-		rc = 0;
-		goto out;
-	}
-
-	if (rc != 0)
-		goto out;
-
-	/* it is a symlink */
-	fattr->cf_eof = link_len;
-	fattr->cf_mode &= ~S_IFMT;
-	fattr->cf_mode |= S_IFLNK | S_IRWXU | S_IRWXG | S_IRWXO;
-	fattr->cf_dtype = DT_LNK;
-out:
-	kfree(buf);
-	return rc;
-}
-
-#ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
-/*
- * SMB 1.0 Protocol specific functions
- */
-
-int
-cifs_query_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
-		      struct cifs_sb_info *cifs_sb, const unsigned char *path,
-		      char *pbuf, unsigned int *pbytes_read)
-{
-	int rc;
-	int oplock = 0;
-	struct cifs_fid fid;
-	struct cifs_open_parms oparms;
-	struct cifs_io_parms io_parms = {0};
-	int buf_type = CIFS_NO_BUFFER;
-	FILE_ALL_INFO file_info;
-
-	oparms.tcon = tcon;
-	oparms.cifs_sb = cifs_sb;
-	oparms.desired_access = GENERIC_READ;
-	oparms.create_options = cifs_create_options(cifs_sb, CREATE_NOT_DIR);
-	oparms.disposition = FILE_OPEN;
-	oparms.path = path;
-	oparms.fid = &fid;
-	oparms.reconnect = false;
-
-	rc = CIFS_open(xid, &oparms, &oplock, &file_info);
-	if (rc)
-		return rc;
-
-	if (file_info.EndOfFile != cpu_to_le64(CIFS_MF_SYMLINK_FILE_SIZE)) {
-		rc = -ENOENT;
-		/* it's not a symlink */
-		goto out;
-	}
-
-	io_parms.netfid = fid.netfid;
-	io_parms.pid = current->tgid;
-	io_parms.tcon = tcon;
-	io_parms.offset = 0;
-	io_parms.length = CIFS_MF_SYMLINK_FILE_SIZE;
-
-	rc = CIFSSMBRead(xid, &io_parms, pbytes_read, &pbuf, &buf_type);
-out:
-	CIFSSMBClose(xid, tcon, fid.netfid);
-	return rc;
-}
-
-int
-cifs_create_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
-		       struct cifs_sb_info *cifs_sb, const unsigned char *path,
-		       char *pbuf, unsigned int *pbytes_written)
-{
-	int rc;
-	int oplock = 0;
-	struct cifs_fid fid;
-	struct cifs_open_parms oparms;
-	struct cifs_io_parms io_parms = {0};
-
-	oparms.tcon = tcon;
-	oparms.cifs_sb = cifs_sb;
-	oparms.desired_access = GENERIC_WRITE;
-	oparms.create_options = cifs_create_options(cifs_sb, CREATE_NOT_DIR);
-	oparms.disposition = FILE_CREATE;
-	oparms.path = path;
-	oparms.fid = &fid;
-	oparms.reconnect = false;
-
-	rc = CIFS_open(xid, &oparms, &oplock, NULL);
-	if (rc)
-		return rc;
-
-	io_parms.netfid = fid.netfid;
-	io_parms.pid = current->tgid;
-	io_parms.tcon = tcon;
-	io_parms.offset = 0;
-	io_parms.length = CIFS_MF_SYMLINK_FILE_SIZE;
-
-	rc = CIFSSMBWrite(xid, &io_parms, pbytes_written, pbuf);
-	CIFSSMBClose(xid, tcon, fid.netfid);
-	return rc;
-}
-#endif /* CONFIG_CIFS_ALLOW_INSECURE_LEGACY */
-
-/*
- * SMB 2.1/SMB3 Protocol specific functions
- */
-int
-smb3_query_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
-		      struct cifs_sb_info *cifs_sb, const unsigned char *path,
-		      char *pbuf, unsigned int *pbytes_read)
-{
-	int rc;
-	struct cifs_fid fid;
-	struct cifs_open_parms oparms;
-	struct cifs_io_parms io_parms = {0};
-	int buf_type = CIFS_NO_BUFFER;
-	__le16 *utf16_path;
-	__u8 oplock = SMB2_OPLOCK_LEVEL_NONE;
-	struct smb2_file_all_info *pfile_info = NULL;
-
-	oparms.tcon = tcon;
-	oparms.cifs_sb = cifs_sb;
-	oparms.desired_access = GENERIC_READ;
-	oparms.create_options = cifs_create_options(cifs_sb, CREATE_NOT_DIR);
-	oparms.disposition = FILE_OPEN;
-	oparms.fid = &fid;
-	oparms.reconnect = false;
-
-	utf16_path = cifs_convert_path_to_utf16(path, cifs_sb);
-	if (utf16_path == NULL)
-		return -ENOMEM;
-
-	pfile_info = kzalloc(sizeof(struct smb2_file_all_info) + PATH_MAX * 2,
-			     GFP_KERNEL);
-
-	if (pfile_info == NULL) {
-		kfree(utf16_path);
-		return  -ENOMEM;
-	}
-
-	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, pfile_info, NULL,
-		       NULL, NULL);
-	if (rc)
-		goto qmf_out_open_fail;
-
-	if (pfile_info->EndOfFile != cpu_to_le64(CIFS_MF_SYMLINK_FILE_SIZE)) {
-		/* it's not a symlink */
-		rc = -ENOENT; /* Is there a better rc to return? */
-		goto qmf_out;
-	}
-
-	io_parms.netfid = fid.netfid;
-	io_parms.pid = current->tgid;
-	io_parms.tcon = tcon;
-	io_parms.offset = 0;
-	io_parms.length = CIFS_MF_SYMLINK_FILE_SIZE;
-	io_parms.persistent_fid = fid.persistent_fid;
-	io_parms.volatile_fid = fid.volatile_fid;
-	rc = SMB2_read(xid, &io_parms, pbytes_read, &pbuf, &buf_type);
-qmf_out:
-	SMB2_close(xid, tcon, fid.persistent_fid, fid.volatile_fid);
-qmf_out_open_fail:
-	kfree(utf16_path);
-	kfree(pfile_info);
-	return rc;
-}
-
-int
-smb3_create_mf_symlink(unsigned int xid, struct cifs_tcon *tcon,
-		       struct cifs_sb_info *cifs_sb, const unsigned char *path,
-		       char *pbuf, unsigned int *pbytes_written)
-{
-	int rc;
-	struct cifs_fid fid;
-	struct cifs_open_parms oparms;
-	struct cifs_io_parms io_parms = {0};
-	__le16 *utf16_path;
-	__u8 oplock = SMB2_OPLOCK_LEVEL_NONE;
-	struct kvec iov[2];
-
-	cifs_dbg(FYI, "%s: path: %s\n", __func__, path);
-
-	utf16_path = cifs_convert_path_to_utf16(path, cifs_sb);
-	if (!utf16_path)
-		return -ENOMEM;
-
-	oparms.tcon = tcon;
-	oparms.cifs_sb = cifs_sb;
-	oparms.desired_access = GENERIC_WRITE;
-	oparms.create_options = cifs_create_options(cifs_sb, CREATE_NOT_DIR);
-	oparms.disposition = FILE_CREATE;
-	oparms.fid = &fid;
-	oparms.reconnect = false;
-
-	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL,
-		       NULL, NULL);
-	if (rc) {
-		kfree(utf16_path);
-		return rc;
-	}
-
-	io_parms.netfid = fid.netfid;
-	io_parms.pid = current->tgid;
-	io_parms.tcon = tcon;
-	io_parms.offset = 0;
-	io_parms.length = CIFS_MF_SYMLINK_FILE_SIZE;
-	io_parms.persistent_fid = fid.persistent_fid;
-	io_parms.volatile_fid = fid.volatile_fid;
-
-	/* iov[0] is reserved for smb header */
-	iov[1].iov_base = pbuf;
-	iov[1].iov_len = CIFS_MF_SYMLINK_FILE_SIZE;
-
-	rc = SMB2_write(xid, &io_parms, pbytes_written, iov, 1);
-
-	/* Make sure we wrote all of the symlink data */
-	if ((rc == 0) && (*pbytes_written != CIFS_MF_SYMLINK_FILE_SIZE))
-		rc = -EIO;
-
-	SMB2_close(xid, tcon, fid.persistent_fid, fid.volatile_fid);
-
-	kfree(utf16_path);
-	return rc;
-}
-
-/*
- * M-F Symlink Functions - End
- */
 
 int
 cifs_hardlink(struct dentry *old_file, struct inode *inode,
 	      struct dentry *direntry)
 {
 	int rc = -EACCES;
-	unsigned int xid;
-	const char *from_name, *to_name;
-	void *page1, *page2;
-	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
-	struct tcon_link *tlink;
-	struct cifs_tcon *tcon;
-	struct TCP_Server_Info *server;
+	int xid;
+	char *fromName = NULL;
+	char *toName = NULL;
+	struct cifs_sb_info *cifs_sb_target;
+	struct cifsTconInfo *pTcon;
 	struct cifsInodeInfo *cifsInode;
 
-	if (unlikely(cifs_forced_shutdown(cifs_sb)))
-		return -EIO;
+	xid = GetXid();
 
-	tlink = cifs_sb_tlink(cifs_sb);
-	if (IS_ERR(tlink))
-		return PTR_ERR(tlink);
-	tcon = tlink_tcon(tlink);
+	cifs_sb_target = CIFS_SB(inode->i_sb);
+	pTcon = cifs_sb_target->tcon;
 
-	xid = get_xid();
-	page1 = alloc_dentry_path();
-	page2 = alloc_dentry_path();
+/* No need to check for cross device links since server will do that
+   BB note DFS case in future though (when we may have to check) */
 
-	from_name = build_path_from_dentry(old_file, page1);
-	if (IS_ERR(from_name)) {
-		rc = PTR_ERR(from_name);
-		goto cifs_hl_exit;
-	}
-	to_name = build_path_from_dentry(direntry, page2);
-	if (IS_ERR(to_name)) {
-		rc = PTR_ERR(to_name);
+	down(&inode->i_sb->s_vfs_rename_sem);
+	fromName = build_path_from_dentry(old_file);
+	toName = build_path_from_dentry(direntry);
+	up(&inode->i_sb->s_vfs_rename_sem);
+	if((fromName == NULL) || (toName == NULL)) {
+		rc = -ENOMEM;
 		goto cifs_hl_exit;
 	}
 
-#ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
-	if (tcon->unix_ext)
-		rc = CIFSUnixCreateHardLink(xid, tcon, from_name, to_name,
-					    cifs_sb->local_nls,
-					    cifs_remap(cifs_sb));
+	if (cifs_sb_target->tcon->ses->capabilities & CAP_UNIX)
+		rc = CIFSUnixCreateHardLink(xid, pTcon, fromName, toName,
+					    cifs_sb_target->local_nls);
 	else {
-#else
+		rc = CIFSCreateHardLink(xid, pTcon, fromName, toName,
+					cifs_sb_target->local_nls);
+		if(rc == -EIO)
+			rc = -EOPNOTSUPP;  
+	}
+
+/* if (!rc)     */
 	{
-#endif /* CONFIG_CIFS_ALLOW_INSECURE_LEGACY */
-		server = tcon->ses->server;
-		if (!server->ops->create_hardlink) {
-			rc = -ENOSYS;
-			goto cifs_hl_exit;
-		}
-		rc = server->ops->create_hardlink(xid, tcon, from_name, to_name,
-						  cifs_sb);
-		if ((rc == -EIO) || (rc == -EINVAL))
-			rc = -EOPNOTSUPP;
+		/*   renew_parental_timestamps(old_file);
+		   inode->i_nlink++;
+		   mark_inode_dirty(inode);
+		   d_instantiate(direntry, inode); */
+		/* BB add call to either mark inode dirty or refresh its data and timestamp to current time */
 	}
-
-	d_drop(direntry);	/* force new lookup from server of target */
-
-	/*
-	 * if source file is cached (oplocked) revalidate will not go to server
-	 * until the file is closed or oplock broken so update nlinks locally
-	 */
-	if (d_really_is_positive(old_file)) {
-		cifsInode = CIFS_I(d_inode(old_file));
-		if (rc == 0) {
-			spin_lock(&d_inode(old_file)->i_lock);
-			inc_nlink(d_inode(old_file));
-			spin_unlock(&d_inode(old_file)->i_lock);
-
-			/*
-			 * parent dir timestamps will update from srv within a
-			 * second, would it really be worth it to set the parent
-			 * dir cifs inode time to zero to force revalidate
-			 * (faster) for it too?
-			 */
-		}
-		/*
-		 * if not oplocked will force revalidate to get info on source
-		 * file from srv.  Note Samba server prior to 4.2 has bug -
-		 * not updating src file ctime on hardlinks but Windows servers
-		 * handle it properly
-		 */
-		cifsInode->time = 0;
-
-		/*
-		 * Will update parent dir timestamps from srv within a second.
-		 * Would it really be worth it to set the parent dir (cifs
-		 * inode) time field to zero to force revalidate on parent
-		 * directory faster ie
-		 *
-		 * CIFS_I(inode)->time = 0;
-		 */
-	}
+	d_drop(direntry);	/* force new lookup from server */
+	cifsInode = CIFS_I(old_file->d_inode);
+	cifsInode->time = 0;	/* will force revalidate to go get info when needed */
 
 cifs_hl_exit:
-	free_dentry_path(page1);
-	free_dentry_path(page2);
-	free_xid(xid);
-	cifs_put_tlink(tlink);
+	if (fromName)
+		kfree(fromName);
+	if (toName)
+		kfree(toName);
+	FreeXid(xid);
 	return rc;
-}
-
-const char *
-cifs_get_link(struct dentry *direntry, struct inode *inode,
-	      struct delayed_call *done)
-{
-	int rc = -ENOMEM;
-	unsigned int xid;
-	const char *full_path;
-	void *page;
-	char *target_path = NULL;
-	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
-	struct tcon_link *tlink = NULL;
-	struct cifs_tcon *tcon;
-	struct TCP_Server_Info *server;
-
-	if (!direntry)
-		return ERR_PTR(-ECHILD);
-
-	xid = get_xid();
-
-	tlink = cifs_sb_tlink(cifs_sb);
-	if (IS_ERR(tlink)) {
-		free_xid(xid);
-		return ERR_CAST(tlink);
-	}
-	tcon = tlink_tcon(tlink);
-	server = tcon->ses->server;
-
-	page = alloc_dentry_path();
-	full_path = build_path_from_dentry(direntry, page);
-	if (IS_ERR(full_path)) {
-		free_xid(xid);
-		cifs_put_tlink(tlink);
-		free_dentry_path(page);
-		return ERR_CAST(full_path);
-	}
-
-	cifs_dbg(FYI, "Full path: %s inode = 0x%p\n", full_path, inode);
-
-	rc = -EACCES;
-	/*
-	 * First try Minshall+French Symlinks, if configured
-	 * and fallback to UNIX Extensions Symlinks.
-	 */
-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MF_SYMLINKS)
-		rc = query_mf_symlink(xid, tcon, cifs_sb, full_path,
-				      &target_path);
-
-	if (rc != 0 && server->ops->query_symlink) {
-		struct cifsInodeInfo *cifsi = CIFS_I(inode);
-		bool reparse_point = false;
-
-		if (cifsi->cifsAttrs & ATTR_REPARSE)
-			reparse_point = true;
-
-		rc = server->ops->query_symlink(xid, tcon, cifs_sb, full_path,
-						&target_path, reparse_point);
-	}
-
-	free_dentry_path(page);
-	free_xid(xid);
-	cifs_put_tlink(tlink);
-	if (rc != 0) {
-		kfree(target_path);
-		return ERR_PTR(rc);
-	}
-	set_delayed_call(done, kfree_link, target_path);
-	return target_path;
 }
 
 int
-cifs_symlink(struct user_namespace *mnt_userns, struct inode *inode,
-	     struct dentry *direntry, const char *symname)
+cifs_follow_link(struct dentry *direntry, struct nameidata *nd)
 {
-	int rc = -EOPNOTSUPP;
-	unsigned int xid;
-	struct cifs_sb_info *cifs_sb = CIFS_SB(inode->i_sb);
-	struct tcon_link *tlink;
-	struct cifs_tcon *pTcon;
-	const char *full_path;
-	void *page;
-	struct inode *newinode = NULL;
+	struct inode *inode = direntry->d_inode;
+	int rc = -EACCES;
+	int xid;
+	char *full_path = NULL;
+	char * target_path = ERR_PTR(-ENOMEM);
+	struct cifs_sb_info *cifs_sb;
+	struct cifsTconInfo *pTcon;
 
-	if (unlikely(cifs_forced_shutdown(cifs_sb)))
-		return -EIO;
+	xid = GetXid();
 
-	page = alloc_dentry_path();
-	if (!page)
-		return -ENOMEM;
+	down(&direntry->d_sb->s_vfs_rename_sem);
+	full_path = build_path_from_dentry(direntry);
+	up(&direntry->d_sb->s_vfs_rename_sem);
 
-	xid = get_xid();
+	if (!full_path)
+		goto out_no_free;
 
-	tlink = cifs_sb_tlink(cifs_sb);
-	if (IS_ERR(tlink)) {
-		rc = PTR_ERR(tlink);
-		goto symlink_exit;
-	}
-	pTcon = tlink_tcon(tlink);
-
-	full_path = build_path_from_dentry(direntry, page);
-	if (IS_ERR(full_path)) {
-		rc = PTR_ERR(full_path);
-		goto symlink_exit;
+	cFYI(1, ("Full path: %s inode = 0x%p", full_path, inode));
+	cifs_sb = CIFS_SB(inode->i_sb);
+	pTcon = cifs_sb->tcon;
+	target_path = kmalloc(PATH_MAX, GFP_KERNEL);
+	if (!target_path) {
+		target_path = ERR_PTR(-ENOMEM);
+		goto out;
 	}
 
-	cifs_dbg(FYI, "Full path: %s\n", full_path);
-	cifs_dbg(FYI, "symname is %s\n", symname);
-
-	/* BB what if DFS and this volume is on different share? BB */
-	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_MF_SYMLINKS)
-		rc = create_mf_symlink(xid, pTcon, cifs_sb, full_path, symname);
-#ifdef CONFIG_CIFS_ALLOW_INSECURE_LEGACY
-	else if (pTcon->unix_ext)
-		rc = CIFSUnixCreateSymLink(xid, pTcon, full_path, symname,
-					   cifs_sb->local_nls,
-					   cifs_remap(cifs_sb));
-#endif /* CONFIG_CIFS_ALLOW_INSECURE_LEGACY */
-	/* else
-	   rc = CIFSCreateReparseSymLink(xid, pTcon, fromName, toName,
-					cifs_sb_target->local_nls); */
+/* BB add read reparse point symlink code and Unix extensions symlink code here BB */
+	if (pTcon->ses->capabilities & CAP_UNIX)
+		rc = CIFSSMBUnixQuerySymLink(xid, pTcon, full_path,
+					     target_path,
+					     PATH_MAX-1,
+					     cifs_sb->local_nls);
+	else {
+		/* rc = CIFSSMBQueryReparseLinkInfo */
+		/* BB Add code to Query ReparsePoint info */
+		/* BB Add MAC style xsymlink check here if enabled */
+	}
 
 	if (rc == 0) {
-		if (pTcon->posix_extensions)
-			rc = smb311_posix_get_inode_info(&newinode, full_path, inode->i_sb, xid);
-		else if (pTcon->unix_ext)
+
+/* BB Add special case check for Samba DFS symlinks */
+
+		target_path[PATH_MAX-1] = 0;
+	} else {
+		kfree(target_path);
+		target_path = ERR_PTR(rc);
+	}
+
+out:
+	kfree(full_path);
+out_no_free:
+	FreeXid(xid);
+	nd_set_link(nd, target_path);
+	return 0;
+}
+
+int
+cifs_symlink(struct inode *inode, struct dentry *direntry, const char *symname)
+{
+	int rc = -EOPNOTSUPP;
+	int xid;
+	struct cifs_sb_info *cifs_sb;
+	struct cifsTconInfo *pTcon;
+	char *full_path = NULL;
+	struct inode *newinode = NULL;
+
+	xid = GetXid();
+
+	cifs_sb = CIFS_SB(inode->i_sb);
+	pTcon = cifs_sb->tcon;
+
+	down(&inode->i_sb->s_vfs_rename_sem);
+	full_path = build_path_from_dentry(direntry);
+	up(&inode->i_sb->s_vfs_rename_sem);
+
+	if(full_path == NULL) {
+		FreeXid(xid);
+		return -ENOMEM;
+	}
+
+	cFYI(1, ("Full path: %s ", full_path));
+	cFYI(1, ("symname is %s", symname));
+
+	/* BB what if DFS and this volume is on different share? BB */
+	if (cifs_sb->tcon->ses->capabilities & CAP_UNIX)
+		rc = CIFSUnixCreateSymLink(xid, pTcon, full_path, symname,
+					   cifs_sb->local_nls);
+	/* else
+	   rc = CIFSCreateReparseSymLink(xid, pTcon, fromName, toName,cifs_sb_target->local_nls); */
+
+	if (rc == 0) {
+		if (pTcon->ses->capabilities & CAP_UNIX)
 			rc = cifs_get_inode_info_unix(&newinode, full_path,
-						      inode->i_sb, xid);
+						      inode->i_sb,xid);
 		else
 			rc = cifs_get_inode_info(&newinode, full_path, NULL,
-						 inode->i_sb, xid, NULL);
+						 inode->i_sb,xid);
 
 		if (rc != 0) {
-			cifs_dbg(FYI, "Create symlink ok, getinodeinfo fail rc = %d\n",
-				 rc);
+			cFYI(1,
+			     ("Create symlink worked but get_inode_info failed with rc = %d ",
+			      rc));
 		} else {
+			direntry->d_op = &cifs_dentry_ops;
 			d_instantiate(direntry, newinode);
 		}
 	}
-symlink_exit:
-	free_dentry_path(page);
-	cifs_put_tlink(tlink);
-	free_xid(xid);
+
+	if (full_path)
+		kfree(full_path);
+	FreeXid(xid);
 	return rc;
+}
+
+int
+cifs_readlink(struct dentry *direntry, char __user *pBuffer, int buflen)
+{
+	struct inode *inode = direntry->d_inode;
+	int rc = -EACCES;
+	int xid;
+	int oplock = FALSE;
+	struct cifs_sb_info *cifs_sb;
+	struct cifsTconInfo *pTcon;
+	char *full_path = NULL;
+	char *tmp_path =  NULL;
+	char * tmpbuffer;
+	unsigned char * referrals = NULL;
+	int num_referrals = 0;
+	int len;
+	__u16 fid;
+
+	xid = GetXid();
+	cifs_sb = CIFS_SB(inode->i_sb);
+	pTcon = cifs_sb->tcon;
+
+/* BB would it be safe against deadlock to grab this sem 
+      even though rename itself grabs the sem and calls lookup? */
+/*       down(&inode->i_sb->s_vfs_rename_sem);*/
+	full_path = build_path_from_dentry(direntry);
+/*       up(&inode->i_sb->s_vfs_rename_sem);*/
+
+	if(full_path == NULL) {
+		FreeXid(xid);
+		return -ENOMEM;
+	}
+
+	cFYI(1,
+	     ("Full path: %s inode = 0x%p pBuffer = 0x%p buflen = %d",
+	      full_path, inode, pBuffer, buflen));
+	if(buflen > PATH_MAX)
+		len = PATH_MAX;
+	else
+		len = buflen;
+	tmpbuffer = kmalloc(len,GFP_KERNEL);   
+	if(tmpbuffer == NULL) {
+		if (full_path)
+			kfree(full_path);
+		FreeXid(xid);
+		return -ENOMEM;
+	}
+
+/* BB add read reparse point symlink code and Unix extensions symlink code here BB */
+	if (cifs_sb->tcon->ses->capabilities & CAP_UNIX)
+		rc = CIFSSMBUnixQuerySymLink(xid, pTcon, full_path,
+				tmpbuffer,
+				len - 1,
+				cifs_sb->local_nls);
+	else {
+		rc = CIFSSMBOpen(xid, pTcon, full_path, FILE_OPEN, GENERIC_READ,
+				OPEN_REPARSE_POINT,&fid, &oplock, NULL, cifs_sb->local_nls);
+		if(!rc) {
+			rc = CIFSSMBQueryReparseLinkInfo(xid, pTcon, full_path,
+				tmpbuffer,
+				len - 1, 
+				fid,
+				cifs_sb->local_nls);
+			if(CIFSSMBClose(xid, pTcon, fid)) {
+				cFYI(1,("Error closing junction point (open for ioctl)"));
+			}
+			if(rc == -EIO) {
+				/* Query if DFS Junction */
+				tmp_path =
+					kmalloc(MAX_TREE_SIZE + MAX_PATHCONF + 1,
+						GFP_KERNEL);
+				if (tmp_path) {
+					strncpy(tmp_path, pTcon->treeName, MAX_TREE_SIZE);
+					strncat(tmp_path, full_path, MAX_PATHCONF);
+					rc = get_dfs_path(xid, pTcon->ses, tmp_path,
+						cifs_sb->local_nls, &num_referrals, &referrals);
+					cFYI(1,("Get DFS for %s rc = %d ",tmp_path, rc));
+					if((num_referrals == 0) && (rc == 0))
+						rc = -EACCES;
+					else {
+						cFYI(1,("num referral: %d",num_referrals));
+						if(referrals) {
+							cFYI(1,("referral string: %s ",referrals));
+							strncpy(tmpbuffer, referrals, len-1);                            
+						}
+					}
+					if(referrals)
+						kfree(referrals);
+					kfree(tmp_path);
+}
+				/* BB add code like else decode referrals then memcpy to
+				  tmpbuffer and free referrals string array BB */
+			}
+		}
+	}
+	/* BB Anything else to do to handle recursive links? */
+	/* BB Should we be using page ops here? */
+
+	/* BB null terminate returned string in pBuffer? BB */
+	if (rc == 0) {
+		rc = vfs_readlink(direntry, pBuffer, len, tmpbuffer);
+		cFYI(1,
+		     ("vfs_readlink called from cifs_readlink returned %d",
+		      rc));
+	}
+
+	if (tmpbuffer) {
+		kfree(tmpbuffer);
+	}
+	if (full_path) {
+		kfree(full_path);
+	}
+	FreeXid(xid);
+	return rc;
+}
+
+void cifs_put_link(struct dentry *direntry, struct nameidata *nd)
+{
+	char *p = nd_get_link(nd);
+	if (!IS_ERR(p))
+		kfree(p);
 }

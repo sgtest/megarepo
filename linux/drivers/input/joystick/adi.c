@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *  Copyright (c) 1998-2005 Vojtech Pavlik
  */
@@ -8,6 +7,23 @@
  */
 
 /*
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ *
+ * Should you need to contact me, the author, you can do so either by
+ * e-mail - mail your message to <vojtech@ucw.cz>, or by paper mail:
+ * Vojtech Pavlik, Simunkova 1594, Prague 8, 182 00 Czech Republic
  */
 
 #include <linux/delay.h>
@@ -17,7 +33,7 @@
 #include <linux/slab.h>
 #include <linux/input.h>
 #include <linux/gameport.h>
-#include <linux/jiffies.h>
+#include <linux/init.h>
 
 #define DRIVER_DESC	"Logitech ADI joystick family driver"
 
@@ -38,7 +54,7 @@ MODULE_LICENSE("GPL");
 #define ADI_MIN_LENGTH		8
 #define ADI_MIN_LEN_LENGTH	10
 #define ADI_MIN_ID_LENGTH	66
-#define ADI_MAX_NAME_LENGTH	64
+#define ADI_MAX_NAME_LENGTH	48
 #define ADI_MAX_CNAME_LENGTH	16
 #define ADI_MAX_PHYS_LENGTH	64
 
@@ -66,7 +82,7 @@ static char adi_cm2_abs[] =	{ ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ };
 static char adi_wmf_abs[] =	{ ABS_WHEEL, ABS_GAS, ABS_BRAKE, ABS_HAT0X, ABS_HAT0Y, ABS_HAT1X, ABS_HAT1Y, ABS_HAT2X, ABS_HAT2Y };
 
 static short adi_wmgpe_key[] =	{ BTN_A, BTN_B, BTN_C, BTN_X, BTN_Y, BTN_Z,  BTN_TL, BTN_TR, BTN_START, BTN_MODE, BTN_SELECT };
-static short adi_wmi_key[] =	{ BTN_TRIGGER,  BTN_TOP, BTN_THUMB, BTN_TOP2, BTN_BASE, BTN_BASE2, BTN_BASE3, BTN_BASE4, BTN_EXTRA };
+static short adi_wmi_key[] = 	{ BTN_TRIGGER,  BTN_TOP, BTN_THUMB, BTN_TOP2, BTN_BASE, BTN_BASE2, BTN_BASE3, BTN_BASE4, BTN_EXTRA };
 static short adi_wmed3d_key[] =	{ BTN_TRIGGER, BTN_THUMB, BTN_THUMB2, BTN_TOP, BTN_TOP2, BTN_BASE, BTN_BASE2 };
 static short adi_cm2_key[] =	{ BTN_1, BTN_2, BTN_3, BTN_4, BTN_5, BTN_6, BTN_7, BTN_8 };
 
@@ -90,7 +106,7 @@ static struct {
  */
 
 struct adi {
-	struct input_dev *dev;
+	struct input_dev dev;
 	int length;
 	int ret;
 	int idx;
@@ -123,7 +139,7 @@ static void adi_read_packet(struct adi_port *port)
 {
 	struct adi *adi = port->adi;
 	struct gameport *gameport = port->gameport;
-	unsigned char u, v, w, x;
+	unsigned char u, v, w, x, z;
 	int t[2], s[2], i;
 	unsigned long flags;
 
@@ -136,7 +152,7 @@ static void adi_read_packet(struct adi_port *port)
 	local_irq_save(flags);
 
 	gameport_trigger(gameport);
-	v = gameport_read(gameport);
+	v = z = gameport_read(gameport);
 
 	do {
 		u = v;
@@ -167,7 +183,7 @@ static void adi_move_bits(struct adi_port *port, int length)
 	int i;
 	struct adi *adi = port->adi;
 
-	adi[0].idx = adi[1].idx = 0;
+ 	adi[0].idx = adi[1].idx = 0;
 
 	if (adi[0].ret <= 0 || adi[1].ret <= 0) return;
 	if (adi[0].data[0] & 0x20 || ~adi[1].data[0] & 0x20) return;
@@ -199,7 +215,7 @@ static inline int adi_get_bits(struct adi *adi, int count)
 
 static int adi_decode(struct adi *adi)
 {
-	struct input_dev *dev = adi->dev;
+	struct input_dev *dev = &adi->dev;
 	char *abs = adi->abs;
 	short *key = adi->key;
 	int i, t;
@@ -273,7 +289,7 @@ static void adi_poll(struct gameport *gameport)
 
 static int adi_open(struct input_dev *dev)
 {
-	struct adi_port *port = input_get_drvdata(dev);
+	struct adi_port *port = dev->private;
 
 	gameport_start_polling(port->gameport);
 	return 0;
@@ -285,7 +301,7 @@ static int adi_open(struct input_dev *dev)
 
 static void adi_close(struct input_dev *dev)
 {
-	struct adi_port *port = input_get_drvdata(dev);
+	struct adi_port *port = dev->private;
 
 	gameport_stop_polling(port->gameport);
 }
@@ -297,13 +313,12 @@ static void adi_close(struct input_dev *dev)
 
 static void adi_init_digital(struct gameport *gameport)
 {
-	static const int seq[] = { 4, -2, -3, 10, -6, -11, -7, -9, 11, 0 };
+	int seq[] = { 4, -2, -3, 10, -6, -11, -7, -9, 11, 0 };
 	int i;
 
 	for (i = 0; seq[i]; i++) {
 		gameport_trigger(gameport);
-		if (seq[i] > 0)
-			msleep(seq[i]);
+		if (seq[i] > 0) msleep(seq[i]);
 		if (seq[i] < 0) {
 			mdelay(-seq[i]);
 			udelay(-seq[i]*14);	/* It looks like mdelay() is off by approx 1.4% */
@@ -382,47 +397,42 @@ static void adi_id_decode(struct adi *adi, struct adi_port *port)
 	}
 }
 
-static int adi_init_input(struct adi *adi, struct adi_port *port, int half)
+static void adi_init_input(struct adi *adi, struct adi_port *port, int half)
 {
-	struct input_dev *input_dev;
-	char buf[ADI_MAX_NAME_LENGTH];
 	int i, t;
+	char buf[ADI_MAX_NAME_LENGTH];
 
-	adi->dev = input_dev = input_allocate_device();
-	if (!input_dev)
-		return -ENOMEM;
+	if (!adi->length) return;
+
+	init_input_dev(&adi->dev);
 
 	t = adi->id < ADI_ID_MAX ? adi->id : ADI_ID_MAX;
 
 	snprintf(buf, ADI_MAX_PHYS_LENGTH, adi_names[t], adi->id);
-	snprintf(adi->name, ADI_MAX_NAME_LENGTH, "Logitech %s [%s]", buf, adi->cname);
+	snprintf(adi->name, ADI_MAX_NAME_LENGTH, "Logitech %s", buf);
 	snprintf(adi->phys, ADI_MAX_PHYS_LENGTH, "%s/input%d", port->gameport->phys, half);
 
 	adi->abs = adi_abs[t];
 	adi->key = adi_key[t];
 
-	input_dev->name = adi->name;
-	input_dev->phys = adi->phys;
-	input_dev->id.bustype = BUS_GAMEPORT;
-	input_dev->id.vendor = GAMEPORT_ID_VENDOR_LOGITECH;
-	input_dev->id.product = adi->id;
-	input_dev->id.version = 0x0100;
-	input_dev->dev.parent = &port->gameport->dev;
+	adi->dev.open = adi_open;
+	adi->dev.close = adi_close;
 
-	input_set_drvdata(input_dev, port);
+	adi->dev.name = adi->name;
+	adi->dev.phys = adi->phys;
+	adi->dev.id.bustype = BUS_GAMEPORT;
+	adi->dev.id.vendor = GAMEPORT_ID_VENDOR_LOGITECH;
+	adi->dev.id.product = adi->id;
+	adi->dev.id.version = 0x0100;
 
-	input_dev->open = adi_open;
-	input_dev->close = adi_close;
-
-	input_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_ABS);
+	adi->dev.private = port;
+	adi->dev.evbit[0] = BIT(EV_KEY) | BIT(EV_ABS);
 
 	for (i = 0; i < adi->axes10 + adi->axes8 + (adi->hats + (adi->pad != -1)) * 2; i++)
-		set_bit(adi->abs[i], input_dev->absbit);
+		set_bit(adi->abs[i], adi->dev.absbit);
 
 	for (i = 0; i < adi->buttons; i++)
-		set_bit(adi->key[i], input_dev->keybit);
-
-	return 0;
+		set_bit(adi->key[i], adi->dev.keybit);
 }
 
 static void adi_init_center(struct adi *adi)
@@ -435,17 +445,17 @@ static void adi_init_center(struct adi *adi)
 	for (i = 0; i < adi->axes10 + adi->axes8 + (adi->hats + (adi->pad != -1)) * 2; i++) {
 
 		t = adi->abs[i];
-		x = input_abs_get_val(adi->dev, t);
+		x = adi->dev.abs[t];
 
 		if (t == ABS_THROTTLE || t == ABS_RUDDER || adi->id == ADI_ID_WGPE)
 			x = i < adi->axes10 ? 512 : 128;
 
 		if (i < adi->axes10)
-			input_set_abs_params(adi->dev, t, 64, x * 2 - 64, 2, 16);
+			input_set_abs_params(&adi->dev, t, 64, x * 2 - 64, 2, 16);
 		else if (i < adi->axes10 + adi->axes8)
-			input_set_abs_params(adi->dev, t, 48, x * 2 - 48, 1, 16);
+			input_set_abs_params(&adi->dev, t, 48, x * 2 - 48, 1, 16);
 		else
-			input_set_abs_params(adi->dev, t, -1, 1, 0, 0);
+			input_set_abs_params(&adi->dev, t, -1, 1, 0, 0);
 	}
 }
 
@@ -459,8 +469,7 @@ static int adi_connect(struct gameport *gameport, struct gameport_driver *drv)
 	int i;
 	int err;
 
-	port = kzalloc(sizeof(struct adi_port), GFP_KERNEL);
-	if (!port)
+	if (!(port = kcalloc(1, sizeof(struct adi_port), GFP_KERNEL)))
 		return -ENOMEM;
 
 	port->gameport = gameport;
@@ -468,8 +477,10 @@ static int adi_connect(struct gameport *gameport, struct gameport_driver *drv)
 	gameport_set_drvdata(gameport, port);
 
 	err = gameport_open(gameport, drv, GAMEPORT_MODE_RAW);
-	if (err)
-		goto fail1;
+	if (err) {
+		kfree(port);
+		return err;
+	}
 
 	adi_init_digital(gameport);
 	adi_read_packet(port);
@@ -479,18 +490,13 @@ static int adi_connect(struct gameport *gameport, struct gameport_driver *drv)
 
 	for (i = 0; i < 2; i++) {
 		adi_id_decode(port->adi + i, port);
-
-		if (!port->adi[i].length)
-			continue;
-
-		err = adi_init_input(port->adi + i, port, i);
-		if (err)
-			goto fail2;
+		adi_init_input(port->adi + i, port, i);
 	}
 
 	if (!port->adi[0].length && !port->adi[1].length) {
-		err = -ENODEV;
-		goto fail2;
+		gameport_close(gameport);
+		kfree(port);
+		return -ENODEV;
 	}
 
 	gameport_set_poll_handler(gameport, adi_poll);
@@ -505,25 +511,12 @@ static int adi_connect(struct gameport *gameport, struct gameport_driver *drv)
 	for (i = 0; i < 2; i++)
 		if (port->adi[i].length > 0) {
 			adi_init_center(port->adi + i);
-			err = input_register_device(port->adi[i].dev);
-			if (err)
-				goto fail3;
+			input_register_device(&port->adi[i].dev);
+			printk(KERN_INFO "input: %s [%s] on %s\n",
+				port->adi[i].name, port->adi[i].cname, gameport->phys);
 		}
 
 	return 0;
-
- fail3: while (--i >= 0) {
-		if (port->adi[i].length > 0) {
-			input_unregister_device(port->adi[i].dev);
-			port->adi[i].dev = NULL;
-		}
-	}
- fail2:	for (i = 0; i < 2; i++)
-		input_free_device(port->adi[i].dev);
-	gameport_close(gameport);
- fail1:	gameport_set_drvdata(gameport, NULL);
-	kfree(port);
-	return err;
 }
 
 static void adi_disconnect(struct gameport *gameport)
@@ -533,11 +526,15 @@ static void adi_disconnect(struct gameport *gameport)
 
 	for (i = 0; i < 2; i++)
 		if (port->adi[i].length > 0)
-			input_unregister_device(port->adi[i].dev);
+			input_unregister_device(&port->adi[i].dev);
 	gameport_close(gameport);
 	gameport_set_drvdata(gameport, NULL);
 	kfree(port);
 }
+
+/*
+ * The gameport device structure.
+ */
 
 static struct gameport_driver adi_drv = {
 	.driver		= {
@@ -548,4 +545,16 @@ static struct gameport_driver adi_drv = {
 	.disconnect	= adi_disconnect,
 };
 
-module_gameport_driver(adi_drv);
+static int __init adi_init(void)
+{
+	gameport_register_driver(&adi_drv);
+	return 0;
+}
+
+static void __exit adi_exit(void)
+{
+	gameport_unregister_driver(&adi_drv);
+}
+
+module_init(adi_init);
+module_exit(adi_exit);

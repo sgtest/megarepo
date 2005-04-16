@@ -1,26 +1,29 @@
-// SPDX-License-Identifier: GPL-2.0-only
-/* uctrl.c: TS102 Microcontroller interface on Tadpole Sparcbook 3
+/* $Id: uctrl.c,v 1.12 2001/10/08 22:19:51 davem Exp $
+ * uctrl.c: TS102 Microcontroller interface on Tadpole Sparcbook 3
  *
  * Copyright 1999 Derrick J Brashear (shadow@dementia.org)
- * Copyright 2008 David S. Miller (davem@davemloft.net)
  */
 
 #include <linux/module.h>
+#include <linux/sched.h>
 #include <linux/errno.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/slab.h>
-#include <linux/mutex.h>
 #include <linux/ioport.h>
+#include <linux/init.h>
 #include <linux/miscdevice.h>
 #include <linux/mm.h>
-#include <linux/of.h>
-#include <linux/of_device.h>
 
 #include <asm/openprom.h>
 #include <asm/oplib.h>
+#include <asm/system.h>
 #include <asm/irq.h>
 #include <asm/io.h>
+#include <asm/pgtable.h>
+#include <asm/sbus.h>
+
+#define UCTRL_MINOR	174
 
 #define DEBUG 1
 #ifdef DEBUG
@@ -30,26 +33,26 @@
 #endif
 
 struct uctrl_regs {
-	u32 uctrl_intr;
-	u32 uctrl_data;
-	u32 uctrl_stat;
-	u32 uctrl_xxx[5];
+	volatile u32 uctrl_intr;
+	volatile u32 uctrl_data;
+	volatile u32 uctrl_stat;
+	volatile u32 uctrl_xxx[5];
 };
 
 struct ts102_regs {
-	u32 card_a_intr;
-	u32 card_a_stat;
-	u32 card_a_ctrl;
-	u32 card_a_xxx;
-	u32 card_b_intr;
-	u32 card_b_stat;
-	u32 card_b_ctrl;
-	u32 card_b_xxx;
-	u32 uctrl_intr;
-	u32 uctrl_data;
-	u32 uctrl_stat;
-	u32 uctrl_xxx;
-	u32 ts102_xxx[4];
+	volatile u32 card_a_intr;
+	volatile u32 card_a_stat;
+	volatile u32 card_a_ctrl;
+	volatile u32 card_a_xxx;
+	volatile u32 card_b_intr;
+	volatile u32 card_b_stat;
+	volatile u32 card_b_ctrl;
+	volatile u32 card_b_xxx;
+	volatile u32 uctrl_intr;
+	volatile u32 uctrl_data;
+	volatile u32 uctrl_stat;
+	volatile u32 uctrl_xxx;
+	volatile u32 ts102_xxx[4];
 };
 
 /* Bits for uctrl_intr register */
@@ -68,7 +71,6 @@ struct ts102_regs {
 #define UCTRL_STAT_RXNE_STA        0x04    /* receive FIFO not empty status */
 #define UCTRL_STAT_RXO_STA         0x08    /* receive FIFO overflow status */
 
-static DEFINE_MUTEX(uctrl_mutex);
 static const char *uctrl_extstatus[16] = {
         "main power available",
         "internal battery attached",
@@ -184,18 +186,21 @@ enum uctrl_opcode {
   POWER_RESTART=0x83,
 };
 
-static struct uctrl_driver {
-	struct uctrl_regs __iomem *regs;
+struct uctrl_driver {
+	struct uctrl_regs *regs;
 	int irq;
 	int pending;
 	struct uctrl_status status;
-} *global_driver;
+};
 
-static void uctrl_get_event_status(struct uctrl_driver *);
-static void uctrl_get_external_status(struct uctrl_driver *);
+static struct uctrl_driver drv;
 
-static long
-uctrl_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+void uctrl_get_event_status(void);
+void uctrl_get_external_status(void);
+
+static int
+uctrl_ioctl(struct inode *inode, struct file *file,
+	      unsigned int cmd, unsigned long arg)
 {
 	switch (cmd) {
 		default:
@@ -207,22 +212,22 @@ uctrl_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 static int
 uctrl_open(struct inode *inode, struct file *file)
 {
-	mutex_lock(&uctrl_mutex);
-	uctrl_get_event_status(global_driver);
-	uctrl_get_external_status(global_driver);
-	mutex_unlock(&uctrl_mutex);
+	uctrl_get_event_status();
+	uctrl_get_external_status();
 	return 0;
 }
 
-static irqreturn_t uctrl_interrupt(int irq, void *dev_id)
+static irqreturn_t uctrl_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 {
+	struct uctrl_driver *driver = (struct uctrl_driver *)dev_id;
+	printk("in uctrl_interrupt\n");
 	return IRQ_HANDLED;
 }
 
-static const struct file_operations uctrl_fops = {
+static struct file_operations uctrl_fops = {
 	.owner =	THIS_MODULE,
 	.llseek =	no_llseek,
-	.unlocked_ioctl =	uctrl_ioctl,
+	.ioctl =	uctrl_ioctl,
 	.open =		uctrl_open,
 };
 
@@ -237,11 +242,11 @@ static struct miscdevice uctrl_dev = {
 { \
   unsigned int i; \
   for (i = 0; i < 10000; i++) { \
-      if (UCTRL_STAT_TXNF_STA & sbus_readl(&driver->regs->uctrl_stat)) \
+    if (UCTRL_STAT_TXNF_STA & driver->regs->uctrl_stat) \
       break; \
   } \
   dprintk(("write data 0x%02x\n", value)); \
-  sbus_writel(value, &driver->regs->uctrl_data); \
+  driver->regs->uctrl_data = value; \
 }
 
 /* Wait for something to read, read it, then clear the bit */
@@ -250,23 +255,30 @@ static struct miscdevice uctrl_dev = {
   unsigned int i; \
   value = 0; \
   for (i = 0; i < 10000; i++) { \
-      if ((UCTRL_STAT_RXNE_STA & sbus_readl(&driver->regs->uctrl_stat)) == 0) \
+    if ((UCTRL_STAT_RXNE_STA & driver->regs->uctrl_stat) == 0) \
       break; \
     udelay(1); \
   } \
-  value = sbus_readl(&driver->regs->uctrl_data); \
+  value = driver->regs->uctrl_data; \
   dprintk(("read data 0x%02x\n", value)); \
-  sbus_writel(UCTRL_STAT_RXNE_STA, &driver->regs->uctrl_stat); \
+  driver->regs->uctrl_stat = UCTRL_STAT_RXNE_STA; \
 }
 
-static void uctrl_do_txn(struct uctrl_driver *driver, struct uctrl_txn *txn)
+void uctrl_set_video(int status)
 {
+	struct uctrl_driver *driver = &drv;
+	
+}
+
+static void uctrl_do_txn(struct uctrl_txn *txn)
+{
+	struct uctrl_driver *driver = &drv;
 	int stat, incnt, outcnt, bytecnt, intr;
 	u32 byte;
 
-	stat = sbus_readl(&driver->regs->uctrl_stat);
-	intr = sbus_readl(&driver->regs->uctrl_intr);
-	sbus_writel(stat, &driver->regs->uctrl_stat);
+	stat = driver->regs->uctrl_stat;
+	intr = driver->regs->uctrl_intr;
+	driver->regs->uctrl_stat = stat;
 
 	dprintk(("interrupt stat 0x%x int 0x%x\n", stat, intr));
 
@@ -297,18 +309,19 @@ static void uctrl_do_txn(struct uctrl_driver *driver, struct uctrl_txn *txn)
 	}
 }
 
-static void uctrl_get_event_status(struct uctrl_driver *driver)
+void uctrl_get_event_status()
 {
+	struct uctrl_driver *driver = &drv;
 	struct uctrl_txn txn;
 	u8 outbits[2];
 
 	txn.opcode = READ_EVENT_STATUS;
 	txn.inbits = 0;
 	txn.outbits = 2;
-	txn.inbuf = NULL;
+	txn.inbuf = 0;
 	txn.outbuf = outbits;
 
-	uctrl_do_txn(driver, &txn);
+	uctrl_do_txn(&txn);
 
 	dprintk(("bytes %x %x\n", (outbits[0] & 0xff), (outbits[1] & 0xff)));
 	driver->status.event_status = 
@@ -316,8 +329,9 @@ static void uctrl_get_event_status(struct uctrl_driver *driver)
 	dprintk(("ev is %x\n", driver->status.event_status));
 }
 
-static void uctrl_get_external_status(struct uctrl_driver *driver)
+void uctrl_get_external_status()
 {
+	struct uctrl_driver *driver = &drv;
 	struct uctrl_txn txn;
 	u8 outbits[2];
 	int i, v;
@@ -325,10 +339,10 @@ static void uctrl_get_external_status(struct uctrl_driver *driver)
 	txn.opcode = READ_EXTERNAL_STATUS;
 	txn.inbits = 0;
 	txn.outbits = 2;
-	txn.inbuf = NULL;
+	txn.inbuf = 0;
 	txn.outbuf = outbits;
 
-	uctrl_do_txn(driver, &txn);
+	uctrl_do_txn(&txn);
 
 	dprintk(("bytes %x %x\n", (outbits[0] & 0xff), (outbits[1] & 0xff)));
 	driver->status.external_status = 
@@ -344,92 +358,65 @@ static void uctrl_get_external_status(struct uctrl_driver *driver)
 	
 }
 
-static int uctrl_probe(struct platform_device *op)
+static int __init ts102_uctrl_init(void)
 {
-	struct uctrl_driver *p;
-	int err = -ENOMEM;
+	struct uctrl_driver *driver = &drv;
+	int len, i;
+	struct linux_prom_irqs tmp_irq[2];
+        unsigned int vaddr[2] = { 0, 0 };
+	int tmpnode, uctrlnode = prom_getchild(prom_root_node);
 
-	p = kzalloc(sizeof(*p), GFP_KERNEL);
-	if (!p) {
-		printk(KERN_ERR "uctrl: Unable to allocate device struct.\n");
-		goto out;
+	tmpnode = prom_searchsiblings(uctrlnode, "obio");
+
+	if (tmpnode)
+	  uctrlnode = prom_getchild(tmpnode);
+
+	uctrlnode = prom_searchsiblings(uctrlnode, "uctrl");
+
+	if (!uctrlnode)
+		return -ENODEV;
+
+	/* the prom mapped it for us */
+	len = prom_getproperty(uctrlnode, "address", (void *) vaddr,
+			       sizeof(vaddr));
+	driver->regs = (struct uctrl_regs *)vaddr[0];
+
+	len = prom_getproperty(uctrlnode, "intr", (char *) tmp_irq,
+			       sizeof(tmp_irq));
+
+	/* Flush device */
+	READUCTLDATA(len);
+
+	if(!driver->irq) 
+		driver->irq = tmp_irq[0].pri;
+
+	request_irq(driver->irq, uctrl_interrupt, 0, "uctrl", driver);
+
+	if (misc_register(&uctrl_dev)) {
+		printk("%s: unable to get misc minor %d\n",
+		       __FUNCTION__, uctrl_dev.minor);
+		free_irq(driver->irq, driver);
+		return -ENODEV;
 	}
 
-	p->regs = of_ioremap(&op->resource[0], 0,
-			     resource_size(&op->resource[0]),
-			     "uctrl");
-	if (!p->regs) {
-		printk(KERN_ERR "uctrl: Unable to map registers.\n");
-		goto out_free;
-	}
-
-	p->irq = op->archdata.irqs[0];
-	err = request_irq(p->irq, uctrl_interrupt, 0, "uctrl", p);
-	if (err) {
-		printk(KERN_ERR "uctrl: Unable to register irq.\n");
-		goto out_iounmap;
-	}
-
-	err = misc_register(&uctrl_dev);
-	if (err) {
-		printk(KERN_ERR "uctrl: Unable to register misc device.\n");
-		goto out_free_irq;
-	}
-
-	sbus_writel(UCTRL_INTR_RXNE_REQ|UCTRL_INTR_RXNE_MSK, &p->regs->uctrl_intr);
-	printk(KERN_INFO "%pOF: uctrl regs[0x%p] (irq %d)\n",
-	       op->dev.of_node, p->regs, p->irq);
-	uctrl_get_event_status(p);
-	uctrl_get_external_status(p);
-
-	dev_set_drvdata(&op->dev, p);
-	global_driver = p;
-
-out:
-	return err;
-
-out_free_irq:
-	free_irq(p->irq, p);
-
-out_iounmap:
-	of_iounmap(&op->resource[0], p->regs, resource_size(&op->resource[0]));
-
-out_free:
-	kfree(p);
-	goto out;
+	driver->regs->uctrl_intr = UCTRL_INTR_RXNE_REQ|UCTRL_INTR_RXNE_MSK;
+	printk("uctrl: 0x%x (irq %s)\n", driver->regs, __irq_itoa(driver->irq));
+	uctrl_get_event_status();
+	uctrl_get_external_status();
+        return 0;
 }
 
-static int uctrl_remove(struct platform_device *op)
+static void __exit ts102_uctrl_cleanup(void)
 {
-	struct uctrl_driver *p = dev_get_drvdata(&op->dev);
+	struct uctrl_driver *driver = &drv;
 
-	if (p) {
-		misc_deregister(&uctrl_dev);
-		free_irq(p->irq, p);
-		of_iounmap(&op->resource[0], p->regs, resource_size(&op->resource[0]));
-		kfree(p);
-	}
-	return 0;
+	misc_deregister(&uctrl_dev);
+	if (driver->irq)
+		free_irq(driver->irq, driver);
+	if (driver->regs)
+		driver->regs = 0;
 }
 
-static const struct of_device_id uctrl_match[] = {
-	{
-		.name = "uctrl",
-	},
-	{},
-};
-MODULE_DEVICE_TABLE(of, uctrl_match);
-
-static struct platform_driver uctrl_driver = {
-	.driver = {
-		.name = "uctrl",
-		.of_match_table = uctrl_match,
-	},
-	.probe		= uctrl_probe,
-	.remove		= uctrl_remove,
-};
-
-
-module_platform_driver(uctrl_driver);
-
+module_init(ts102_uctrl_init);
+module_exit(ts102_uctrl_cleanup);
 MODULE_LICENSE("GPL");

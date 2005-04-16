@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Device driver for the SYMBIOS/LSILOGIC 53C8XX and 53C1010 family 
  * of PCI-SCSI IO processors.
@@ -22,6 +21,20 @@
  * Copyright (C) 1997 Richard Waltham <dormouse@farsrobt.demon.co.uk>
  *
  *-----------------------------------------------------------------------------
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
 #ifndef SYM_MISC_H
@@ -39,17 +52,17 @@ typedef struct sym_quehead {
 	(ptr)->flink = (ptr); (ptr)->blink = (ptr); \
 } while (0)
 
-static inline struct sym_quehead *sym_que_first(struct sym_quehead *head)
+static __inline struct sym_quehead *sym_que_first(struct sym_quehead *head)
 {
 	return (head->flink == head) ? 0 : head->flink;
 }
 
-static inline struct sym_quehead *sym_que_last(struct sym_quehead *head)
+static __inline struct sym_quehead *sym_que_last(struct sym_quehead *head)
 {
 	return (head->blink == head) ? 0 : head->blink;
 }
 
-static inline void __sym_que_add(struct sym_quehead * new,
+static __inline void __sym_que_add(struct sym_quehead * new,
 	struct sym_quehead * blink,
 	struct sym_quehead * flink)
 {
@@ -59,19 +72,19 @@ static inline void __sym_que_add(struct sym_quehead * new,
 	blink->flink	= new;
 }
 
-static inline void __sym_que_del(struct sym_quehead * blink,
+static __inline void __sym_que_del(struct sym_quehead * blink,
 	struct sym_quehead * flink)
 {
 	flink->blink = blink;
 	blink->flink = flink;
 }
 
-static inline int sym_que_empty(struct sym_quehead *head)
+static __inline int sym_que_empty(struct sym_quehead *head)
 {
 	return head->flink == head;
 }
 
-static inline void sym_que_splice(struct sym_quehead *list,
+static __inline void sym_que_splice(struct sym_quehead *list,
 	struct sym_quehead *head)
 {
 	struct sym_quehead *first = list->flink;
@@ -88,7 +101,7 @@ static inline void sym_que_splice(struct sym_quehead *list,
 	}
 }
 
-static inline void sym_que_move(struct sym_quehead *orig,
+static __inline void sym_que_move(struct sym_quehead *orig,
 	struct sym_quehead *dest)
 {
 	struct sym_quehead *first, *last;
@@ -108,7 +121,9 @@ static inline void sym_que_move(struct sym_quehead *orig,
 	}
 }
 
-#define sym_que_entry(ptr, type, member) container_of(ptr, type, member)
+#define sym_que_entry(ptr, type, member) \
+	((type *)((char *)(ptr)-(unsigned int)(&((type *)0)->member)))
+
 
 #define sym_insque(new, pos)		__sym_que_add(new, pos, (pos)->flink)
 
@@ -116,7 +131,7 @@ static inline void sym_que_move(struct sym_quehead *orig,
 
 #define sym_insque_head(new, head)	__sym_que_add(new, head, (head)->flink)
 
-static inline struct sym_quehead *sym_remque_head(struct sym_quehead *head)
+static __inline struct sym_quehead *sym_remque_head(struct sym_quehead *head)
 {
 	struct sym_quehead *elem = head->flink;
 
@@ -129,7 +144,7 @@ static inline struct sym_quehead *sym_remque_head(struct sym_quehead *head)
 
 #define sym_insque_tail(new, head)	__sym_que_add(new, (head)->blink, head)
 
-static inline struct sym_quehead *sym_remque_tail(struct sym_quehead *head)
+static __inline struct sym_quehead *sym_remque_tail(struct sym_quehead *head)
 {
 	struct sym_quehead *elem = head->blink;
 

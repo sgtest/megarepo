@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * processor_thermal.c - Passive cooling submodule of the ACPI processor driver
  *
@@ -7,15 +6,92 @@
  *  Copyright (C) 2004       Dominik Brodowski <linux@brodo.de>
  *  Copyright (C) 2004  Anil S Keshavamurthy <anil.s.keshavamurthy@intel.com>
  *  			- Added processor hotplug support
+ *
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or (at
+ *  your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful, but
+ *  WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ *  General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License along
+ *  with this program; if not, write to the Free Software Foundation, Inc.,
+ *  59 Temple Place, Suite 330, Boston, MA 02111-1307 USA.
+ *
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  */
 
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/cpufreq.h>
-#include <linux/acpi.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+
+#include <asm/uaccess.h>
+
+#include <acpi/acpi_bus.h>
 #include <acpi/processor.h>
-#include <linux/uaccess.h>
+#include <acpi/acpi_drivers.h>
+
+#define ACPI_PROCESSOR_COMPONENT        0x01000000
+#define ACPI_PROCESSOR_CLASS            "processor"
+#define ACPI_PROCESSOR_DRIVER_NAME      "ACPI Processor Driver"
+#define _COMPONENT              ACPI_PROCESSOR_COMPONENT
+ACPI_MODULE_NAME                ("acpi_processor")
+
+
+/* --------------------------------------------------------------------------
+                                 Limit Interface
+   -------------------------------------------------------------------------- */
+
+static int
+acpi_processor_apply_limit (
+	struct acpi_processor* 	pr)
+{
+	int			result = 0;
+	u16			px = 0;
+	u16			tx = 0;
+
+	ACPI_FUNCTION_TRACE("acpi_processor_apply_limit");
+
+	if (!pr)
+		return_VALUE(-EINVAL);
+
+	if (!pr->flags.limit)
+		return_VALUE(-ENODEV);
+
+	if (pr->flags.throttling) {
+		if (pr->limit.user.tx > tx)
+			tx = pr->limit.user.tx;
+		if (pr->limit.thermal.tx > tx)
+			tx = pr->limit.thermal.tx;
+
+		result = acpi_processor_set_throttling(pr, tx);
+		if (result)
+			goto end;
+	}
+
+	pr->limit.state.px = px;
+	pr->limit.state.tx = tx;
+
+	ACPI_DEBUG_PRINT((ACPI_DB_INFO, "Processor [%d] limit set to (P%d:T%d)\n",
+		pr->id,
+		pr->limit.state.px,
+		pr->limit.state.tx));
+
+end:
+	if (result)
+		ACPI_DEBUG_PRINT((ACPI_DB_ERROR, "Unable to set limit\n"));
+
+	return_VALUE(result);
+}
+
 
 #ifdef CONFIG_CPU_FREQ
 
@@ -25,298 +101,306 @@
  * _any_ cpufreq driver and not only the acpi-cpufreq driver.
  */
 
-#define CPUFREQ_THERMAL_MIN_STEP 0
-#define CPUFREQ_THERMAL_MAX_STEP 3
+static unsigned int cpufreq_thermal_reduction_pctg[NR_CPUS];
+static unsigned int acpi_thermal_cpufreq_is_init = 0;
 
-static DEFINE_PER_CPU(unsigned int, cpufreq_thermal_reduction_pctg);
-
-#define reduction_pctg(cpu) \
-	per_cpu(cpufreq_thermal_reduction_pctg, phys_package_first_cpu(cpu))
-
-/*
- * Emulate "per package data" using per cpu data (which should really be
- * provided elsewhere)
- *
- * Note we can lose a CPU on cpu hotunplug, in this case we forget the state
- * temporarily. Fortunately that's not a big issue here (I hope)
- */
-static int phys_package_first_cpu(int cpu)
-{
-	int i;
-	int id = topology_physical_package_id(cpu);
-
-	for_each_online_cpu(i)
-		if (topology_physical_package_id(i) == id)
-			return i;
-	return 0;
-}
 
 static int cpu_has_cpufreq(unsigned int cpu)
 {
-	struct cpufreq_policy *policy;
-
-	if (!acpi_processor_cpufreq_init)
-		return 0;
-
-	policy = cpufreq_cpu_get(cpu);
-	if (policy) {
-		cpufreq_cpu_put(policy);
-		return 1;
-	}
+	struct cpufreq_policy policy;
+	if (!acpi_thermal_cpufreq_is_init)
+		return -ENODEV;
+	if (!cpufreq_get_policy(&policy, cpu))
+		return -ENODEV;
 	return 0;
 }
 
-static int cpufreq_get_max_state(unsigned int cpu)
+
+static int acpi_thermal_cpufreq_increase(unsigned int cpu)
 {
 	if (!cpu_has_cpufreq(cpu))
-		return 0;
+		return -ENODEV;
 
-	return CPUFREQ_THERMAL_MAX_STEP;
+	if (cpufreq_thermal_reduction_pctg[cpu] < 60) {
+		cpufreq_thermal_reduction_pctg[cpu] += 20;
+		cpufreq_update_policy(cpu);
+		return 0;
+	}
+
+	return -ERANGE;
 }
 
-static int cpufreq_get_cur_state(unsigned int cpu)
+
+static int acpi_thermal_cpufreq_decrease(unsigned int cpu)
 {
 	if (!cpu_has_cpufreq(cpu))
+		return -ENODEV;
+
+	if (cpufreq_thermal_reduction_pctg[cpu] >= 20) {
+		cpufreq_thermal_reduction_pctg[cpu] -= 20;
+		cpufreq_update_policy(cpu);
 		return 0;
-
-	return reduction_pctg(cpu);
-}
-
-static int cpufreq_set_cur_state(unsigned int cpu, int state)
-{
-	struct cpufreq_policy *policy;
-	struct acpi_processor *pr;
-	unsigned long max_freq;
-	int i, ret;
-
-	if (!cpu_has_cpufreq(cpu))
-		return 0;
-
-	reduction_pctg(cpu) = state;
-
-	/*
-	 * Update all the CPUs in the same package because they all
-	 * contribute to the temperature and often share the same
-	 * frequency.
-	 */
-	for_each_online_cpu(i) {
-		if (topology_physical_package_id(i) !=
-		    topology_physical_package_id(cpu))
-			continue;
-
-		pr = per_cpu(processors, i);
-
-		if (unlikely(!freq_qos_request_active(&pr->thermal_req)))
-			continue;
-
-		policy = cpufreq_cpu_get(i);
-		if (!policy)
-			return -EINVAL;
-
-		max_freq = (policy->cpuinfo.max_freq * (100 - reduction_pctg(i) * 20)) / 100;
-
-		cpufreq_cpu_put(policy);
-
-		ret = freq_qos_update_request(&pr->thermal_req, max_freq);
-		if (ret < 0) {
-			pr_warn("Failed to update thermal freq constraint: CPU%d (%d)\n",
-				pr->id, ret);
-		}
 	}
+
+	return -ERANGE;
+}
+
+
+static int acpi_thermal_cpufreq_notifier(
+	struct notifier_block *nb,
+	unsigned long event,
+	void *data)
+{
+	struct cpufreq_policy *policy = data;
+	unsigned long max_freq = 0;
+
+	if (event != CPUFREQ_ADJUST)
+		goto out;
+
+	max_freq = (policy->cpuinfo.max_freq * (100 - cpufreq_thermal_reduction_pctg[policy->cpu])) / 100;
+
+	cpufreq_verify_within_limits(policy, 0, max_freq);
+
+ out:
 	return 0;
 }
 
-void acpi_thermal_cpufreq_init(struct cpufreq_policy *policy)
-{
-	unsigned int cpu;
 
-	for_each_cpu(cpu, policy->related_cpus) {
-		struct acpi_processor *pr = per_cpu(processors, cpu);
-		int ret;
+static struct notifier_block acpi_thermal_cpufreq_notifier_block = {
+	.notifier_call = acpi_thermal_cpufreq_notifier,
+};
 
-		if (!pr)
-			continue;
 
-		ret = freq_qos_add_request(&policy->constraints,
-					   &pr->thermal_req,
-					   FREQ_QOS_MAX, INT_MAX);
-		if (ret < 0)
-			pr_err("Failed to add freq constraint for CPU%d (%d)\n",
-			       cpu, ret);
-	}
+void acpi_thermal_cpufreq_init(void) {
+	int i;
+
+	for (i=0; i<NR_CPUS; i++)
+		cpufreq_thermal_reduction_pctg[i] = 0;
+
+	i = cpufreq_register_notifier(&acpi_thermal_cpufreq_notifier_block, CPUFREQ_POLICY_NOTIFIER);
+	if (!i)
+		acpi_thermal_cpufreq_is_init = 1;
 }
 
-void acpi_thermal_cpufreq_exit(struct cpufreq_policy *policy)
-{
-	unsigned int cpu;
+void acpi_thermal_cpufreq_exit(void) {
+	if (acpi_thermal_cpufreq_is_init)
+		cpufreq_unregister_notifier(&acpi_thermal_cpufreq_notifier_block, CPUFREQ_POLICY_NOTIFIER);
 
-	for_each_cpu(cpu, policy->related_cpus) {
-		struct acpi_processor *pr = per_cpu(processors, policy->cpu);
-
-		if (pr)
-			freq_qos_remove_request(&pr->thermal_req);
-	}
-}
-#else				/* ! CONFIG_CPU_FREQ */
-static int cpufreq_get_max_state(unsigned int cpu)
-{
-	return 0;
+	acpi_thermal_cpufreq_is_init = 0;
 }
 
-static int cpufreq_get_cur_state(unsigned int cpu)
-{
-	return 0;
-}
+#else /* ! CONFIG_CPU_FREQ */
 
-static int cpufreq_set_cur_state(unsigned int cpu, int state)
-{
-	return 0;
-}
+static int acpi_thermal_cpufreq_increase(unsigned int cpu) { return -ENODEV; }
+static int acpi_thermal_cpufreq_decrease(unsigned int cpu) { return -ENODEV; }
+
 
 #endif
 
-/* thermal cooling device callbacks */
-static int acpi_processor_max_state(struct acpi_processor *pr)
+
+int
+acpi_processor_set_thermal_limit (
+	acpi_handle		handle,
+	int			type)
 {
-	int max_state = 0;
+	int			result = 0;
+	struct acpi_processor	*pr = NULL;
+	struct acpi_device	*device = NULL;
+	int			tx = 0;
+
+	ACPI_FUNCTION_TRACE("acpi_processor_set_thermal_limit");
+
+	if ((type < ACPI_PROCESSOR_LIMIT_NONE)
+		|| (type > ACPI_PROCESSOR_LIMIT_DECREMENT))
+		return_VALUE(-EINVAL);
+
+	result = acpi_bus_get_device(handle, &device);
+	if (result)
+		return_VALUE(result);
+
+	pr = (struct acpi_processor *) acpi_driver_data(device);
+	if (!pr)
+		return_VALUE(-ENODEV);
+
+	/* Thermal limits are always relative to the current Px/Tx state. */
+	if (pr->flags.throttling)
+		pr->limit.thermal.tx = pr->throttling.state;
 
 	/*
-	 * There exists four states according to
-	 * cpufreq_thermal_reduction_pctg. 0, 1, 2, 3
+	 * Our default policy is to only use throttling at the lowest
+	 * performance state.
 	 */
-	max_state += cpufreq_get_max_state(pr->id);
-	if (pr->flags.throttling)
-		max_state += (pr->throttling.state_count -1);
 
-	return max_state;
-}
-static int
-processor_get_max_state(struct thermal_cooling_device *cdev,
-			unsigned long *state)
-{
-	struct acpi_device *device = cdev->devdata;
-	struct acpi_processor *pr;
+	tx = pr->limit.thermal.tx;
 
-	if (!device)
-		return -EINVAL;
+	switch (type) {
 
-	pr = acpi_driver_data(device);
-	if (!pr)
-		return -EINVAL;
+	case ACPI_PROCESSOR_LIMIT_NONE:
+		do {
+			result = acpi_thermal_cpufreq_decrease(pr->id);
+		} while (!result);
+		tx = 0;
+		break;
 
-	*state = acpi_processor_max_state(pr);
-	return 0;
-}
+	case ACPI_PROCESSOR_LIMIT_INCREMENT:
+		/* if going up: P-states first, T-states later */
 
-static int
-processor_get_cur_state(struct thermal_cooling_device *cdev,
-			unsigned long *cur_state)
-{
-	struct acpi_device *device = cdev->devdata;
-	struct acpi_processor *pr;
+		result = acpi_thermal_cpufreq_increase(pr->id);
+		if (!result)
+			goto end;
+		else if (result == -ERANGE)
+			ACPI_DEBUG_PRINT((ACPI_DB_INFO,
+					"At maximum performance state\n"));
 
-	if (!device)
-		return -EINVAL;
+		if (pr->flags.throttling) {
+			if (tx == (pr->throttling.state_count - 1))
+				ACPI_DEBUG_PRINT((ACPI_DB_INFO,
+					"At maximum throttling state\n"));
+			else
+				tx++;
+		}
+		break;
 
-	pr = acpi_driver_data(device);
-	if (!pr)
-		return -EINVAL;
+	case ACPI_PROCESSOR_LIMIT_DECREMENT:
+		/* if going down: T-states first, P-states later */
 
-	*cur_state = cpufreq_get_cur_state(pr->id);
-	if (pr->flags.throttling)
-		*cur_state += pr->throttling.state;
-	return 0;
-}
+		if (pr->flags.throttling) {
+			if (tx == 0)
+				ACPI_DEBUG_PRINT((ACPI_DB_INFO,
+					"At minimum throttling state\n"));
+			else {
+				tx--;
+				goto end;
+			}
+		}
 
-static int
-processor_set_cur_state(struct thermal_cooling_device *cdev,
-			unsigned long state)
-{
-	struct acpi_device *device = cdev->devdata;
-	struct acpi_processor *pr;
-	int result = 0;
-	int max_pstate;
+		result = acpi_thermal_cpufreq_decrease(pr->id);
+		if (result == -ERANGE)
+			ACPI_DEBUG_PRINT((ACPI_DB_INFO,
+					"At minimum performance state\n"));
 
-	if (!device)
-		return -EINVAL;
-
-	pr = acpi_driver_data(device);
-	if (!pr)
-		return -EINVAL;
-
-	max_pstate = cpufreq_get_max_state(pr->id);
-
-	if (state > acpi_processor_max_state(pr))
-		return -EINVAL;
-
-	if (state <= max_pstate) {
-		if (pr->flags.throttling && pr->throttling.state)
-			result = acpi_processor_set_throttling(pr, 0, false);
-		cpufreq_set_cur_state(pr->id, state);
-	} else {
-		cpufreq_set_cur_state(pr->id, max_pstate);
-		result = acpi_processor_set_throttling(pr,
-				state - max_pstate, false);
+		break;
 	}
-	return result;
+
+end:
+	if (pr->flags.throttling) {
+		pr->limit.thermal.px = 0;
+		pr->limit.thermal.tx = tx;
+
+		result = acpi_processor_apply_limit(pr);
+		if (result)
+			ACPI_DEBUG_PRINT((ACPI_DB_ERROR,
+					  "Unable to set thermal limit\n"));
+
+		ACPI_DEBUG_PRINT((ACPI_DB_INFO, "Thermal limit now (P%d:T%d)\n",
+				  pr->limit.thermal.px,
+				  pr->limit.thermal.tx));
+	} else
+		result = 0;
+
+	return_VALUE(result);
 }
 
-const struct thermal_cooling_device_ops processor_cooling_ops = {
-	.get_max_state = processor_get_max_state,
-	.get_cur_state = processor_get_cur_state,
-	.set_cur_state = processor_set_cur_state,
+
+int
+acpi_processor_get_limit_info (
+	struct acpi_processor	*pr)
+{
+	ACPI_FUNCTION_TRACE("acpi_processor_get_limit_info");
+
+	if (!pr)
+		return_VALUE(-EINVAL);
+
+	if (pr->flags.throttling)
+		pr->flags.limit = 1;
+
+	return_VALUE(0);
+}
+
+
+/* /proc interface */
+
+static int acpi_processor_limit_seq_show(struct seq_file *seq, void *offset)
+{
+	struct acpi_processor	*pr = (struct acpi_processor *)seq->private;
+
+	ACPI_FUNCTION_TRACE("acpi_processor_limit_seq_show");
+
+	if (!pr)
+		goto end;
+
+	if (!pr->flags.limit) {
+		seq_puts(seq, "<not supported>\n");
+		goto end;
+	}
+
+	seq_printf(seq, "active limit:            P%d:T%d\n"
+			"user limit:              P%d:T%d\n"
+			"thermal limit:           P%d:T%d\n",
+			pr->limit.state.px, pr->limit.state.tx,
+			pr->limit.user.px, pr->limit.user.tx,
+			pr->limit.thermal.px, pr->limit.thermal.tx);
+
+end:
+	return_VALUE(0);
+}
+
+static int acpi_processor_limit_open_fs(struct inode *inode, struct file *file)
+{
+	return single_open(file, acpi_processor_limit_seq_show,
+						PDE(inode)->data);
+}
+
+ssize_t acpi_processor_write_limit (
+	struct file		*file,
+	const char		__user *buffer,
+	size_t			count,
+	loff_t			*data)
+{
+	int			result = 0;
+        struct seq_file 	*m = (struct seq_file *)file->private_data;
+	struct acpi_processor	*pr = (struct acpi_processor *)m->private;
+	char			limit_string[25] = {'\0'};
+	int			px = 0;
+	int			tx = 0;
+
+	ACPI_FUNCTION_TRACE("acpi_processor_write_limit");
+
+	if (!pr || (count > sizeof(limit_string) - 1)) {
+		ACPI_DEBUG_PRINT((ACPI_DB_ERROR, "Invalid argument\n"));
+		return_VALUE(-EINVAL);
+	}
+
+	if (copy_from_user(limit_string, buffer, count)) {
+		ACPI_DEBUG_PRINT((ACPI_DB_ERROR, "Invalid data\n"));
+		return_VALUE(-EFAULT);
+	}
+
+	limit_string[count] = '\0';
+
+	if (sscanf(limit_string, "%d:%d", &px, &tx) != 2) {
+		ACPI_DEBUG_PRINT((ACPI_DB_ERROR, "Invalid data format\n"));
+		return_VALUE(-EINVAL);
+	}
+
+	if (pr->flags.throttling) {
+		if ((tx < 0) || (tx > (pr->throttling.state_count - 1))) {
+			ACPI_DEBUG_PRINT((ACPI_DB_ERROR, "Invalid tx\n"));
+			return_VALUE(-EINVAL);
+		}
+		pr->limit.user.tx = tx;
+	}
+
+	result = acpi_processor_apply_limit(pr);
+
+	return_VALUE(count);
+}
+
+
+struct file_operations acpi_processor_limit_fops = {
+	.open 		= acpi_processor_limit_open_fs,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
 };
 
-int acpi_processor_thermal_init(struct acpi_processor *pr,
-				struct acpi_device *device)
-{
-	int result = 0;
-
-	pr->cdev = thermal_cooling_device_register("Processor", device,
-						   &processor_cooling_ops);
-	if (IS_ERR(pr->cdev)) {
-		result = PTR_ERR(pr->cdev);
-		return result;
-	}
-
-	dev_dbg(&device->dev, "registered as cooling_device%d\n",
-		pr->cdev->id);
-
-	result = sysfs_create_link(&device->dev.kobj,
-				   &pr->cdev->device.kobj,
-				   "thermal_cooling");
-	if (result) {
-		dev_err(&device->dev,
-			"Failed to create sysfs link 'thermal_cooling'\n");
-		goto err_thermal_unregister;
-	}
-
-	result = sysfs_create_link(&pr->cdev->device.kobj,
-				   &device->dev.kobj,
-				   "device");
-	if (result) {
-		dev_err(&pr->cdev->device,
-			"Failed to create sysfs link 'device'\n");
-		goto err_remove_sysfs_thermal;
-	}
-
-	return 0;
-
-err_remove_sysfs_thermal:
-	sysfs_remove_link(&device->dev.kobj, "thermal_cooling");
-err_thermal_unregister:
-	thermal_cooling_device_unregister(pr->cdev);
-
-	return result;
-}
-
-void acpi_processor_thermal_exit(struct acpi_processor *pr,
-				 struct acpi_device *device)
-{
-	if (pr->cdev) {
-		sysfs_remove_link(&device->dev.kobj, "thermal_cooling");
-		sysfs_remove_link(&pr->cdev->device.kobj, "device");
-		thermal_cooling_device_unregister(pr->cdev);
-		pr->cdev = NULL;
-	}
-}

@@ -1,8 +1,9 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * drivers/parisc/gsc.h
  * Declarations for functions in gsc.c
  * Copyright (c) 2000-2002 Helge Deller, Matthew Wilcox
+ *
+ * Distributed under the terms of the GPL, version 2
  */
 
 #include <linux/interrupt.h>
@@ -31,17 +32,16 @@ struct gsc_asic {
 	int version;
 	int type;
 	int eim;
-	struct gsc_irq gsc_irq;
 	int global_irq[32];
 };
 
 int gsc_common_setup(struct parisc_device *parent, struct gsc_asic *gsc_asic);
 int gsc_alloc_irq(struct gsc_irq *dev);			/* dev needs an irq */
 int gsc_claim_irq(struct gsc_irq *dev, int irq);	/* dev needs this irq */
-int gsc_assign_irq(struct irq_chip *type, void *data);
+int gsc_assign_irq(struct hw_interrupt_type *type, void *data);
 int gsc_find_local_irq(unsigned int irq, int *global_irq, int limit);
 void gsc_fixup_irqs(struct parisc_device *parent, void *ctrl,
 		void (*choose)(struct parisc_device *child, void *ctrl));
 void gsc_asic_assign_irq(struct gsc_asic *asic, int local_irq, int *irqp);
 
-irqreturn_t gsc_asic_intr(int irq, void *dev);
+irqreturn_t gsc_asic_intr(int irq, void *dev, struct pt_regs *regs);

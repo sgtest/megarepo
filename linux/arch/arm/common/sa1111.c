@@ -1,96 +1,45 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
- * linux/arch/arm/common/sa1111.c
+ * linux/arch/arm/mach-sa1100/sa1111.c
  *
  * SA1111 support
  *
  * Original code by John Dorsey
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  *
  * This file contains all generic SA1111 support.
  *
  * All initialization functions provided here are intended to be called
  * from machine specific code with proper arguments when required.
  */
+#include <linux/config.h>
 #include <linux/module.h>
-#include <linux/gpio/driver.h>
 #include <linux/init.h>
-#include <linux/irq.h>
 #include <linux/kernel.h>
 #include <linux/delay.h>
+#include <linux/ptrace.h>
 #include <linux/errno.h>
 #include <linux/ioport.h>
-#include <linux/platform_device.h>
+#include <linux/device.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
-#include <linux/dma-map-ops.h>
-#include <linux/clk.h>
-#include <linux/io.h>
+#include <linux/dma-mapping.h>
 
-#include <asm/mach/irq.h>
+#include <asm/hardware.h>
 #include <asm/mach-types.h>
-#include <linux/sizes.h>
+#include <asm/io.h>
+#include <asm/irq.h>
+#include <asm/mach/irq.h>
 
 #include <asm/hardware/sa1111.h>
 
-#ifdef CONFIG_ARCH_SA1100
-#include <mach/hardware.h>
+#ifdef CONFIG_ARCH_PXA
+#include <asm/arch/pxa-regs.h>
 #endif
 
-/* SA1111 IRQs */
-#define IRQ_GPAIN0		(0)
-#define IRQ_GPAIN1		(1)
-#define IRQ_GPAIN2		(2)
-#define IRQ_GPAIN3		(3)
-#define IRQ_GPBIN0		(4)
-#define IRQ_GPBIN1		(5)
-#define IRQ_GPBIN2		(6)
-#define IRQ_GPBIN3		(7)
-#define IRQ_GPBIN4		(8)
-#define IRQ_GPBIN5		(9)
-#define IRQ_GPCIN0		(10)
-#define IRQ_GPCIN1		(11)
-#define IRQ_GPCIN2		(12)
-#define IRQ_GPCIN3		(13)
-#define IRQ_GPCIN4		(14)
-#define IRQ_GPCIN5		(15)
-#define IRQ_GPCIN6		(16)
-#define IRQ_GPCIN7		(17)
-#define IRQ_MSTXINT		(18)
-#define IRQ_MSRXINT		(19)
-#define IRQ_MSSTOPERRINT	(20)
-#define IRQ_TPTXINT		(21)
-#define IRQ_TPRXINT		(22)
-#define IRQ_TPSTOPERRINT	(23)
-#define SSPXMTINT		(24)
-#define SSPRCVINT		(25)
-#define SSPROR			(26)
-#define AUDXMTDMADONEA		(32)
-#define AUDRCVDMADONEA		(33)
-#define AUDXMTDMADONEB		(34)
-#define AUDRCVDMADONEB		(35)
-#define AUDTFSR			(36)
-#define AUDRFSR			(37)
-#define AUDTUR			(38)
-#define AUDROR			(39)
-#define AUDDTS			(40)
-#define AUDRDD			(41)
-#define AUDSTO			(42)
-#define IRQ_USBPWR		(43)
-#define IRQ_HCIM		(44)
-#define IRQ_HCIBUFFACC		(45)
-#define IRQ_HCIRMTWKP		(46)
-#define IRQ_NHCIMFCIR		(47)
-#define IRQ_USB_PORT_RESUME	(48)
-#define IRQ_S0_READY_NINT	(49)
-#define IRQ_S1_READY_NINT	(50)
-#define IRQ_S0_CD_VALID		(51)
-#define IRQ_S1_CD_VALID		(52)
-#define IRQ_S0_BVD1_STSCHG	(53)
-#define IRQ_S1_BVD1_STSCHG	(54)
-#define SA1111_IRQ_NR		(55)
-
-extern void sa1110_mb_enable(void);
-extern void sa1110_mb_disable(void);
+extern void __init sa1110_mb_enable(void);
 
 /*
  * We keep the following data for the overall SA1111.  Note that the
@@ -101,18 +50,10 @@ extern void sa1110_mb_disable(void);
  */
 struct sa1111 {
 	struct device	*dev;
-	struct clk	*clk;
 	unsigned long	phys;
 	int		irq;
-	int		irq_base;	/* base for cascaded on-chip IRQs */
 	spinlock_t	lock;
 	void __iomem	*base;
-	struct sa1111_platform_data *pdata;
-	struct irq_domain *irqdomain;
-	struct gpio_chip gc;
-#ifdef CONFIG_PM
-	void		*saved_state;
-#endif
 };
 
 /*
@@ -124,18 +65,16 @@ static struct sa1111 *g_sa1111;
 struct sa1111_dev_info {
 	unsigned long	offset;
 	unsigned long	skpcr_mask;
-	bool		dma;
 	unsigned int	devid;
-	unsigned int	hwirq[6];
+	unsigned int	irq[6];
 };
 
 static struct sa1111_dev_info sa1111_devices[] = {
 	{
 		.offset		= SA1111_USB,
 		.skpcr_mask	= SKPCR_UCLKEN,
-		.dma		= true,
 		.devid		= SA1111_DEVID_USB,
-		.hwirq = {
+		.irq = {
 			IRQ_USBPWR,
 			IRQ_HCIM,
 			IRQ_HCIBUFFACC,
@@ -147,9 +86,8 @@ static struct sa1111_dev_info sa1111_devices[] = {
 	{
 		.offset		= 0x0600,
 		.skpcr_mask	= SKPCR_I2SCLKEN | SKPCR_L3CLKEN,
-		.dma		= true,
 		.devid		= SA1111_DEVID_SAC,
-		.hwirq = {
+		.irq = {
 			AUDXMTDMADONEA,
 			AUDXMTDMADONEB,
 			AUDRCVDMADONEA,
@@ -164,8 +102,8 @@ static struct sa1111_dev_info sa1111_devices[] = {
 	{
 		.offset		= SA1111_KBD,
 		.skpcr_mask	= SKPCR_PTCLKEN,
-		.devid		= SA1111_DEVID_PS2_KBD,
-		.hwirq = {
+		.devid		= SA1111_DEVID_PS2,
+		.irq = {
 			IRQ_TPRXINT,
 			IRQ_TPTXINT
 		},
@@ -173,8 +111,8 @@ static struct sa1111_dev_info sa1111_devices[] = {
 	{
 		.offset		= SA1111_MSE,
 		.skpcr_mask	= SKPCR_PMCLKEN,
-		.devid		= SA1111_DEVID_PS2_MSE,
-		.hwirq = {
+		.devid		= SA1111_DEVID_PS2,
+		.irq = {
 			IRQ_MSRXINT,
 			IRQ_MSTXINT
 		},
@@ -183,7 +121,7 @@ static struct sa1111_dev_info sa1111_devices[] = {
 		.offset		= 0x1800,
 		.skpcr_mask	= 0,
 		.devid		= SA1111_DEVID_PCMCIA,
-		.hwirq = {
+		.irq = {
 			IRQ_S0_READY_NINT,
 			IRQ_S0_CD_VALID,
 			IRQ_S0_BVD1_STSCHG,
@@ -194,85 +132,68 @@ static struct sa1111_dev_info sa1111_devices[] = {
 	},
 };
 
-static int sa1111_map_irq(struct sa1111 *sachip, irq_hw_number_t hwirq)
-{
-	return irq_create_mapping(sachip->irqdomain, hwirq);
-}
-
 /*
  * SA1111 interrupt support.  Since clearing an IRQ while there are
  * active IRQs causes the interrupt output to pulse, the upper levels
  * will call us again if there are more interrupts to process.
  */
-static void sa1111_irq_handler(struct irq_desc *desc)
+static void
+sa1111_irq_handler(unsigned int irq, struct irqdesc *desc, struct pt_regs *regs)
 {
 	unsigned int stat0, stat1, i;
-	struct sa1111 *sachip = irq_desc_get_handler_data(desc);
-	struct irq_domain *irqdomain;
-	void __iomem *mapbase = sachip->base + SA1111_INTC;
+	void __iomem *base = desc->data;
 
-	stat0 = readl_relaxed(mapbase + SA1111_INTSTATCLR0);
-	stat1 = readl_relaxed(mapbase + SA1111_INTSTATCLR1);
+	stat0 = sa1111_readl(base + SA1111_INTSTATCLR0);
+	stat1 = sa1111_readl(base + SA1111_INTSTATCLR1);
 
-	writel_relaxed(stat0, mapbase + SA1111_INTSTATCLR0);
+	sa1111_writel(stat0, base + SA1111_INTSTATCLR0);
 
-	desc->irq_data.chip->irq_ack(&desc->irq_data);
+	desc->chip->ack(irq);
 
-	writel_relaxed(stat1, mapbase + SA1111_INTSTATCLR1);
+	sa1111_writel(stat1, base + SA1111_INTSTATCLR1);
 
 	if (stat0 == 0 && stat1 == 0) {
-		do_bad_IRQ(desc);
+		do_bad_IRQ(irq, desc, regs);
 		return;
 	}
 
-	irqdomain = sachip->irqdomain;
-
-	for (i = 0; stat0; i++, stat0 >>= 1)
+	for (i = IRQ_SA1111_START; stat0; i++, stat0 >>= 1)
 		if (stat0 & 1)
-			generic_handle_domain_irq(irqdomain, i);
+			do_edge_IRQ(i, irq_desc + i, regs);
 
-	for (i = 32; stat1; i++, stat1 >>= 1)
+	for (i = IRQ_SA1111_START + 32; stat1; i++, stat1 >>= 1)
 		if (stat1 & 1)
-			generic_handle_domain_irq(irqdomain, i);
+			do_edge_IRQ(i, irq_desc + i, regs);
 
 	/* For level-based interrupts */
-	desc->irq_data.chip->irq_unmask(&desc->irq_data);
+	desc->chip->unmask(irq);
 }
 
-static u32 sa1111_irqmask(struct irq_data *d)
-{
-	return BIT(irqd_to_hwirq(d) & 31);
-}
+#define SA1111_IRQMASK_LO(x)	(1 << (x - IRQ_SA1111_START))
+#define SA1111_IRQMASK_HI(x)	(1 << (x - IRQ_SA1111_START - 32))
 
-static int sa1111_irqbank(struct irq_data *d)
-{
-	return (irqd_to_hwirq(d) / 32) * 4;
-}
-
-static void sa1111_ack_irq(struct irq_data *d)
+static void sa1111_ack_irq(unsigned int irq)
 {
 }
 
-static void sa1111_mask_irq(struct irq_data *d)
+static void sa1111_mask_lowirq(unsigned int irq)
 {
-	struct sa1111 *sachip = irq_data_get_irq_chip_data(d);
-	void __iomem *mapbase = sachip->base + SA1111_INTC + sa1111_irqbank(d);
-	u32 ie;
+	void __iomem *mapbase = get_irq_chipdata(irq);
+	unsigned long ie0;
 
-	ie = readl_relaxed(mapbase + SA1111_INTEN0);
-	ie &= ~sa1111_irqmask(d);
-	writel(ie, mapbase + SA1111_INTEN0);
+	ie0 = sa1111_readl(mapbase + SA1111_INTEN0);
+	ie0 &= ~SA1111_IRQMASK_LO(irq);
+	writel(ie0, mapbase + SA1111_INTEN0);
 }
 
-static void sa1111_unmask_irq(struct irq_data *d)
+static void sa1111_unmask_lowirq(unsigned int irq)
 {
-	struct sa1111 *sachip = irq_data_get_irq_chip_data(d);
-	void __iomem *mapbase = sachip->base + SA1111_INTC + sa1111_irqbank(d);
-	u32 ie;
+	void __iomem *mapbase = get_irq_chipdata(irq);
+	unsigned long ie0;
 
-	ie = readl_relaxed(mapbase + SA1111_INTEN0);
-	ie |= sa1111_irqmask(d);
-	writel_relaxed(ie, mapbase + SA1111_INTEN0);
+	ie0 = sa1111_readl(mapbase + SA1111_INTEN0);
+	ie0 |= SA1111_IRQMASK_LO(irq);
+	sa1111_writel(ie0, mapbase + SA1111_INTEN0);
 }
 
 /*
@@ -282,344 +203,220 @@ static void sa1111_unmask_irq(struct irq_data *d)
  * be triggered.  In fact, its very difficult, if not impossible to get
  * INTSET to re-trigger the interrupt.
  */
-static int sa1111_retrigger_irq(struct irq_data *d)
+static int sa1111_retrigger_lowirq(unsigned int irq)
 {
-	struct sa1111 *sachip = irq_data_get_irq_chip_data(d);
-	void __iomem *mapbase = sachip->base + SA1111_INTC + sa1111_irqbank(d);
-	u32 ip, mask = sa1111_irqmask(d);
+	unsigned int mask = SA1111_IRQMASK_LO(irq);
+	void __iomem *mapbase = get_irq_chipdata(irq);
+	unsigned long ip0;
 	int i;
 
-	ip = readl_relaxed(mapbase + SA1111_INTPOL0);
+	ip0 = sa1111_readl(mapbase + SA1111_INTPOL0);
 	for (i = 0; i < 8; i++) {
-		writel_relaxed(ip ^ mask, mapbase + SA1111_INTPOL0);
-		writel_relaxed(ip, mapbase + SA1111_INTPOL0);
-		if (readl_relaxed(mapbase + SA1111_INTSTATCLR0) & mask)
+		sa1111_writel(ip0 ^ mask, mapbase + SA1111_INTPOL0);
+		sa1111_writel(ip0, mapbase + SA1111_INTPOL0);
+		if (sa1111_readl(mapbase + SA1111_INTSTATCLR1) & mask)
 			break;
 	}
 
-	if (i == 8) {
-		pr_err("Danger Will Robinson: failed to re-trigger IRQ%d\n",
-		       d->irq);
+	if (i == 8)
+		printk(KERN_ERR "Danger Will Robinson: failed to "
+			"re-trigger IRQ%d\n", irq);
+	return i == 8 ? -1 : 0;
+}
+
+static int sa1111_type_lowirq(unsigned int irq, unsigned int flags)
+{
+	unsigned int mask = SA1111_IRQMASK_LO(irq);
+	void __iomem *mapbase = get_irq_chipdata(irq);
+	unsigned long ip0;
+
+	if (flags == IRQT_PROBE)
 		return 0;
+
+	if ((!(flags & __IRQT_RISEDGE) ^ !(flags & __IRQT_FALEDGE)) == 0)
+		return -EINVAL;
+
+	ip0 = sa1111_readl(mapbase + SA1111_INTPOL0);
+	if (flags & __IRQT_RISEDGE)
+		ip0 &= ~mask;
+	else
+		ip0 |= mask;
+	sa1111_writel(ip0, mapbase + SA1111_INTPOL0);
+	sa1111_writel(ip0, mapbase + SA1111_WAKEPOL0);
+
+	return 0;
+}
+
+static int sa1111_wake_lowirq(unsigned int irq, unsigned int on)
+{
+	unsigned int mask = SA1111_IRQMASK_LO(irq);
+	void __iomem *mapbase = get_irq_chipdata(irq);
+	unsigned long we0;
+
+	we0 = sa1111_readl(mapbase + SA1111_WAKEEN0);
+	if (on)
+		we0 |= mask;
+	else
+		we0 &= ~mask;
+	sa1111_writel(we0, mapbase + SA1111_WAKEEN0);
+
+	return 0;
+}
+
+static struct irqchip sa1111_low_chip = {
+	.ack		= sa1111_ack_irq,
+	.mask		= sa1111_mask_lowirq,
+	.unmask		= sa1111_unmask_lowirq,
+	.retrigger	= sa1111_retrigger_lowirq,
+	.type		= sa1111_type_lowirq,
+	.wake		= sa1111_wake_lowirq,
+};
+
+static void sa1111_mask_highirq(unsigned int irq)
+{
+	void __iomem *mapbase = get_irq_chipdata(irq);
+	unsigned long ie1;
+
+	ie1 = sa1111_readl(mapbase + SA1111_INTEN1);
+	ie1 &= ~SA1111_IRQMASK_HI(irq);
+	sa1111_writel(ie1, mapbase + SA1111_INTEN1);
+}
+
+static void sa1111_unmask_highirq(unsigned int irq)
+{
+	void __iomem *mapbase = get_irq_chipdata(irq);
+	unsigned long ie1;
+
+	ie1 = sa1111_readl(mapbase + SA1111_INTEN1);
+	ie1 |= SA1111_IRQMASK_HI(irq);
+	sa1111_writel(ie1, mapbase + SA1111_INTEN1);
+}
+
+/*
+ * Attempt to re-trigger the interrupt.  The SA1111 contains a register
+ * (INTSET) which claims to do this.  However, in practice no amount of
+ * manipulation of INTEN and INTSET guarantees that the interrupt will
+ * be triggered.  In fact, its very difficult, if not impossible to get
+ * INTSET to re-trigger the interrupt.
+ */
+static int sa1111_retrigger_highirq(unsigned int irq)
+{
+	unsigned int mask = SA1111_IRQMASK_HI(irq);
+	void __iomem *mapbase = get_irq_chipdata(irq);
+	unsigned long ip1;
+	int i;
+
+	ip1 = sa1111_readl(mapbase + SA1111_INTPOL1);
+	for (i = 0; i < 8; i++) {
+		sa1111_writel(ip1 ^ mask, mapbase + SA1111_INTPOL1);
+		sa1111_writel(ip1, mapbase + SA1111_INTPOL1);
+		if (sa1111_readl(mapbase + SA1111_INTSTATCLR1) & mask)
+			break;
 	}
 
-	return 1;
+	if (i == 8)
+		printk(KERN_ERR "Danger Will Robinson: failed to "
+			"re-trigger IRQ%d\n", irq);
+	return i == 8 ? -1 : 0;
 }
 
-static int sa1111_type_irq(struct irq_data *d, unsigned int flags)
+static int sa1111_type_highirq(unsigned int irq, unsigned int flags)
 {
-	struct sa1111 *sachip = irq_data_get_irq_chip_data(d);
-	void __iomem *mapbase = sachip->base + SA1111_INTC + sa1111_irqbank(d);
-	u32 ip, mask = sa1111_irqmask(d);
+	unsigned int mask = SA1111_IRQMASK_HI(irq);
+	void __iomem *mapbase = get_irq_chipdata(irq);
+	unsigned long ip1;
 
-	if (flags == IRQ_TYPE_PROBE)
+	if (flags == IRQT_PROBE)
 		return 0;
 
-	if ((!(flags & IRQ_TYPE_EDGE_RISING) ^ !(flags & IRQ_TYPE_EDGE_FALLING)) == 0)
+	if ((!(flags & __IRQT_RISEDGE) ^ !(flags & __IRQT_FALEDGE)) == 0)
 		return -EINVAL;
 
-	ip = readl_relaxed(mapbase + SA1111_INTPOL0);
-	if (flags & IRQ_TYPE_EDGE_RISING)
-		ip &= ~mask;
+	ip1 = sa1111_readl(mapbase + SA1111_INTPOL1);
+	if (flags & __IRQT_RISEDGE)
+		ip1 &= ~mask;
 	else
-		ip |= mask;
-	writel_relaxed(ip, mapbase + SA1111_INTPOL0);
-	writel_relaxed(ip, mapbase + SA1111_WAKEPOL0);
+		ip1 |= mask;
+	sa1111_writel(ip1, mapbase + SA1111_INTPOL1);
+	sa1111_writel(ip1, mapbase + SA1111_WAKEPOL1);
 
 	return 0;
 }
 
-static int sa1111_wake_irq(struct irq_data *d, unsigned int on)
+static int sa1111_wake_highirq(unsigned int irq, unsigned int on)
 {
-	struct sa1111 *sachip = irq_data_get_irq_chip_data(d);
-	void __iomem *mapbase = sachip->base + SA1111_INTC + sa1111_irqbank(d);
-	u32 we, mask = sa1111_irqmask(d);
+	unsigned int mask = SA1111_IRQMASK_HI(irq);
+	void __iomem *mapbase = get_irq_chipdata(irq);
+	unsigned long we1;
 
-	we = readl_relaxed(mapbase + SA1111_WAKEEN0);
+	we1 = sa1111_readl(mapbase + SA1111_WAKEEN1);
 	if (on)
-		we |= mask;
+		we1 |= mask;
 	else
-		we &= ~mask;
-	writel_relaxed(we, mapbase + SA1111_WAKEEN0);
+		we1 &= ~mask;
+	sa1111_writel(we1, mapbase + SA1111_WAKEEN1);
 
 	return 0;
 }
 
-static struct irq_chip sa1111_irq_chip = {
-	.name		= "SA1111",
-	.irq_ack	= sa1111_ack_irq,
-	.irq_mask	= sa1111_mask_irq,
-	.irq_unmask	= sa1111_unmask_irq,
-	.irq_retrigger	= sa1111_retrigger_irq,
-	.irq_set_type	= sa1111_type_irq,
-	.irq_set_wake	= sa1111_wake_irq,
+static struct irqchip sa1111_high_chip = {
+	.ack		= sa1111_ack_irq,
+	.mask		= sa1111_mask_highirq,
+	.unmask		= sa1111_unmask_highirq,
+	.retrigger	= sa1111_retrigger_highirq,
+	.type		= sa1111_type_highirq,
+	.wake		= sa1111_wake_highirq,
 };
 
-static int sa1111_irqdomain_map(struct irq_domain *d, unsigned int irq,
-	irq_hw_number_t hwirq)
-{
-	struct sa1111 *sachip = d->host_data;
-
-	/* Disallow unavailable interrupts */
-	if (hwirq > SSPROR && hwirq < AUDXMTDMADONEA)
-		return -EINVAL;
-
-	irq_set_chip_data(irq, sachip);
-	irq_set_chip_and_handler(irq, &sa1111_irq_chip, handle_edge_irq);
-	irq_clear_status_flags(irq, IRQ_NOREQUEST | IRQ_NOPROBE);
-
-	return 0;
-}
-
-static const struct irq_domain_ops sa1111_irqdomain_ops = {
-	.map = sa1111_irqdomain_map,
-	.xlate = irq_domain_xlate_twocell,
-};
-
-static int sa1111_setup_irq(struct sa1111 *sachip, unsigned irq_base)
+static void sa1111_setup_irq(struct sa1111 *sachip)
 {
 	void __iomem *irqbase = sachip->base + SA1111_INTC;
-	int ret;
+	unsigned int irq;
 
 	/*
 	 * We're guaranteed that this region hasn't been taken.
 	 */
 	request_mem_region(sachip->phys + SA1111_INTC, 512, "irq");
 
-	ret = irq_alloc_descs(-1, irq_base, SA1111_IRQ_NR, -1);
-	if (ret <= 0) {
-		dev_err(sachip->dev, "unable to allocate %u irqs: %d\n",
-			SA1111_IRQ_NR, ret);
-		if (ret == 0)
-			ret = -EINVAL;
-		return ret;
-	}
-
-	sachip->irq_base = ret;
-
 	/* disable all IRQs */
-	writel_relaxed(0, irqbase + SA1111_INTEN0);
-	writel_relaxed(0, irqbase + SA1111_INTEN1);
-	writel_relaxed(0, irqbase + SA1111_WAKEEN0);
-	writel_relaxed(0, irqbase + SA1111_WAKEEN1);
+	sa1111_writel(0, irqbase + SA1111_INTEN0);
+	sa1111_writel(0, irqbase + SA1111_INTEN1);
+	sa1111_writel(0, irqbase + SA1111_WAKEEN0);
+	sa1111_writel(0, irqbase + SA1111_WAKEEN1);
 
 	/*
 	 * detect on rising edge.  Note: Feb 2001 Errata for SA1111
 	 * specifies that S0ReadyInt and S1ReadyInt should be '1'.
 	 */
-	writel_relaxed(0, irqbase + SA1111_INTPOL0);
-	writel_relaxed(BIT(IRQ_S0_READY_NINT & 31) |
-		       BIT(IRQ_S1_READY_NINT & 31),
-		       irqbase + SA1111_INTPOL1);
+	sa1111_writel(0, irqbase + SA1111_INTPOL0);
+	sa1111_writel(SA1111_IRQMASK_HI(IRQ_S0_READY_NINT) |
+		      SA1111_IRQMASK_HI(IRQ_S1_READY_NINT),
+		      irqbase + SA1111_INTPOL1);
 
 	/* clear all IRQs */
-	writel_relaxed(~0, irqbase + SA1111_INTSTATCLR0);
-	writel_relaxed(~0, irqbase + SA1111_INTSTATCLR1);
+	sa1111_writel(~0, irqbase + SA1111_INTSTATCLR0);
+	sa1111_writel(~0, irqbase + SA1111_INTSTATCLR1);
 
-	sachip->irqdomain = irq_domain_add_linear(NULL, SA1111_IRQ_NR,
-						  &sa1111_irqdomain_ops,
-						  sachip);
-	if (!sachip->irqdomain) {
-		irq_free_descs(sachip->irq_base, SA1111_IRQ_NR);
-		return -ENOMEM;
+	for (irq = IRQ_GPAIN0; irq <= SSPROR; irq++) {
+		set_irq_chip(irq, &sa1111_low_chip);
+		set_irq_chipdata(irq, irqbase);
+		set_irq_handler(irq, do_edge_IRQ);
+		set_irq_flags(irq, IRQF_VALID | IRQF_PROBE);
 	}
 
-	irq_domain_associate_many(sachip->irqdomain,
-				  sachip->irq_base + IRQ_GPAIN0,
-				  IRQ_GPAIN0, SSPROR + 1 - IRQ_GPAIN0);
-	irq_domain_associate_many(sachip->irqdomain,
-				  sachip->irq_base + AUDXMTDMADONEA,
-				  AUDXMTDMADONEA,
-				  IRQ_S1_BVD1_STSCHG + 1 - AUDXMTDMADONEA);
+	for (irq = AUDXMTDMADONEA; irq <= IRQ_S1_BVD1_STSCHG; irq++) {
+		set_irq_chip(irq, &sa1111_high_chip);
+		set_irq_chipdata(irq, irqbase);
+		set_irq_handler(irq, do_edge_IRQ);
+		set_irq_flags(irq, IRQF_VALID | IRQF_PROBE);
+	}
 
 	/*
 	 * Register SA1111 interrupt
 	 */
-	irq_set_irq_type(sachip->irq, IRQ_TYPE_EDGE_RISING);
-	irq_set_chained_handler_and_data(sachip->irq, sa1111_irq_handler,
-					 sachip);
-
-	dev_info(sachip->dev, "Providing IRQ%u-%u\n",
-		sachip->irq_base, sachip->irq_base + SA1111_IRQ_NR - 1);
-
-	return 0;
-}
-
-static void sa1111_remove_irq(struct sa1111 *sachip)
-{
-	struct irq_domain *domain = sachip->irqdomain;
-	void __iomem *irqbase = sachip->base + SA1111_INTC;
-	int i;
-
-	/* disable all IRQs */
-	writel_relaxed(0, irqbase + SA1111_INTEN0);
-	writel_relaxed(0, irqbase + SA1111_INTEN1);
-	writel_relaxed(0, irqbase + SA1111_WAKEEN0);
-	writel_relaxed(0, irqbase + SA1111_WAKEEN1);
-
-	irq_set_chained_handler_and_data(sachip->irq, NULL, NULL);
-	for (i = 0; i < SA1111_IRQ_NR; i++)
-		irq_dispose_mapping(irq_find_mapping(domain, i));
-	irq_domain_remove(domain);
-
-	release_mem_region(sachip->phys + SA1111_INTC, 512);
-}
-
-enum {
-	SA1111_GPIO_PXDDR = (SA1111_GPIO_PADDR - SA1111_GPIO_PADDR),
-	SA1111_GPIO_PXDRR = (SA1111_GPIO_PADRR - SA1111_GPIO_PADDR),
-	SA1111_GPIO_PXDWR = (SA1111_GPIO_PADWR - SA1111_GPIO_PADDR),
-	SA1111_GPIO_PXSDR = (SA1111_GPIO_PASDR - SA1111_GPIO_PADDR),
-	SA1111_GPIO_PXSSR = (SA1111_GPIO_PASSR - SA1111_GPIO_PADDR),
-};
-
-static struct sa1111 *gc_to_sa1111(struct gpio_chip *gc)
-{
-	return container_of(gc, struct sa1111, gc);
-}
-
-static void __iomem *sa1111_gpio_map_reg(struct sa1111 *sachip, unsigned offset)
-{
-	void __iomem *reg = sachip->base + SA1111_GPIO;
-
-	if (offset < 4)
-		return reg + SA1111_GPIO_PADDR;
-	if (offset < 10)
-		return reg + SA1111_GPIO_PBDDR;
-	if (offset < 18)
-		return reg + SA1111_GPIO_PCDDR;
-	return NULL;
-}
-
-static u32 sa1111_gpio_map_bit(unsigned offset)
-{
-	if (offset < 4)
-		return BIT(offset);
-	if (offset < 10)
-		return BIT(offset - 4);
-	if (offset < 18)
-		return BIT(offset - 10);
-	return 0;
-}
-
-static void sa1111_gpio_modify(void __iomem *reg, u32 mask, u32 set)
-{
-	u32 val;
-
-	val = readl_relaxed(reg);
-	val &= ~mask;
-	val |= mask & set;
-	writel_relaxed(val, reg);
-}
-
-static int sa1111_gpio_get_direction(struct gpio_chip *gc, unsigned offset)
-{
-	struct sa1111 *sachip = gc_to_sa1111(gc);
-	void __iomem *reg = sa1111_gpio_map_reg(sachip, offset);
-	u32 mask = sa1111_gpio_map_bit(offset);
-
-	return !!(readl_relaxed(reg + SA1111_GPIO_PXDDR) & mask);
-}
-
-static int sa1111_gpio_direction_input(struct gpio_chip *gc, unsigned offset)
-{
-	struct sa1111 *sachip = gc_to_sa1111(gc);
-	unsigned long flags;
-	void __iomem *reg = sa1111_gpio_map_reg(sachip, offset);
-	u32 mask = sa1111_gpio_map_bit(offset);
-
-	spin_lock_irqsave(&sachip->lock, flags);
-	sa1111_gpio_modify(reg + SA1111_GPIO_PXDDR, mask, mask);
-	sa1111_gpio_modify(reg + SA1111_GPIO_PXSDR, mask, mask);
-	spin_unlock_irqrestore(&sachip->lock, flags);
-
-	return 0;
-}
-
-static int sa1111_gpio_direction_output(struct gpio_chip *gc, unsigned offset,
-	int value)
-{
-	struct sa1111 *sachip = gc_to_sa1111(gc);
-	unsigned long flags;
-	void __iomem *reg = sa1111_gpio_map_reg(sachip, offset);
-	u32 mask = sa1111_gpio_map_bit(offset);
-
-	spin_lock_irqsave(&sachip->lock, flags);
-	sa1111_gpio_modify(reg + SA1111_GPIO_PXDWR, mask, value ? mask : 0);
-	sa1111_gpio_modify(reg + SA1111_GPIO_PXSSR, mask, value ? mask : 0);
-	sa1111_gpio_modify(reg + SA1111_GPIO_PXDDR, mask, 0);
-	sa1111_gpio_modify(reg + SA1111_GPIO_PXSDR, mask, 0);
-	spin_unlock_irqrestore(&sachip->lock, flags);
-
-	return 0;
-}
-
-static int sa1111_gpio_get(struct gpio_chip *gc, unsigned offset)
-{
-	struct sa1111 *sachip = gc_to_sa1111(gc);
-	void __iomem *reg = sa1111_gpio_map_reg(sachip, offset);
-	u32 mask = sa1111_gpio_map_bit(offset);
-
-	return !!(readl_relaxed(reg + SA1111_GPIO_PXDRR) & mask);
-}
-
-static void sa1111_gpio_set(struct gpio_chip *gc, unsigned offset, int value)
-{
-	struct sa1111 *sachip = gc_to_sa1111(gc);
-	unsigned long flags;
-	void __iomem *reg = sa1111_gpio_map_reg(sachip, offset);
-	u32 mask = sa1111_gpio_map_bit(offset);
-
-	spin_lock_irqsave(&sachip->lock, flags);
-	sa1111_gpio_modify(reg + SA1111_GPIO_PXDWR, mask, value ? mask : 0);
-	sa1111_gpio_modify(reg + SA1111_GPIO_PXSSR, mask, value ? mask : 0);
-	spin_unlock_irqrestore(&sachip->lock, flags);
-}
-
-static void sa1111_gpio_set_multiple(struct gpio_chip *gc, unsigned long *mask,
-	unsigned long *bits)
-{
-	struct sa1111 *sachip = gc_to_sa1111(gc);
-	unsigned long flags;
-	void __iomem *reg = sachip->base + SA1111_GPIO;
-	u32 msk, val;
-
-	msk = *mask;
-	val = *bits;
-
-	spin_lock_irqsave(&sachip->lock, flags);
-	sa1111_gpio_modify(reg + SA1111_GPIO_PADWR, msk & 15, val);
-	sa1111_gpio_modify(reg + SA1111_GPIO_PASSR, msk & 15, val);
-	sa1111_gpio_modify(reg + SA1111_GPIO_PBDWR, (msk >> 4) & 255, val >> 4);
-	sa1111_gpio_modify(reg + SA1111_GPIO_PBSSR, (msk >> 4) & 255, val >> 4);
-	sa1111_gpio_modify(reg + SA1111_GPIO_PCDWR, (msk >> 12) & 255, val >> 12);
-	sa1111_gpio_modify(reg + SA1111_GPIO_PCSSR, (msk >> 12) & 255, val >> 12);
-	spin_unlock_irqrestore(&sachip->lock, flags);
-}
-
-static int sa1111_gpio_to_irq(struct gpio_chip *gc, unsigned offset)
-{
-	struct sa1111 *sachip = gc_to_sa1111(gc);
-
-	return sa1111_map_irq(sachip, offset);
-}
-
-static int sa1111_setup_gpios(struct sa1111 *sachip)
-{
-	sachip->gc.label = "sa1111";
-	sachip->gc.parent = sachip->dev;
-	sachip->gc.owner = THIS_MODULE;
-	sachip->gc.get_direction = sa1111_gpio_get_direction;
-	sachip->gc.direction_input = sa1111_gpio_direction_input;
-	sachip->gc.direction_output = sa1111_gpio_direction_output;
-	sachip->gc.get = sa1111_gpio_get;
-	sachip->gc.set = sa1111_gpio_set;
-	sachip->gc.set_multiple = sa1111_gpio_set_multiple;
-	sachip->gc.to_irq = sa1111_gpio_to_irq;
-	sachip->gc.base = -1;
-	sachip->gc.ngpio = 18;
-
-	return devm_gpiochip_add_data(sachip->dev, &sachip->gc, sachip);
+	set_irq_type(sachip->irq, IRQT_RISING);
+	set_irq_data(sachip->irq, irqbase);
+	set_irq_chained_handler(sachip->irq, sa1111_irq_handler);
 }
 
 /*
@@ -642,16 +439,28 @@ static void sa1111_wake(struct sa1111 *sachip)
 
 	spin_lock_irqsave(&sachip->lock, flags);
 
-	clk_enable(sachip->clk);
+#ifdef CONFIG_ARCH_SA1100
+	/*
+	 * First, set up the 3.6864MHz clock on GPIO 27 for the SA-1111:
+	 * (SA-1110 Developer's Manual, section 9.1.2.1)
+	 */
+	GAFR |= GPIO_32_768kHz;
+	GPDR |= GPIO_32_768kHz;
+	TUCR = TUCR_3_6864MHz;
+#elif CONFIG_ARCH_PXA
+	pxa_gpio_mode(GPIO11_3_6MHz_MD);
+#else
+#error missing clock setup
+#endif
 
 	/*
 	 * Turn VCO on, and disable PLL Bypass.
 	 */
-	r = readl_relaxed(sachip->base + SA1111_SKCR);
+	r = sa1111_readl(sachip->base + SA1111_SKCR);
 	r &= ~SKCR_VCO_OFF;
-	writel_relaxed(r, sachip->base + SA1111_SKCR);
+	sa1111_writel(r, sachip->base + SA1111_SKCR);
 	r |= SKCR_PLL_BYPASS | SKCR_OE_EN;
-	writel_relaxed(r, sachip->base + SA1111_SKCR);
+	sa1111_writel(r, sachip->base + SA1111_SKCR);
 
 	/*
 	 * Wait lock time.  SA1111 manual _doesn't_
@@ -663,7 +472,7 @@ static void sa1111_wake(struct sa1111 *sachip)
 	 * Enable RCLK.  We also ensure that RDYEN is set.
 	 */
 	r |= SKCR_RCLKEN | SKCR_RDYEN;
-	writel_relaxed(r, sachip->base + SA1111_SKCR);
+	sa1111_writel(r, sachip->base + SA1111_SKCR);
 
 	/*
 	 * Wait 14 RCLK cycles for the chip to finish coming out
@@ -674,7 +483,7 @@ static void sa1111_wake(struct sa1111 *sachip)
 	/*
 	 * Ensure all clocks are initially off.
 	 */
-	writel_relaxed(0, sachip->base + SA1111_SKPCR);
+	sa1111_writel(0, sachip->base + SA1111_SKPCR);
 
 	spin_unlock_irqrestore(&sachip->lock, flags);
 }
@@ -704,7 +513,7 @@ sa1111_configure_smc(struct sa1111 *sachip, int sdram, unsigned int drac,
 	if (cas_latency == 3)
 		smcr |= SMCR_CLAT;
 
-	writel_relaxed(smcr, sachip->base + SA1111_SMCR);
+	sa1111_writel(smcr, sachip->base + SA1111_SMCR);
 
 	/*
 	 * Now clear the bits in the DMA mask to work around the SA1111
@@ -716,12 +525,14 @@ sa1111_configure_smc(struct sa1111 *sachip, int sdram, unsigned int drac,
 
 	sachip->dev->coherent_dma_mask &= sa1111_dma_mask[drac >> 2];
 }
+
 #endif
 
 static void sa1111_dev_release(struct device *_dev)
 {
-	struct sa1111_dev *dev = to_sa1111_device(_dev);
+	struct sa1111_dev *dev = SA1111_DEV(_dev);
 
+	release_resource(&dev->res);
 	kfree(dev);
 }
 
@@ -730,58 +541,65 @@ sa1111_init_one_child(struct sa1111 *sachip, struct resource *parent,
 		      struct sa1111_dev_info *info)
 {
 	struct sa1111_dev *dev;
-	unsigned i;
 	int ret;
 
-	dev = kzalloc(sizeof(struct sa1111_dev), GFP_KERNEL);
+	dev = kmalloc(sizeof(struct sa1111_dev), GFP_KERNEL);
 	if (!dev) {
 		ret = -ENOMEM;
-		goto err_alloc;
+		goto out;
 	}
+	memset(dev, 0, sizeof(struct sa1111_dev));
 
-	device_initialize(&dev->dev);
-	dev_set_name(&dev->dev, "%4.4lx", info->offset);
+	snprintf(dev->dev.bus_id, sizeof(dev->dev.bus_id),
+		 "%4.4lx", info->offset);
+
 	dev->devid	 = info->devid;
 	dev->dev.parent  = sachip->dev;
 	dev->dev.bus     = &sa1111_bus_type;
 	dev->dev.release = sa1111_dev_release;
+	dev->dev.coherent_dma_mask = sachip->dev->coherent_dma_mask;
 	dev->res.start   = sachip->phys + info->offset;
 	dev->res.end     = dev->res.start + 511;
-	dev->res.name    = dev_name(&dev->dev);
+	dev->res.name    = dev->dev.bus_id;
 	dev->res.flags   = IORESOURCE_MEM;
 	dev->mapbase     = sachip->base + info->offset;
 	dev->skpcr_mask  = info->skpcr_mask;
-
-	for (i = 0; i < ARRAY_SIZE(info->hwirq); i++)
-		dev->hwirq[i] = info->hwirq[i];
-
-	/*
-	 * If the parent device has a DMA mask associated with it, and
-	 * this child supports DMA, propagate it down to the children.
-	 */
-	if (info->dma && sachip->dev->dma_mask) {
-		dev->dma_mask = *sachip->dev->dma_mask;
-		dev->dev.dma_mask = &dev->dma_mask;
-		dev->dev.coherent_dma_mask = sachip->dev->coherent_dma_mask;
-	}
+	memmove(dev->irq, info->irq, sizeof(dev->irq));
 
 	ret = request_resource(parent, &dev->res);
 	if (ret) {
-		dev_err(sachip->dev, "failed to allocate resource for %s\n",
+		printk("SA1111: failed to allocate resource for %s\n",
 			dev->res.name);
-		goto err_resource;
+		kfree(dev);
+		goto out;
 	}
 
-	ret = device_add(&dev->dev);
-	if (ret)
-		goto err_add;
-	return 0;
 
- err_add:
-	release_resource(&dev->res);
- err_resource:
-	put_device(&dev->dev);
- err_alloc:
+	ret = device_register(&dev->dev);
+	if (ret) {
+		release_resource(&dev->res);
+		kfree(dev);
+		goto out;
+	}
+
+	/*
+	 * If the parent device has a DMA mask associated with it,
+	 * propagate it down to the children.
+	 */
+	if (sachip->dev->dma_mask) {
+		dev->dma_mask = *sachip->dev->dma_mask;
+		dev->dev.dma_mask = &dev->dma_mask;
+
+		if (dev->dma_mask != 0xffffffffUL) {
+			ret = dmabounce_register_dev(&dev->dev, 1024, 4096);
+			if (ret) {
+				printk("SA1111: Failed to register %s with dmabounce", dev->dev.bus_id);
+				device_unregister(&dev->dev);
+			}
+		}
+	}
+
+out:
 	return ret;
 }
 
@@ -795,38 +613,27 @@ sa1111_init_one_child(struct sa1111 *sachip, struct resource *parent,
  *	Returns:
  *	%-ENODEV	device not found.
  *	%-EBUSY		physical address already marked in-use.
- *	%-EINVAL	no platform data passed
  *	%0		successful.
  */
-static int __sa1111_probe(struct device *me, struct resource *mem, int irq)
+static int
+__sa1111_probe(struct device *me, struct resource *mem, int irq)
 {
-	struct sa1111_platform_data *pd = me->platform_data;
 	struct sa1111 *sachip;
 	unsigned long id;
-	unsigned int has_devs;
+	unsigned int has_devs, val;
 	int i, ret = -ENODEV;
 
-	if (!pd)
-		return -EINVAL;
-
-	sachip = devm_kzalloc(me, sizeof(struct sa1111), GFP_KERNEL);
+	sachip = kmalloc(sizeof(struct sa1111), GFP_KERNEL);
 	if (!sachip)
 		return -ENOMEM;
 
-	sachip->clk = devm_clk_get(me, "SA1111_CLK");
-	if (IS_ERR(sachip->clk))
-		return PTR_ERR(sachip->clk);
-
-	ret = clk_prepare(sachip->clk);
-	if (ret)
-		return ret;
+	memset(sachip, 0, sizeof(struct sa1111));
 
 	spin_lock_init(&sachip->lock);
 
 	sachip->dev = me;
 	dev_set_drvdata(sachip->dev, sachip);
 
-	sachip->pdata = pd;
 	sachip->phys = mem->start;
 	sachip->irq = irq;
 
@@ -837,44 +644,29 @@ static int __sa1111_probe(struct device *me, struct resource *mem, int irq)
 	sachip->base = ioremap(mem->start, PAGE_SIZE * 2);
 	if (!sachip->base) {
 		ret = -ENOMEM;
-		goto err_clk_unprep;
+		goto out;
 	}
 
 	/*
 	 * Probe for the chip.  Only touch the SBI registers.
 	 */
-	id = readl_relaxed(sachip->base + SA1111_SKID);
+	id = sa1111_readl(sachip->base + SA1111_SKID);
 	if ((id & SKID_ID_MASK) != SKID_SA1111_ID) {
 		printk(KERN_DEBUG "SA1111 not detected: ID = %08lx\n", id);
 		ret = -ENODEV;
-		goto err_unmap;
+		goto unmap;
 	}
 
-	pr_info("SA1111 Microprocessor Companion Chip: silicon revision %lx, metal revision %lx\n",
-		(id & SKID_SIREV_MASK) >> 4, id & SKID_MTREV_MASK);
+	printk(KERN_INFO "SA1111 Microprocessor Companion Chip: "
+		"silicon revision %lx, metal revision %lx\n",
+		(id & SKID_SIREV_MASK)>>4, (id & SKID_MTREV_MASK));
 
 	/*
 	 * We found it.  Wake the chip up, and initialise.
 	 */
 	sa1111_wake(sachip);
 
-	/*
-	 * The interrupt controller must be initialised before any
-	 * other device to ensure that the interrupts are available.
-	 */
-	ret = sa1111_setup_irq(sachip, pd->irq_base);
-	if (ret)
-		goto err_clk;
-
-	/* Setup the GPIOs - should really be done after the IRQ setup */
-	ret = sa1111_setup_gpios(sachip);
-	if (ret)
-		goto err_irq;
-
 #ifdef CONFIG_ARCH_SA1100
-	{
-	unsigned int val;
-
 	/*
 	 * The SDRAM configuration of the SA1110 and the SA1111 must
 	 * match.  This is very important to ensure that SA1111 accesses
@@ -891,60 +683,98 @@ static int __sa1111_probe(struct device *me, struct resource *mem, int irq)
 	 * DMA.  It can otherwise be held firmly in the off position.
 	 * (currently, we always enable it.)
 	 */
-	val = readl_relaxed(sachip->base + SA1111_SKPCR);
-	writel_relaxed(val | SKPCR_DCLKEN, sachip->base + SA1111_SKPCR);
+	val = sa1111_readl(sachip->base + SA1111_SKPCR);
+	sa1111_writel(val | SKPCR_DCLKEN, sachip->base + SA1111_SKPCR);
 
 	/*
 	 * Enable the SA1110 memory bus request and grant signals.
 	 */
 	sa1110_mb_enable();
-	}
 #endif
+
+	/*
+	 * The interrupt controller must be initialised before any
+	 * other device to ensure that the interrupts are available.
+	 */
+	if (sachip->irq != NO_IRQ)
+		sa1111_setup_irq(sachip);
 
 	g_sa1111 = sachip;
 
 	has_devs = ~0;
-	if (pd)
-		has_devs &= ~pd->disable_devs;
+	if (machine_is_assabet() || machine_is_jornada720() ||
+	    machine_is_badge4())
+		has_devs &= ~(1 << 4);
+	else
+		has_devs &= ~(1 << 1);
 
 	for (i = 0; i < ARRAY_SIZE(sa1111_devices); i++)
-		if (sa1111_devices[i].devid & has_devs)
+		if (has_devs & (1 << i))
 			sa1111_init_one_child(sachip, mem, &sa1111_devices[i]);
 
 	return 0;
 
- err_irq:
-	sa1111_remove_irq(sachip);
- err_clk:
-	clk_disable(sachip->clk);
- err_unmap:
+ unmap:
 	iounmap(sachip->base);
- err_clk_unprep:
-	clk_unprepare(sachip->clk);
+ out:
+	kfree(sachip);
 	return ret;
-}
-
-static int sa1111_remove_one(struct device *dev, void *data)
-{
-	struct sa1111_dev *sadev = to_sa1111_device(dev);
-	if (dev->bus != &sa1111_bus_type)
-		return 0;
-	device_del(&sadev->dev);
-	release_resource(&sadev->res);
-	put_device(&sadev->dev);
-	return 0;
 }
 
 static void __sa1111_remove(struct sa1111 *sachip)
 {
-	device_for_each_child(sachip->dev, NULL, sa1111_remove_one);
+	struct list_head *l, *n;
+	void __iomem *irqbase = sachip->base + SA1111_INTC;
 
-	sa1111_remove_irq(sachip);
+	list_for_each_safe(l, n, &sachip->dev->children) {
+		struct device *d = list_to_dev(l);
 
-	clk_disable(sachip->clk);
-	clk_unprepare(sachip->clk);
+		device_unregister(d);
+	}
+
+	/* disable all IRQs */
+	sa1111_writel(0, irqbase + SA1111_INTEN0);
+	sa1111_writel(0, irqbase + SA1111_INTEN1);
+	sa1111_writel(0, irqbase + SA1111_WAKEEN0);
+	sa1111_writel(0, irqbase + SA1111_WAKEEN1);
+
+	if (sachip->irq != NO_IRQ) {
+		set_irq_chained_handler(sachip->irq, NULL);
+		set_irq_data(sachip->irq, NULL);
+
+		release_mem_region(sachip->phys + SA1111_INTC, 512);
+	}
 
 	iounmap(sachip->base);
+	kfree(sachip);
+}
+
+/*
+ * According to the "Intel StrongARM SA-1111 Microprocessor Companion
+ * Chip Specification Update" (June 2000), erratum #7, there is a
+ * significant bug in the SA1111 SDRAM shared memory controller.  If
+ * an access to a region of memory above 1MB relative to the bank base,
+ * it is important that address bit 10 _NOT_ be asserted. Depending
+ * on the configuration of the RAM, bit 10 may correspond to one
+ * of several different (processor-relative) address bits.
+ *
+ * This routine only identifies whether or not a given DMA address
+ * is susceptible to the bug.
+ *
+ * This should only get called for sa1111_device types due to the
+ * way we configure our device dma_masks.
+ */
+int dma_needs_bounce(struct device *dev, dma_addr_t addr, size_t size)
+{
+	/*
+	 * Section 4.6 of the "Intel StrongARM SA-1111 Development Module
+	 * User's Guide" mentions that jumpers R51 and R52 control the
+	 * target of SA-1111 DMA (either SDRAM bank 0 on Assabet, or
+	 * SDRAM bank 1 on Neponset). The default configuration selects
+	 * Assabet, so any address in bank 1 is necessarily invalid.
+	 */
+	return ((machine_is_assabet() || machine_is_pfs168()) &&
+		(addr >= 0xc8000000 || (addr + size) >= 0xc8000000));
 }
 
 struct sa1111_save_data {
@@ -970,7 +800,7 @@ struct sa1111_save_data {
 
 #ifdef CONFIG_PM
 
-static int sa1111_suspend_noirq(struct device *dev)
+static int sa1111_suspend(struct device *dev, pm_message_t state, u32 level)
 {
 	struct sa1111 *sachip = dev_get_drvdata(dev);
 	struct sa1111_save_data *save;
@@ -978,10 +808,13 @@ static int sa1111_suspend_noirq(struct device *dev)
 	unsigned int val;
 	void __iomem *base;
 
+	if (level != SUSPEND_DISABLE)
+		return 0;
+
 	save = kmalloc(sizeof(struct sa1111_save_data), GFP_KERNEL);
 	if (!save)
 		return -ENOMEM;
-	sachip->saved_state = save;
+	dev->power.saved_state = save;
 
 	spin_lock_irqsave(&sachip->lock, flags);
 
@@ -989,39 +822,32 @@ static int sa1111_suspend_noirq(struct device *dev)
 	 * Save state.
 	 */
 	base = sachip->base;
-	save->skcr     = readl_relaxed(base + SA1111_SKCR);
-	save->skpcr    = readl_relaxed(base + SA1111_SKPCR);
-	save->skcdr    = readl_relaxed(base + SA1111_SKCDR);
-	save->skaud    = readl_relaxed(base + SA1111_SKAUD);
-	save->skpwm0   = readl_relaxed(base + SA1111_SKPWM0);
-	save->skpwm1   = readl_relaxed(base + SA1111_SKPWM1);
-
-	writel_relaxed(0, sachip->base + SA1111_SKPWM0);
-	writel_relaxed(0, sachip->base + SA1111_SKPWM1);
+	save->skcr     = sa1111_readl(base + SA1111_SKCR);
+	save->skpcr    = sa1111_readl(base + SA1111_SKPCR);
+	save->skcdr    = sa1111_readl(base + SA1111_SKCDR);
+	save->skaud    = sa1111_readl(base + SA1111_SKAUD);
+	save->skpwm0   = sa1111_readl(base + SA1111_SKPWM0);
+	save->skpwm1   = sa1111_readl(base + SA1111_SKPWM1);
 
 	base = sachip->base + SA1111_INTC;
-	save->intpol0  = readl_relaxed(base + SA1111_INTPOL0);
-	save->intpol1  = readl_relaxed(base + SA1111_INTPOL1);
-	save->inten0   = readl_relaxed(base + SA1111_INTEN0);
-	save->inten1   = readl_relaxed(base + SA1111_INTEN1);
-	save->wakepol0 = readl_relaxed(base + SA1111_WAKEPOL0);
-	save->wakepol1 = readl_relaxed(base + SA1111_WAKEPOL1);
-	save->wakeen0  = readl_relaxed(base + SA1111_WAKEEN0);
-	save->wakeen1  = readl_relaxed(base + SA1111_WAKEEN1);
+	save->intpol0  = sa1111_readl(base + SA1111_INTPOL0);
+	save->intpol1  = sa1111_readl(base + SA1111_INTPOL1);
+	save->inten0   = sa1111_readl(base + SA1111_INTEN0);
+	save->inten1   = sa1111_readl(base + SA1111_INTEN1);
+	save->wakepol0 = sa1111_readl(base + SA1111_WAKEPOL0);
+	save->wakepol1 = sa1111_readl(base + SA1111_WAKEPOL1);
+	save->wakeen0  = sa1111_readl(base + SA1111_WAKEEN0);
+	save->wakeen1  = sa1111_readl(base + SA1111_WAKEEN1);
 
 	/*
 	 * Disable.
 	 */
-	val = readl_relaxed(sachip->base + SA1111_SKCR);
-	writel_relaxed(val | SKCR_SLEEP, sachip->base + SA1111_SKCR);
-
-	clk_disable(sachip->clk);
+	val = sa1111_readl(sachip->base + SA1111_SKCR);
+	sa1111_writel(val | SKCR_SLEEP, sachip->base + SA1111_SKCR);
+	sa1111_writel(0, sachip->base + SA1111_SKPWM0);
+	sa1111_writel(0, sachip->base + SA1111_SKPWM1);
 
 	spin_unlock_irqrestore(&sachip->lock, flags);
-
-#ifdef CONFIG_ARCH_SA1100
-	sa1110_mb_disable();
-#endif
 
 	return 0;
 }
@@ -1029,28 +855,34 @@ static int sa1111_suspend_noirq(struct device *dev)
 /*
  *	sa1111_resume - Restore the SA1111 device state.
  *	@dev: device to restore
+ *	@level: resume level
  *
  *	Restore the general state of the SA1111; clock control and
  *	interrupt controller.  Other parts of the SA1111 must be
  *	restored by their respective drivers, and must be called
  *	via LDM after this function.
  */
-static int sa1111_resume_noirq(struct device *dev)
+static int sa1111_resume(struct device *dev, u32 level)
 {
 	struct sa1111 *sachip = dev_get_drvdata(dev);
 	struct sa1111_save_data *save;
 	unsigned long flags, id;
 	void __iomem *base;
 
-	save = sachip->saved_state;
+	if (level != RESUME_ENABLE)
+		return 0;
+
+	save = (struct sa1111_save_data *)dev->power.saved_state;
 	if (!save)
 		return 0;
+
+	spin_lock_irqsave(&sachip->lock, flags);
 
 	/*
 	 * Ensure that the SA1111 is still here.
 	 * FIXME: shouldn't do this here.
 	 */
-	id = readl_relaxed(sachip->base + SA1111_SKID);
+	id = sa1111_readl(sachip->base + SA1111_SKID);
 	if ((id & SKID_ID_MASK) != SKID_SA1111_ID) {
 		__sa1111_remove(sachip);
 		dev_set_drvdata(dev, NULL);
@@ -1062,54 +894,43 @@ static int sa1111_resume_noirq(struct device *dev)
 	 * First of all, wake up the chip.
 	 */
 	sa1111_wake(sachip);
-
-#ifdef CONFIG_ARCH_SA1100
-	/* Enable the memory bus request/grant signals */
-	sa1110_mb_enable();
-#endif
-
-	/*
-	 * Only lock for write ops. Also, sa1111_wake must be called with
-	 * released spinlock!
-	 */
-	spin_lock_irqsave(&sachip->lock, flags);
-
-	writel_relaxed(0, sachip->base + SA1111_INTC + SA1111_INTEN0);
-	writel_relaxed(0, sachip->base + SA1111_INTC + SA1111_INTEN1);
+	sa1111_writel(0, sachip->base + SA1111_INTC + SA1111_INTEN0);
+	sa1111_writel(0, sachip->base + SA1111_INTC + SA1111_INTEN1);
 
 	base = sachip->base;
-	writel_relaxed(save->skcr,     base + SA1111_SKCR);
-	writel_relaxed(save->skpcr,    base + SA1111_SKPCR);
-	writel_relaxed(save->skcdr,    base + SA1111_SKCDR);
-	writel_relaxed(save->skaud,    base + SA1111_SKAUD);
-	writel_relaxed(save->skpwm0,   base + SA1111_SKPWM0);
-	writel_relaxed(save->skpwm1,   base + SA1111_SKPWM1);
+	sa1111_writel(save->skcr,     base + SA1111_SKCR);
+	sa1111_writel(save->skpcr,    base + SA1111_SKPCR);
+	sa1111_writel(save->skcdr,    base + SA1111_SKCDR);
+	sa1111_writel(save->skaud,    base + SA1111_SKAUD);
+	sa1111_writel(save->skpwm0,   base + SA1111_SKPWM0);
+	sa1111_writel(save->skpwm1,   base + SA1111_SKPWM1);
 
 	base = sachip->base + SA1111_INTC;
-	writel_relaxed(save->intpol0,  base + SA1111_INTPOL0);
-	writel_relaxed(save->intpol1,  base + SA1111_INTPOL1);
-	writel_relaxed(save->inten0,   base + SA1111_INTEN0);
-	writel_relaxed(save->inten1,   base + SA1111_INTEN1);
-	writel_relaxed(save->wakepol0, base + SA1111_WAKEPOL0);
-	writel_relaxed(save->wakepol1, base + SA1111_WAKEPOL1);
-	writel_relaxed(save->wakeen0,  base + SA1111_WAKEEN0);
-	writel_relaxed(save->wakeen1,  base + SA1111_WAKEEN1);
+	sa1111_writel(save->intpol0,  base + SA1111_INTPOL0);
+	sa1111_writel(save->intpol1,  base + SA1111_INTPOL1);
+	sa1111_writel(save->inten0,   base + SA1111_INTEN0);
+	sa1111_writel(save->inten1,   base + SA1111_INTEN1);
+	sa1111_writel(save->wakepol0, base + SA1111_WAKEPOL0);
+	sa1111_writel(save->wakepol1, base + SA1111_WAKEPOL1);
+	sa1111_writel(save->wakeen0,  base + SA1111_WAKEEN0);
+	sa1111_writel(save->wakeen1,  base + SA1111_WAKEEN1);
 
 	spin_unlock_irqrestore(&sachip->lock, flags);
 
-	sachip->saved_state = NULL;
+	dev->power.saved_state = NULL;
 	kfree(save);
 
 	return 0;
 }
 
 #else
-#define sa1111_suspend_noirq NULL
-#define sa1111_resume_noirq  NULL
+#define sa1111_suspend NULL
+#define sa1111_resume  NULL
 #endif
 
-static int sa1111_probe(struct platform_device *pdev)
+static int sa1111_probe(struct device *dev)
 {
+	struct platform_device *pdev = to_platform_device(dev);
 	struct resource *mem;
 	int irq;
 
@@ -1117,32 +938,26 @@ static int sa1111_probe(struct platform_device *pdev)
 	if (!mem)
 		return -EINVAL;
 	irq = platform_get_irq(pdev, 0);
-	if (irq < 0)
-		return irq;
 
-	return __sa1111_probe(&pdev->dev, mem, irq);
+	return __sa1111_probe(dev, mem, irq);
 }
 
-static int sa1111_remove(struct platform_device *pdev)
+static int sa1111_remove(struct device *dev)
 {
-	struct sa1111 *sachip = platform_get_drvdata(pdev);
+	struct sa1111 *sachip = dev_get_drvdata(dev);
 
 	if (sachip) {
-#ifdef CONFIG_PM
-		kfree(sachip->saved_state);
-		sachip->saved_state = NULL;
-#endif
 		__sa1111_remove(sachip);
-		platform_set_drvdata(pdev, NULL);
+		dev_set_drvdata(dev, NULL);
+
+#ifdef CONFIG_PM
+		kfree(dev->power.saved_state);
+		dev->power.saved_state = NULL;
+#endif
 	}
 
 	return 0;
 }
-
-static struct dev_pm_ops sa1111_pm_ops = {
-	.suspend_noirq = sa1111_suspend_noirq,
-	.resume_noirq = sa1111_resume_noirq,
-};
 
 /*
  *	Not sure if this should be on the system bus or not yet.
@@ -1153,13 +968,13 @@ static struct dev_pm_ops sa1111_pm_ops = {
  *	We also need to handle the SDRAM configuration for
  *	PXA250/SA1110 machine classes.
  */
-static struct platform_driver sa1111_device_driver = {
+static struct device_driver sa1111_device_driver = {
+	.name		= "sa1111",
+	.bus		= &platform_bus_type,
 	.probe		= sa1111_probe,
 	.remove		= sa1111_remove,
-	.driver		= {
-		.name	= "sa1111",
-		.pm	= &sa1111_pm_ops,
-	},
+	.suspend	= sa1111_suspend,
+	.resume		= sa1111_resume,
 };
 
 /*
@@ -1180,7 +995,7 @@ static unsigned int __sa1111_pll_clock(struct sa1111 *sachip)
 {
 	unsigned int skcdr, fbdiv, ipdiv, opdiv;
 
-	skcdr = readl_relaxed(sachip->base + SA1111_SKCDR);
+	skcdr = sa1111_readl(sachip->base + SA1111_SKCDR);
 
 	fbdiv = (skcdr & 0x007f) + 2;
 	ipdiv = ((skcdr & 0x0f80) >> 7) + 2;
@@ -1204,7 +1019,6 @@ unsigned int sa1111_pll_clock(struct sa1111_dev *sadev)
 
 	return __sa1111_pll_clock(sachip);
 }
-EXPORT_SYMBOL(sa1111_pll_clock);
 
 /**
  *	sa1111_select_audio_mode - select I2S or AC link mode
@@ -1222,17 +1036,16 @@ void sa1111_select_audio_mode(struct sa1111_dev *sadev, int mode)
 
 	spin_lock_irqsave(&sachip->lock, flags);
 
-	val = readl_relaxed(sachip->base + SA1111_SKCR);
+	val = sa1111_readl(sachip->base + SA1111_SKCR);
 	if (mode == SA1111_AUDIO_I2S) {
 		val &= ~SKCR_SELAC;
 	} else {
 		val |= SKCR_SELAC;
 	}
-	writel_relaxed(val, sachip->base + SA1111_SKCR);
+	sa1111_writel(val, sachip->base + SA1111_SKCR);
 
 	spin_unlock_irqrestore(&sachip->lock, flags);
 }
-EXPORT_SYMBOL(sa1111_select_audio_mode);
 
 /**
  *	sa1111_set_audio_rate - set the audio sample rate
@@ -1253,11 +1066,10 @@ int sa1111_set_audio_rate(struct sa1111_dev *sadev, int rate)
 	if (div > 128)
 		div = 128;
 
-	writel_relaxed(div - 1, sachip->base + SA1111_SKAUD);
+	sa1111_writel(div - 1, sachip->base + SA1111_SKAUD);
 
 	return 0;
 }
-EXPORT_SYMBOL(sa1111_set_audio_rate);
 
 /**
  *	sa1111_get_audio_rate - get the audio sample rate
@@ -1271,11 +1083,66 @@ int sa1111_get_audio_rate(struct sa1111_dev *sadev)
 	if (sadev->devid != SA1111_DEVID_SAC)
 		return -EINVAL;
 
-	div = readl_relaxed(sachip->base + SA1111_SKAUD) + 1;
+	div = sa1111_readl(sachip->base + SA1111_SKAUD) + 1;
 
 	return __sa1111_pll_clock(sachip) / (256 * div);
 }
-EXPORT_SYMBOL(sa1111_get_audio_rate);
+
+void sa1111_set_io_dir(struct sa1111_dev *sadev,
+		       unsigned int bits, unsigned int dir,
+		       unsigned int sleep_dir)
+{
+	struct sa1111 *sachip = sa1111_chip_driver(sadev);
+	unsigned long flags;
+	unsigned int val;
+	void __iomem *gpio = sachip->base + SA1111_GPIO;
+
+#define MODIFY_BITS(port, mask, dir)		\
+	if (mask) {				\
+		val = sa1111_readl(port);	\
+		val &= ~(mask);			\
+		val |= (dir) & (mask);		\
+		sa1111_writel(val, port);	\
+	}
+
+	spin_lock_irqsave(&sachip->lock, flags);
+	MODIFY_BITS(gpio + SA1111_GPIO_PADDR, bits & 15, dir);
+	MODIFY_BITS(gpio + SA1111_GPIO_PBDDR, (bits >> 8) & 255, dir >> 8);
+	MODIFY_BITS(gpio + SA1111_GPIO_PCDDR, (bits >> 16) & 255, dir >> 16);
+
+	MODIFY_BITS(gpio + SA1111_GPIO_PASDR, bits & 15, sleep_dir);
+	MODIFY_BITS(gpio + SA1111_GPIO_PBSDR, (bits >> 8) & 255, sleep_dir >> 8);
+	MODIFY_BITS(gpio + SA1111_GPIO_PCSDR, (bits >> 16) & 255, sleep_dir >> 16);
+	spin_unlock_irqrestore(&sachip->lock, flags);
+}
+
+void sa1111_set_io(struct sa1111_dev *sadev, unsigned int bits, unsigned int v)
+{
+	struct sa1111 *sachip = sa1111_chip_driver(sadev);
+	unsigned long flags;
+	unsigned int val;
+	void __iomem *gpio = sachip->base + SA1111_GPIO;
+
+	spin_lock_irqsave(&sachip->lock, flags);
+	MODIFY_BITS(gpio + SA1111_GPIO_PADWR, bits & 15, v);
+	MODIFY_BITS(gpio + SA1111_GPIO_PBDWR, (bits >> 8) & 255, v >> 8);
+	MODIFY_BITS(gpio + SA1111_GPIO_PCDWR, (bits >> 16) & 255, v >> 16);
+	spin_unlock_irqrestore(&sachip->lock, flags);
+}
+
+void sa1111_set_sleep_io(struct sa1111_dev *sadev, unsigned int bits, unsigned int v)
+{
+	struct sa1111 *sachip = sa1111_chip_driver(sadev);
+	unsigned long flags;
+	unsigned int val;
+	void __iomem *gpio = sachip->base + SA1111_GPIO;
+
+	spin_lock_irqsave(&sachip->lock, flags);
+	MODIFY_BITS(gpio + SA1111_GPIO_PASSR, bits & 15, v);
+	MODIFY_BITS(gpio + SA1111_GPIO_PBSSR, (bits >> 8) & 255, v >> 8);
+	MODIFY_BITS(gpio + SA1111_GPIO_PCSSR, (bits >> 16) & 255, v >> 16);
+	spin_unlock_irqrestore(&sachip->lock, flags);
+}
 
 /*
  * Individual device operations.
@@ -1285,25 +1152,17 @@ EXPORT_SYMBOL(sa1111_get_audio_rate);
  *	sa1111_enable_device - enable an on-chip SA1111 function block
  *	@sadev: SA1111 function block device to enable
  */
-int sa1111_enable_device(struct sa1111_dev *sadev)
+void sa1111_enable_device(struct sa1111_dev *sadev)
 {
 	struct sa1111 *sachip = sa1111_chip_driver(sadev);
 	unsigned long flags;
 	unsigned int val;
-	int ret = 0;
 
-	if (sachip->pdata && sachip->pdata->enable)
-		ret = sachip->pdata->enable(sachip->pdata->data, sadev->devid);
-
-	if (ret == 0) {
-		spin_lock_irqsave(&sachip->lock, flags);
-		val = readl_relaxed(sachip->base + SA1111_SKPCR);
-		writel_relaxed(val | sadev->skpcr_mask, sachip->base + SA1111_SKPCR);
-		spin_unlock_irqrestore(&sachip->lock, flags);
-	}
-	return ret;
+	spin_lock_irqsave(&sachip->lock, flags);
+	val = sa1111_readl(sachip->base + SA1111_SKPCR);
+	sa1111_writel(val | sadev->skpcr_mask, sachip->base + SA1111_SKPCR);
+	spin_unlock_irqrestore(&sachip->lock, flags);
 }
-EXPORT_SYMBOL(sa1111_enable_device);
 
 /**
  *	sa1111_disable_device - disable an on-chip SA1111 function block
@@ -1316,23 +1175,10 @@ void sa1111_disable_device(struct sa1111_dev *sadev)
 	unsigned int val;
 
 	spin_lock_irqsave(&sachip->lock, flags);
-	val = readl_relaxed(sachip->base + SA1111_SKPCR);
-	writel_relaxed(val & ~sadev->skpcr_mask, sachip->base + SA1111_SKPCR);
+	val = sa1111_readl(sachip->base + SA1111_SKPCR);
+	sa1111_writel(val & ~sadev->skpcr_mask, sachip->base + SA1111_SKPCR);
 	spin_unlock_irqrestore(&sachip->lock, flags);
-
-	if (sachip->pdata && sachip->pdata->disable)
-		sachip->pdata->disable(sachip->pdata->data, sadev->devid);
 }
-EXPORT_SYMBOL(sa1111_disable_device);
-
-int sa1111_get_irq(struct sa1111_dev *sadev, unsigned num)
-{
-	struct sa1111 *sachip = sa1111_chip_driver(sadev);
-	if (num >= ARRAY_SIZE(sadev->hwirq))
-		return -EINVAL;
-	return sa1111_map_irq(sachip, sadev->hwirq[num]);
-}
-EXPORT_SYMBOL_GPL(sa1111_get_irq);
 
 /*
  *	SA1111 "Register Access Bus."
@@ -1342,15 +1188,37 @@ EXPORT_SYMBOL_GPL(sa1111_get_irq);
  */
 static int sa1111_match(struct device *_dev, struct device_driver *_drv)
 {
-	struct sa1111_dev *dev = to_sa1111_device(_dev);
+	struct sa1111_dev *dev = SA1111_DEV(_dev);
 	struct sa1111_driver *drv = SA1111_DRV(_drv);
 
-	return !!(dev->devid & drv->devid);
+	return dev->devid == drv->devid;
+}
+
+static int sa1111_bus_suspend(struct device *dev, pm_message_t state)
+{
+	struct sa1111_dev *sadev = SA1111_DEV(dev);
+	struct sa1111_driver *drv = SA1111_DRV(dev->driver);
+	int ret = 0;
+
+	if (drv && drv->suspend)
+		ret = drv->suspend(sadev, state);
+	return ret;
+}
+
+static int sa1111_bus_resume(struct device *dev)
+{
+	struct sa1111_dev *sadev = SA1111_DEV(dev);
+	struct sa1111_driver *drv = SA1111_DRV(dev->driver);
+	int ret = 0;
+
+	if (drv && drv->resume)
+		ret = drv->resume(sadev);
+	return ret;
 }
 
 static int sa1111_bus_probe(struct device *dev)
 {
-	struct sa1111_dev *sadev = to_sa1111_device(dev);
+	struct sa1111_dev *sadev = SA1111_DEV(dev);
 	struct sa1111_driver *drv = SA1111_DRV(dev->driver);
 	int ret = -ENODEV;
 
@@ -1359,52 +1227,66 @@ static int sa1111_bus_probe(struct device *dev)
 	return ret;
 }
 
-static void sa1111_bus_remove(struct device *dev)
+static int sa1111_bus_remove(struct device *dev)
 {
-	struct sa1111_dev *sadev = to_sa1111_device(dev);
+	struct sa1111_dev *sadev = SA1111_DEV(dev);
 	struct sa1111_driver *drv = SA1111_DRV(dev->driver);
+	int ret = 0;
 
 	if (drv->remove)
-		drv->remove(sadev);
+		ret = drv->remove(sadev);
+	return ret;
 }
 
 struct bus_type sa1111_bus_type = {
 	.name		= "sa1111-rab",
 	.match		= sa1111_match,
-	.probe		= sa1111_bus_probe,
-	.remove		= sa1111_bus_remove,
+	.suspend	= sa1111_bus_suspend,
+	.resume		= sa1111_bus_resume,
 };
-EXPORT_SYMBOL(sa1111_bus_type);
 
 int sa1111_driver_register(struct sa1111_driver *driver)
 {
+	driver->drv.probe = sa1111_bus_probe;
+	driver->drv.remove = sa1111_bus_remove;
 	driver->drv.bus = &sa1111_bus_type;
 	return driver_register(&driver->drv);
 }
-EXPORT_SYMBOL(sa1111_driver_register);
 
 void sa1111_driver_unregister(struct sa1111_driver *driver)
 {
 	driver_unregister(&driver->drv);
 }
-EXPORT_SYMBOL(sa1111_driver_unregister);
 
 static int __init sa1111_init(void)
 {
 	int ret = bus_register(&sa1111_bus_type);
 	if (ret == 0)
-		platform_driver_register(&sa1111_device_driver);
+		driver_register(&sa1111_device_driver);
 	return ret;
 }
 
 static void __exit sa1111_exit(void)
 {
-	platform_driver_unregister(&sa1111_device_driver);
+	driver_unregister(&sa1111_device_driver);
 	bus_unregister(&sa1111_bus_type);
 }
 
-subsys_initcall(sa1111_init);
+module_init(sa1111_init);
 module_exit(sa1111_exit);
 
 MODULE_DESCRIPTION("Intel Corporation SA1111 core driver");
 MODULE_LICENSE("GPL");
+
+EXPORT_SYMBOL(sa1111_select_audio_mode);
+EXPORT_SYMBOL(sa1111_set_audio_rate);
+EXPORT_SYMBOL(sa1111_get_audio_rate);
+EXPORT_SYMBOL(sa1111_set_io_dir);
+EXPORT_SYMBOL(sa1111_set_io);
+EXPORT_SYMBOL(sa1111_set_sleep_io);
+EXPORT_SYMBOL(sa1111_enable_device);
+EXPORT_SYMBOL(sa1111_disable_device);
+EXPORT_SYMBOL(sa1111_pll_clock);
+EXPORT_SYMBOL(sa1111_bus_type);
+EXPORT_SYMBOL(sa1111_driver_register);
+EXPORT_SYMBOL(sa1111_driver_unregister);

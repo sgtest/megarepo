@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * linux/include/linux/sunrpc/debug.h
  *
@@ -6,125 +5,95 @@
  *
  * Copyright (C) 1996, Olaf Kirch <okir@monad.swb.de>
  */
+
 #ifndef _LINUX_SUNRPC_DEBUG_H_
 #define _LINUX_SUNRPC_DEBUG_H_
 
-#include <uapi/linux/sunrpc/debug.h>
+#include <linux/config.h>
+
+#include <linux/timer.h>
+#include <linux/workqueue.h>
+
+/*
+ * Enable RPC debugging/profiling.
+ */
+#ifdef CONFIG_SYSCTL
+#define  RPC_DEBUG
+#endif
+/* #define  RPC_PROFILE */
+
+/*
+ * RPC debug facilities
+ */
+#define RPCDBG_XPRT		0x0001
+#define RPCDBG_CALL		0x0002
+#define RPCDBG_DEBUG		0x0004
+#define RPCDBG_NFS		0x0008
+#define RPCDBG_AUTH		0x0010
+#define RPCDBG_PMAP		0x0020
+#define RPCDBG_SCHED		0x0040
+#define RPCDBG_SVCSOCK		0x0100
+#define RPCDBG_SVCDSP		0x0200
+#define RPCDBG_MISC		0x0400
+#define RPCDBG_CACHE		0x0800
+#define RPCDBG_ALL		0x7fff
+
+#ifdef __KERNEL__
 
 /*
  * Debugging macros etc
  */
-#if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
+#ifdef RPC_DEBUG
 extern unsigned int		rpc_debug;
 extern unsigned int		nfs_debug;
 extern unsigned int		nfsd_debug;
 extern unsigned int		nlm_debug;
 #endif
 
-#define dprintk(fmt, ...)						\
-	dfprintk(FACILITY, fmt, ##__VA_ARGS__)
-#define dprintk_cont(fmt, ...)						\
-	dfprintk_cont(FACILITY, fmt, ##__VA_ARGS__)
-#define dprintk_rcu(fmt, ...)						\
-	dfprintk_rcu(FACILITY, fmt, ##__VA_ARGS__)
-#define dprintk_rcu_cont(fmt, ...)					\
-	dfprintk_rcu_cont(FACILITY, fmt, ##__VA_ARGS__)
+#define dprintk(args...)	dfprintk(FACILITY, ## args)
 
 #undef ifdebug
-#if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
+#ifdef RPC_DEBUG			
 # define ifdebug(fac)		if (unlikely(rpc_debug & RPCDBG_##fac))
-
-# define dfprintk(fac, fmt, ...)					\
-do {									\
-	ifdebug(fac)							\
-		printk(KERN_DEFAULT fmt, ##__VA_ARGS__);		\
-} while (0)
-
-# define dfprintk_cont(fac, fmt, ...)					\
-do {									\
-	ifdebug(fac)							\
-		printk(KERN_CONT fmt, ##__VA_ARGS__);			\
-} while (0)
-
-# define dfprintk_rcu(fac, fmt, ...)					\
-do {									\
-	ifdebug(fac) {							\
-		rcu_read_lock();					\
-		printk(KERN_DEFAULT fmt, ##__VA_ARGS__);		\
-		rcu_read_unlock();					\
-	}								\
-} while (0)
-
-# define dfprintk_rcu_cont(fac, fmt, ...)				\
-do {									\
-	ifdebug(fac) {							\
-		rcu_read_lock();					\
-		printk(KERN_CONT fmt, ##__VA_ARGS__);			\
-		rcu_read_unlock();					\
-	}								\
-} while (0)
-
+# define dfprintk(fac, args...)	do { ifdebug(fac) printk(args); } while(0)
 # define RPC_IFDEBUG(x)		x
 #else
 # define ifdebug(fac)		if (0)
-# define dfprintk(fac, fmt, ...)	do {} while (0)
-# define dfprintk_cont(fac, fmt, ...)	do {} while (0)
-# define dfprintk_rcu(fac, fmt, ...)	do {} while (0)
+# define dfprintk(fac, args...)	do ; while (0)
 # define RPC_IFDEBUG(x)
+#endif
+
+#ifdef RPC_PROFILE
+# define pprintk(args...)	printk(## args)
+#else
+# define pprintk(args...)	do ; while (0)
 #endif
 
 /*
  * Sysctl interface for RPC debugging
  */
-
-struct rpc_clnt;
-struct rpc_xprt;
-
-#if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
+#ifdef RPC_DEBUG
 void		rpc_register_sysctl(void);
 void		rpc_unregister_sysctl(void);
-void		sunrpc_debugfs_init(void);
-void		sunrpc_debugfs_exit(void);
-void		rpc_clnt_debugfs_register(struct rpc_clnt *);
-void		rpc_clnt_debugfs_unregister(struct rpc_clnt *);
-void		rpc_xprt_debugfs_register(struct rpc_xprt *);
-void		rpc_xprt_debugfs_unregister(struct rpc_xprt *);
-#else
-static inline void
-sunrpc_debugfs_init(void)
-{
-	return;
-}
-
-static inline void
-sunrpc_debugfs_exit(void)
-{
-	return;
-}
-
-static inline void
-rpc_clnt_debugfs_register(struct rpc_clnt *clnt)
-{
-	return;
-}
-
-static inline void
-rpc_clnt_debugfs_unregister(struct rpc_clnt *clnt)
-{
-	return;
-}
-
-static inline void
-rpc_xprt_debugfs_register(struct rpc_xprt *xprt)
-{
-	return;
-}
-
-static inline void
-rpc_xprt_debugfs_unregister(struct rpc_xprt *xprt)
-{
-	return;
-}
 #endif
+
+#endif /* __KERNEL__ */
+
+/*
+ * Declarations for the sysctl debug interface, which allows to read or
+ * change the debug flags for rpc, nfs, nfsd, and lockd. Since the sunrpc
+ * module currently registers its sysctl table dynamically, the sysctl path
+ * for module FOO is <CTL_SUNRPC, CTL_FOODEBUG>.
+ */
+#define CTL_SUNRPC	7249	/* arbitrary and hopefully unused */
+
+enum {
+	CTL_RPCDEBUG = 1,
+	CTL_NFSDEBUG,
+	CTL_NFSDDEBUG,
+	CTL_NLMDEBUG,
+	CTL_SLOTTABLE_UDP,
+	CTL_SLOTTABLE_TCP,
+};
 
 #endif /* _LINUX_SUNRPC_DEBUG_H_ */

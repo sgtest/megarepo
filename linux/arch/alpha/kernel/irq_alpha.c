@@ -1,18 +1,15 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Alpha specific irq code.
  */
 
+#include <linux/config.h>
 #include <linux/init.h>
 #include <linux/sched.h>
 #include <linux/irq.h>
 #include <linux/kernel_stat.h>
-#include <linux/module.h>
 
 #include <asm/machvec.h>
 #include <asm/dma.h>
-#include <asm/perf_event.h>
-#include <asm/mce.h>
 
 #include "proto.h"
 #include "irq_impl.h"
@@ -20,7 +17,6 @@
 /* Hack minimum IPL during interrupt processing for broken hardware.  */
 #ifdef CONFIG_ALPHA_BROKEN_IRQ_MASK
 int __min_ipl;
-EXPORT_SYMBOL(__min_ipl);
 #endif
 
 /*
@@ -35,7 +31,6 @@ dummy_perf(unsigned long vector, struct pt_regs *regs)
 }
 
 void (*perf_irq)(unsigned long, struct pt_regs *) = dummy_perf;
-EXPORT_SYMBOL(perf_irq);
 
 /*
  * The main interrupt entry point.
@@ -45,15 +40,6 @@ asmlinkage void
 do_entInt(unsigned long type, unsigned long vector,
 	  unsigned long la_ptr, struct pt_regs *regs)
 {
-	struct pt_regs *old_regs;
-
-	/*
-	 * Disable interrupts during IRQ handling.
-	 * Note that there is no matching local_irq_enable() due to
-	 * severe problems with RTI at IPL0 and some MILO PALcode
-	 * (namely LX164).
-	 */
-	local_irq_disable();
 	switch (type) {
 	case 0:
 #ifdef CONFIG_SMP
@@ -66,19 +52,26 @@ do_entInt(unsigned long type, unsigned long vector,
 #endif
 		break;
 	case 1:
-		old_regs = set_irq_regs(regs);
-		handle_irq(RTC_IRQ);
-		set_irq_regs(old_regs);
+#ifdef CONFIG_SMP
+	  {
+		long cpu;
+		smp_percpu_timer_interrupt(regs);
+		cpu = smp_processor_id();
+		if (cpu != boot_cpuid) {
+		        kstat_cpu(cpu).irqs[RTC_IRQ]++;
+		} else {
+			handle_irq(RTC_IRQ, regs);
+		}
+	  }
+#else
+		handle_irq(RTC_IRQ, regs);
+#endif
 		return;
 	case 2:
-		old_regs = set_irq_regs(regs);
-		alpha_mv.machine_check(vector, la_ptr);
-		set_irq_regs(old_regs);
+		alpha_mv.machine_check(vector, la_ptr, regs);
 		return;
 	case 3:
-		old_regs = set_irq_regs(regs);
-		alpha_mv.device_interrupt(vector);
-		set_irq_regs(old_regs);
+		alpha_mv.device_interrupt(vector, regs);
 		return;
 	case 4:
 		perf_irq(la_ptr, regs);
@@ -126,7 +119,8 @@ struct mcheck_info __mcheck_info;
 
 void
 process_mcheck_info(unsigned long vector, unsigned long la_ptr,
-		    const char *machine, int expected)
+		    struct pt_regs *regs, const char *machine,
+		    int expected)
 {
 	struct el_common *mchk_header;
 	const char *reason;
@@ -153,7 +147,7 @@ process_mcheck_info(unsigned long vector, unsigned long la_ptr,
 	mchk_header = (struct el_common *)la_ptr;
 
 	printk(KERN_CRIT "%s machine check: vector=0x%lx pc=0x%lx code=0x%x\n",
-	       machine, vector, get_irq_regs()->pc, mchk_header->code);
+	       machine, vector, regs->pc, mchk_header->code);
 
 	switch (mchk_header->code) {
 	/* Machine check reasons.  Defined according to PALcode sources.  */
@@ -194,7 +188,7 @@ process_mcheck_info(unsigned long vector, unsigned long la_ptr,
 	printk(KERN_CRIT "machine check type: %s%s\n",
 	       reason, mchk_header->retry ? " (retryable)" : "");
 
-	dik_show_regs(get_irq_regs(), NULL);
+	dik_show_regs(regs, NULL);
 
 #ifdef CONFIG_VERBOSE_MCHECK
 	if (alpha_verbose_mcheck > 1) {
@@ -213,13 +207,46 @@ process_mcheck_info(unsigned long vector, unsigned long la_ptr,
  * The special RTC interrupt type.  The interrupt itself was
  * processed by PALcode, and comes in via entInt vector 1.
  */
+
+static void rtc_enable_disable(unsigned int irq) { }
+static unsigned int rtc_startup(unsigned int irq) { return 0; }
+
+struct irqaction timer_irqaction = {
+	.handler	= timer_interrupt,
+	.flags		= SA_INTERRUPT,
+	.name		= "timer",
+};
+
+static struct hw_interrupt_type rtc_irq_type = {
+	.typename	= "RTC",
+	.startup	= rtc_startup,
+	.shutdown	= rtc_enable_disable,
+	.enable		= rtc_enable_disable,
+	.disable	= rtc_enable_disable,
+	.ack		= rtc_enable_disable,
+	.end		= rtc_enable_disable,
+};
+
 void __init
-init_rtc_irq(irq_handler_t handler)
+init_rtc_irq(void)
 {
-	irq_set_chip_and_handler_name(RTC_IRQ, &dummy_irq_chip,
-				      handle_percpu_irq, "RTC");
-	if (!handler)
-		handler = rtc_timer_interrupt;
-	if (request_irq(RTC_IRQ, handler, 0, "timer", NULL))
-		pr_err("Failed to register timer interrupt\n");
+	irq_desc[RTC_IRQ].status = IRQ_DISABLED;
+	irq_desc[RTC_IRQ].handler = &rtc_irq_type;
+	setup_irq(RTC_IRQ, &timer_irqaction);
 }
+
+/* Dummy irqactions.  */
+struct irqaction isa_cascade_irqaction = {
+	.handler	= no_action,
+	.name		= "isa-cascade"
+};
+
+struct irqaction timer_cascade_irqaction = {
+	.handler	= no_action,
+	.name		= "timer-cascade"
+};
+
+struct irqaction halt_switch_irqaction = {
+	.handler	= no_action,
+	.name		= "halt-switch"
+};

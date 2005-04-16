@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Architecture-specific unaligned trap handling.
  *
@@ -14,26 +13,23 @@
  * 2001/08/13	Correct size of extended floats (float_fsz) from 16 to 10 bytes.
  * 2001/01/17	Add support emulation of unaligned kernel accesses.
  */
-#include <linux/jiffies.h>
 #include <linux/kernel.h>
-#include <linux/sched/signal.h>
+#include <linux/sched.h>
+#include <linux/smp_lock.h>
 #include <linux/tty.h>
-#include <linux/extable.h>
-#include <linux/ratelimit.h>
-#include <linux/uaccess.h>
 
 #include <asm/intrinsics.h>
 #include <asm/processor.h>
 #include <asm/rse.h>
-#include <asm/exception.h>
+#include <asm/uaccess.h>
 #include <asm/unaligned.h>
 
-extern int die_if_kernel(char *str, struct pt_regs *regs, long err);
+extern void die_if_kernel(char *str, struct pt_regs *regs, long err) __attribute__ ((noreturn));
 
 #undef DEBUG_UNALIGNED_TRAP
 
 #ifdef DEBUG_UNALIGNED_TRAP
-# define DPRINT(a...)	do { printk("%s %u: ", __func__, __LINE__); printk (a); } while (0)
+# define DPRINT(a...)	do { printk("%s %u: ", __FUNCTION__, __LINE__); printk (a); } while (0)
 # define DDUMP(str,vp,len)	dump(str, vp, len)
 
 static void
@@ -55,15 +51,6 @@ dump (const char *str, void *vp, size_t len)
 #define IA64_FIRST_STACKED_GR	32
 #define IA64_FIRST_ROTATING_FR	32
 #define SIGN_EXT9		0xffffffffffffff00ul
-
-/*
- *  sysctl settable hook which tells the kernel whether to honor the
- *  IA64_THREAD_UAC_NOPRINT prctl.  Because this is user settable, we want
- *  to allow the super user to enable/disable this for security reasons
- *  (i.e. don't allow attacker to fill up logs with unaligned accesses).
- */
-int no_unaligned_warning;
-int unaligned_dump_stack;
 
 /*
  * For M-unit:
@@ -679,10 +666,9 @@ emulate_load_updates (update_t type, load_store_t ld, struct pt_regs *regs, unsi
 	 * just in case.
 	 */
 	if (ld.x6_op == 1 || ld.x6_op == 3) {
-		printk(KERN_ERR "%s: register update on speculative load, error\n", __func__);
-		if (die_if_kernel("unaligned reference on speculative load with register update\n",
-				  regs, 30))
-			return;
+		printk(KERN_ERR "%s: register update on speculative load, error\n", __FUNCTION__);
+		die_if_kernel("unaligned reference on speculative load with register update\n",
+			      regs, 30);
 	}
 
 
@@ -749,25 +735,9 @@ emulate_load_updates (update_t type, load_store_t ld, struct pt_regs *regs, unsi
 	}
 }
 
-static int emulate_store(unsigned long ifa, void *val, int len, bool kernel_mode)
-{
-	if (kernel_mode)
-		return copy_to_kernel_nofault((void *)ifa, val, len);
-
-	return copy_to_user((void __user *)ifa, val, len);
-}
-
-static int emulate_load(void *val, unsigned long ifa, int len, bool kernel_mode)
-{
-	if (kernel_mode)
-	       return copy_from_kernel_nofault(val, (void *)ifa, len);
-
-	return copy_from_user(val, (void __user *)ifa, len);
-}
 
 static int
-emulate_load_int (unsigned long ifa, load_store_t ld, struct pt_regs *regs,
-		  bool kernel_mode)
+emulate_load_int (unsigned long ifa, load_store_t ld, struct pt_regs *regs)
 {
 	unsigned int len = 1 << ld.x6_sz;
 	unsigned long val = 0;
@@ -790,7 +760,7 @@ emulate_load_int (unsigned long ifa, load_store_t ld, struct pt_regs *regs,
 		return -1;
 	}
 	/* this assumes little-endian byte-order: */
-	if (emulate_load(&val, ifa, len, kernel_mode))
+	if (copy_from_user(&val, (void __user *) ifa, len))
 		return -1;
 	setreg(ld.r1, val, 0, regs);
 
@@ -888,8 +858,7 @@ emulate_load_int (unsigned long ifa, load_store_t ld, struct pt_regs *regs,
 }
 
 static int
-emulate_store_int (unsigned long ifa, load_store_t ld, struct pt_regs *regs,
-		   bool kernel_mode)
+emulate_store_int (unsigned long ifa, load_store_t ld, struct pt_regs *regs)
 {
 	unsigned long r2;
 	unsigned int len = 1 << ld.x6_sz;
@@ -918,7 +887,7 @@ emulate_store_int (unsigned long ifa, load_store_t ld, struct pt_regs *regs,
 	}
 
 	/* this assumes little-endian byte-order: */
-	if (emulate_store(ifa, &r2, len, kernel_mode))
+	if (copy_to_user((void __user *) ifa, &r2, len))
 		return -1;
 
 	/*
@@ -1038,7 +1007,7 @@ float2mem_double (struct ia64_fpreg *init, struct ia64_fpreg *final)
 }
 
 static int
-emulate_load_floatpair (unsigned long ifa, load_store_t ld, struct pt_regs *regs, bool kernel_mode)
+emulate_load_floatpair (unsigned long ifa, load_store_t ld, struct pt_regs *regs)
 {
 	struct ia64_fpreg fpr_init[2];
 	struct ia64_fpreg fpr_final[2];
@@ -1067,8 +1036,8 @@ emulate_load_floatpair (unsigned long ifa, load_store_t ld, struct pt_regs *regs
 		 * This assumes little-endian byte-order.  Note that there is no "ldfpe"
 		 * instruction:
 		 */
-		if (emulate_load(&fpr_init[0], ifa, len, kernel_mode)
-		    || emulate_load(&fpr_init[1], (ifa + len), len, kernel_mode))
+		if (copy_from_user(&fpr_init[0], (void __user *) ifa, len)
+		    || copy_from_user(&fpr_init[1], (void __user *) (ifa + len), len))
 			return -1;
 
 		DPRINT("ld.r1=%d ld.imm=%d x6_sz=%d\n", ld.r1, ld.imm, ld.x6_sz);
@@ -1126,7 +1095,7 @@ emulate_load_floatpair (unsigned long ifa, load_store_t ld, struct pt_regs *regs
 		 */
 		if (ld.x6_op == 1 || ld.x6_op == 3)
 			printk(KERN_ERR "%s: register update on speculative load pair, error\n",
-			       __func__);
+			       __FUNCTION__);
 
 		setreg(ld.r3, ifa, 0, regs);
 	}
@@ -1143,8 +1112,7 @@ emulate_load_floatpair (unsigned long ifa, load_store_t ld, struct pt_regs *regs
 
 
 static int
-emulate_load_float (unsigned long ifa, load_store_t ld, struct pt_regs *regs,
-	            bool kernel_mode)
+emulate_load_float (unsigned long ifa, load_store_t ld, struct pt_regs *regs)
 {
 	struct ia64_fpreg fpr_init;
 	struct ia64_fpreg fpr_final;
@@ -1170,7 +1138,7 @@ emulate_load_float (unsigned long ifa, load_store_t ld, struct pt_regs *regs,
 	 * See comments in ldX for descriptions on how the various loads are handled.
 	 */
 	if (ld.x6_op != 0x2) {
-		if (emulate_load(&fpr_init, ifa, len, kernel_mode))
+		if (copy_from_user(&fpr_init, (void __user *) ifa, len))
 			return -1;
 
 		DPRINT("ld.r1=%d x6_sz=%d\n", ld.r1, ld.x6_sz);
@@ -1220,8 +1188,7 @@ emulate_load_float (unsigned long ifa, load_store_t ld, struct pt_regs *regs,
 
 
 static int
-emulate_store_float (unsigned long ifa, load_store_t ld, struct pt_regs *regs,
-		     bool kernel_mode)
+emulate_store_float (unsigned long ifa, load_store_t ld, struct pt_regs *regs)
 {
 	struct ia64_fpreg fpr_init;
 	struct ia64_fpreg fpr_final;
@@ -1263,7 +1230,7 @@ emulate_store_float (unsigned long ifa, load_store_t ld, struct pt_regs *regs,
 	DDUMP("fpr_init =", &fpr_init, len);
 	DDUMP("fpr_final =", &fpr_final, len);
 
-	if (emulate_store(ifa, &fpr_final, len, kernel_mode))
+	if (copy_to_user((void __user *) ifa, &fpr_final, len))
 		return -1;
 
 	/*
@@ -1306,28 +1273,42 @@ emulate_store_float (unsigned long ifa, load_store_t ld, struct pt_regs *regs,
 /*
  * Make sure we log the unaligned access, so that user/sysadmin can notice it and
  * eventually fix the program.  However, we don't want to do that for every access so we
- * pace it with jiffies.
+ * pace it with jiffies.  This isn't really MP-safe, but it doesn't really have to be
+ * either...
  */
-static DEFINE_RATELIMIT_STATE(logging_rate_limit, 5 * HZ, 5);
+static int
+within_logging_rate_limit (void)
+{
+	static unsigned long count, last_time;
+
+	if (jiffies - last_time > 5*HZ)
+		count = 0;
+	if (++count < 5) {
+		last_time = jiffies;
+		return 1;
+	}
+	return 0;
+
+}
 
 void
 ia64_handle_unaligned (unsigned long ifa, struct pt_regs *regs)
 {
 	struct ia64_psr *ipsr = ia64_psr(regs);
+	mm_segment_t old_fs = get_fs();
 	unsigned long bundle[2];
 	unsigned long opcode;
+	struct siginfo si;
 	const struct exception_table_entry *eh = NULL;
 	union {
 		unsigned long l;
 		load_store_t insn;
 	} u;
 	int ret = -1;
-	bool kernel_mode = false;
 
 	if (ia64_psr(regs)->be) {
 		/* we don't support big-endian accesses */
-		if (die_if_kernel("big-endian unaligned accesses are not supported", regs, 0))
-			return;
+		die_if_kernel("big-endian unaligned accesses are not supported", regs, 0);
 		goto force_sigbus;
 	}
 
@@ -1342,64 +1323,41 @@ ia64_handle_unaligned (unsigned long ifa, struct pt_regs *regs)
 		if ((current->thread.flags & IA64_THREAD_UAC_SIGBUS) != 0)
 			goto force_sigbus;
 
-		if (!no_unaligned_warning &&
-		    !(current->thread.flags & IA64_THREAD_UAC_NOPRINT) &&
-		    __ratelimit(&logging_rate_limit))
+		if (!(current->thread.flags & IA64_THREAD_UAC_NOPRINT)
+		    && within_logging_rate_limit())
 		{
 			char buf[200];	/* comm[] is at most 16 bytes... */
 			size_t len;
 
 			len = sprintf(buf, "%s(%d): unaligned access to 0x%016lx, "
-				      "ip=0x%016lx\n\r", current->comm,
-				      task_pid_nr(current),
+				      "ip=0x%016lx\n\r", current->comm, current->pid,
 				      ifa, regs->cr_iip + ipsr->ri);
 			/*
 			 * Don't call tty_write_message() if we're in the kernel; we might
 			 * be holding locks...
 			 */
-			if (user_mode(regs)) {
-				struct tty_struct *tty = get_current_tty();
-				tty_write_message(tty, buf);
-				tty_kref_put(tty);
-			}
+			if (user_mode(regs))
+				tty_write_message(current->signal->tty, buf);
 			buf[len-1] = '\0';	/* drop '\r' */
-			/* watch for command names containing %s */
-			printk(KERN_WARNING "%s", buf);
-		} else {
-			if (no_unaligned_warning) {
-				printk_once(KERN_WARNING "%s(%d) encountered an "
-				       "unaligned exception which required\n"
-				       "kernel assistance, which degrades "
-				       "the performance of the application.\n"
-				       "Unaligned exception warnings have "
-				       "been disabled by the system "
-				       "administrator\n"
-				       "echo 0 > /proc/sys/kernel/ignore-"
-				       "unaligned-usertrap to re-enable\n",
-				       current->comm, task_pid_nr(current));
-			}
+			printk(KERN_WARNING "%s", buf);	/* watch for command names containing %s */
 		}
 	} else {
-		if (__ratelimit(&logging_rate_limit)) {
+		if (within_logging_rate_limit())
 			printk(KERN_WARNING "kernel unaligned access to 0x%016lx, ip=0x%016lx\n",
 			       ifa, regs->cr_iip + ipsr->ri);
-			if (unaligned_dump_stack)
-				dump_stack();
-		}
-		kernel_mode = true;
+		set_fs(KERNEL_DS);
 	}
 
 	DPRINT("iip=%lx ifa=%lx isr=%lx (ei=%d, sp=%d)\n",
 	       regs->cr_iip, ifa, regs->cr_ipsr, ipsr->ri, ipsr->it);
 
-	if (emulate_load(bundle, regs->cr_iip, 16, kernel_mode))
+	if (__copy_from_user(bundle, (void __user *) regs->cr_iip, 16))
 		goto failure;
 
 	/*
 	 * extract the instruction from the bundle given the slot number
 	 */
 	switch (ipsr->ri) {
-	      default:
 	      case 0: u.l = (bundle[0] >>  5); break;
 	      case 1: u.l = (bundle[0] >> 46) | (bundle[1] << 18); break;
 	      case 2: u.l = (bundle[1] >> 23); break;
@@ -1450,7 +1408,7 @@ ia64_handle_unaligned (unsigned long ifa, struct pt_regs *regs)
 		if (u.insn.x)
 			/* oops, really a semaphore op (cmpxchg, etc) */
 			goto failure;
-		fallthrough;
+		/* no break */
 	      case LDS_IMM_OP:
 	      case LDSA_IMM_OP:
 	      case LDFS_OP:
@@ -1478,7 +1436,7 @@ ia64_handle_unaligned (unsigned long ifa, struct pt_regs *regs)
 		if (u.insn.x)
 			/* oops, really a semaphore op (cmpxchg, etc) */
 			goto failure;
-		fallthrough;
+		/* no break */
 	      case LD_IMM_OP:
 	      case LDA_IMM_OP:
 	      case LDBIAS_IMM_OP:
@@ -1486,7 +1444,7 @@ ia64_handle_unaligned (unsigned long ifa, struct pt_regs *regs)
 	      case LDCCLR_IMM_OP:
 	      case LDCNC_IMM_OP:
 	      case LDCCLRACQ_IMM_OP:
-		ret = emulate_load_int(ifa, u.insn, regs, kernel_mode);
+		ret = emulate_load_int(ifa, u.insn, regs);
 		break;
 
 	      case ST_OP:
@@ -1494,32 +1452,29 @@ ia64_handle_unaligned (unsigned long ifa, struct pt_regs *regs)
 		if (u.insn.x)
 			/* oops, really a semaphore op (cmpxchg, etc) */
 			goto failure;
-		fallthrough;
+		/* no break */
 	      case ST_IMM_OP:
 	      case STREL_IMM_OP:
-		ret = emulate_store_int(ifa, u.insn, regs, kernel_mode);
+		ret = emulate_store_int(ifa, u.insn, regs);
 		break;
 
 	      case LDF_OP:
 	      case LDFA_OP:
 	      case LDFCCLR_OP:
 	      case LDFCNC_OP:
-		if (u.insn.x)
-			ret = emulate_load_floatpair(ifa, u.insn, regs, kernel_mode);
-		else
-			ret = emulate_load_float(ifa, u.insn, regs, kernel_mode);
-		break;
-
 	      case LDF_IMM_OP:
 	      case LDFA_IMM_OP:
 	      case LDFCCLR_IMM_OP:
 	      case LDFCNC_IMM_OP:
-		ret = emulate_load_float(ifa, u.insn, regs, kernel_mode);
+		if (u.insn.x)
+			ret = emulate_load_floatpair(ifa, u.insn, regs);
+		else
+			ret = emulate_load_float(ifa, u.insn, regs);
 		break;
 
 	      case STF_OP:
 	      case STF_IMM_OP:
-		ret = emulate_store_float(ifa, u.insn, regs, kernel_mode);
+		ret = emulate_store_float(ifa, u.insn, regs);
 		break;
 
 	      default:
@@ -1540,6 +1495,7 @@ ia64_handle_unaligned (unsigned long ifa, struct pt_regs *regs)
 
 	DPRINT("ipsr->ri=%d iip=%lx\n", ipsr->ri, regs->cr_iip);
   done:
+	set_fs(old_fs);		/* restore original address limit */
 	return;
 
   failure:
@@ -1549,12 +1505,17 @@ ia64_handle_unaligned (unsigned long ifa, struct pt_regs *regs)
 			ia64_handle_exception(regs, eh);
 			goto done;
 		}
-		if (die_if_kernel("error during unaligned kernel access\n", regs, ret))
-			return;
+		die_if_kernel("error during unaligned kernel access\n", regs, ret);
 		/* NOT_REACHED */
 	}
   force_sigbus:
-	force_sig_fault(SIGBUS, BUS_ADRALN, (void __user *) ifa,
-			0, 0, 0);
+	si.si_signo = SIGBUS;
+	si.si_errno = 0;
+	si.si_code = BUS_ADRALN;
+	si.si_addr = (void __user *) ifa;
+	si.si_flags = 0;
+	si.si_isr = 0;
+	si.si_imm = 0;
+	force_sig_info(SIGBUS, &si, current);
 	goto done;
 }

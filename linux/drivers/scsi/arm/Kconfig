@@ -1,14 +1,23 @@
-# SPDX-License-Identifier: GPL-2.0-only
 #
 # SCSI driver configuration for Acorn
 #
 config SCSI_ACORNSCSI_3
 	tristate "Acorn SCSI card (aka30) support"
 	depends on ARCH_ACORN && SCSI
-	select SCSI_SPI_ATTRS
 	help
 	  This enables support for the Acorn SCSI card (aka30). If you have an
 	  Acorn system with one of these, say Y. If unsure, say N.
+
+config SCSI_ACORNSCSI_TAGGED_QUEUE
+	bool "Support SCSI 2 Tagged queueing"
+	depends on SCSI_ACORNSCSI_3
+	help
+	  Say Y here to enable tagged queuing support on the Acorn SCSI card.
+
+	  This is a feature of SCSI-2 which improves performance: the host
+	  adapter can send several SCSI commands to a device's queue even if
+	  previous commands haven't finished yet. Some SCSI devices don't
+	  implement this properly, so the safe answer is N.
 
 config SCSI_ACORNSCSI_SYNC
 	bool "Support SCSI 2 Synchronous Transfers"
@@ -54,20 +63,26 @@ config SCSI_POWERTECSCSI
 	  you have one of these, say Y. If unsure, say N.
 
 comment "The following drivers are not fully supported"
-	depends on ARCH_ACORN
+	depends on ARCH_ACORN && EXPERIMENTAL
 
 config SCSI_CUMANA_1
-	tristate "CumanaSCSI I support"
-	depends on ARCH_ACORN && SCSI
-	select SCSI_SPI_ATTRS
+	tristate "CumanaSCSI I support (EXPERIMENTAL)"
+	depends on ARCH_ACORN && EXPERIMENTAL && SCSI
 	help
 	  This enables support for the Cumana SCSI I card. If you have an
 	  Acorn system with one of these, say Y. If unsure, say N.
 
+config SCSI_ECOSCSI
+	tristate "EcoScsi support (EXPERIMENTAL)"
+	depends on ARCH_ACORN && EXPERIMENTAL && (ARCH_ARC || ARCH_A5K) && SCSI
+	help
+	  This enables support for the EcoSCSI card -- a small card that sits
+	  in the Econet socket. If you have an Acorn system with one of these,
+	  say Y. If unsure, say N.
+
 config SCSI_OAK1
-	tristate "Oak SCSI support"
-	depends on ARCH_ACORN && SCSI
-	select SCSI_SPI_ATTRS
+	tristate "Oak SCSI support (EXPERIMENTAL)"
+	depends on ARCH_ACORN && EXPERIMENTAL && SCSI
 	help
 	  This enables support for the Oak SCSI card. If you have an Acorn
 	  system with one of these, say Y. If unsure, say N.

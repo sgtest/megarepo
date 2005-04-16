@@ -1,7 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Pioctl operations for Coda.
- * Original version: (C) 1996 Peter Braam
+ * Original version: (C) 1996 Peter Braam 
  * Rewritten for Linux 2.1: (C) 1997 Carnegie Mellon University
  *
  * Carnegie Mellon encourages users of this code to contribute improvements
@@ -17,72 +16,80 @@
 #include <linux/string.h>
 #include <linux/namei.h>
 #include <linux/module.h>
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
 
 #include <linux/coda.h>
-#include "coda_psdev.h"
-#include "coda_linux.h"
+#include <linux/coda_linux.h>
+#include <linux/coda_fs_i.h>
+#include <linux/coda_psdev.h>
 
 /* pioctl ops */
-static int coda_ioctl_permission(struct user_namespace *mnt_userns,
-				 struct inode *inode, int mask);
-static long coda_pioctl(struct file *filp, unsigned int cmd,
-			unsigned long user_data);
+static int coda_ioctl_permission(struct inode *inode, int mask,
+				 struct nameidata *nd);
+static int coda_pioctl(struct inode * inode, struct file * filp, 
+                       unsigned int cmd, unsigned long user_data);
 
 /* exported from this file */
-const struct inode_operations coda_ioctl_inode_operations = {
+struct inode_operations coda_ioctl_inode_operations =
+{
 	.permission	= coda_ioctl_permission,
 	.setattr	= coda_setattr,
 };
 
-const struct file_operations coda_ioctl_operations = {
-	.unlocked_ioctl	= coda_pioctl,
-	.llseek		= noop_llseek,
+struct file_operations coda_ioctl_operations = {
+	.owner		= THIS_MODULE,
+	.ioctl		= coda_pioctl,
 };
 
 /* the coda pioctl inode ops */
-static int coda_ioctl_permission(struct user_namespace *mnt_userns,
-				 struct inode *inode, int mask)
+static int coda_ioctl_permission(struct inode *inode, int mask,
+				 struct nameidata *nd)
 {
-	return (mask & MAY_EXEC) ? -EACCES : 0;
+        return 0;
 }
 
-static long coda_pioctl(struct file *filp, unsigned int cmd,
-			unsigned long user_data)
+static int coda_pioctl(struct inode * inode, struct file * filp, 
+                       unsigned int cmd, unsigned long user_data)
 {
-	struct path path;
-	int error;
+	struct nameidata nd;
+        int error;
 	struct PioctlData data;
-	struct inode *inode = file_inode(filp);
-	struct inode *target_inode = NULL;
-	struct coda_inode_info *cnp;
+        struct inode *target_inode = NULL;
+        struct coda_inode_info *cnp;
 
-	/* get the Pioctl data arguments from user space */
-	if (copy_from_user(&data, (void __user *)user_data, sizeof(data)))
-		return -EINVAL;
-
-	/*
-	 * Look up the pathname. Note that the pathname is in
-	 * user memory, and namei takes care of this
-	 */
-	error = user_path_at(AT_FDCWD, data.path,
-			     data.follow ? LOOKUP_FOLLOW : 0, &path);
-	if (error)
+        /* get the Pioctl data arguments from user space */
+        if (copy_from_user(&data, (void __user *)user_data, sizeof(data))) {
+	    return -EINVAL;
+	}
+       
+        /* 
+         * Look up the pathname. Note that the pathname is in 
+         * user memory, and namei takes care of this
+         */
+        if ( data.follow ) {
+                error = user_path_walk(data.path, &nd);
+	} else {
+	        error = user_path_walk_link(data.path, &nd);
+	}
+		
+	if ( error ) {
 		return error;
-
-	target_inode = d_inode(path.dentry);
-
+        } else {
+	        target_inode = nd.dentry->d_inode;
+	}
+	
 	/* return if it is not a Coda inode */
-	if (target_inode->i_sb != inode->i_sb) {
-		error = -EINVAL;
-		goto out;
+	if ( target_inode->i_sb != inode->i_sb ) {
+		path_release(&nd);
+	        return  -EINVAL;
 	}
 
 	/* now proceed to make the upcall */
-	cnp = ITOC(target_inode);
+        cnp = ITOC(target_inode);
 
 	error = venus_pioctl(inode->i_sb, &(cnp->c_fid), cmd, &data);
-out:
-	path_put(&path);
-	return error;
+
+	path_release(&nd);
+        return error;
 }
+

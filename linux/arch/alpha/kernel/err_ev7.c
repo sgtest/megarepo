@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *	linux/arch/alpha/kernel/err_ev7.c
  *
@@ -8,6 +7,7 @@
  */
 
 #include <linux/init.h>
+#include <linux/pci.h>
 #include <linux/sched.h>
 
 #include <asm/io.h>
@@ -118,7 +118,7 @@ ev7_collect_logout_frame_subpackets(struct el_subpacket *el_ptr,
 }
 
 void
-ev7_machine_check(unsigned long vector, unsigned long la_ptr)
+ev7_machine_check(u64 vector, u64 la_ptr, struct pt_regs *regs)
 {
 	struct el_subpacket *el_ptr = (struct el_subpacket *)la_ptr;
 	char *saved_err_prefix = err_print_prefix;
@@ -247,13 +247,13 @@ ev7_process_pal_subpacket(struct el_subpacket *header)
 
 	switch(header->type) {
 	case EL_TYPE__PAL__LOGOUT_FRAME:
-		printk("%s*** MCHK occurred on LPID %lld (RBOX %llx)\n",
+		printk("%s*** MCHK occurred on LPID %ld (RBOX %lx)\n",
 		       err_print_prefix,
 		       packet->by_type.logout.whami, 
 		       packet->by_type.logout.rbox_whami);
 		el_print_timestamp(&packet->by_type.logout.timestamp);
-		printk("%s  EXC_ADDR: %016llx\n"
-		         "  HALT_CODE: %llx\n",
+		printk("%s  EXC_ADDR: %016lx\n"
+		         "  HALT_CODE: %lx\n", 
 		       err_print_prefix,
 		       packet->by_type.logout.exc_addr,
 		       packet->by_type.logout.halt_code);
@@ -274,14 +274,16 @@ ev7_process_pal_subpacket(struct el_subpacket *header)
 struct el_subpacket_handler ev7_pal_subpacket_handler =
 	SUBPACKET_HANDLER_INIT(EL_CLASS__PAL, ev7_process_pal_subpacket);
 
-void __init
+void 
 ev7_register_error_handlers(void)
 {
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(el_ev7_pal_annotations); i++)
+	for(i = 0;
+	    i<sizeof(el_ev7_pal_annotations)/sizeof(el_ev7_pal_annotations[1]);
+	    i++) {
 		cdl_register_subpacket_annotation(&el_ev7_pal_annotations[i]);
-
+	}	
 	cdl_register_subpacket_handler(&ev7_pal_subpacket_handler);
 }
 

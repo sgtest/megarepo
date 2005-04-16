@@ -1,4 +1,6 @@
 /*
+ * $Id: ftl.h,v 1.6 2003/01/24 13:20:04 dwmw2 Exp $
+ * 
  * Derived from (and probably identical to):
  * ftl.h 1.7 1999/10/25 20:23:17
  *
@@ -10,7 +12,7 @@
  * Software distributed under the License is distributed on an "AS IS"
  * basis, WITHOUT WARRANTY OF ANY KIND, either express or implied. See
  * the License for the specific language governing rights and
- * limitations under the License.
+ * limitations under the License. 
  *
  * The initial developer of the original code is David A. Hinds
  * <dahinds@users.sourceforge.net>.  Portions created by David A. Hinds
@@ -32,25 +34,25 @@
 #define _LINUX_FTL_H
 
 typedef struct erase_unit_header_t {
-    uint8_t	LinkTargetTuple[5];
-    uint8_t	DataOrgTuple[10];
-    uint8_t	NumTransferUnits;
-    uint32_t	EraseCount;
-    uint16_t	LogicalEUN;
-    uint8_t	BlockSize;
-    uint8_t	EraseUnitSize;
-    uint16_t	FirstPhysicalEUN;
-    uint16_t	NumEraseUnits;
-    uint32_t	FormattedSize;
-    uint32_t	FirstVMAddress;
-    uint16_t	NumVMPages;
-    uint8_t	Flags;
-    uint8_t	Code;
-    uint32_t	SerialNumber;
-    uint32_t	AltEUHOffset;
-    uint32_t	BAMOffset;
-    uint8_t	Reserved[12];
-    uint8_t	EndTuple[2];
+    u_int8_t	LinkTargetTuple[5];
+    u_int8_t	DataOrgTuple[10];
+    u_int8_t	NumTransferUnits;
+    u_int32_t	EraseCount;
+    u_int16_t	LogicalEUN;
+    u_int8_t	BlockSize;
+    u_int8_t	EraseUnitSize;
+    u_int16_t	FirstPhysicalEUN;
+    u_int16_t	NumEraseUnits;
+    u_int32_t	FormattedSize;
+    u_int32_t	FirstVMAddress;
+    u_int16_t	NumVMPages;
+    u_int8_t	Flags;
+    u_int8_t	Code;
+    u_int32_t	SerialNumber;
+    u_int32_t	AltEUHOffset;
+    u_int32_t	BAMOffset;
+    u_int8_t	Reserved[12];
+    u_int8_t	EndTuple[2];
 } erase_unit_header_t;
 
 /* Flags in erase_unit_header_t */

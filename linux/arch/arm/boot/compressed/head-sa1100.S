@@ -1,18 +1,17 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /* 
  * linux/arch/arm/boot/compressed/head-sa1100.S
  * 
- * Copyright (C) 1999 Nicolas Pitre <nico@fluxnic.net>
+ * Copyright (C) 1999 Nicolas Pitre <nico@cam.org>
  * 
  * SA1100 specific tweaks.  This is merged into head.S by the linker.
  *
  */
 
+#include <linux/config.h>
 #include <linux/linkage.h>
 #include <asm/mach-types.h>
 
 		.section        ".start", "ax"
-		.arch	armv4
 
 __SA1100_start:
 

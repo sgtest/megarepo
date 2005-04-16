@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *  linux/fs/bad_inode.c
  *
@@ -10,179 +9,66 @@
  */
 
 #include <linux/fs.h>
-#include <linux/export.h>
+#include <linux/module.h>
 #include <linux/stat.h>
 #include <linux/time.h>
+#include <linux/smp_lock.h>
 #include <linux/namei.h>
-#include <linux/poll.h>
-#include <linux/fiemap.h>
 
-static int bad_file_open(struct inode *inode, struct file *filp)
+static int return_EIO(void)
 {
 	return -EIO;
 }
 
-static const struct file_operations bad_file_ops =
+#define EIO_ERROR ((void *) (return_EIO))
+
+static struct file_operations bad_file_ops =
 {
-	.open		= bad_file_open,
+	.llseek		= EIO_ERROR,
+	.aio_read	= EIO_ERROR,
+	.read		= EIO_ERROR,
+	.write		= EIO_ERROR,
+	.aio_write	= EIO_ERROR,
+	.readdir	= EIO_ERROR,
+	.poll		= EIO_ERROR,
+	.ioctl		= EIO_ERROR,
+	.mmap		= EIO_ERROR,
+	.open		= EIO_ERROR,
+	.flush		= EIO_ERROR,
+	.release	= EIO_ERROR,
+	.fsync		= EIO_ERROR,
+	.aio_fsync	= EIO_ERROR,
+	.fasync		= EIO_ERROR,
+	.lock		= EIO_ERROR,
+	.readv		= EIO_ERROR,
+	.writev		= EIO_ERROR,
+	.sendfile	= EIO_ERROR,
+	.sendpage	= EIO_ERROR,
+	.get_unmapped_area = EIO_ERROR,
 };
 
-static int bad_inode_create(struct user_namespace *mnt_userns,
-			    struct inode *dir, struct dentry *dentry,
-			    umode_t mode, bool excl)
+struct inode_operations bad_inode_ops =
 {
-	return -EIO;
-}
-
-static struct dentry *bad_inode_lookup(struct inode *dir,
-			struct dentry *dentry, unsigned int flags)
-{
-	return ERR_PTR(-EIO);
-}
-
-static int bad_inode_link (struct dentry *old_dentry, struct inode *dir,
-		struct dentry *dentry)
-{
-	return -EIO;
-}
-
-static int bad_inode_unlink(struct inode *dir, struct dentry *dentry)
-{
-	return -EIO;
-}
-
-static int bad_inode_symlink(struct user_namespace *mnt_userns,
-			     struct inode *dir, struct dentry *dentry,
-			     const char *symname)
-{
-	return -EIO;
-}
-
-static int bad_inode_mkdir(struct user_namespace *mnt_userns, struct inode *dir,
-			   struct dentry *dentry, umode_t mode)
-{
-	return -EIO;
-}
-
-static int bad_inode_rmdir (struct inode *dir, struct dentry *dentry)
-{
-	return -EIO;
-}
-
-static int bad_inode_mknod(struct user_namespace *mnt_userns, struct inode *dir,
-			   struct dentry *dentry, umode_t mode, dev_t rdev)
-{
-	return -EIO;
-}
-
-static int bad_inode_rename2(struct user_namespace *mnt_userns,
-			     struct inode *old_dir, struct dentry *old_dentry,
-			     struct inode *new_dir, struct dentry *new_dentry,
-			     unsigned int flags)
-{
-	return -EIO;
-}
-
-static int bad_inode_readlink(struct dentry *dentry, char __user *buffer,
-		int buflen)
-{
-	return -EIO;
-}
-
-static int bad_inode_permission(struct user_namespace *mnt_userns,
-				struct inode *inode, int mask)
-{
-	return -EIO;
-}
-
-static int bad_inode_getattr(struct user_namespace *mnt_userns,
-			     const struct path *path, struct kstat *stat,
-			     u32 request_mask, unsigned int query_flags)
-{
-	return -EIO;
-}
-
-static int bad_inode_setattr(struct user_namespace *mnt_userns,
-			     struct dentry *direntry, struct iattr *attrs)
-{
-	return -EIO;
-}
-
-static ssize_t bad_inode_listxattr(struct dentry *dentry, char *buffer,
-			size_t buffer_size)
-{
-	return -EIO;
-}
-
-static const char *bad_inode_get_link(struct dentry *dentry,
-				      struct inode *inode,
-				      struct delayed_call *done)
-{
-	return ERR_PTR(-EIO);
-}
-
-static struct posix_acl *bad_inode_get_acl(struct inode *inode, int type, bool rcu)
-{
-	return ERR_PTR(-EIO);
-}
-
-static int bad_inode_fiemap(struct inode *inode,
-			    struct fiemap_extent_info *fieinfo, u64 start,
-			    u64 len)
-{
-	return -EIO;
-}
-
-static int bad_inode_update_time(struct inode *inode, struct timespec64 *time,
-				 int flags)
-{
-	return -EIO;
-}
-
-static int bad_inode_atomic_open(struct inode *inode, struct dentry *dentry,
-				 struct file *file, unsigned int open_flag,
-				 umode_t create_mode)
-{
-	return -EIO;
-}
-
-static int bad_inode_tmpfile(struct user_namespace *mnt_userns,
-			     struct inode *inode, struct dentry *dentry,
-			     umode_t mode)
-{
-	return -EIO;
-}
-
-static int bad_inode_set_acl(struct user_namespace *mnt_userns,
-			     struct inode *inode, struct posix_acl *acl,
-			     int type)
-{
-	return -EIO;
-}
-
-static const struct inode_operations bad_inode_ops =
-{
-	.create		= bad_inode_create,
-	.lookup		= bad_inode_lookup,
-	.link		= bad_inode_link,
-	.unlink		= bad_inode_unlink,
-	.symlink	= bad_inode_symlink,
-	.mkdir		= bad_inode_mkdir,
-	.rmdir		= bad_inode_rmdir,
-	.mknod		= bad_inode_mknod,
-	.rename		= bad_inode_rename2,
-	.readlink	= bad_inode_readlink,
-	.permission	= bad_inode_permission,
-	.getattr	= bad_inode_getattr,
-	.setattr	= bad_inode_setattr,
-	.listxattr	= bad_inode_listxattr,
-	.get_link	= bad_inode_get_link,
-	.get_acl	= bad_inode_get_acl,
-	.fiemap		= bad_inode_fiemap,
-	.update_time	= bad_inode_update_time,
-	.atomic_open	= bad_inode_atomic_open,
-	.tmpfile	= bad_inode_tmpfile,
-	.set_acl	= bad_inode_set_acl,
+	.create		= EIO_ERROR,
+	.lookup		= EIO_ERROR,
+	.link		= EIO_ERROR,
+	.unlink		= EIO_ERROR,
+	.symlink	= EIO_ERROR,
+	.mkdir		= EIO_ERROR,
+	.rmdir		= EIO_ERROR,
+	.mknod		= EIO_ERROR,
+	.rename		= EIO_ERROR,
+	.readlink	= EIO_ERROR,
+	/* follow_link must be no-op, otherwise unmounting this inode
+	   won't work */
+	.truncate	= EIO_ERROR,
+	.permission	= EIO_ERROR,
+	.getattr	= EIO_ERROR,
+	.setattr	= EIO_ERROR,
+	.setxattr	= EIO_ERROR,
+	.getxattr	= EIO_ERROR,
+	.listxattr	= EIO_ERROR,
+	.removexattr	= EIO_ERROR,
 };
 
 
@@ -204,15 +90,14 @@ static const struct inode_operations bad_inode_ops =
  *	on it to fail from this point on.
  */
  
-void make_bad_inode(struct inode *inode)
+void make_bad_inode(struct inode * inode) 
 {
 	remove_inode_hash(inode);
 
 	inode->i_mode = S_IFREG;
 	inode->i_atime = inode->i_mtime = inode->i_ctime =
-		current_time(inode);
+		current_fs_time(inode->i_sb);
 	inode->i_op = &bad_inode_ops;	
-	inode->i_opflags &= ~IOP_XATTR;
 	inode->i_fop = &bad_file_ops;	
 }
 EXPORT_SYMBOL(make_bad_inode);
@@ -230,23 +115,9 @@ EXPORT_SYMBOL(make_bad_inode);
  *	Returns true if the inode in question has been marked as bad.
  */
  
-bool is_bad_inode(struct inode *inode)
+int is_bad_inode(struct inode * inode) 
 {
 	return (inode->i_op == &bad_inode_ops);	
 }
 
 EXPORT_SYMBOL(is_bad_inode);
-
-/**
- * iget_failed - Mark an under-construction inode as dead and release it
- * @inode: The inode to discard
- *
- * Mark an under-construction inode as dead and release it.
- */
-void iget_failed(struct inode *inode)
-{
-	make_bad_inode(inode);
-	unlock_new_inode(inode);
-	iput(inode);
-}
-EXPORT_SYMBOL(iget_failed);

@@ -1,10 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  *
  * Copyright Tomi Manninen OH2BNS (oh2bns@sral.fi)
  */
 #include <linux/types.h>
-#include <linux/slab.h>
 #include <linux/socket.h>
 #include <linux/timer.h>
 #include <net/ax25.h>
@@ -12,10 +14,10 @@
 #include <net/netrom.h>
 #include <linux/init.h>
 
-static void nr_loopback_timer(struct timer_list *);
+static void nr_loopback_timer(unsigned long);
 
 static struct sk_buff_head loopback_queue;
-static DEFINE_TIMER(loopback_timer, nr_loopback_timer);
+static struct timer_list loopback_timer = TIMER_INITIALIZER(nr_loopback_timer, 0, 0);
 
 void __init nr_loopback_init(void)
 {
@@ -32,8 +34,8 @@ int nr_loopback_queue(struct sk_buff *skb)
 	struct sk_buff *skbn;
 
 	if ((skbn = alloc_skb(skb->len, GFP_ATOMIC)) != NULL) {
-		skb_copy_from_linear_data(skb, skb_put(skbn, skb->len), skb->len);
-		skb_reset_transport_header(skbn);
+		memcpy(skb_put(skbn, skb->len), skb->data, skb->len);
+		skbn->h.raw = skbn->data;
 
 		skb_queue_tail(&loopback_queue, skbn);
 
@@ -45,7 +47,7 @@ int nr_loopback_queue(struct sk_buff *skb)
 	return 1;
 }
 
-static void nr_loopback_timer(struct timer_list *unused)
+static void nr_loopback_timer(unsigned long param)
 {
 	struct sk_buff *skb;
 	ax25_address *nr_dest;
@@ -59,14 +61,15 @@ static void nr_loopback_timer(struct timer_list *unused)
 		if (dev == NULL || nr_rx_frame(skb, dev) == 0)
 			kfree_skb(skb);
 
-		dev_put(dev);
+		if (dev != NULL)
+			dev_put(dev);
 
 		if (!skb_queue_empty(&loopback_queue) && !nr_loopback_running())
 			mod_timer(&loopback_timer, jiffies + 10);
 	}
 }
 
-void nr_loopback_clear(void)
+void __exit nr_loopback_clear(void)
 {
 	del_timer_sync(&loopback_timer);
 	skb_queue_purge(&loopback_queue);

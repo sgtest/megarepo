@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Interrupt management for most GSC and related devices.
  *
@@ -7,14 +6,21 @@
  * (c) Copyright 1999 Matthew Wilcox
  * (c) Copyright 2000 Helge Deller
  * (c) Copyright 2001 Matthew Wilcox for Hewlett-Packard
+ *
+ *	This program is free software; you can redistribute it and/or modify
+ *	it under the terms of the GNU General Public License as published by
+ *      the Free Software Foundation; either version 2 of the License, or
+ *      (at your option) any later version.
  */
 
 #include <linux/bitops.h>
+#include <linux/config.h>
 #include <linux/errno.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/ioport.h>
 #include <linux/module.h>
+#include <linux/slab.h>
 #include <linux/types.h>
 
 #include <asm/hardware.h>
@@ -68,7 +74,7 @@ EXPORT_SYMBOL(gsc_alloc_irq);
 EXPORT_SYMBOL(gsc_claim_irq);
 
 /* Common interrupt demultiplexer used by Asp, Lasi & Wax.  */
-irqreturn_t gsc_asic_intr(int gsc_asic_irq, void *dev)
+irqreturn_t gsc_asic_intr(int gsc_asic_irq, void *dev, struct pt_regs *regs)
 {
 	unsigned long irr;
 	struct gsc_asic *gsc_asic = dev;
@@ -82,7 +88,7 @@ irqreturn_t gsc_asic_intr(int gsc_asic_irq, void *dev)
 	do {
 		int local_irq = __ffs(irr);
 		unsigned int irq = gsc_asic->global_irq[local_irq];
-		generic_handle_irq(irq);
+		__do_IRQ(irq, regs);
 		irr &= ~(1 << local_irq);
 	} while (irr);
 
@@ -101,13 +107,13 @@ int gsc_find_local_irq(unsigned int irq, int *global_irqs, int limit)
 	return NO_IRQ;
 }
 
-static void gsc_asic_mask_irq(struct irq_data *d)
+static void gsc_asic_disable_irq(unsigned int irq)
 {
-	struct gsc_asic *irq_dev = irq_data_get_irq_chip_data(d);
-	int local_irq = gsc_find_local_irq(d->irq, irq_dev->global_irq, 32);
+	struct gsc_asic *irq_dev = irq_desc[irq].handler_data;
+	int local_irq = gsc_find_local_irq(irq, irq_dev->global_irq, 32);
 	u32 imr;
 
-	DEBPRINTK(KERN_DEBUG "%s(%d) %s: IMR 0x%x\n", __func__, d->irq,
+	DEBPRINTK(KERN_DEBUG "%s(%d) %s: IMR 0x%x\n", __FUNCTION__, irq,
 			irq_dev->name, imr);
 
 	/* Disable the IRQ line by clearing the bit in the IMR */
@@ -116,13 +122,13 @@ static void gsc_asic_mask_irq(struct irq_data *d)
 	gsc_writel(imr, irq_dev->hpa + OFFSET_IMR);
 }
 
-static void gsc_asic_unmask_irq(struct irq_data *d)
+static void gsc_asic_enable_irq(unsigned int irq)
 {
-	struct gsc_asic *irq_dev = irq_data_get_irq_chip_data(d);
-	int local_irq = gsc_find_local_irq(d->irq, irq_dev->global_irq, 32);
+	struct gsc_asic *irq_dev = irq_desc[irq].handler_data;
+	int local_irq = gsc_find_local_irq(irq, irq_dev->global_irq, 32);
 	u32 imr;
 
-	DEBPRINTK(KERN_DEBUG "%s(%d) %s: IMR 0x%x\n", __func__, d->irq,
+	DEBPRINTK(KERN_DEBUG "%s(%d) %s: IMR 0x%x\n", __FUNCTION__, irq,
 			irq_dev->name, imr);
 
 	/* Enable the IRQ line by setting the bit in the IMR */
@@ -135,53 +141,31 @@ static void gsc_asic_unmask_irq(struct irq_data *d)
 	 */
 }
 
-#ifdef CONFIG_SMP
-static int gsc_set_affinity_irq(struct irq_data *d, const struct cpumask *dest,
-				bool force)
+static unsigned int gsc_asic_startup_irq(unsigned int irq)
 {
-	struct gsc_asic *gsc_dev = irq_data_get_irq_chip_data(d);
-	struct cpumask tmask;
-	int cpu_irq;
-
-	if (!cpumask_and(&tmask, dest, cpu_online_mask))
-		return -EINVAL;
-
-	cpu_irq = cpu_check_affinity(d, &tmask);
-	if (cpu_irq < 0)
-		return cpu_irq;
-
-	gsc_dev->gsc_irq.txn_addr = txn_affinity_addr(d->irq, cpu_irq);
-	gsc_dev->eim = ((u32) gsc_dev->gsc_irq.txn_addr) | gsc_dev->gsc_irq.txn_data;
-
-	/* switch IRQ's for devices below LASI/WAX to other CPU */
-	gsc_writel(gsc_dev->eim, gsc_dev->hpa + OFFSET_IAR);
-
-	irq_data_update_effective_affinity(d, &tmask);
-
-	return IRQ_SET_MASK_OK;
+	gsc_asic_enable_irq(irq);
+	return 0;
 }
-#endif
 
-
-static struct irq_chip gsc_asic_interrupt_type = {
-	.name		=	"GSC-ASIC",
-	.irq_unmask	=	gsc_asic_unmask_irq,
-	.irq_mask	=	gsc_asic_mask_irq,
-#ifdef CONFIG_SMP
-	.irq_set_affinity =	gsc_set_affinity_irq,
-#endif
+static struct hw_interrupt_type gsc_asic_interrupt_type = {
+	.typename =	"GSC-ASIC",
+	.startup =	gsc_asic_startup_irq,
+	.shutdown =	gsc_asic_disable_irq,
+	.enable =	gsc_asic_enable_irq,
+	.disable =	gsc_asic_disable_irq,
+	.ack =		no_ack_irq,
+	.end =		no_end_irq,
 };
 
-int gsc_assign_irq(struct irq_chip *type, void *data)
+int gsc_assign_irq(struct hw_interrupt_type *type, void *data)
 {
 	static int irq = GSC_IRQ_BASE;
 
 	if (irq > GSC_IRQ_MAX)
 		return NO_IRQ;
 
-	irq_set_chip_and_handler(irq, type, handle_simple_irq);
-	irq_set_chip_data(irq, data);
-
+	irq_desc[irq].handler = type;
+	irq_desc[irq].handler_data = data;
 	return irq++;
 }
 
@@ -199,34 +183,20 @@ void gsc_asic_assign_irq(struct gsc_asic *asic, int local_irq, int *irqp)
 	*irqp = irq;
 }
 
-struct gsc_fixup_struct {
-	void (*choose_irq)(struct parisc_device *, void *);
-	void *ctrl;
-};
-
-static int gsc_fixup_irqs_callback(struct device *dev, void *data)
-{
-	struct parisc_device *padev = to_parisc_device(dev);
-	struct gsc_fixup_struct *gf = data;
-
-	/* work-around for 715/64 and others which have parent
-	   at path [5] and children at path [5/0/x] */
-	if (padev->id.hw_type == HPHW_FAULTY)
-		gsc_fixup_irqs(padev, gf->ctrl, gf->choose_irq);
-	gf->choose_irq(padev, gf->ctrl);
-
-	return 0;
-}
-
 void gsc_fixup_irqs(struct parisc_device *parent, void *ctrl,
 			void (*choose_irq)(struct parisc_device *, void *))
 {
-	struct gsc_fixup_struct data = {
-		.choose_irq	= choose_irq,
-		.ctrl		= ctrl,
-	};
+	struct device *dev;
 
-	device_for_each_child(&parent->dev, &data, gsc_fixup_irqs_callback);
+	list_for_each_entry(dev, &parent->dev.children, node) {
+		struct parisc_device *padev = to_parisc_device(dev);
+
+		/* work-around for 715/64 and others which have parent 
+		   at path [5] and children at path [5/0/x] */
+		if (padev->id.hw_type == HPHW_FAULTY)
+			return gsc_fixup_irqs(padev, ctrl, choose_irq);
+		choose_irq(padev, ctrl);
+	}
 }
 
 int gsc_common_setup(struct parisc_device *parent, struct gsc_asic *gsc_asic)

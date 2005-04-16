@@ -1,14 +1,13 @@
-// SPDX-License-Identifier: GPL-2.0
-/*
- * Copyright (C) 2002 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
+/* 
+ * Copyright (C) 2002 Jeff Dike (jdike@karaya.com)
+ * Licensed under the GPL
  */
 
 #include <stdlib.h>
-#include <unistd.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <kern_util.h>
-#include <os.h>
+#include "os.h"
+#include "user.h"
+#include "kern_util.h"
 
 struct grantpt_info {
 	int fd;
@@ -27,34 +26,36 @@ static void grantpt_cb(void *arg)
 int get_pty(void)
 {
 	struct grantpt_info info;
-	int fd, err;
+	int fd;
 
-	fd = open("/dev/ptmx", O_RDWR);
-	if (fd < 0) {
-		err = -errno;
-		printk(UM_KERN_ERR "get_pty : Couldn't open /dev/ptmx - "
-		       "err = %d\n", errno);
-		return err;
+	fd = os_open_file("/dev/ptmx", of_rdwr(OPENFLAGS()), 0);
+	if(fd < 0){
+		printk("get_pty : Couldn't open /dev/ptmx - err = %d\n", -fd);
+		return(fd);
 	}
 
 	info.fd = fd;
 	initial_thread_cb(grantpt_cb, &info);
 
-	if (info.res < 0) {
-		err = -info.err;
-		printk(UM_KERN_ERR "get_pty : Couldn't grant pty - "
-		       "errno = %d\n", -info.err);
-		goto out;
+	if(info.res < 0){
+		printk("get_pty : Couldn't grant pty - errno = %d\n", 
+		       -info.err);
+		return(-1);
 	}
-
-	if (unlockpt(fd) < 0) {
-		err = -errno;
-		printk(UM_KERN_ERR "get_pty : Couldn't unlock pty - "
-		       "errno = %d\n", errno);
-		goto out;
+	if(unlockpt(fd) < 0){
+		printk("get_pty : Couldn't unlock pty - errno = %d\n", errno);
+		return(-1);
 	}
-	return fd;
-out:
-	close(fd);
-	return err;
+	return(fd);
 }
+
+/*
+ * Overrides for Emacs so that we follow Linus's tabbing style.
+ * Emacs will notice this stuff at the end of the file and automatically
+ * adjust the settings for this buffer only.  This must remain at the end
+ * of the file.
+ * ---------------------------------------------------------------------------
+ * Local variables:
+ * c-file-style: "linux"
+ * End:
+ */

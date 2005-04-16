@@ -1,8 +1,11 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  *  linux/arch/arm/lib/io-readsw-armv4.S
  *
  *  Copyright (C) 1995-2000 Russell King
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  */
 #include <linux/linkage.h>
 #include <asm/assembler.h>
@@ -15,24 +18,24 @@
 #endif
 		.endm
 
-.Linsw_align:	movs	ip, r1, lsl #31
-		bne	.Linsw_noalign
+.insw_align:	movs	ip, r1, lsl #31
+		bne	.insw_noalign
 		ldrh	ip, [r0]
 		sub	r2, r2, #1
 		strh	ip, [r1], #2
 
 ENTRY(__raw_readsw)
 		teq	r2, #0
-		reteq	lr
+		moveq	pc, lr
 		tst	r1, #3
-		bne	.Linsw_align
+		bne	.insw_align
 
 		stmfd	sp!, {r4, r5, lr}
 
 		subs	r2, r2, #8
-		bmi	.Lno_insw_8
+		bmi	.no_insw_8
 
-.Linsw_8_lp:	ldrh	r3, [r0]
+.insw_8_lp:	ldrh	r3, [r0]
 		ldrh	r4, [r0]
 		pack	r3, r3, r4
 
@@ -50,10 +53,10 @@ ENTRY(__raw_readsw)
 
 		subs	r2, r2, #8
 		stmia	r1!, {r3 - r5, ip}
-		bpl	.Linsw_8_lp
+		bpl	.insw_8_lp
 
-.Lno_insw_8:	tst	r2, #4
-		beq	.Lno_insw_4
+.no_insw_8:	tst	r2, #4
+		beq	.no_insw_4
 
 		ldrh	r3, [r0]
 		ldrh	r4, [r0]
@@ -65,16 +68,16 @@ ENTRY(__raw_readsw)
 
 		stmia	r1!, {r3, r4}
 
-.Lno_insw_4:	movs	r2, r2, lsl #31
-		bcc	.Lno_insw_2
+.no_insw_4:	movs	r2, r2, lsl #31
+		bcc	.no_insw_2
 
 		ldrh	r3, [r0]
 		ldrh	ip, [r0]
 		pack	r3, r3, ip
 		str	r3, [r1], #4
 
-.Lno_insw_2:	ldrhne	r3, [r0]
-		strhne	r3, [r1]
+.no_insw_2:	ldrneh	r3, [r0]
+		strneh	r3, [r1]
 
 		ldmfd	sp!, {r4, r5, pc}
 
@@ -90,8 +93,8 @@ ENTRY(__raw_readsw)
 #define pull_hbyte1		lsr #8
 #endif
 
-.Linsw_noalign:	stmfd	sp!, {r4, lr}
-		ldrbcc	ip, [r1, #-1]!
+.insw_noalign:	stmfd	sp!, {r4, lr}
+		ldrccb	ip, [r1, #-1]!
 		bcc	1f
 
 		ldrh	ip, [r0]
@@ -118,11 +121,10 @@ ENTRY(__raw_readsw)
 
 3:		tst	r2, #1
 		strb	ip, [r1], #1
-		ldrhne	ip, [r0]
+		ldrneh	ip, [r0]
    _BE_ONLY_(	movne	ip, ip, ror #8		)
-		strbne	ip, [r1], #1
+		strneb	ip, [r1], #1
    _LE_ONLY_(	movne	ip, ip, lsr #8		)
    _BE_ONLY_(	movne	ip, ip, lsr #24		)
-		strbne	ip, [r1]
+		strneb	ip, [r1]
 		ldmfd	sp!, {r4, pc}
-ENDPROC(__raw_readsw)

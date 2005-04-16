@@ -7,25 +7,10 @@
  * Copyright (C) 2000 Hewlett Packard (Paul Bame bame@puffin.external.hp.com)
  *
  */
-
-#include <asm/pdc.h>
-#include <asm/psw.h>
 #include <asm/assembly.h>
-#include <asm/asm-offsets.h>
-
-#include <linux/linkage.h>
-
+#include <asm/psw.h>
 
 	.section	.bss
-
-	.export pdc_result
-	.export pdc_result2
-	.align 8
-pdc_result:
-	.block	ASM_PDC_RESULT_SIZE
-pdc_result2:
-	.block	ASM_PDC_RESULT_SIZE
-
 	.export real_stack
 	.export real32_stack
 	.export real64_stack
@@ -34,6 +19,12 @@ real_stack:
 real32_stack:
 real64_stack:
 	.block	8192
+
+#ifdef __LP64__
+#  define REG_SZ 8
+#else
+#  define REG_SZ 4
+#endif
 
 #define N_SAVED_REGS 9
 
@@ -47,6 +38,8 @@ save_cr_end:
 
 	.text
 
+	.export real32_call_asm
+
 	/* unsigned long real32_call_asm(unsigned int *sp,
 	 *		unsigned int *arg0p,
 	 *		unsigned int iodc_fn)
@@ -55,9 +48,9 @@ save_cr_end:
 	 *	iodc_fn is the IODC function to call
 	 */
 
-ENTRY_CFI(real32_call_asm)
+real32_call_asm:
 	STREG	%rp, -RP_OFFSET(%sp)	/* save RP */
-#ifdef CONFIG_64BIT
+#ifdef __LP64__
 	callee_save
 	ldo	2*REG_SZ(%sp), %sp	/* room for a couple more saves */
 	STREG	%r27, -1*REG_SZ(%sp)
@@ -84,7 +77,7 @@ ENTRY_CFI(real32_call_asm)
 	b,l	save_control_regs,%r2		/* modifies r1, r2, r28 */
 	nop
 
-#ifdef CONFIG_64BIT
+#ifdef __LP64__
 	rsm	PSW_SM_W, %r0		/* go narrow */
 #endif
 
@@ -92,7 +85,7 @@ ENTRY_CFI(real32_call_asm)
 	bv	0(%r31)
 	nop
 ric_ret:
-#ifdef CONFIG_64BIT
+#ifdef __LP64__
 	ssm	PSW_SM_W, %r0		/* go wide */
 #endif
 	/* restore CRs before going virtual in case we page fault */
@@ -104,7 +97,7 @@ ric_ret:
 
 	tovirt_r1 %sp
 	LDREG	-REG_SZ(%sp), %sp	/* restore SP */
-#ifdef CONFIG_64BIT
+#ifdef __LP64__
 	LDREG	-1*REG_SZ(%sp), %r27
 	LDREG	-2*REG_SZ(%sp), %r29
 	ldo	-2*REG_SZ(%sp), %sp
@@ -113,14 +106,13 @@ ric_ret:
 	LDREG	-RP_OFFSET(%sp), %rp	/* restore RP */
 	bv	0(%rp)
 	nop
-ENDPROC_CFI(real32_call_asm)
 
 
 #  define PUSH_CR(r, where) mfctl r, %r1 ! STREG,ma %r1, REG_SZ(where)
 #  define POP_CR(r, where) LDREG,mb -REG_SZ(where), %r1 ! mtctl %r1, r
 
 	.text
-ENTRY_CFI(save_control_regs)
+save_control_regs:
 	load32	PA(save_cr_space), %r28
 	PUSH_CR(%cr24, %r28)
 	PUSH_CR(%cr25, %r28)
@@ -133,9 +125,8 @@ ENTRY_CFI(save_control_regs)
 	PUSH_CR(%cr15, %r28)
 	bv 0(%r2)
 	nop
-ENDPROC_CFI(save_control_regs)
 
-ENTRY_CFI(restore_control_regs)
+restore_control_regs:
 	load32	PA(save_cr_end), %r26
 	POP_CR(%cr15, %r26)
 	POP_CR(%cr31, %r26)
@@ -148,27 +139,28 @@ ENTRY_CFI(restore_control_regs)
 	POP_CR(%cr24, %r26)
 	bv 0(%r2)
 	nop
-ENDPROC_CFI(restore_control_regs)
 
 /* rfi_virt2real() and rfi_real2virt() could perhaps be adapted for
  * more general-purpose use by the several places which need RFIs
  */
-	.text
 	.align 128
-ENTRY_CFI(rfi_virt2real)
-#if !defined(BOOTLOADER)
+	.text
+rfi_virt2real:
 	/* switch to real mode... */
-	rsm		PSW_SM_I,%r0
-	load32		PA(rfi_v2r_1), %r1
+	ssm		0,0		/* See "relied upon translation" */
+	nop				/* PA 2.0 Arch. F-5 */
+	nop
+	nop
 	nop
 	nop
 	nop
 	nop
 	nop
 	
-	rsm             PSW_SM_Q,%r0  /* disable Q & I bits to load iia queue */
+	rsm             (PSW_SM_Q|PSW_SM_I),%r0  /* disable Q & I bits to load iia queue */
 	mtctl		%r0, %cr17	/* Clear IIASQ tail */
 	mtctl		%r0, %cr17	/* Clear IIASQ head */
+	load32		PA(rfi_v2r_1), %r1
 	mtctl		%r1, %cr18	/* IIAOQ head */
 	ldo		4(%r1), %r1
 	mtctl		%r1, %cr18	/* IIAOQ tail */
@@ -186,17 +178,16 @@ ENTRY_CFI(rfi_virt2real)
 	nop
 rfi_v2r_1:
 	tophys_r1 %r2
-#endif /* defined(BOOTLOADER) */
 	bv	0(%r2)
 	nop
-ENDPROC_CFI(rfi_virt2real)
 
 	.text
 	.align 128
-ENTRY_CFI(rfi_real2virt)
-#if !defined(BOOTLOADER)
-	rsm		PSW_SM_I,%r0
-	load32		(rfi_r2v_1), %r1
+rfi_real2virt:
+	ssm		0,0		/* See "relied upon translation" */
+	nop				/* PA 2.0 Arch. F-5 */
+	nop
+	nop
 	nop
 	nop
 	nop
@@ -206,6 +197,7 @@ ENTRY_CFI(rfi_real2virt)
 	rsm             PSW_SM_Q,%r0    /* disable Q bit to load iia queue */
 	mtctl		%r0, %cr17	/* Clear IIASQ tail */
 	mtctl		%r0, %cr17	/* Clear IIASQ head */
+	load32		(rfi_r2v_1), %r1
 	mtctl		%r1, %cr18	/* IIAOQ head */
 	ldo		4(%r1), %r1
 	mtctl		%r1, %cr18	/* IIAOQ tail */
@@ -223,16 +215,15 @@ ENTRY_CFI(rfi_real2virt)
 	nop
 rfi_r2v_1:
 	tovirt_r1 %r2
-#endif /* defined(BOOTLOADER) */
 	bv	0(%r2)
 	nop
-ENDPROC_CFI(rfi_real2virt)
 
-#ifdef CONFIG_64BIT
+#ifdef __LP64__
 
 /************************ 64-bit real-mode calls ***********************/
 /* This is only usable in wide kernels right now and will probably stay so */
 	.text
+	.export real64_call_asm
 	/* unsigned long real64_call_asm(unsigned long *sp,
 	 *		unsigned long *arg0p,
 	 *		unsigned long fn)
@@ -240,7 +231,7 @@ ENDPROC_CFI(rfi_real2virt)
 	 *	arg0p points to where saved arg values may be found
 	 *	iodc_fn is the IODC function to call
 	 */
-ENTRY_CFI(real64_call_asm)
+real64_call_asm:
 	std	%rp, -0x10(%sp)		/* save RP */
 	std	%sp, -8(%arg0)		/* save SP on real-mode stack */
 	copy	%arg0, %sp		/* adopt the real-mode SP */
@@ -286,21 +277,28 @@ r64_ret:
 	ldd	-0x10(%sp), %rp		/* restore RP */
 	bv	0(%rp)
 	nop
-ENDPROC_CFI(real64_call_asm)
 
 #endif
 
+	.export pc_in_user_space
+	.text
+	/* Doesn't belong here but I couldn't find a nicer spot. */
+	/* Should never get called, only used by profile stuff in time.c */
+pc_in_user_space:
+	bv,n	0(%rp)
+	nop
+
+
+	.export __canonicalize_funcptr_for_compare
 	.text
 	/* http://lists.parisc-linux.org/hypermail/parisc-linux/10916.html
 	**	GCC 3.3 and later has a new function in libgcc.a for
 	**	comparing function pointers.
 	*/
-ENTRY_CFI(__canonicalize_funcptr_for_compare)
-#ifdef CONFIG_64BIT
+__canonicalize_funcptr_for_compare:
+#ifdef __LP64__
 	bve (%r2)
 #else
 	bv %r0(%r2)
 #endif
 	copy %r26,%r28
-ENDPROC_CFI(__canonicalize_funcptr_for_compare)
-

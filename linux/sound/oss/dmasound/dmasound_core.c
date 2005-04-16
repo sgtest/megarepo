@@ -181,10 +181,9 @@
 #include <linux/init.h>
 #include <linux/soundcard.h>
 #include <linux/poll.h>
-#include <linux/mutex.h>
-#include <linux/sched/signal.h>
+#include <linux/smp_lock.h>
 
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
 
 #include "dmasound.h"
 
@@ -195,33 +194,43 @@
      *  Declarations
      */
 
-static DEFINE_MUTEX(dmasound_core_mutex);
 int dmasound_catchRadius = 0;
-module_param(dmasound_catchRadius, int, 0);
+MODULE_PARM(dmasound_catchRadius, "i");
 
 static unsigned int numWriteBufs = DEFAULT_N_BUFFERS;
-module_param(numWriteBufs, int, 0);
+MODULE_PARM(numWriteBufs, "i");
 static unsigned int writeBufSize = DEFAULT_BUFF_SIZE ;	/* in bytes */
-module_param(writeBufSize, int, 0);
+MODULE_PARM(writeBufSize, "i");
+
+#ifdef HAS_RECORD
+static unsigned int numReadBufs = DEFAULT_N_BUFFERS;
+MODULE_PARM(numReadBufs, "i");
+static unsigned int readBufSize = DEFAULT_BUFF_SIZE;	/* in bytes */
+MODULE_PARM(readBufSize, "i");
+#endif
 
 MODULE_LICENSE("GPL");
 
+#ifdef MODULE
 static int sq_unit = -1;
 static int mixer_unit = -1;
 static int state_unit = -1;
 static int irq_installed;
+#endif /* MODULE */
+
+/* software implemented recording volume! */
+uint software_input_volume = SW_INPUT_VOLUME_SCALE * SW_INPUT_VOLUME_DEFAULT;
+EXPORT_SYMBOL(software_input_volume);
 
 /* control over who can modify resources shared between play/record */
-static fmode_t shared_resource_owner;
+static mode_t shared_resource_owner;
 static int shared_resources_initialised;
 
     /*
      *  Mid level stuff
      */
 
-struct sound_settings dmasound = {
-	.lock = __SPIN_LOCK_UNLOCKED(dmasound.lock)
-};
+struct sound_settings dmasound = { .lock = SPIN_LOCK_UNLOCKED };
 
 static inline void sound_silence(void)
 {
@@ -323,26 +332,22 @@ static struct {
 
 static int mixer_open(struct inode *inode, struct file *file)
 {
-	mutex_lock(&dmasound_core_mutex);
-	if (!try_module_get(dmasound.mach.owner)) {
-		mutex_unlock(&dmasound_core_mutex);
+	if (!try_module_get(dmasound.mach.owner))
 		return -ENODEV;
-	}
 	mixer.busy = 1;
-	mutex_unlock(&dmasound_core_mutex);
 	return 0;
 }
 
 static int mixer_release(struct inode *inode, struct file *file)
 {
-	mutex_lock(&dmasound_core_mutex);
+	lock_kernel();
 	mixer.busy = 0;
 	module_put(dmasound.mach.owner);
-	mutex_unlock(&dmasound_core_mutex);
+	unlock_kernel();
 	return 0;
 }
-
-static int mixer_ioctl(struct file *file, u_int cmd, u_long arg)
+static int mixer_ioctl(struct inode *inode, struct file *file, u_int cmd,
+		       u_long arg)
 {
 	if (_SIOC_DIR(cmd) & _SIOC_WRITE)
 	    mixer.modify_counter++;
@@ -353,8 +358,8 @@ static int mixer_ioctl(struct file *file, u_int cmd, u_long arg)
 		{
 		    mixer_info info;
 		    memset(&info, 0, sizeof(info));
-		    strscpy(info.id, dmasound.mach.name2, sizeof(info.id));
-		    strscpy(info.name, dmasound.mach.name2, sizeof(info.name));
+		    strlcpy(info.id, dmasound.mach.name2, sizeof(info.id));
+		    strlcpy(info.name, dmasound.mach.name2, sizeof(info.name));
 		    info.modify_counter = mixer.modify_counter;
 		    if (copy_to_user((void __user *)arg, &info, sizeof(info)))
 			    return -EFAULT;
@@ -366,29 +371,20 @@ static int mixer_ioctl(struct file *file, u_int cmd, u_long arg)
 	return -EINVAL;
 }
 
-static long mixer_unlocked_ioctl(struct file *file, u_int cmd, u_long arg)
-{
-	int ret;
-
-	mutex_lock(&dmasound_core_mutex);
-	ret = mixer_ioctl(file, cmd, arg);
-	mutex_unlock(&dmasound_core_mutex);
-
-	return ret;
-}
-
-static const struct file_operations mixer_fops =
+static struct file_operations mixer_fops =
 {
 	.owner		= THIS_MODULE,
 	.llseek		= no_llseek,
-	.unlocked_ioctl	= mixer_unlocked_ioctl,
-	.compat_ioctl	= compat_ptr_ioctl,
+	.ioctl		= mixer_ioctl,
 	.open		= mixer_open,
 	.release	= mixer_release,
 };
 
 static void mixer_init(void)
 {
+#ifndef MODULE
+	int mixer_unit;
+#endif
 	mixer_unit = register_sound_mixer(&mixer_fops, -1);
 	if (mixer_unit < 0)
 		return;
@@ -407,6 +403,10 @@ static void mixer_init(void)
 
 struct sound_queue dmasound_write_sq;
 static void sq_reset_output(void) ;
+#ifdef HAS_RECORD
+struct sound_queue dmasound_read_sq;
+static void sq_reset_input(void) ;
+#endif
 
 static int sq_allocate_buffers(struct sound_queue *sq, int num, int size)
 {
@@ -416,7 +416,7 @@ static int sq_allocate_buffers(struct sound_queue *sq, int num, int size)
 		return 0;
 	sq->numBufs = num;
 	sq->bufSize = size;
-	sq->buffers = kmalloc_array (num, sizeof(char *), GFP_KERNEL);
+	sq->buffers = kmalloc (num * sizeof(char *), GFP_KERNEL);
 	if (!sq->buffers)
 		return -ENOMEM;
 	for (i = 0; i < num; i++) {
@@ -530,6 +530,12 @@ printk("dmasound_core: invalid frag count (user set %d)\n", sq->user_frags) ;
 	    sq->rear = -1;
 	    setup_func = dmasound.mach.write_sq_setup;
 	}
+#ifdef HAS_RECORD
+	else {
+	    sq->rear = 0;
+	    setup_func = dmasound.mach.read_sq_setup;
+	}
+#endif
 	if (setup_func)
 	    return setup_func();
 	return 0 ;
@@ -616,26 +622,14 @@ static ssize_t sq_write(struct file *file, const char __user *src, size_t uLeft,
 	}
 
 	while (uLeft) {
-		DEFINE_WAIT(wait);
-
 		while (write_sq.count >= write_sq.max_active) {
-			prepare_to_wait(&write_sq.action_queue, &wait, TASK_INTERRUPTIBLE);
 			sq_play();
-			if (write_sq.non_blocking) {
-				finish_wait(&write_sq.action_queue, &wait);
+			if (write_sq.open_mode & O_NONBLOCK)
 				return uWritten > 0 ? uWritten : -EAGAIN;
-			}
-			if (write_sq.count < write_sq.max_active)
-				break;
-
-			schedule_timeout(HZ);
-			if (signal_pending(current)) {
-				finish_wait(&write_sq.action_queue, &wait);
+			SLEEP(write_sq.action_queue);
+			if (signal_pending(current))
 				return uWritten > 0 ? uWritten : -EINTR;
-			}
 		}
-
-		finish_wait(&write_sq.action_queue, &wait);
 
 		/* Here, we can avoid disabling the interrupt by first
 		 * copying and translating the data, and then updating
@@ -666,9 +660,9 @@ static ssize_t sq_write(struct file *file, const char __user *src, size_t uLeft,
 	return uUsed < 0? uUsed: uWritten;
 }
 
-static __poll_t sq_poll(struct file *file, struct poll_table_struct *wait)
+static unsigned int sq_poll(struct file *file, struct poll_table_struct *wait)
 {
-	__poll_t mask = 0;
+	unsigned int mask = 0;
 	int retVal;
 	
 	if (write_sq.locked == 0) {
@@ -678,12 +672,114 @@ static __poll_t sq_poll(struct file *file, struct poll_table_struct *wait)
 	}
 	if (file->f_mode & FMODE_WRITE )
 		poll_wait(file, &write_sq.action_queue, wait);
+#ifdef HAS_RECORD
+	if (file->f_mode & FMODE_READ)
+		poll_wait(file, &read_sq.action_queue, wait);
+	if (file->f_mode & FMODE_READ)
+		if (read_sq.block_size - read_sq.rear_size > 0)
+			mask |= POLLIN | POLLRDNORM;
+#endif
 	if (file->f_mode & FMODE_WRITE)
 		if (write_sq.count < write_sq.max_active || write_sq.block_size - write_sq.rear_size > 0)
-			mask |= EPOLLOUT | EPOLLWRNORM;
+			mask |= POLLOUT | POLLWRNORM;
 	return mask;
 
 }
+
+#ifdef HAS_RECORD
+    /*
+     *  Here is how the values are used for reading.
+     *  The value 'active' simply indicates the DMA is running.  This is done
+     *  so the driver semantics are DMA starts when the first read is posted.
+     *  The value 'front' indicates the buffer we should next send to the user.
+     *  The value 'rear' indicates the buffer the DMA is currently filling.
+     *  When 'front' == 'rear' the buffer "ring" is empty (we always have an
+     *  empty available).  The 'rear_size' is used to track partial offsets
+     *  into the buffer we are currently returning to the user.
+
+     *  This level (> [1.5]) doesn't care what strategy the LL driver uses with
+     *  DMA on over-run.  It can leave it running (and keep active == 1) or it
+     *  can kill it and set active == 0 in which case this routine will spot
+     *  it and restart the DMA.
+     */
+
+static ssize_t sq_read(struct file *file, char __user *dst, size_t uLeft,
+		       loff_t *ppos)
+{
+
+	ssize_t	uRead, bLeft, bUsed, uUsed;
+
+	if (uLeft == 0)
+		return 0;
+
+	/* cater for the compatibility mode - record compiled in but no LL */
+	if (dmasound.mach.record == NULL)
+		return -EINVAL ;
+
+	/* see comment in sq_write()
+	*/
+
+	if( shared_resources_initialised == 0) {
+		dmasound.mach.init() ;
+		shared_resources_initialised = 1 ;
+	}
+
+	/* set up the sq if it is not already done. see comments in sq_write().
+	*/
+
+	if (read_sq.locked == 0) {
+		if ((uRead = sq_setup(&read_sq)) < 0)
+			return uRead ;
+	}
+
+	uRead = 0;
+
+	/* Move what the user requests, depending upon other options.
+	*/
+	while (uLeft > 0) {
+
+		/* we happened to get behind and the LL driver killed DMA
+		   then we should set it going again.  This also sets it
+		   going the first time through.
+		*/
+		if ( !read_sq.active )
+			dmasound.mach.record();
+
+		/* When front == rear, the DMA is not done yet.
+		*/
+		while (read_sq.front == read_sq.rear) {
+			if (read_sq.open_mode & O_NONBLOCK) {
+			       return uRead > 0 ? uRead : -EAGAIN;
+			}
+			SLEEP(read_sq.action_queue);
+			if (signal_pending(current))
+				return uRead > 0 ? uRead : -EINTR;
+		}
+
+		/* The amount we move is either what is left in the
+		 * current buffer or what the user wants.
+		 */
+		bLeft = read_sq.block_size - read_sq.rear_size;
+		bUsed = read_sq.rear_size;
+		uUsed = sound_copy_translate(dmasound.trans_read, dst, uLeft,
+					     read_sq.buffers[read_sq.front],
+					     &bUsed, bLeft);
+		if (uUsed <= 0)
+			return uUsed;
+		dst += uUsed;
+		uRead += uUsed;
+		uLeft -= uUsed;
+		read_sq.rear_size += bUsed;
+		if (read_sq.rear_size >= read_sq.block_size) {
+			read_sq.rear_size = 0;
+			read_sq.front++;
+			if (read_sq.front >= read_sq.max_active)
+				read_sq.front = 0;
+		}
+	}
+	return uRead;
+}
+#endif /* HAS_RECORD */
 
 static inline void sq_init_waitqueue(struct sound_queue *sq)
 {
@@ -695,7 +791,7 @@ static inline void sq_init_waitqueue(struct sound_queue *sq)
 
 #if 0 /* blocking open() */
 static inline void sq_wake_up(struct sound_queue *sq, struct file *file,
-			      fmode_t mode)
+			      mode_t mode)
 {
 	if (file->f_mode & mode) {
 		sq->busy = 0; /* CHECK: IS THIS OK??? */
@@ -704,7 +800,7 @@ static inline void sq_wake_up(struct sound_queue *sq, struct file *file,
 }
 #endif
 
-static int sq_open2(struct sound_queue *sq, struct file *file, fmode_t mode,
+static int sq_open2(struct sound_queue *sq, struct file *file, mode_t mode,
 		    int numbufs, int bufsize)
 {
 	int rc = 0;
@@ -716,8 +812,11 @@ static int sq_open2(struct sound_queue *sq, struct file *file, fmode_t mode,
 			if (file->f_flags & O_NONBLOCK)
 				return rc;
 			rc = -EINTR;
-			if (wait_event_interruptible(sq->open_queue, !sq->busy))
-				return rc;
+			while (sq->busy) {
+				SLEEP(sq->open_queue);
+				if (signal_pending(current))
+					return rc;
+			}
 			rc = 0;
 #else
 			/* OSS manual says we will return EBUSY regardless
@@ -742,7 +841,7 @@ static int sq_open2(struct sound_queue *sq, struct file *file, fmode_t mode,
 			return rc;
 		}
 
-		sq->non_blocking = file->f_flags & O_NONBLOCK;
+		sq->open_mode = file->f_mode;
 	}
 	return rc;
 }
@@ -755,24 +854,52 @@ static int sq_open2(struct sound_queue *sq, struct file *file, fmode_t mode,
 #define write_sq_open(file)	\
 	sq_open2(&write_sq, file, FMODE_WRITE, numWriteBufs, writeBufSize )
 
+#ifdef HAS_RECORD
+#define read_sq_init_waitqueue()	sq_init_waitqueue(&read_sq)
+#if 0 /* blocking open() */
+#define read_sq_wake_up(file)		sq_wake_up(&read_sq, file, FMODE_READ)
+#endif
+#define read_sq_release_buffers()	sq_release_buffers(&read_sq)
+#define read_sq_open(file)	\
+	sq_open2(&read_sq, file, FMODE_READ, numReadBufs, readBufSize )
+#else
+#define read_sq_init_waitqueue()	do {} while (0)
+#if 0 /* blocking open() */
+#define read_sq_wake_up(file)		do {} while (0)
+#endif
+#define read_sq_release_buffers()	do {} while (0)
+#define sq_reset_input()		do {} while (0)
+#endif
+
 static int sq_open(struct inode *inode, struct file *file)
 {
 	int rc;
 
-	mutex_lock(&dmasound_core_mutex);
-	if (!try_module_get(dmasound.mach.owner)) {
-		mutex_unlock(&dmasound_core_mutex);
+	if (!try_module_get(dmasound.mach.owner))
 		return -ENODEV;
-	}
 
 	rc = write_sq_open(file); /* checks the f_mode */
 	if (rc)
 		goto out;
+#ifdef HAS_RECORD
+	if (dmasound.mach.record) {
+		rc = read_sq_open(file); /* checks the f_mode */
+		if (rc)
+			goto out;
+	} else { /* no record function installed; in compat mode */
+		if (file->f_mode & FMODE_READ) {
+			/* TODO: if O_RDWR, release any resources grabbed by write part */
+			rc = -ENXIO;
+			goto out;
+		}
+	}
+#else /* !HAS_RECORD */
 	if (file->f_mode & FMODE_READ) {
 		/* TODO: if O_RDWR, release any resources grabbed by write part */
 		rc = -ENXIO ; /* I think this is what is required by open(2) */
 		goto out;
 	}
+#endif /* HAS_RECORD */
 
 	if (dmasound.mach.sq_open)
 	    dmasound.mach.sq_open(file->f_mode);
@@ -806,11 +933,10 @@ static int sq_open(struct inode *inode, struct file *file)
 		sound_set_format(AFMT_MU_LAW);
 	}
 #endif
-	mutex_unlock(&dmasound_core_mutex);
+
 	return 0;
  out:
 	module_put(dmasound.mach.owner);
-	mutex_unlock(&dmasound_core_mutex);
 	return rc;
 }
 
@@ -830,9 +956,43 @@ static void sq_reset_output(void)
 	write_sq.user_frag_size = 0 ;
 }
 
+#ifdef HAS_RECORD
+
+static void sq_reset_input(void)
+{
+	if (dmasound.mach.record && read_sq.active) {
+		if (dmasound.mach.abort_read) { /* this routine must really be present */
+			read_sq.syncing = 1 ;
+			/* this can use the read_sq.sync_queue to sleep if
+			   necessary - it should not return until DMA
+			   is really stopped - because we might deallocate
+			   the buffers as the next action...
+			*/
+			dmasound.mach.abort_read() ;
+		} else {
+			printk(KERN_ERR
+			"dmasound_core: %s has no abort_read()!! all bets are off\n",
+				dmasound.mach.name) ;
+		}
+	}
+	read_sq.syncing =
+	read_sq.active =
+	read_sq.front =
+	read_sq.count =
+	read_sq.rear = 0 ;
+
+	/* OK - we can unlock the parameters and fragment settings */
+	read_sq.locked = 0 ;
+	read_sq.user_frags = 0 ;
+	read_sq.user_frag_size = 0 ;
+}
+
+#endif
+
 static void sq_reset(void)
 {
 	sq_reset_output() ;
+	sq_reset_input() ;
 	/* we could consider resetting the shared_resources_owner here... but I
 	   think it is probably still rather non-obvious to application writer
 	*/
@@ -841,7 +1001,7 @@ static void sq_reset(void)
 	shared_resources_initialised = 0 ;
 }
 
-static int sq_fsync(void)
+static int sq_fsync(struct file *filp, struct dentry *dentry)
 {
 	int rc = 0;
 	int timeout = 5;
@@ -850,8 +1010,7 @@ static int sq_fsync(void)
 	sq_play();	/* there may be an incomplete frame waiting */
 
 	while (write_sq.active) {
-		wait_event_interruptible_timeout(write_sq.sync_queue,
-						 !write_sq.active, HZ);
+		SLEEP(write_sq.sync_queue);
 		if (signal_pending(current)) {
 			/* While waiting for audio output to drain, an
 			 * interrupt occurred.  Stop audio output immediately
@@ -877,11 +1036,22 @@ static int sq_release(struct inode *inode, struct file *file)
 {
 	int rc = 0;
 
-	mutex_lock(&dmasound_core_mutex);
+	lock_kernel();
+
+#ifdef HAS_RECORD
+	/* probably best to do the read side first - so that time taken to do it
+	   overlaps with playing any remaining output samples.
+	*/
+	if (file->f_mode & FMODE_READ) {
+		sq_reset_input() ; /* make sure dma is stopped and all is quiet */
+		read_sq_release_buffers();
+		read_sq.busy = 0;
+	}
+#endif
 
 	if (file->f_mode & FMODE_WRITE) {
 		if (write_sq.busy)
-			rc = sq_fsync();
+			rc = sq_fsync(file, file->f_dentry);
 
 		sq_reset_output() ; /* make sure dma is stopped and all is quiet */
 		write_sq_release_buffers();
@@ -908,7 +1078,7 @@ static int sq_release(struct inode *inode, struct file *file)
 	write_sq_wake_up(file); /* checks f_mode */
 #endif /* blocking open() */
 
-	mutex_unlock(&dmasound_core_mutex);
+	unlock_kernel();
 
 	return rc;
 }
@@ -920,10 +1090,10 @@ static int sq_release(struct inode *inode, struct file *file)
    is the owner - if we have problems.
 */
 
-static int shared_resources_are_mine(fmode_t md)
+static int shared_resources_are_mine(mode_t md)
 {
 	if (shared_resource_owner)
-		return (shared_resource_owner & md) != 0;
+		return (shared_resource_owner & md ) ;
 	else {
 		shared_resource_owner = md ;
 		return 1 ;
@@ -935,6 +1105,11 @@ static int shared_resources_are_mine(fmode_t md)
 
 static int queues_are_quiescent(void)
 {
+#ifdef HAS_RECORD
+	if (dmasound.mach.record)
+		if (read_sq.locked)
+			return 0 ;
+#endif
 	if (write_sq.locked)
 		return 0 ;
 	return 1 ;
@@ -982,7 +1157,8 @@ printk("dmasound_core: tried to set_queue_frags on a locked queue\n") ;
 	return 0 ;
 }
 
-static int sq_ioctl(struct file *file, u_int cmd, u_long arg)
+static int sq_ioctl(struct inode *inode, struct file *file, u_int cmd,
+		    u_long arg)
 {
 	int val, result;
 	u_long fmt;
@@ -994,9 +1170,11 @@ static int sq_ioctl(struct file *file, u_int cmd, u_long arg)
 	case SNDCTL_DSP_RESET:
 		sq_reset();
 		return 0;
+		break ;
 	case SNDCTL_DSP_GETFMTS:
 		fmt = dmasound.mach.hardware_afmts ; /* this is what OSS says.. */
 		return IOCTL_OUT(arg, fmt);
+		break ;
 	case SNDCTL_DSP_GETBLKSIZE:
 		/* this should tell the caller about bytes that the app can
 		   read/write - the app doesn't care about our internal buffers.
@@ -1007,12 +1185,20 @@ static int sq_ioctl(struct file *file, u_int cmd, u_long arg)
 		   the read_sq ones.
 		*/
 		size = 0 ;
+#ifdef HAS_RECORD
+		if (dmasound.mach.record && (file->f_mode & FMODE_READ)) {
+			if ( !read_sq.locked )
+				sq_setup(&read_sq) ; /* set params */
+			size = read_sq.user_frag_size ;
+		}
+#endif
 		if (file->f_mode & FMODE_WRITE) {
 			if ( !write_sq.locked )
 				sq_setup(&write_sq) ;
 			size = write_sq.user_frag_size ;
 		}
 		return IOCTL_OUT(arg, size);
+		break ;
 	case SNDCTL_DSP_POST:
 		/* all we are going to do is to tell the LL that any
 		   partial frags can be queued for output.
@@ -1025,17 +1211,20 @@ static int sq_ioctl(struct file *file, u_int cmd, u_long arg)
 	case SNDCTL_DSP_SYNC:
 		/* This call, effectively, has the same behaviour as SNDCTL_DSP_RESET
 		   except that it waits for output to finish before resetting
-		   everything - read, however, is killed immediately.
+		   everything - read, however, is killed imediately.
 		*/
 		result = 0 ;
+		if ((file->f_mode & FMODE_READ) && dmasound.mach.record)
+			sq_reset_input() ;
 		if (file->f_mode & FMODE_WRITE) {
-			result = sq_fsync();
+			result = sq_fsync(file, file->f_dentry);
 			sq_reset_output() ;
 		}
 		/* if we are the shared resource owner then release them */
 		if (file->f_mode & shared_resource_owner)
 			shared_resources_initialised = 0 ;
 		return result ;
+		break ;
 	case SOUND_PCM_READ_RATE:
 		return IOCTL_OUT(arg, dmasound.soft.speed);
 	case SNDCTL_DSP_SPEED:
@@ -1105,6 +1294,13 @@ static int sq_ioctl(struct file *file, u_int cmd, u_long arg)
 		result = 0 ;
 		nbufs = (data >> 16) & 0x7fff ; /* 0x7fff is 'use maximum' */
 		size = data & 0xffff;
+#ifdef HAS_RECORD
+		if ((file->f_mode & FMODE_READ) && dmasound.mach.record) {
+			result = set_queue_frags(&read_sq, nbufs, size) ;
+			if (result)
+				return result ;
+		}
+#endif
 		if (file->f_mode & FMODE_WRITE) {
 			result = set_queue_frags(&write_sq, nbufs, size) ;
 			if (result)
@@ -1114,6 +1310,7 @@ static int sq_ioctl(struct file *file, u_int cmd, u_long arg)
 		   the value is 'random' and that the user _must_ check the actual
 		   frags values using SNDCTL_DSP_GETBLKSIZE or similar */
 		return IOCTL_OUT(arg, data);
+		break ;
 	case SNDCTL_DSP_GETOSPACE:
 		/*
 		*/
@@ -1135,45 +1332,43 @@ static int sq_ioctl(struct file *file, u_int cmd, u_long arg)
 		return IOCTL_OUT(arg,val);
 
 	default:
-		return mixer_ioctl(file, cmd, arg);
+		return mixer_ioctl(inode, file, cmd, arg);
 	}
 	return -EINVAL;
 }
 
-static long sq_unlocked_ioctl(struct file *file, u_int cmd, u_long arg)
-{
-	int ret;
-
-	mutex_lock(&dmasound_core_mutex);
-	ret = sq_ioctl(file, cmd, arg);
-	mutex_unlock(&dmasound_core_mutex);
-
-	return ret;
-}
-
-static const struct file_operations sq_fops =
+static struct file_operations sq_fops =
 {
 	.owner		= THIS_MODULE,
 	.llseek		= no_llseek,
 	.write		= sq_write,
 	.poll		= sq_poll,
-	.unlocked_ioctl	= sq_unlocked_ioctl,
-	.compat_ioctl	= compat_ptr_ioctl,
+	.ioctl		= sq_ioctl,
 	.open		= sq_open,
 	.release	= sq_release,
+#ifdef HAS_RECORD
+	.read		= NULL	/* default to no read for compat mode */
+#endif
 };
 
 static int sq_init(void)
 {
-	const struct file_operations *fops = &sq_fops;
+#ifndef MODULE
+	int sq_unit;
+#endif
 
-	sq_unit = register_sound_dsp(fops, -1);
+#ifdef HAS_RECORD
+	if (dmasound.mach.record)
+		sq_fops.read = sq_read ;
+#endif
+	sq_unit = register_sound_dsp(&sq_fops, -1);
 	if (sq_unit < 0) {
 		printk(KERN_ERR "dmasound_core: couldn't register fops\n") ;
 		return sq_unit ;
 	}
 
 	write_sq_init_waitqueue();
+	read_sq_init_waitqueue();
 
 	/* These parameters will be restored for every clean open()
 	 * in the case of multiple open()s (e.g. dsp0 & dsp1) they
@@ -1199,7 +1394,11 @@ static int sq_init(void)
    driver.
 */
 
+#ifdef HAS_RECORD
+#define STAT_BUFF_LEN 1024
+#else
 #define STAT_BUFF_LEN 768
+#endif
 
 /* this is how much space we will allow the low-level driver to use
    in the stat buffer.  Currently, 2 * (80 character line + <NL>).
@@ -1216,27 +1415,36 @@ static struct {
 
 /* publish this function for use by low-level code, if required */
 
-static char *get_afmt_string(int afmt)
+char *get_afmt_string(int afmt)
 {
         switch(afmt) {
             case AFMT_MU_LAW:
                 return "mu-law";
+                break;
             case AFMT_A_LAW:
                 return "A-law";
+                break;
             case AFMT_U8:
                 return "unsigned 8 bit";
+                break;
             case AFMT_S8:
                 return "signed 8 bit";
+                break;
             case AFMT_S16_BE:
                 return "signed 16 bit BE";
+                break;
             case AFMT_U16_BE:
                 return "unsigned 16 bit BE";
+                break;
             case AFMT_S16_LE:
                 return "signed 16 bit LE";
+                break;
             case AFMT_U16_LE:
                 return "unsigned 16 bit LE";
+                break;
 	    case 0:
 		return "format not set" ;
+		break ;
             default:
                 break ;
         }
@@ -1247,17 +1455,12 @@ static int state_open(struct inode *inode, struct file *file)
 {
 	char *buffer = state.buf;
 	int len = 0;
-	int ret;
 
-	mutex_lock(&dmasound_core_mutex);
-	ret = -EBUSY;
 	if (state.busy)
-		goto out;
+		return -EBUSY;
 
-	ret = -ENODEV;
 	if (!try_module_get(dmasound.mach.owner))
-		goto out;
-
+		return -ENODEV;
 	state.ptr = 0;
 	state.busy = 1;
 
@@ -1303,6 +1506,11 @@ static int state_open(struct inode *inode, struct file *file)
 	len += sprintf(buffer+len,"Allocated:%8s%6s\n","Buffers","Size") ;
 	len += sprintf(buffer+len,"%9s:%8d%6d\n",
 		"write", write_sq.numBufs, write_sq.bufSize) ;
+#ifdef HAS_RECORD
+	if (dmasound.mach.record)
+		len += sprintf(buffer+len,"%9s:%8d%6d\n",
+			"read", read_sq.numBufs, read_sq.bufSize) ;
+#endif
 	len += sprintf(buffer+len,
 		"Current  : MaxFrg FragSiz MaxAct Frnt Rear "
 		"Cnt RrSize A B S L  xruns\n") ;
@@ -1311,6 +1519,14 @@ static int state_open(struct inode *inode, struct file *file)
 		write_sq.max_active, write_sq.front, write_sq.rear,
 		write_sq.count, write_sq.rear_size, write_sq.active,
 		write_sq.busy, write_sq.syncing, write_sq.locked, write_sq.xruns) ;
+#ifdef HAS_RECORD
+	if (dmasound.mach.record)
+		len += sprintf(buffer+len,"%9s:%7d%8d%7d%5d%5d%4d%7d%2d%2d%2d%2d%7d\n",
+			"read", read_sq.max_count, read_sq.block_size,
+			read_sq.max_active, read_sq.front, read_sq.rear,
+			read_sq.count, read_sq.rear_size, read_sq.active,
+			read_sq.busy, read_sq.syncing, read_sq.locked, read_sq.xruns) ;
+#endif
 #ifdef DEBUG_DMASOUND
 printk("dmasound: stat buffer used %d bytes\n", len) ;
 #endif
@@ -1319,18 +1535,15 @@ printk("dmasound: stat buffer used %d bytes\n", len) ;
 		printk(KERN_ERR "dmasound_core: stat buffer overflowed!\n");
 
 	state.len = len;
-	ret = 0;
-out:
-	mutex_unlock(&dmasound_core_mutex);
-	return ret;
+	return 0;
 }
 
 static int state_release(struct inode *inode, struct file *file)
 {
-	mutex_lock(&dmasound_core_mutex);
+	lock_kernel();
 	state.busy = 0;
 	module_put(dmasound.mach.owner);
-	mutex_unlock(&dmasound_core_mutex);
+	unlock_kernel();
 	return 0;
 }
 
@@ -1348,7 +1561,7 @@ static ssize_t state_read(struct file *file, char __user *buf, size_t count,
 	return n;
 }
 
-static const struct file_operations state_fops = {
+static struct file_operations state_fops = {
 	.owner		= THIS_MODULE,
 	.llseek		= no_llseek,
 	.read		= state_read,
@@ -1358,6 +1571,9 @@ static const struct file_operations state_fops = {
 
 static int state_init(void)
 {
+#ifndef MODULE
+	int state_unit;
+#endif
 	state_unit = register_sound_special(&state_fops, SND_DEV_STATUS);
 	if (state_unit < 0)
 		return state_unit ;
@@ -1375,9 +1591,10 @@ static int state_init(void)
 int dmasound_init(void)
 {
 	int res ;
-
+#ifdef MODULE
 	if (irq_installed)
 		return -EBUSY;
+#endif
 
 	/* Set up sound queue, /dev/audio and /dev/dsp. */
 
@@ -1396,7 +1613,9 @@ int dmasound_init(void)
 		printk(KERN_ERR "DMA sound driver: Interrupt initialization failed\n");
 		return -ENODEV;
 	}
+#ifdef MODULE
 	irq_installed = 1;
+#endif
 
 	printk(KERN_INFO "%s DMA sound driver rev %03d installed\n",
 		dmasound.mach.name, (DMASOUND_CORE_REVISION<<4) +
@@ -1407,8 +1626,17 @@ int dmasound_init(void)
 		(dmasound.mach.version >> 8), (dmasound.mach.version & 0xff)) ;
 	printk(KERN_INFO "Write will use %4d fragments of %7d bytes as default\n",
 		numWriteBufs, writeBufSize) ;
+#ifdef HAS_RECORD
+	if (dmasound.mach.record)
+		printk(KERN_INFO
+			"Read  will use %4d fragments of %7d bytes as default\n",
+			numReadBufs, readBufSize) ;
+#endif
+
 	return 0;
 }
+
+#ifdef MODULE
 
 void dmasound_deinit(void)
 {
@@ -1419,6 +1647,7 @@ void dmasound_deinit(void)
 	}
 
 	write_sq_release_buffers();
+	read_sq_release_buffers();
 
 	if (mixer_unit >= 0)
 		unregister_sound_mixer(mixer_unit);
@@ -1428,7 +1657,9 @@ void dmasound_deinit(void)
 		unregister_sound_dsp(sq_unit);
 }
 
-static int __maybe_unused dmasound_setup(char *str)
+#else /* !MODULE */
+
+static int dmasound_setup(char *str)
 {
 	int ints[6], size;
 
@@ -1441,18 +1672,42 @@ static int __maybe_unused dmasound_setup(char *str)
 	 */
 
 	switch (ints[0]) {
+#ifdef HAS_RECORD
+        case 5:
+                if ((ints[5] < 0) || (ints[5] > MAX_CATCH_RADIUS))
+                        printk("dmasound_setup: invalid catch radius, using default = %d\n", catchRadius);
+                else
+                        catchRadius = ints[5];
+                /* fall through */
+        case 4:
+                if (ints[4] < MIN_BUFFERS)
+                        printk("dmasound_setup: invalid number of read buffers, using default = %d\n",
+                                 numReadBufs);
+                else
+                        numReadBufs = ints[4];
+                /* fall through */
+        case 3:
+		if ((size = ints[3]) < 256)  /* check for small buffer specs */
+			size <<= 10 ;
+                if (size < MIN_BUFSIZE || size > MAX_BUFSIZE)
+                        printk("dmasound_setup: invalid read buffer size, using default = %d\n", readBufSize);
+                else
+                        readBufSize = size;
+                /* fall through */
+#else
 	case 3:
 		if ((ints[3] < 0) || (ints[3] > MAX_CATCH_RADIUS))
 			printk("dmasound_setup: invalid catch radius, using default = %d\n", catchRadius);
 		else
 			catchRadius = ints[3];
-		fallthrough;
+		/* fall through */
+#endif
 	case 2:
 		if (ints[1] < MIN_BUFFERS)
 			printk("dmasound_setup: invalid number of buffers, using default = %d\n", numWriteBufs);
 		else
 			numWriteBufs = ints[1];
-		fallthrough;
+		/* fall through */
 	case 1:
 		if ((size = ints[2]) < 256) /* check for small buffer specs */
 			size <<= 10 ;
@@ -1470,6 +1725,8 @@ static int __maybe_unused dmasound_setup(char *str)
 }
 
 __setup("dmasound=", dmasound_setup);
+
+#endif /* !MODULE */
 
     /*
      *  Conversion tables
@@ -1557,10 +1814,16 @@ char dmasound_alaw2dma8[] = {
 
 EXPORT_SYMBOL(dmasound);
 EXPORT_SYMBOL(dmasound_init);
+#ifdef MODULE
 EXPORT_SYMBOL(dmasound_deinit);
+#endif
 EXPORT_SYMBOL(dmasound_write_sq);
+#ifdef HAS_RECORD
+EXPORT_SYMBOL(dmasound_read_sq);
+#endif
 EXPORT_SYMBOL(dmasound_catchRadius);
 #ifdef HAS_8BIT_TABLES
 EXPORT_SYMBOL(dmasound_ulaw2dma8);
 EXPORT_SYMBOL(dmasound_alaw2dma8);
 #endif
+EXPORT_SYMBOL(get_afmt_string) ;

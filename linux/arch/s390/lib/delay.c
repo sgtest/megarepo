@@ -1,15 +1,23 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
+ *  arch/s390/kernel/delay.c
  *    Precise Delay Loops for S390
  *
- *    Copyright IBM Corp. 1999, 2008
- *    Author(s): Martin Schwidefsky <schwidefsky@de.ibm.com>,
+ *  S390 version
+ *    Copyright (C) 1999 IBM Deutschland Entwicklung GmbH, IBM Corporation
+ *    Author(s): Martin Schwidefsky (schwidefsky@de.ibm.com),
+ *
+ *  Derived from "arch/i386/lib/delay.c"
+ *    Copyright (C) 1993 Linus Torvalds
+ *    Copyright (C) 1997 Martin Mares <mj@atrey.karlin.mff.cuni.cz>
  */
 
-#include <linux/processor.h>
+#include <linux/config.h>
+#include <linux/sched.h>
 #include <linux/delay.h>
-#include <asm/div64.h>
-#include <asm/timex.h>
+
+#ifdef CONFIG_SMP
+#include <asm/smp.h>
+#endif
 
 void __delay(unsigned long loops)
 {
@@ -20,29 +28,24 @@ void __delay(unsigned long loops)
          * yield the megahertz number of the cpu. The important function
          * is udelay and that is done using the tod clock. -- martin.
          */
-	asm volatile("0: brct %0,0b" : : "d" ((loops/2) + 1));
-}
-EXPORT_SYMBOL(__delay);
-
-static void delay_loop(unsigned long delta)
-{
-	unsigned long end;
-
-	end = get_tod_clock_monotonic() + delta;
-	while (!tod_after(get_tod_clock_monotonic(), end))
-		cpu_relax();
+        __asm__ __volatile__(
+                "0: brct %0,0b"
+                : /* no outputs */ : "r" (loops/2) );
 }
 
+/*
+ * Waits for 'usecs' microseconds using the tod clock, giving up the time slice
+ * of the virtual PU inbetween to avoid congestion.
+ */
 void __udelay(unsigned long usecs)
 {
-	delay_loop(usecs << 12);
-}
-EXPORT_SYMBOL(__udelay);
+        uint64_t start_cc, end_cc;
 
-void __ndelay(unsigned long nsecs)
-{
-	nsecs <<= 9;
-	do_div(nsecs, 125);
-	delay_loop(nsecs);
+        if (usecs == 0)
+                return;
+        asm volatile ("STCK %0" : "=m" (start_cc));
+        do {
+		cpu_relax();
+                asm volatile ("STCK %0" : "=m" (end_cc));
+        } while (((end_cc - start_cc)/4096) < usecs);
 }
-EXPORT_SYMBOL(__ndelay);

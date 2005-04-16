@@ -1,9 +1,13 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  *
  *			Linux MegaRAID device driver
  *
  * Copyright (c) 2003-2004  LSI Logic Corporation.
+ *
+ *	   This program is free software; you can redistribute it and/or
+ *	   modify it under the terms of the GNU General Public License
+ *	   as published by the Free Software Foundation; either version
+ *	   2 of the License, or (at your option) any later version.
  *
  * FILE		: megaraid_ioctl.h
  *
@@ -14,28 +18,27 @@
 #define _MEGARAID_IOCTL_H_
 
 #include <linux/types.h>
-#include <linux/semaphore.h>
-#include <linux/timer.h>
+#include <asm/semaphore.h>
 
 #include "mbox_defs.h"
 
-/*
- * console messages debug levels
+/**
+ * con_log() - console log routine
+ * @param level		: indicates the severity of the message.
+ * @fparam mt		: format string
+ *
+ * con_log displays the error messages on the console based on the current
+ * debug level. Also it attaches the appropriate kernel severity level with
+ * the message.
+ *
+ *
+ * consolge messages debug levels
  */
 #define	CL_ANN		0	/* print unconditionally, announcements */
 #define CL_DLEVEL1	1	/* debug level 1, informative */
 #define CL_DLEVEL2	2	/* debug level 2, verbose */
 #define CL_DLEVEL3	3	/* debug level 3, very verbose */
 
-/**
- * con_log() - console log routine
- * @level		: indicates the severity of the message.
- * @fmt			: format string
- *
- * con_log displays the error messages on the console based on the current
- * debug level. Also it attaches the appropriate kernel severity level with
- * the message.
- */
 #define	con_log(level, fmt) if (LSI_DBGLVL >= level) printk fmt;
 
 /*
@@ -129,10 +132,6 @@ typedef struct uioc {
 /* Driver Data: */
 	void __user *		user_data;
 	uint32_t		user_data_len;
-
-	/* 64bit alignment */
-	uint32_t                pad_for_64bit_align;
-
 	mraid_passthru_t	__user *user_pthru;
 
 	mraid_passthru_t	*pthru32;
@@ -150,23 +149,18 @@ typedef struct uioc {
 
 } __attribute__ ((aligned(1024),packed)) uioc_t;
 
-/* For on-stack uioc timers. */
-struct uioc_timeout {
-	struct timer_list timer;
-	uioc_t		  *uioc;
-};
 
 /**
  * struct mraid_hba_info - information about the controller
  *
- * @pci_vendor_id		: PCI vendor id
- * @pci_device_id		: PCI device id
- * @subsystem_vendor_id		: PCI subsystem vendor id
- * @subsystem_device_id		: PCI subsystem device id
- * @baseport			: base port of hba memory
- * @pci_bus			: PCI bus
- * @pci_dev_fn			: PCI device/function values
- * @irq				: interrupt vector for the device
+ * @param pci_vendor_id		: PCI vendor id
+ * @param pci_device_id		: PCI device id
+ * @param subsystem_vendor_id	: PCI subsystem vendor id
+ * @param subsystem_device_id	: PCI subsystem device id
+ * @param baseport		: base port of hba memory
+ * @param pci_bus		: PCI bus
+ * @param pci_dev_fn		: PCI device/function values
+ * @param irq			: interrupt vector for the device
  *
  * Extended information of 256 bytes about the controller. Align on the single
  * byte boundary so that 32-bit applications can be run on 64-bit platform

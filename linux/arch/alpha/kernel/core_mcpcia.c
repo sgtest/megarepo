@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *	linux/arch/alpha/kernel/core_mcpcia.c
  *
@@ -40,6 +39,8 @@
 #else
 # define DBG_CFG(args)
 #endif
+
+#define MCPCIA_MAX_HOSES 4
 
 /*
  * Given a bus, device, and function number, compute resulting
@@ -89,7 +90,7 @@ conf_read(unsigned long addr, unsigned char type1,
 {
 	unsigned long flags;
 	unsigned long mid = MCPCIA_HOSE2MID(hose->index);
-	unsigned int stat0, value, cpu;
+	unsigned int stat0, value, temp, cpu;
 
 	cpu = smp_processor_id();
 
@@ -102,7 +103,7 @@ conf_read(unsigned long addr, unsigned char type1,
 	stat0 = *(vuip)MCPCIA_CAP_ERR(mid);
 	*(vuip)MCPCIA_CAP_ERR(mid) = stat0;
 	mb();
-	*(vuip)MCPCIA_CAP_ERR(mid);
+	temp = *(vuip)MCPCIA_CAP_ERR(mid);
 	DBG_CFG(("conf_read: MCPCIA_CAP_ERR(%d) was 0x%x\n", mid, stat0));
 
 	mb();
@@ -137,7 +138,7 @@ conf_write(unsigned long addr, unsigned int value, unsigned char type1,
 {
 	unsigned long flags;
 	unsigned long mid = MCPCIA_HOSE2MID(hose->index);
-	unsigned int stat0, cpu;
+	unsigned int stat0, temp, cpu;
 
 	cpu = smp_processor_id();
 
@@ -146,7 +147,7 @@ conf_write(unsigned long addr, unsigned int value, unsigned char type1,
 	/* Reset status register to avoid losing errors.  */
 	stat0 = *(vuip)MCPCIA_CAP_ERR(mid);
 	*(vuip)MCPCIA_CAP_ERR(mid) = stat0; mb();
-	*(vuip)MCPCIA_CAP_ERR(mid);
+	temp = *(vuip)MCPCIA_CAP_ERR(mid);
 	DBG_CFG(("conf_write: MCPCIA CAP_ERR(%d) was 0x%x\n", mid, stat0));
 
 	draina();
@@ -158,7 +159,7 @@ conf_write(unsigned long addr, unsigned int value, unsigned char type1,
 	*((vuip)addr) = value;
 	mb();
 	mb();  /* magic */
-	*(vuip)MCPCIA_CAP_ERR(mid); /* read to force the write */
+	temp = *(vuip)MCPCIA_CAP_ERR(mid); /* read to force the write */
 	mcheck_expected(cpu) = 0;
 	mb();
 
@@ -364,11 +365,9 @@ mcpcia_startup_hose(struct pci_controller *hose)
 	 * Window 1 is scatter-gather (up to) 1GB at 1GB (for pci)
 	 * Window 2 is direct access 2GB at 2GB
 	 */
-	hose->sg_isa = iommu_arena_new(hose, 0x00800000, 0x00800000,
-				       SMP_CACHE_BYTES);
+	hose->sg_isa = iommu_arena_new(hose, 0x00800000, 0x00800000, 0);
 	hose->sg_pci = iommu_arena_new(hose, 0x40000000,
-				       size_for_memory(0x40000000),
-				       SMP_CACHE_BYTES);
+				       size_for_memory(0x40000000), 0);
 
 	__direct_map_base = 0x80000000;
 	__direct_map_size = 0x80000000;
@@ -573,12 +572,15 @@ mcpcia_print_system_area(unsigned long la_ptr)
 }
 
 void
-mcpcia_machine_check(unsigned long vector, unsigned long la_ptr)
+mcpcia_machine_check(unsigned long vector, unsigned long la_ptr,
+		     struct pt_regs * regs)
 {
+	struct el_common *mchk_header;
 	struct el_MCPCIA_uncorrected_frame_mcheck *mchk_logout;
 	unsigned int cpu = smp_processor_id();
 	int expected;
 
+	mchk_header = (struct el_common *)la_ptr;
 	mchk_logout = (struct el_MCPCIA_uncorrected_frame_mcheck *)la_ptr;
 	expected = mcheck_expected(cpu);
 
@@ -608,7 +610,7 @@ mcpcia_machine_check(unsigned long vector, unsigned long la_ptr)
 	wrmces(0x7);
 	mb();
 
-	process_mcheck_info(vector, la_ptr, "MCPCIA", expected != 0);
+	process_mcheck_info(vector, la_ptr, regs, "MCPCIA", expected != 0);
 	if (!expected && vector != 0x620 && vector != 0x630) {
 		mcpcia_print_uncorrectable(mchk_logout);
 		mcpcia_print_system_area(la_ptr);

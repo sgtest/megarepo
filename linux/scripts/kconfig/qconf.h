@@ -1,260 +1,247 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Copyright (C) 2002 Roman Zippel <zippel@linux-m68k.org>
+ * Released under the terms of the GNU GPL v2.0.
  */
 
-#include <QCheckBox>
-#include <QDialog>
-#include <QHeaderView>
-#include <QLineEdit>
-#include <QMainWindow>
-#include <QPushButton>
-#include <QSettings>
-#include <QSplitter>
-#include <QStyledItemDelegate>
-#include <QTextBrowser>
-#include <QTreeWidget>
-
-#include "expr.h"
+#include <qlistview.h>
+#if QT_VERSION >= 300
+#include <qsettings.h>
+#else
+class QSettings { };
+#endif
 
 class ConfigList;
 class ConfigItem;
+class ConfigLineEdit;
 class ConfigMainWindow;
+
 
 class ConfigSettings : public QSettings {
 public:
 	ConfigSettings();
-	QList<int> readSizes(const QString& key, bool *ok);
-	bool writeSizes(const QString& key, const QList<int>& value);
+
+#if QT_VERSION >= 300
+	void readListSettings();
+	QValueList<int> ConfigSettings::readSizes(const QString& key, bool *ok);
+	bool ConfigSettings::writeSizes(const QString& key, const QValueList<int>& value);
+#endif
+
+	bool showAll;
+	bool showName;
+	bool showRange;
+	bool showData;
+};
+
+class ConfigView : public QVBox {
+	Q_OBJECT
+	typedef class QVBox Parent;
+public:
+	ConfigView(QWidget* parent, ConfigMainWindow* cview, ConfigSettings* configSettings);
+	~ConfigView(void);
+	static void updateList(ConfigItem* item);
+	static void updateListAll(void);
+
+public:
+	ConfigList* list;
+	ConfigLineEdit* lineEdit;
+
+	static ConfigView* viewList;
+	ConfigView* nextView;
 };
 
 enum colIdx {
-	promptColIdx, nameColIdx, dataColIdx
+	promptColIdx, nameColIdx, noColIdx, modColIdx, yesColIdx, dataColIdx, colNr
 };
 enum listMode {
-	singleMode, menuMode, symbolMode, fullMode, listMode
-};
-enum optionMode {
-	normalOpt = 0, allOpt, promptOpt
+	singleMode, menuMode, symbolMode, fullMode
 };
 
-class ConfigList : public QTreeWidget {
+class ConfigList : public QListView {
 	Q_OBJECT
-	typedef class QTreeWidget Parent;
+	typedef class QListView Parent;
 public:
-	ConfigList(QWidget *parent, const char *name = 0);
-	~ConfigList();
+	ConfigList(ConfigView* p, ConfigMainWindow* cview, ConfigSettings *configSettings);
 	void reinit(void);
-	ConfigItem* findConfigItem(struct menu *);
-	void setSelected(QTreeWidgetItem *item, bool enable) {
-		for (int i = 0; i < selectedItems().size(); i++)
-			selectedItems().at(i)->setSelected(false);
-
-		item->setSelected(enable);
+	ConfigView* parent(void) const
+	{
+		return (ConfigView*)Parent::parent();
 	}
 
 protected:
-	void keyPressEvent(QKeyEvent *e);
-	void mousePressEvent(QMouseEvent *e);
-	void mouseReleaseEvent(QMouseEvent *e);
-	void mouseMoveEvent(QMouseEvent *e);
-	void mouseDoubleClickEvent(QMouseEvent *e);
-	void focusInEvent(QFocusEvent *e);
-	void contextMenuEvent(QContextMenuEvent *e);
+	ConfigMainWindow* cview;
 
+	void keyPressEvent(QKeyEvent *e);
+	void contentsMousePressEvent(QMouseEvent *e);
+	void contentsMouseReleaseEvent(QMouseEvent *e);
+	void contentsMouseMoveEvent(QMouseEvent *e);
+	void contentsMouseDoubleClickEvent(QMouseEvent *e);
+	void focusInEvent(QFocusEvent *e);
 public slots:
 	void setRootMenu(struct menu *menu);
 
-	void updateList();
+	void updateList(ConfigItem *item);
 	void setValue(ConfigItem* item, tristate val);
 	void changeValue(ConfigItem* item);
 	void updateSelection(void);
-	void saveSettings(void);
-	void setOptionMode(QAction *action);
-	void setShowName(bool on);
-
 signals:
-	void menuChanged(struct menu *menu);
 	void menuSelected(struct menu *menu);
-	void itemSelected(struct menu *menu);
 	void parentSelected(void);
-	void gotFocus(struct menu *);
-	void showNameChanged(bool on);
+	void gotFocus(void);
 
 public:
 	void updateListAll(void)
 	{
 		updateAll = true;
-		updateList();
+		updateList(NULL);
 		updateAll = false;
+	}
+	ConfigList* listView()
+	{
+		return this;
+	}
+	ConfigItem* firstChild() const
+	{
+		return (ConfigItem *)Parent::firstChild();
+	}
+	int mapIdx(colIdx idx)
+	{
+		return colMap[idx];
+	}
+	void addColumn(colIdx idx, const QString& label)
+	{
+		colMap[idx] = Parent::addColumn(label);
+		colRevMap[colMap[idx]] = idx;
+	}
+	void removeColumn(colIdx idx)
+	{
+		int col = colMap[idx];
+		if (col >= 0) {
+			Parent::removeColumn(col);
+			colRevMap[col] = colMap[idx] = -1;
+		}
 	}
 	void setAllOpen(bool open);
 	void setParentMenu(void);
 
-	bool menuSkip(struct menu *);
-
-	void updateMenuList(ConfigItem *parent, struct menu*);
-	void updateMenuList(struct menu *menu);
+	template <class P>
+	void ConfigList::updateMenuList(P*, struct menu*);
 
 	bool updateAll;
 
-	bool showName;
+	QPixmap symbolYesPix, symbolModPix, symbolNoPix;
+	QPixmap choiceYesPix, choiceNoPix;
+	QPixmap menuPix, menuInvPix, menuBackPix, voidPix;
+
+	bool showAll, showName, showRange, showData;
 	enum listMode mode;
-	enum optionMode optMode;
 	struct menu *rootEntry;
-	QPalette disabledColorGroup;
-	QPalette inactivedColorGroup;
-	QMenu* headerPopup;
+	QColorGroup disabledColorGroup;
+	QColorGroup inactivedColorGroup;
 
-	static QList<ConfigList *> allLists;
-	static void updateListForAll();
-	static void updateListAllForAll();
-
-	static QAction *showNormalAction, *showAllAction, *showPromptAction;
+private:
+	int colMap[colNr];
+	int colRevMap[colNr];
 };
 
-class ConfigItem : public QTreeWidgetItem {
-	typedef class QTreeWidgetItem Parent;
+class ConfigItem : public QListViewItem {
+	typedef class QListViewItem Parent;
 public:
-	ConfigItem(ConfigList *parent, ConfigItem *after, struct menu *m, bool v)
-	: Parent(parent, after), nextItem(0), menu(m), visible(v), goParent(false)
+	ConfigItem(QListView *parent, ConfigItem *after, struct menu *m, bool v)
+	: Parent(parent, after), menu(m), visible(v), goParent(false)
 	{
 		init();
 	}
 	ConfigItem(ConfigItem *parent, ConfigItem *after, struct menu *m, bool v)
-	: Parent(parent, after), nextItem(0), menu(m), visible(v), goParent(false)
+	: Parent(parent, after), menu(m), visible(v), goParent(false)
 	{
 		init();
 	}
-	ConfigItem(ConfigList *parent, ConfigItem *after, bool v)
-	: Parent(parent, after), nextItem(0), menu(0), visible(v), goParent(true)
+	ConfigItem(QListView *parent, ConfigItem *after, bool v)
+	: Parent(parent, after), menu(0), visible(v), goParent(true)
 	{
 		init();
 	}
 	~ConfigItem(void);
 	void init(void);
+#if QT_VERSION >= 300
+	void okRename(int col);
+#endif
 	void updateMenu(void);
 	void testUpdateMenu(bool v);
 	ConfigList* listView() const
 	{
-		return (ConfigList*)Parent::treeWidget();
+		return (ConfigList*)Parent::listView();
 	}
 	ConfigItem* firstChild() const
 	{
-		return (ConfigItem *)Parent::child(0);
+		return (ConfigItem *)Parent::firstChild();
 	}
-	ConfigItem* nextSibling()
+	ConfigItem* nextSibling() const
 	{
-		ConfigItem *ret = NULL;
-		ConfigItem *_parent = (ConfigItem *)parent();
-
-		if(_parent) {
-			ret = (ConfigItem *)_parent->child(_parent->indexOfChild(this)+1);
-		} else {
-			QTreeWidget *_treeWidget = treeWidget();
-			ret = (ConfigItem *)_treeWidget->topLevelItem(_treeWidget->indexOfTopLevelItem(this)+1);
-		}
-
-		return ret;
+		return (ConfigItem *)Parent::nextSibling();
 	}
-	// TODO: Implement paintCell
+	void setText(colIdx idx, const QString& text)
+	{
+		Parent::setText(listView()->mapIdx(idx), text);
+	}
+	QString text(colIdx idx) const
+	{
+		return Parent::text(listView()->mapIdx(idx));
+	}
+	void setPixmap(colIdx idx, const QPixmap& pm)
+	{
+		Parent::setPixmap(listView()->mapIdx(idx), pm);
+	}
+	const QPixmap* pixmap(colIdx idx) const
+	{
+		return Parent::pixmap(listView()->mapIdx(idx));
+	}
+	void paintCell(QPainter* p, const QColorGroup& cg, int column, int width, int align);
 
 	ConfigItem* nextItem;
 	struct menu *menu;
 	bool visible;
 	bool goParent;
-
-	static QIcon symbolYesIcon, symbolModIcon, symbolNoIcon;
-	static QIcon choiceYesIcon, choiceNoIcon;
-	static QIcon menuIcon, menubackIcon;
 };
 
-class ConfigItemDelegate : public QStyledItemDelegate
-{
-private:
-	struct menu *menu;
-public:
-	ConfigItemDelegate(QObject *parent = nullptr)
-		: QStyledItemDelegate(parent) {}
-	QWidget *createEditor(QWidget *parent,
-			      const QStyleOptionViewItem &option,
-			      const QModelIndex &index) const override;
-	void setModelData(QWidget *editor, QAbstractItemModel *model,
-			  const QModelIndex &index) const override;
-};
-
-class ConfigInfoView : public QTextBrowser {
+class ConfigLineEdit : public QLineEdit {
 	Q_OBJECT
-	typedef class QTextBrowser Parent;
-	QMenu *contextMenu;
+	typedef class QLineEdit Parent;
 public:
-	ConfigInfoView(QWidget* parent, const char *name = 0);
-	bool showDebug(void) const { return _showDebug; }
+	ConfigLineEdit(ConfigView* parent)
+	: Parent(parent)
+	{ }
+	ConfigView* parent(void) const
+	{
+		return (ConfigView*)Parent::parent();
+	}
+	void show(ConfigItem *i);
+	void keyPressEvent(QKeyEvent *e);
 
-public slots:
-	void setInfo(struct menu *menu);
-	void saveSettings(void);
-	void setShowDebug(bool);
-	void clicked (const QUrl &url);
-
-signals:
-	void showDebugChanged(bool);
-	void menuSelected(struct menu *);
-
-protected:
-	void symbolInfo(void);
-	void menuInfo(void);
-	QString debug_info(struct symbol *sym);
-	static QString print_filter(const QString &str);
-	static void expr_print_help(void *data, struct symbol *sym, const char *str);
-	void contextMenuEvent(QContextMenuEvent *event);
-
-	struct symbol *sym;
-	struct menu *_menu;
-	bool _showDebug;
-};
-
-class ConfigSearchWindow : public QDialog {
-	Q_OBJECT
-	typedef class QDialog Parent;
 public:
-	ConfigSearchWindow(ConfigMainWindow *parent);
-
-public slots:
-	void saveSettings(void);
-	void search(void);
-
-protected:
-	QLineEdit* editField;
-	QPushButton* searchButton;
-	QSplitter* split;
-	ConfigList *list;
-	ConfigInfoView* info;
-
-	struct symbol **result;
+	ConfigItem *item;
 };
 
 class ConfigMainWindow : public QMainWindow {
 	Q_OBJECT
-
-	char *configname;
-	static QAction *saveAction;
-	static void conf_changed(void);
 public:
 	ConfigMainWindow(void);
 public slots:
+	void setHelp(QListViewItem* item);
 	void changeMenu(struct menu *);
-	void changeItens(struct menu *);
-	void setMenuLink(struct menu *);
 	void listFocusChanged(void);
 	void goBack(void);
 	void loadConfig(void);
-	bool saveConfig(void);
+	void saveConfig(void);
 	void saveConfigAs(void);
-	void searchConfig(void);
 	void showSingleView(void);
 	void showSplitView(void);
 	void showFullView(void);
+	void setShowAll(bool);
+	void setShowDebug(bool);
+	void setShowRange(bool);
+	void setShowName(bool);
+	void setShowData(bool);
 	void showIntro(void);
 	void showAbout(void);
 	void saveSettings(void);
@@ -262,14 +249,15 @@ public slots:
 protected:
 	void closeEvent(QCloseEvent *e);
 
-	ConfigSearchWindow *searchWindow;
+	ConfigView *menuView;
 	ConfigList *menuList;
+	ConfigView *configView;
 	ConfigList *configList;
-	ConfigInfoView *helpText;
+	QTextView *helpText;
+	QToolBar *toolBar;
 	QAction *backAction;
-	QAction *singleViewAction;
-	QAction *splitViewAction;
-	QAction *fullViewAction;
-	QSplitter *split1;
-	QSplitter *split2;
+	QSplitter* split1;
+	QSplitter* split2;
+
+	bool showDebug;
 };

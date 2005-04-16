@@ -1,16 +1,19 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
+ * $Id: chipreg.c,v 1.17 2004/11/16 18:29:00 dwmw2 Exp $
+ *
  * Registration for chip drivers
  *
  */
 
 #include <linux/kernel.h>
+#include <linux/config.h>
 #include <linux/module.h>
 #include <linux/kmod.h>
 #include <linux/spinlock.h>
 #include <linux/slab.h>
 #include <linux/mtd/map.h>
 #include <linux/mtd/mtd.h>
+#include <linux/mtd/compatmac.h>
 
 static DEFINE_SPINLOCK(chip_drvs_lock);
 static LIST_HEAD(chip_drvs_list);
@@ -31,11 +34,14 @@ void unregister_mtd_chip_driver(struct mtd_chip_driver *drv)
 
 static struct mtd_chip_driver *get_mtd_chip_driver (const char *name)
 {
+	struct list_head *pos;
 	struct mtd_chip_driver *ret = NULL, *this;
 
 	spin_lock(&chip_drvs_lock);
 
-	list_for_each_entry(this, &chip_drvs_list, list) {
+	list_for_each(pos, &chip_drvs_list) {
+		this = list_entry(pos, typeof(*this), list);
+		
 		if (!strcmp(this->name, name)) {
 			ret = this;
 			break;
@@ -67,14 +73,17 @@ struct mtd_info *do_map_probe(const char *name, struct map_info *map)
 
 	ret = drv->probe(map);
 
-	/* We decrease the use count here. It may have been a
+	/* We decrease the use count here. It may have been a 
 	   probe-only module, which is no longer required from this
 	   point, having given us a handle on (and increased the use
 	   count of) the actual driver code.
 	*/
 	module_put(drv->module);
 
-	return ret;
+	if (ret)
+		return ret;
+	
+	return NULL;
 }
 /*
  * Destroy an MTD device which was created for a map device.

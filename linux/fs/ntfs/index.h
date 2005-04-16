@@ -1,9 +1,23 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * index.h - Defines for NTFS kernel index handling.  Part of the Linux-NTFS
  *	     project.
  *
  * Copyright (c) 2004 Anton Altaparmakov
+ *
+ * This program/include file is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License as published
+ * by the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program/include file is distributed in the hope that it will be
+ * useful, but WITHOUT ANY WARRANTY; without even the implied warranty
+ * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program (in the main directory of the Linux-NTFS
+ * distribution in the file COPYING); if not, write to the Free Software
+ * Foundation,Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
 #ifndef _LINUX_NTFS_INDEX_H
@@ -23,12 +37,12 @@
  * @entry:	index entry (points into @ir or @ia)
  * @data:	index entry data (points into @entry)
  * @data_len:	length in bytes of @data
- * @is_in_root:	'true' if @entry is in @ir and 'false' if it is in @ia
+ * @is_in_root:	TRUE if @entry is in @ir and FALSE if it is in @ia
  * @ir:		index root if @is_in_root and NULL otherwise
  * @actx:	attribute search context if @is_in_root and NULL otherwise
  * @base_ni:	base inode if @is_in_root and NULL otherwise
- * @ia:		index block if @is_in_root is 'false' and NULL otherwise
- * @page:	page if @is_in_root is 'false' and NULL otherwise
+ * @ia:		index block if @is_in_root is FALSE and NULL otherwise
+ * @page:	page if @is_in_root is FALSE and NULL otherwise
  *
  * @idx_ni is the index inode this context belongs to.
  *
@@ -36,11 +50,11 @@
  * are the index entry data and its length in bytes, respectively.  @data
  * simply points into @entry.  This is probably what the user is interested in.
  *
- * If @is_in_root is 'true', @entry is in the index root attribute @ir described
+ * If @is_in_root is TRUE, @entry is in the index root attribute @ir described
  * by the attribute search context @actx and the base inode @base_ni.  @ia and
  * @page are NULL in this case.
  *
- * If @is_in_root is 'false', @entry is in the index allocation attribute and @ia
+ * If @is_in_root is FALSE, @entry is in the index allocation attribute and @ia
  * and @page point to the index allocation block and the mapped, locked page it
  * is in, respectively.  @ir, @actx and @base_ni are NULL in this case.
  *
@@ -63,7 +77,7 @@ typedef struct {
 	INDEX_ENTRY *entry;
 	void *data;
 	u16 data_len;
-	bool is_in_root;
+	BOOL is_in_root;
 	INDEX_ROOT *ir;
 	ntfs_attr_search_ctx *actx;
 	ntfs_inode *base_ni;

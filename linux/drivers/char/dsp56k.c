@@ -24,6 +24,8 @@
  */
 
 #include <linux/module.h>
+#include <linux/slab.h>	/* for kmalloc() and kfree() */
+#include <linux/sched.h>	/* for struct wait_queue etc */
 #include <linux/major.h>
 #include <linux/types.h>
 #include <linux/errno.h>
@@ -31,14 +33,13 @@
 #include <linux/fs.h>
 #include <linux/mm.h>
 #include <linux/init.h>
+#include <linux/devfs_fs_kernel.h>
+#include <linux/smp_lock.h>
 #include <linux/device.h>
-#include <linux/mutex.h>
-#include <linux/firmware.h>
-#include <linux/platform_device.h>
-#include <linux/uaccess.h>	/* For put_user and get_user */
 
 #include <asm/atarihw.h>
 #include <asm/traps.h>
+#include <asm/uaccess.h>	/* For put_user and get_user */
 
 #include <asm/dsp56k.h>
 
@@ -94,14 +95,56 @@
 	} \
 }
 
-static DEFINE_MUTEX(dsp56k_mutex);
+/* DSP56001 bootstrap code */
+static char bootstrap[] = {
+	0x0c, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x60, 0xf4, 0x00, 0x00, 0x00, 0x4f, 0x61, 0xf4,
+	0x00, 0x00, 0x7e, 0xa9, 0x06, 0x2e, 0x80, 0x00, 0x00, 0x47,
+	0x07, 0xd8, 0x84, 0x07, 0x59, 0x84, 0x08, 0xf4, 0xa8, 0x00,
+	0x00, 0x04, 0x08, 0xf4, 0xbf, 0x00, 0x0c, 0x00, 0x00, 0xfe,
+	0xb8, 0x0a, 0xf0, 0x80, 0x00, 0x7e, 0xa9, 0x08, 0xf4, 0xa0,
+	0x00, 0x00, 0x01, 0x08, 0xf4, 0xbe, 0x00, 0x00, 0x00, 0x0a,
+	0xa9, 0x80, 0x00, 0x7e, 0xad, 0x08, 0x4e, 0x2b, 0x44, 0xf4,
+	0x00, 0x00, 0x00, 0x03, 0x44, 0xf4, 0x45, 0x00, 0x00, 0x01,
+	0x0e, 0xa0, 0x00, 0x0a, 0xa9, 0x80, 0x00, 0x7e, 0xb5, 0x08,
+	0x50, 0x2b, 0x0a, 0xa9, 0x80, 0x00, 0x7e, 0xb8, 0x08, 0x46,
+	0x2b, 0x44, 0xf4, 0x45, 0x00, 0x00, 0x02, 0x0a, 0xf0, 0xaa,
+	0x00, 0x7e, 0xc9, 0x20, 0x00, 0x45, 0x0a, 0xf0, 0xaa, 0x00,
+	0x7e, 0xd0, 0x06, 0xc6, 0x00, 0x00, 0x7e, 0xc6, 0x0a, 0xa9,
+	0x80, 0x00, 0x7e, 0xc4, 0x08, 0x58, 0x6b, 0x0a, 0xf0, 0x80,
+	0x00, 0x7e, 0xad, 0x06, 0xc6, 0x00, 0x00, 0x7e, 0xcd, 0x0a,
+	0xa9, 0x80, 0x00, 0x7e, 0xcb, 0x08, 0x58, 0xab, 0x0a, 0xf0,
+	0x80, 0x00, 0x7e, 0xad, 0x06, 0xc6, 0x00, 0x00, 0x7e, 0xd4,
+	0x0a, 0xa9, 0x80, 0x00, 0x7e, 0xd2, 0x08, 0x58, 0xeb, 0x0a,
+	0xf0, 0x80, 0x00, 0x7e, 0xad};
+static int sizeof_bootstrap = 375;
+
+
 static struct dsp56k_device {
-	unsigned long in_use;
+	long in_use;
 	long maxio, timeout;
 	int tx_wsize, rx_wsize;
 } dsp56k;
 
-static struct class *dsp56k_class;
+static struct class_simple *dsp56k_class;
 
 static int dsp56k_reset(void)
 {
@@ -122,42 +165,20 @@ static int dsp56k_reset(void)
 	return 0;
 }
 
-static int dsp56k_upload(u_char __user *bin, int len)
+static int dsp56k_upload(u_char *bin, int len)
 {
-	struct platform_device *pdev;
-	const struct firmware *fw;
-	const char fw_name[] = "dsp56k/bootstrap.bin";
-	int err;
 	int i;
-
+	u_char *p;
+	
 	dsp56k_reset();
-
-	pdev = platform_device_register_simple("dsp56k", 0, NULL, 0);
-	if (IS_ERR(pdev)) {
-		printk(KERN_ERR "Failed to register device for \"%s\"\n",
-		       fw_name);
-		return -EINVAL;
-	}
-	err = request_firmware(&fw, fw_name, &pdev->dev);
-	platform_device_unregister(pdev);
-	if (err) {
-		printk(KERN_ERR "Failed to load image \"%s\" err %d\n",
-		       fw_name, err);
-		return err;
-	}
-	if (fw->size % 3) {
-		printk(KERN_ERR "Bogus length %d in image \"%s\"\n",
-		       fw->size, fw_name);
-		release_firmware(fw);
-		return -EINVAL;
-	}
-	for (i = 0; i < fw->size; i = i + 3) {
+  
+	p = bootstrap;
+	for (i = 0; i < sizeof_bootstrap/3; i++) {
 		/* tx_wait(10); */
-		dsp56k_host_interface.data.b[1] = fw->data[i];
-		dsp56k_host_interface.data.b[2] = fw->data[i + 1];
-		dsp56k_host_interface.data.b[3] = fw->data[i + 2];
+		dsp56k_host_interface.data.b[1] = *p++;
+		dsp56k_host_interface.data.b[2] = *p++;
+		dsp56k_host_interface.data.b[3] = *p++;
 	}
-	release_firmware(fw);
 	for (; i < 512; i++) {
 		/* tx_wait(10); */
 		dsp56k_host_interface.data.b[1] = 0;
@@ -178,10 +199,10 @@ static int dsp56k_upload(u_char __user *bin, int len)
 	return 0;
 }
 
-static ssize_t dsp56k_read(struct file *file, char __user *buf, size_t count,
+static ssize_t dsp56k_read(struct file *file, char *buf, size_t count,
 			   loff_t *ppos)
 {
-	struct inode *inode = file_inode(file);
+	struct inode *inode = file->f_dentry->d_inode;
 	int dev = iminor(inode) & 0x0f;
 
 	switch(dev)
@@ -204,10 +225,10 @@ static ssize_t dsp56k_read(struct file *file, char __user *buf, size_t count,
 		}
 		case 2:  /* 16 bit */
 		{
-			short __user *data;
+			short *data;
 
 			count /= 2;
-			data = (short __user *) buf;
+			data = (short*) buf;
 			handshake(count, dsp56k.maxio, dsp56k.timeout, DSP56K_RECEIVE,
 				  put_user(dsp56k_host_interface.data.w[1], data+n++));
 			return 2*n;
@@ -223,10 +244,10 @@ static ssize_t dsp56k_read(struct file *file, char __user *buf, size_t count,
 		}
 		case 4:  /* 32 bit */
 		{
-			long __user *data;
+			long *data;
 
 			count /= 4;
-			data = (long __user *) buf;
+			data = (long*) buf;
 			handshake(count, dsp56k.maxio, dsp56k.timeout, DSP56K_RECEIVE,
 				  put_user(dsp56k_host_interface.data.l, data+n++));
 			return 4*n;
@@ -241,10 +262,10 @@ static ssize_t dsp56k_read(struct file *file, char __user *buf, size_t count,
 	}
 }
 
-static ssize_t dsp56k_write(struct file *file, const char __user *buf, size_t count,
+static ssize_t dsp56k_write(struct file *file, const char *buf, size_t count,
 			    loff_t *ppos)
 {
-	struct inode *inode = file_inode(file);
+	struct inode *inode = file->f_dentry->d_inode;
 	int dev = iminor(inode) & 0x0f;
 
 	switch(dev)
@@ -266,10 +287,10 @@ static ssize_t dsp56k_write(struct file *file, const char __user *buf, size_t co
 		}
 		case 2:  /* 16 bit */
 		{
-			const short __user *data;
+			const short *data;
 
 			count /= 2;
-			data = (const short __user *)buf;
+			data = (const short *)buf;
 			handshake(count, dsp56k.maxio, dsp56k.timeout, DSP56K_TRANSMIT,
 				  get_user(dsp56k_host_interface.data.w[1], data+n++));
 			return 2*n;
@@ -285,10 +306,10 @@ static ssize_t dsp56k_write(struct file *file, const char __user *buf, size_t co
 		}
 		case 4:  /* 32 bit */
 		{
-			const long __user *data;
+			const long *data;
 
 			count /= 4;
-			data = (const long __user *)buf;
+			data = (const long *)buf;
 			handshake(count, dsp56k.maxio, dsp56k.timeout, DSP56K_TRANSMIT,
 				  get_user(dsp56k_host_interface.data.l, data+n++));
 			return 4*n;
@@ -303,11 +324,10 @@ static ssize_t dsp56k_write(struct file *file, const char __user *buf, size_t co
 	}
 }
 
-static long dsp56k_ioctl(struct file *file, unsigned int cmd,
-			 unsigned long arg)
+static int dsp56k_ioctl(struct inode *inode, struct file *file,
+			unsigned int cmd, unsigned long arg)
 {
-	int dev = iminor(file_inode(file)) & 0x0f;
-	void __user *argp = (void __user *)arg;
+	int dev = iminor(inode) & 0x0f;
 
 	switch(dev)
 	{
@@ -316,24 +336,23 @@ static long dsp56k_ioctl(struct file *file, unsigned int cmd,
 		switch(cmd) {
 		case DSP56K_UPLOAD:
 		{
-			char __user *bin;
+			char *bin;
 			int r, len;
-			struct dsp56k_upload __user *binary = argp;
+			struct dsp56k_upload *binary = (struct dsp56k_upload *) arg;
     
 			if(get_user(len, &binary->len) < 0)
 				return -EFAULT;
 			if(get_user(bin, &binary->bin) < 0)
 				return -EFAULT;
 		
-			if (len <= 0) {
+			if (len == 0) {
 				return -EINVAL;      /* nothing to upload?!? */
 			}
 			if (len > DSP56K_MAX_BINARY_LENGTH) {
 				return -EINVAL;
 			}
-			mutex_lock(&dsp56k_mutex);
+    
 			r = dsp56k_upload(bin, len);
-			mutex_unlock(&dsp56k_mutex);
 			if (r < 0) {
 				return r;
 			}
@@ -343,28 +362,23 @@ static long dsp56k_ioctl(struct file *file, unsigned int cmd,
 		case DSP56K_SET_TX_WSIZE:
 			if (arg > 4 || arg < 1)
 				return -EINVAL;
-			mutex_lock(&dsp56k_mutex);
 			dsp56k.tx_wsize = (int) arg;
-			mutex_unlock(&dsp56k_mutex);
 			break;
 		case DSP56K_SET_RX_WSIZE:
 			if (arg > 4 || arg < 1)
 				return -EINVAL;
-			mutex_lock(&dsp56k_mutex);
 			dsp56k.rx_wsize = (int) arg;
-			mutex_unlock(&dsp56k_mutex);
 			break;
 		case DSP56K_HOST_FLAGS:
 		{
 			int dir, out, status;
-			struct dsp56k_host_flags __user *hf = argp;
+			struct dsp56k_host_flags *hf = (struct dsp56k_host_flags*) arg;
     
 			if(get_user(dir, &hf->dir) < 0)
 				return -EFAULT;
 			if(get_user(out, &hf->out) < 0)
 				return -EFAULT;
 
-			mutex_lock(&dsp56k_mutex);
 			if ((dir & 0x1) && (out & 0x1))
 				dsp56k_host_interface.icr |= DSP56K_ICR_HF0;
 			else if (dir & 0x1)
@@ -379,16 +393,14 @@ static long dsp56k_ioctl(struct file *file, unsigned int cmd,
 			if (dsp56k_host_interface.icr & DSP56K_ICR_HF1) status |= 0x2;
 			if (dsp56k_host_interface.isr & DSP56K_ISR_HF2) status |= 0x4;
 			if (dsp56k_host_interface.isr & DSP56K_ISR_HF3) status |= 0x8;
-			mutex_unlock(&dsp56k_mutex);
+
 			return put_user(status, &hf->status);
 		}
 		case DSP56K_HOST_CMD:
-			if (arg > 31)
+			if (arg > 31 || arg < 0)
 				return -EINVAL;
-			mutex_lock(&dsp56k_mutex);
 			dsp56k_host_interface.cvr = (u_char)((arg & DSP56K_CVR_HV_MASK) |
 							     DSP56K_CVR_HC);
-			mutex_unlock(&dsp56k_mutex);
 			break;
 		default:
 			return -EINVAL;
@@ -406,15 +418,15 @@ static long dsp56k_ioctl(struct file *file, unsigned int cmd,
  * Do I need this function at all???
  */
 #if 0
-static __poll_t dsp56k_poll(struct file *file, poll_table *wait)
+static unsigned int dsp56k_poll(struct file *file, poll_table *wait)
 {
-	int dev = iminor(file_inode(file)) & 0x0f;
+	int dev = iminor(file->f_dentry->d_inode) & 0x0f;
 
 	switch(dev)
 	{
 	case DSP56K_DEV_56001:
 		/* poll_wait(file, ???, wait); */
-		return EPOLLIN | EPOLLRDNORM | EPOLLOUT;
+		return POLLIN | POLLRDNORM | POLLOUT;
 
 	default:
 		printk("DSP56k driver: Unknown minor device: %d\n", dev);
@@ -426,17 +438,13 @@ static __poll_t dsp56k_poll(struct file *file, poll_table *wait)
 static int dsp56k_open(struct inode *inode, struct file *file)
 {
 	int dev = iminor(inode) & 0x0f;
-	int ret = 0;
 
-	mutex_lock(&dsp56k_mutex);
 	switch(dev)
 	{
 	case DSP56K_DEV_56001:
 
-		if (test_and_set_bit(0, &dsp56k.in_use)) {
-			ret = -EBUSY;
-			goto out;
-		}
+		if (test_and_set_bit(0, &dsp56k.in_use))
+			return -EBUSY;
 
 		dsp56k.timeout = TIMEOUT;
 		dsp56k.maxio = MAXIO;
@@ -452,11 +460,10 @@ static int dsp56k_open(struct inode *inode, struct file *file)
 		break;
 
 	default:
-		ret = -ENODEV;
+		return -ENODEV;
 	}
-out:
-	mutex_unlock(&dsp56k_mutex);
-	return ret;
+
+	return 0;
 }
 
 static int dsp56k_release(struct inode *inode, struct file *file)
@@ -476,20 +483,19 @@ static int dsp56k_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static const struct file_operations dsp56k_fops = {
+static struct file_operations dsp56k_fops = {
 	.owner		= THIS_MODULE,
 	.read		= dsp56k_read,
 	.write		= dsp56k_write,
-	.unlocked_ioctl	= dsp56k_ioctl,
+	.ioctl		= dsp56k_ioctl,
 	.open		= dsp56k_open,
 	.release	= dsp56k_release,
-	.llseek		= noop_llseek,
 };
 
 
 /****** Init and module functions ******/
 
-static const char banner[] __initconst = KERN_INFO "DSP56k driver installed\n";
+static char banner[] __initdata = KERN_INFO "DSP56k driver installed\n";
 
 static int __init dsp56k_init_driver(void)
 {
@@ -504,17 +510,24 @@ static int __init dsp56k_init_driver(void)
 		printk("DSP56k driver: Unable to register driver\n");
 		return -ENODEV;
 	}
-	dsp56k_class = class_create(THIS_MODULE, "dsp56k");
+	dsp56k_class = class_simple_create(THIS_MODULE, "dsp56k");
 	if (IS_ERR(dsp56k_class)) {
 		err = PTR_ERR(dsp56k_class);
 		goto out_chrdev;
 	}
-	device_create(dsp56k_class, NULL, MKDEV(DSP56K_MAJOR, 0), NULL,
-		      "dsp56k");
+	class_simple_device_add(dsp56k_class, MKDEV(DSP56K_MAJOR, 0), NULL, "dsp56k");
+
+	err = devfs_mk_cdev(MKDEV(DSP56K_MAJOR, 0),
+		      S_IFCHR | S_IRUSR | S_IWUSR, "dsp56k");
+	if(err)
+		goto out_class;
 
 	printk(banner);
 	goto out;
 
+out_class:
+	class_simple_device_remove(MKDEV(DSP56K_MAJOR, 0));
+	class_simple_destroy(dsp56k_class);
 out_chrdev:
 	unregister_chrdev(DSP56K_MAJOR, "dsp56k");
 out:
@@ -524,11 +537,11 @@ module_init(dsp56k_init_driver);
 
 static void __exit dsp56k_cleanup_driver(void)
 {
-	device_destroy(dsp56k_class, MKDEV(DSP56K_MAJOR, 0));
-	class_destroy(dsp56k_class);
+	class_simple_device_remove(MKDEV(DSP56K_MAJOR, 0));
+	class_simple_destroy(dsp56k_class);
 	unregister_chrdev(DSP56K_MAJOR, "dsp56k");
+	devfs_remove("dsp56k");
 }
 module_exit(dsp56k_cleanup_driver);
 
 MODULE_LICENSE("GPL");
-MODULE_FIRMWARE("dsp56k/bootstrap.bin");

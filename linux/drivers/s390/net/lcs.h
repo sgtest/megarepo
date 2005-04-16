@@ -1,12 +1,12 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*lcs.h*/
 
 #include <linux/interrupt.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
 #include <linux/workqueue.h>
-#include <linux/refcount.h>
 #include <asm/ccwdev.h>
+
+#define VERSION_LCS_H "$Revision: 1.19 $"
 
 #define LCS_DBF_TEXT(level, name, text) \
 	do { \
@@ -19,37 +19,22 @@ do { \
 } while (0)
 
 #define LCS_DBF_TEXT_(level,name,text...) \
-	do { \
-		if (debug_level_enabled(lcs_dbf_##name, level)) { \
-			sprintf(debug_buffer, text); \
-			debug_text_event(lcs_dbf_##name, level, debug_buffer); \
-		} \
-	} while (0)
+do {                                       \
+	sprintf(debug_buffer, text);  \
+		debug_text_event(lcs_dbf_##name,level, debug_buffer);\
+} while (0)
+
+/**
+ * some more definitions for debug or output stuff
+ */
+#define PRINTK_HEADER		" lcs: "
 
 /**
  *	sysfs related stuff
  */
 #define CARD_FROM_DEV(cdev) \
-	(struct lcs_card *) dev_get_drvdata( \
-		&((struct ccwgroup_device *)dev_get_drvdata(&cdev->dev))->dev);
-
-/**
- * Enum for classifying detected devices.
- */
-enum lcs_channel_types {
-	/* Device is not a channel  */
-	lcs_channel_type_none,
-
-	/* Device is a 2216 channel */
-	lcs_channel_type_parallel,
-
-	/* Device is a 2216 channel */
-	lcs_channel_type_2216,
-
-	/* Device is a OSA2 card */
-	lcs_channel_type_osa2
-};
-
+	(struct lcs_card *) \
+	((struct ccwgroup_device *)cdev->dev.driver_data)->dev.driver_data;
 /**
  * CCW commands used in this driver
  */
@@ -90,17 +75,13 @@ enum lcs_channel_types {
 /**
  * LCS sense byte definitions
  */
-#define LCS_SENSE_BYTE_0 		0
-#define LCS_SENSE_BYTE_1 		1
-#define LCS_SENSE_BYTE_2 		2
-#define LCS_SENSE_BYTE_3 		3
 #define LCS_SENSE_INTERFACE_DISCONNECT	0x01
 #define LCS_SENSE_EQUIPMENT_CHECK	0x10
 #define LCS_SENSE_BUS_OUT_CHECK		0x20
 #define LCS_SENSE_INTERVENTION_REQUIRED 0x40
 #define LCS_SENSE_CMD_REJECT		0x80
-#define LCS_SENSE_RESETTING_EVENT	0x80
-#define LCS_SENSE_DEVICE_ONLINE		0x20
+#define LCS_SENSE_RESETTING_EVENT	0x0080
+#define LCS_SENSE_DEVICE_ONLINE		0x0020
 
 /**
  * LCS packet type definitions
@@ -116,7 +97,7 @@ enum lcs_channel_types {
  */
 #define LCS_ILLEGAL_OFFSET		0xffff
 #define LCS_IOBUFFERSIZE		0x5000
-#define LCS_NUM_BUFFS			32	/* needs to be power of 2 */
+#define LCS_NUM_BUFFS			8	/* needs to be power of 2 */
 #define LCS_MAC_LENGTH			6
 #define LCS_INVALID_PORT_NO		-1
 #define LCS_LANCMD_TIMEOUT_DEFAULT      5
@@ -144,23 +125,22 @@ enum lcs_channel_types {
  * LCS Buffer states
  */
 enum lcs_buffer_states {
-	LCS_BUF_STATE_EMPTY,	/* buffer is empty */
-	LCS_BUF_STATE_LOCKED,	/* buffer is locked, don't touch */
-	LCS_BUF_STATE_READY,	/* buffer is ready for read/write */
-	LCS_BUF_STATE_PROCESSED,
+	BUF_STATE_EMPTY,	/* buffer is empty */
+	BUF_STATE_LOCKED,	/* buffer is locked, don't touch */
+	BUF_STATE_READY,	/* buffer is ready for read/write */
+	BUF_STATE_PROCESSED,
 };
 
 /**
  * LCS Channel State Machine declarations
  */
 enum lcs_channel_states {
-	LCS_CH_STATE_INIT,
-	LCS_CH_STATE_HALTED,
-	LCS_CH_STATE_STOPPED,
-	LCS_CH_STATE_RUNNING,
-	LCS_CH_STATE_SUSPENDED,
-	LCS_CH_STATE_CLEARED,
-	LCS_CH_STATE_ERROR,
+	CH_STATE_INIT,
+	CH_STATE_HALTED,
+	CH_STATE_STOPPED,
+	CH_STATE_RUNNING,
+	CH_STATE_SUSPENDED,
+	CH_STATE_CLEARED,
 };
 
 /**
@@ -174,9 +154,10 @@ enum lcs_dev_states {
 
 enum lcs_threads {
 	LCS_SET_MC_THREAD 	= 1,
-	LCS_RECOVERY_THREAD 	= 2,
+	LCS_STARTLAN_THREAD	= 2,
+	LCS_STOPLAN_THREAD	= 4,
+	LCS_STARTUP_THREAD	= 8,
 };
-
 /**
  * LCS struct declarations
  */
@@ -187,7 +168,7 @@ struct lcs_header {
 }  __attribute__ ((packed));
 
 struct lcs_ip_mac_pair {
-	__be32  ip_addr;
+	__u32  ip_addr;
 	__u8   mac_addr[LCS_MAC_LENGTH];
 	__u8   reserved[2];
 }  __attribute__ ((packed));
@@ -272,12 +253,11 @@ struct lcs_buffer {
 struct lcs_reply {
 	struct list_head list;
 	__u16 sequence_no;
-	refcount_t refcnt;
+	atomic_t refcnt;
 	/* Callback for completion notification. */
 	void (*callback)(struct lcs_card *, struct lcs_cmd *);
 	wait_queue_head_t wait_q;
 	struct lcs_card *card;
-	struct timer_list timer;
 	int received;
 	int rc;
 };
@@ -306,9 +286,8 @@ struct lcs_card {
 	enum lcs_dev_states state;
 	struct net_device *dev;
 	struct net_device_stats stats;
-	__be16 (*lan_type_trans)(struct sk_buff *skb,
+	unsigned short (*lan_type_trans)(struct sk_buff *skb,
 					 struct net_device *dev);
-	struct ccwgroup_device *gdev;
 	struct lcs_channel read;
 	struct lcs_channel write;
 	struct lcs_buffer *tx_buffer;

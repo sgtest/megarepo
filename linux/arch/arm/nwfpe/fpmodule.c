@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 
 /*
     NetWinder Floating Point Emulator
@@ -7,22 +6,35 @@
 
     Direct questions, comments to Scott Bambrough <scottb@netwinder.org>
 
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 */
 
 #include "fpa11.h"
 
 #include <linux/module.h>
-#include <linux/moduleparam.h>
+#include <linux/version.h>
+#include <linux/config.h>
 
 /* XXX */
 #include <linux/errno.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/signal.h>
-#include <linux/sched/signal.h>
+#include <linux/sched.h>
 #include <linux/init.h>
-
-#include <asm/thread_notify.h>
+/* XXX */
 
 #include "softfloat.h"
 #include "fpopcode.h"
@@ -45,28 +57,16 @@ void fp_send_sig(unsigned long sig, struct task_struct *p, int priv);
 extern char fpe_type[];
 #endif
 
-static int nwfpe_notify(struct notifier_block *self, unsigned long cmd, void *v)
-{
-	struct thread_info *thread = v;
-
-	if (cmd == THREAD_NOTIFY_FLUSH)
-		nwfpe_init_fpa(&thread->fpstate);
-
-	return NOTIFY_DONE;
-}
-
-static struct notifier_block nwfpe_notifier_block = {
-	.notifier_call = nwfpe_notify,
-};
-
 /* kernel function prototypes required */
 void fp_setup(void);
 
 /* external declarations for saved kernel symbols */
 extern void (*kern_fp_enter)(void);
+extern void (*fp_init)(union fp_state *);
 
 /* Original value of fp_enter from kernel before patched by fpe_init. */
 static void (*orig_fp_enter)(void);
+static void (*orig_fp_init)(union fp_state *);
 
 /* forward declarations */
 extern void nwfpe_enter(void);
@@ -74,35 +74,35 @@ extern void nwfpe_enter(void);
 static int __init fpe_init(void)
 {
 	if (sizeof(FPA11) > sizeof(union fp_state)) {
-		pr_err("nwfpe: bad structure size\n");
+		printk(KERN_ERR "nwfpe: bad structure size\n");
 		return -EINVAL;
 	}
 
 	if (sizeof(FPREG) != 12) {
-		pr_err("nwfpe: bad register size\n");
+		printk(KERN_ERR "nwfpe: bad register size\n");
 		return -EINVAL;
 	}
 	if (fpe_type[0] && strcmp(fpe_type, "nwfpe"))
 		return 0;
 
 	/* Display title, version and copyright information. */
-	pr_info("NetWinder Floating Point Emulator V0.97 ("
-	        NWFPE_BITS " precision)\n");
-
-	thread_register_notifier(&nwfpe_notifier_block);
+	printk(KERN_WARNING "NetWinder Floating Point Emulator V0.97 ("
+	       NWFPE_BITS " precision)\n");
 
 	/* Save pointer to the old FP handler and then patch ourselves in */
 	orig_fp_enter = kern_fp_enter;
+	orig_fp_init = fp_init;
 	kern_fp_enter = nwfpe_enter;
+	fp_init = nwfpe_init_fpa;
 
 	return 0;
 }
 
 static void __exit fpe_exit(void)
 {
-	thread_unregister_notifier(&nwfpe_notifier_block);
 	/* Restore the values we saved earlier. */
 	kern_fp_enter = orig_fp_enter;
+	fp_init = orig_fp_init;
 }
 
 /*
@@ -117,28 +117,27 @@ fpmodule.c to integrate with the NetBSD kernel (I hope!).
 code to access data in user space in some other source files at the 
 moment (grep for get_user / put_user calls).  --philb]
 
+float_exception_flags is a global variable in SoftFloat.
+
 This function is called by the SoftFloat routines to raise a floating
 point exception.  We check the trap enable byte in the FPSR, and raise
 a SIGFPE exception if necessary.  If not the relevant bits in the 
 cumulative exceptions flag byte are set and we return.
 */
 
-#ifdef CONFIG_DEBUG_USER
-/* By default, ignore inexact errors as there are far too many of them to log */
-static int debug = ~BIT_IXC;
-#endif
-
 void float_raise(signed char flags)
 {
 	register unsigned int fpsr, cumulativeTraps;
 
 #ifdef CONFIG_DEBUG_USER
-	if (flags & debug)
- 		printk(KERN_DEBUG
-		       "NWFPE: %s[%d] takes exception %08x at %ps from %08lx\n",
-		       current->comm, current->pid, flags,
-		       __builtin_return_address(0), GET_USERREG()->ARM_pc);
+	printk(KERN_DEBUG
+	       "NWFPE: %s[%d] takes exception %08x at %p from %08lx\n",
+	       current->comm, current->pid, flags,
+	       __builtin_return_address(0), GET_USERREG()[15]);
 #endif
+
+	/* Keep SoftFloat exception flags up to date.  */
+	float_exception_flags |= flags;
 
 	/* Read fpsr and initialize the cumulativeTraps.  */
 	fpsr = readFPSR();
@@ -172,7 +171,3 @@ module_exit(fpe_exit);
 MODULE_AUTHOR("Scott Bambrough <scottb@rebel.com>");
 MODULE_DESCRIPTION("NWFPE floating point emulator (" NWFPE_BITS " precision)");
 MODULE_LICENSE("GPL");
-
-#ifdef CONFIG_DEBUG_USER
-module_param(debug, int, 0644);
-#endif

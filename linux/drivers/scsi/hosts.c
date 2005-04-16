@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  *  hosts.c Copyright (C) 1992 Drew Eckhardt
  *          Copyright (C) 1993, 1994, 1995 Eric Youngdale
@@ -25,137 +24,48 @@
 #include <linux/module.h>
 #include <linux/blkdev.h>
 #include <linux/kernel.h>
-#include <linux/slab.h>
-#include <linux/kthread.h>
 #include <linux/string.h>
 #include <linux/mm.h>
 #include <linux/init.h>
 #include <linux/completion.h>
 #include <linux/transport_class.h>
-#include <linux/platform_device.h>
-#include <linux/pm_runtime.h>
-#include <linux/idr.h>
+
 #include <scsi/scsi_device.h>
 #include <scsi/scsi_host.h>
 #include <scsi/scsi_transport.h>
-#include <scsi/scsi_cmnd.h>
 
 #include "scsi_priv.h"
 #include "scsi_logging.h"
 
 
-static int shost_eh_deadline = -1;
-
-module_param_named(eh_deadline, shost_eh_deadline, int, S_IRUGO|S_IWUSR);
-MODULE_PARM_DESC(eh_deadline,
-		 "SCSI EH timeout in seconds (should be between 0 and 2^31-1)");
-
-static DEFINE_IDA(host_index_ida);
+static int scsi_host_next_hn;		/* host_no for next new host */
 
 
-static void scsi_host_cls_release(struct device *dev)
+static void scsi_host_cls_release(struct class_device *class_dev)
 {
-	put_device(&class_to_shost(dev)->shost_gendev);
+	put_device(&class_to_shost(class_dev)->shost_gendev);
 }
 
 static struct class shost_class = {
 	.name		= "scsi_host",
-	.dev_release	= scsi_host_cls_release,
-	.dev_groups	= scsi_shost_groups,
+	.release	= scsi_host_cls_release,
 };
 
 /**
- *	scsi_host_set_state - Take the given host through the host state model.
- *	@shost:	scsi host to change the state of.
- *	@state:	state to change to.
- *
- *	Returns zero if unsuccessful or an error if the requested
- *	transition is illegal.
+ * scsi_host_cancel - cancel outstanding IO to this host
+ * @shost:	pointer to struct Scsi_Host
+ * recovery:	recovery requested to run.
  **/
-int scsi_host_set_state(struct Scsi_Host *shost, enum scsi_host_state state)
+void scsi_host_cancel(struct Scsi_Host *shost, int recovery)
 {
-	enum scsi_host_state oldstate = shost->shost_state;
+	struct scsi_device *sdev;
 
-	if (state == oldstate)
-		return 0;
-
-	switch (state) {
-	case SHOST_CREATED:
-		/* There are no legal states that come back to
-		 * created.  This is the manually initialised start
-		 * state */
-		goto illegal;
-
-	case SHOST_RUNNING:
-		switch (oldstate) {
-		case SHOST_CREATED:
-		case SHOST_RECOVERY:
-			break;
-		default:
-			goto illegal;
-		}
-		break;
-
-	case SHOST_RECOVERY:
-		switch (oldstate) {
-		case SHOST_RUNNING:
-			break;
-		default:
-			goto illegal;
-		}
-		break;
-
-	case SHOST_CANCEL:
-		switch (oldstate) {
-		case SHOST_CREATED:
-		case SHOST_RUNNING:
-		case SHOST_CANCEL_RECOVERY:
-			break;
-		default:
-			goto illegal;
-		}
-		break;
-
-	case SHOST_DEL:
-		switch (oldstate) {
-		case SHOST_CANCEL:
-		case SHOST_DEL_RECOVERY:
-			break;
-		default:
-			goto illegal;
-		}
-		break;
-
-	case SHOST_CANCEL_RECOVERY:
-		switch (oldstate) {
-		case SHOST_CANCEL:
-		case SHOST_RECOVERY:
-			break;
-		default:
-			goto illegal;
-		}
-		break;
-
-	case SHOST_DEL_RECOVERY:
-		switch (oldstate) {
-		case SHOST_CANCEL_RECOVERY:
-			break;
-		default:
-			goto illegal;
-		}
-		break;
+	set_bit(SHOST_CANCEL, &shost->shost_state);
+	shost_for_each_device(sdev, shost) {
+		scsi_device_cancel(sdev, recovery);
 	}
-	shost->shost_state = state;
-	return 0;
-
- illegal:
-	SCSI_LOG_ERROR_RECOVERY(1,
-				shost_printk(KERN_ERR, shost,
-					     "Illegal host state transition"
-					     "%s->%s\n",
-					     scsi_host_state_name(oldstate),
-					     scsi_host_state_name(state)));
-	return -EINVAL;
+	wait_event(shost->host_wait, (!test_bit(SHOST_RECOVERY,
+						&shost->shost_state)));
 }
 
 /**
@@ -164,208 +74,121 @@ int scsi_host_set_state(struct Scsi_Host *shost, enum scsi_host_state state)
  **/
 void scsi_remove_host(struct Scsi_Host *shost)
 {
-	unsigned long flags;
-
-	mutex_lock(&shost->scan_mutex);
-	spin_lock_irqsave(shost->host_lock, flags);
-	if (scsi_host_set_state(shost, SHOST_CANCEL))
-		if (scsi_host_set_state(shost, SHOST_CANCEL_RECOVERY)) {
-			spin_unlock_irqrestore(shost->host_lock, flags);
-			mutex_unlock(&shost->scan_mutex);
-			return;
-		}
-	spin_unlock_irqrestore(shost->host_lock, flags);
-
-	scsi_autopm_get_host(shost);
-	flush_workqueue(shost->tmf_work_q);
 	scsi_forget_host(shost);
-	mutex_unlock(&shost->scan_mutex);
+	scsi_host_cancel(shost, 0);
 	scsi_proc_host_rm(shost);
 
-	spin_lock_irqsave(shost->host_lock, flags);
-	if (scsi_host_set_state(shost, SHOST_DEL))
-		BUG_ON(scsi_host_set_state(shost, SHOST_DEL_RECOVERY));
-	spin_unlock_irqrestore(shost->host_lock, flags);
+	set_bit(SHOST_DEL, &shost->shost_state);
 
 	transport_unregister_device(&shost->shost_gendev);
-	device_unregister(&shost->shost_dev);
+	class_device_unregister(&shost->shost_classdev);
 	device_del(&shost->shost_gendev);
 }
 EXPORT_SYMBOL(scsi_remove_host);
 
 /**
- * scsi_add_host_with_dma - add a scsi host with dma device
+ * scsi_add_host - add a scsi host
  * @shost:	scsi host pointer to add
  * @dev:	a struct device of type scsi class
- * @dma_dev:	dma device for the host
- *
- * Note: You rarely need to worry about this unless you're in a
- * virtualised host environments, so use the simpler scsi_add_host()
- * function instead.
  *
  * Return value: 
  * 	0 on success / != 0 for error
  **/
-int scsi_add_host_with_dma(struct Scsi_Host *shost, struct device *dev,
-			   struct device *dma_dev)
+int scsi_add_host(struct Scsi_Host *shost, struct device *dev)
 {
 	struct scsi_host_template *sht = shost->hostt;
 	int error = -EINVAL;
 
-	shost_printk(KERN_INFO, shost, "%s\n",
+	printk(KERN_INFO "scsi%d : %s\n", shost->host_no,
 			sht->info ? sht->info(shost) : sht->name);
 
 	if (!shost->can_queue) {
-		shost_printk(KERN_ERR, shost,
-			     "can_queue = 0 no longer supported\n");
-		goto fail;
+		printk(KERN_ERR "%s: can_queue = 0 no longer supported\n",
+				sht->name);
+		goto out;
 	}
-
-	/* Use min_t(int, ...) in case shost->can_queue exceeds SHRT_MAX */
-	shost->cmd_per_lun = min_t(int, shost->cmd_per_lun,
-				   shost->can_queue);
-
-	error = scsi_init_sense_cache(shost);
-	if (error)
-		goto fail;
 
 	if (!shost->shost_gendev.parent)
 		shost->shost_gendev.parent = dev ? dev : &platform_bus;
-	if (!dma_dev)
-		dma_dev = shost->shost_gendev.parent;
-
-	shost->dma_dev = dma_dev;
-
-	if (dma_dev->dma_mask) {
-		shost->max_sectors = min_t(unsigned int, shost->max_sectors,
-				dma_max_mapping_size(dma_dev) >> SECTOR_SHIFT);
-	}
-
-	error = scsi_mq_setup_tags(shost);
-	if (error)
-		goto fail;
-
-	/*
-	 * Increase usage count temporarily here so that calling
-	 * scsi_autopm_put_host() will trigger runtime idle if there is
-	 * nothing else preventing suspending the device.
-	 */
-	pm_runtime_get_noresume(&shost->shost_gendev);
-	pm_runtime_set_active(&shost->shost_gendev);
-	pm_runtime_enable(&shost->shost_gendev);
-	device_enable_async_suspend(&shost->shost_gendev);
 
 	error = device_add(&shost->shost_gendev);
 	if (error)
-		goto out_disable_runtime_pm;
+		goto out;
 
-	scsi_host_set_state(shost, SHOST_RUNNING);
+	set_bit(SHOST_ADD, &shost->shost_state);
 	get_device(shost->shost_gendev.parent);
 
-	device_enable_async_suspend(&shost->shost_dev);
-
-	get_device(&shost->shost_gendev);
-	error = device_add(&shost->shost_dev);
+	error = class_device_add(&shost->shost_classdev);
 	if (error)
 		goto out_del_gendev;
 
-	if (shost->transportt->host_size) {
-		shost->shost_data = kzalloc(shost->transportt->host_size,
-					 GFP_KERNEL);
-		if (shost->shost_data == NULL) {
-			error = -ENOMEM;
-			goto out_del_dev;
-		}
-	}
+	get_device(&shost->shost_gendev);
+
+	if (shost->transportt->host_size &&
+	    (shost->shost_data = kmalloc(shost->transportt->host_size,
+					 GFP_KERNEL)) == NULL)
+		goto out_del_classdev;
 
 	if (shost->transportt->create_work_queue) {
-		snprintf(shost->work_q_name, sizeof(shost->work_q_name),
-			 "scsi_wq_%d", shost->host_no);
-		shost->work_q = alloc_workqueue("%s",
-			WQ_SYSFS | __WQ_LEGACY | WQ_MEM_RECLAIM | WQ_UNBOUND,
-			1, shost->work_q_name);
-
-		if (!shost->work_q) {
-			error = -EINVAL;
-			goto out_del_dev;
-		}
+		snprintf(shost->work_q_name, KOBJ_NAME_LEN, "scsi_wq_%d",
+			shost->host_no);
+		shost->work_q = create_singlethread_workqueue(
+					shost->work_q_name);
+		if (!shost->work_q)
+			goto out_free_shost_data;
 	}
 
 	error = scsi_sysfs_add_host(shost);
 	if (error)
-		goto out_del_dev;
+		goto out_destroy_host;
 
 	scsi_proc_host_add(shost);
-	scsi_autopm_put_host(shost);
 	return error;
 
-	/*
-	 * Any host allocation in this function will be freed in
-	 * scsi_host_dev_release().
-	 */
- out_del_dev:
-	device_del(&shost->shost_dev);
+ out_destroy_host:
+	if (shost->work_q)
+		destroy_workqueue(shost->work_q);
+ out_free_shost_data:
+	kfree(shost->shost_data);
+ out_del_classdev:
+	class_device_del(&shost->shost_classdev);
  out_del_gendev:
-	/*
-	 * Host state is SHOST_RUNNING so we have to explicitly release
-	 * ->shost_dev.
-	 */
-	put_device(&shost->shost_dev);
 	device_del(&shost->shost_gendev);
- out_disable_runtime_pm:
-	device_disable_async_suspend(&shost->shost_gendev);
-	pm_runtime_disable(&shost->shost_gendev);
-	pm_runtime_set_suspended(&shost->shost_gendev);
-	pm_runtime_put_noidle(&shost->shost_gendev);
- fail:
+ out:
 	return error;
 }
-EXPORT_SYMBOL(scsi_add_host_with_dma);
+EXPORT_SYMBOL(scsi_add_host);
 
 static void scsi_host_dev_release(struct device *dev)
 {
 	struct Scsi_Host *shost = dev_to_shost(dev);
 	struct device *parent = dev->parent;
 
-	scsi_proc_hostdir_rm(shost->hostt);
+	if (shost->ehandler) {
+		DECLARE_COMPLETION(sem);
+		shost->eh_notify = &sem;
+		shost->eh_kill = 1;
+		up(shost->eh_wait);
+		wait_for_completion(&sem);
+		shost->eh_notify = NULL;
+	}
 
-	/* Wait for functions invoked through call_rcu(&scmd->rcu, ...) */
-	rcu_barrier();
-
-	if (shost->tmf_work_q)
-		destroy_workqueue(shost->tmf_work_q);
-	if (shost->ehandler)
-		kthread_stop(shost->ehandler);
 	if (shost->work_q)
 		destroy_workqueue(shost->work_q);
 
-	if (shost->shost_state == SHOST_CREATED) {
-		/*
-		 * Free the shost_dev device name here if scsi_host_alloc()
-		 * and scsi_host_put() have been called but neither
-		 * scsi_host_add() nor scsi_host_remove() has been called.
-		 * This avoids that the memory allocated for the shost_dev
-		 * name is leaked.
-		 */
-		kfree(dev_name(&shost->shost_dev));
-	}
-
-	if (shost->tag_set.tags)
-		scsi_mq_destroy_tags(shost);
-
+	scsi_proc_hostdir_rm(shost->hostt);
+	scsi_destroy_command_freelist(shost);
 	kfree(shost->shost_data);
 
-	ida_free(&host_index_ida, shost->host_no);
-
-	if (shost->shost_state != SHOST_CREATED)
+	/*
+	 * Some drivers (eg aha1542) do scsi_register()/scsi_unregister()
+	 * during probing without performing a scsi_set_device() in between.
+	 * In this case dev->parent is NULL.
+	 */
+	if (parent)
 		put_device(parent);
 	kfree(shost);
 }
-
-static struct device_type scsi_host_type = {
-	.name =		"scsi_host",
-	.release =	scsi_host_dev_release,
-};
 
 /**
  * scsi_host_alloc - register a scsi host adapter instance.
@@ -383,30 +206,40 @@ static struct device_type scsi_host_type = {
 struct Scsi_Host *scsi_host_alloc(struct scsi_host_template *sht, int privsize)
 {
 	struct Scsi_Host *shost;
-	int index;
+	int gfp_mask = GFP_KERNEL, rval;
+	DECLARE_COMPLETION(complete);
 
-	shost = kzalloc(sizeof(struct Scsi_Host) + privsize, GFP_KERNEL);
+	if (sht->unchecked_isa_dma && privsize)
+		gfp_mask |= __GFP_DMA;
+
+        /* Check to see if this host has any error handling facilities */
+        if (!sht->eh_strategy_handler && !sht->eh_abort_handler &&
+	    !sht->eh_device_reset_handler && !sht->eh_bus_reset_handler &&
+            !sht->eh_host_reset_handler) {
+		printk(KERN_ERR "ERROR: SCSI host `%s' has no error handling\n"
+				"ERROR: This is not a safe way to run your "
+				        "SCSI host\n"
+				"ERROR: The error handling must be added to "
+				"this driver\n", sht->proc_name);
+		dump_stack();
+        }
+
+	shost = kmalloc(sizeof(struct Scsi_Host) + privsize, gfp_mask);
 	if (!shost)
 		return NULL;
+	memset(shost, 0, sizeof(struct Scsi_Host) + privsize);
 
-	shost->host_lock = &shost->default_lock;
-	spin_lock_init(shost->host_lock);
-	shost->shost_state = SHOST_CREATED;
+	spin_lock_init(&shost->default_lock);
+	scsi_assign_lock(shost, &shost->default_lock);
 	INIT_LIST_HEAD(&shost->__devices);
 	INIT_LIST_HEAD(&shost->__targets);
-	INIT_LIST_HEAD(&shost->eh_abort_list);
 	INIT_LIST_HEAD(&shost->eh_cmd_q);
 	INIT_LIST_HEAD(&shost->starved_list);
 	init_waitqueue_head(&shost->host_wait);
-	mutex_init(&shost->scan_mutex);
 
-	index = ida_alloc(&host_index_ida, GFP_KERNEL);
-	if (index < 0) {
-		kfree(shost);
-		return NULL;
-	}
-	shost->host_no = index;
+	init_MUTEX(&shost->scan_mutex);
 
+	shost->host_no = scsi_host_next_hn++; /* XXX(hch): still racy */
 	shost->dma_channel = 0xff;
 
 	/* These three are default values which can be overridden */
@@ -428,26 +261,19 @@ struct Scsi_Host *scsi_host_alloc(struct scsi_host_template *sht, int privsize)
 	shost->this_id = sht->this_id;
 	shost->can_queue = sht->can_queue;
 	shost->sg_tablesize = sht->sg_tablesize;
-	shost->sg_prot_tablesize = sht->sg_prot_tablesize;
 	shost->cmd_per_lun = sht->cmd_per_lun;
-	shost->no_write_same = sht->no_write_same;
-	shost->host_tagset = sht->host_tagset;
+	shost->unchecked_isa_dma = sht->unchecked_isa_dma;
+	shost->use_clustering = sht->use_clustering;
+	shost->ordered_flush = sht->ordered_flush;
+	shost->ordered_tag = sht->ordered_tag;
 
-	if (shost_eh_deadline == -1 || !sht->eh_host_reset_handler)
-		shost->eh_deadline = -1;
-	else if ((ulong) shost_eh_deadline * HZ > INT_MAX) {
-		shost_printk(KERN_WARNING, shost,
-			     "eh_deadline %u too large, setting to %u\n",
-			     shost_eh_deadline, INT_MAX / HZ);
-		shost->eh_deadline = INT_MAX;
-	} else
-		shost->eh_deadline = shost_eh_deadline * HZ;
-
-	if (sht->supported_mode == MODE_UNKNOWN)
-		/* means we didn't set it ... default to INITIATOR */
-		shost->active_mode = MODE_INITIATOR;
-	else
-		shost->active_mode = sht->supported_mode;
+	/*
+	 * hosts/devices that do queueing must support ordered tags
+	 */
+	if (shost->can_queue > 1 && shost->ordered_flush) {
+		printk(KERN_ERR "scsi: ordered flushes don't support queueing\n");
+		shost->ordered_flush = 0;
+	}
 
 	if (sht->max_host_blocked)
 		shost->max_host_blocked = sht->max_host_blocked;
@@ -463,11 +289,6 @@ struct Scsi_Host *scsi_host_alloc(struct scsi_host_template *sht, int privsize)
 	else
 		shost->max_sectors = SCSI_DEFAULT_MAX_SECTORS;
 
-	if (sht->max_segment_size)
-		shost->max_segment_size = sht->max_segment_size;
-	else
-		shost->max_segment_size = BLK_MAX_SEGMENT_SIZE;
-
 	/*
 	 * assume a 4GB boundary, if not set
 	 */
@@ -476,84 +297,86 @@ struct Scsi_Host *scsi_host_alloc(struct scsi_host_template *sht, int privsize)
 	else
 		shost->dma_boundary = 0xffffffff;
 
-	if (sht->virt_boundary_mask)
-		shost->virt_boundary_mask = sht->virt_boundary_mask;
+	rval = scsi_setup_command_freelist(shost);
+	if (rval)
+		goto fail_kfree;
 
 	device_initialize(&shost->shost_gendev);
-	dev_set_name(&shost->shost_gendev, "host%d", shost->host_no);
-	shost->shost_gendev.bus = &scsi_bus_type;
-	shost->shost_gendev.type = &scsi_host_type;
-	scsi_enable_async_suspend(&shost->shost_gendev);
+	snprintf(shost->shost_gendev.bus_id, BUS_ID_SIZE, "host%d",
+		shost->host_no);
+	shost->shost_gendev.release = scsi_host_dev_release;
 
-	device_initialize(&shost->shost_dev);
-	shost->shost_dev.parent = &shost->shost_gendev;
-	shost->shost_dev.class = &shost_class;
-	dev_set_name(&shost->shost_dev, "host%d", shost->host_no);
-	shost->shost_dev.groups = sht->shost_groups;
+	class_device_initialize(&shost->shost_classdev);
+	shost->shost_classdev.dev = &shost->shost_gendev;
+	shost->shost_classdev.class = &shost_class;
+	snprintf(shost->shost_classdev.class_id, BUS_ID_SIZE, "host%d",
+		  shost->host_no);
 
-	shost->ehandler = kthread_run(scsi_error_handler, shost,
-			"scsi_eh_%d", shost->host_no);
-	if (IS_ERR(shost->ehandler)) {
-		shost_printk(KERN_WARNING, shost,
-			"error handler thread failed to spawn, error = %ld\n",
-			PTR_ERR(shost->ehandler));
-		shost->ehandler = NULL;
-		goto fail;
-	}
+	shost->eh_notify = &complete;
+	rval = kernel_thread(scsi_error_handler, shost, 0);
+	if (rval < 0)
+		goto fail_destroy_freelist;
+	wait_for_completion(&complete);
+	shost->eh_notify = NULL;
 
-	shost->tmf_work_q = alloc_workqueue("scsi_tmf_%d",
-					WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_SYSFS,
-					   1, shost->host_no);
-	if (!shost->tmf_work_q) {
-		shost_printk(KERN_WARNING, shost,
-			     "failed to create tmf workq\n");
-		goto fail;
-	}
 	scsi_proc_hostdir_add(shost->hostt);
 	return shost;
- fail:
-	/*
-	 * Host state is still SHOST_CREATED and that is enough to release
-	 * ->shost_gendev. scsi_host_dev_release() will free
-	 * dev_name(&shost->shost_dev).
-	 */
-	put_device(&shost->shost_gendev);
 
+ fail_destroy_freelist:
+	scsi_destroy_command_freelist(shost);
+ fail_kfree:
+	kfree(shost);
 	return NULL;
 }
 EXPORT_SYMBOL(scsi_host_alloc);
 
-static int __scsi_host_match(struct device *dev, const void *data)
+struct Scsi_Host *scsi_register(struct scsi_host_template *sht, int privsize)
 {
-	struct Scsi_Host *p;
-	const unsigned short *hostnum = data;
+	struct Scsi_Host *shost = scsi_host_alloc(sht, privsize);
 
-	p = class_to_shost(dev);
-	return p->host_no == *hostnum;
+	if (!sht->detect) {
+		printk(KERN_WARNING "scsi_register() called on new-style "
+				    "template for driver %s\n", sht->name);
+		dump_stack();
+	}
+
+	if (shost)
+		list_add_tail(&shost->sht_legacy_list, &sht->legacy_hosts);
+	return shost;
 }
+EXPORT_SYMBOL(scsi_register);
+
+void scsi_unregister(struct Scsi_Host *shost)
+{
+	list_del(&shost->sht_legacy_list);
+	scsi_host_put(shost);
+}
+EXPORT_SYMBOL(scsi_unregister);
 
 /**
  * scsi_host_lookup - get a reference to a Scsi_Host by host no
+ *
  * @hostnum:	host number to locate
  *
  * Return value:
  *	A pointer to located Scsi_Host or NULL.
- *
- *	The caller must do a scsi_host_put() to drop the reference
- *	that scsi_host_get() took. The put_device() below dropped
- *	the reference from class_find_device().
  **/
 struct Scsi_Host *scsi_host_lookup(unsigned short hostnum)
 {
-	struct device *cdev;
-	struct Scsi_Host *shost = NULL;
+	struct class *class = &shost_class;
+	struct class_device *cdev;
+	struct Scsi_Host *shost = ERR_PTR(-ENXIO), *p;
 
-	cdev = class_find_device(&shost_class, NULL, &hostnum,
-				 __scsi_host_match);
-	if (cdev) {
-		shost = scsi_host_get(class_to_shost(cdev));
-		put_device(cdev);
+	down_read(&class->subsys.rwsem);
+	list_for_each_entry(cdev, &class->children, node) {
+		p = class_to_shost(cdev);
+		if (p->host_no == hostnum) {
+			shost = scsi_host_get(p);
+			break;
+		}
 	}
+	up_read(&class->subsys.rwsem);
+
 	return shost;
 }
 EXPORT_SYMBOL(scsi_host_lookup);
@@ -564,37 +387,12 @@ EXPORT_SYMBOL(scsi_host_lookup);
  **/
 struct Scsi_Host *scsi_host_get(struct Scsi_Host *shost)
 {
-	if ((shost->shost_state == SHOST_DEL) ||
+	if (test_bit(SHOST_DEL, &shost->shost_state) ||
 		!get_device(&shost->shost_gendev))
 		return NULL;
 	return shost;
 }
 EXPORT_SYMBOL(scsi_host_get);
-
-static bool scsi_host_check_in_flight(struct request *rq, void *data)
-{
-	int *count = data;
-	struct scsi_cmnd *cmd = blk_mq_rq_to_pdu(rq);
-
-	if (test_bit(SCMD_STATE_INFLIGHT, &cmd->state))
-		(*count)++;
-
-	return true;
-}
-
-/**
- * scsi_host_busy - Return the host busy counter
- * @shost:	Pointer to Scsi_Host to inc.
- **/
-int scsi_host_busy(struct Scsi_Host *shost)
-{
-	int cnt = 0;
-
-	blk_mq_tagset_busy_iter(&shost->tag_set,
-				scsi_host_check_in_flight, &cnt);
-	return cnt;
-}
-EXPORT_SYMBOL(scsi_host_busy);
 
 /**
  * scsi_host_put - dec a Scsi_Host ref count
@@ -614,12 +412,11 @@ int scsi_init_hosts(void)
 void scsi_exit_hosts(void)
 {
 	class_unregister(&shost_class);
-	ida_destroy(&host_index_ida);
 }
 
 int scsi_is_host_device(const struct device *dev)
 {
-	return dev->type == &scsi_host_type;
+	return dev->release == scsi_host_dev_release;
 }
 EXPORT_SYMBOL(scsi_is_host_device);
 
@@ -629,14 +426,12 @@ EXPORT_SYMBOL(scsi_is_host_device);
  * @work:	Work to queue for execution.
  *
  * Return value:
- * 	1 - work queued for execution
- *	0 - work is already queued
- *	-EINVAL - work queue doesn't exist
+ * 	0 on success / != 0 for error
  **/
 int scsi_queue_work(struct Scsi_Host *shost, struct work_struct *work)
 {
 	if (unlikely(!shost->work_q)) {
-		shost_printk(KERN_ERR, shost,
+		printk(KERN_ERR
 			"ERROR: Scsi host '%s' attempted to queue scsi-work, "
 			"when no workqueue created.\n", shost->hostt->name);
 		dump_stack();
@@ -655,7 +450,7 @@ EXPORT_SYMBOL_GPL(scsi_queue_work);
 void scsi_flush_work(struct Scsi_Host *shost)
 {
 	if (!shost->work_q) {
-		shost_printk(KERN_ERR, shost,
+		printk(KERN_ERR
 			"ERROR: Scsi host '%s' attempted to flush scsi-work, "
 			"when no workqueue created.\n", shost->hostt->name);
 		dump_stack();
@@ -665,69 +460,3 @@ void scsi_flush_work(struct Scsi_Host *shost)
 	flush_workqueue(shost->work_q);
 }
 EXPORT_SYMBOL_GPL(scsi_flush_work);
-
-static bool complete_all_cmds_iter(struct request *rq, void *data)
-{
-	struct scsi_cmnd *scmd = blk_mq_rq_to_pdu(rq);
-	enum scsi_host_status status = *(enum scsi_host_status *)data;
-
-	scsi_dma_unmap(scmd);
-	scmd->result = 0;
-	set_host_byte(scmd, status);
-	scsi_done(scmd);
-	return true;
-}
-
-/**
- * scsi_host_complete_all_commands - Terminate all running commands
- * @shost:	Scsi Host on which commands should be terminated
- * @status:	Status to be set for the terminated commands
- *
- * There is no protection against modification of the number
- * of outstanding commands. It is the responsibility of the
- * caller to ensure that concurrent I/O submission and/or
- * completion is stopped when calling this function.
- */
-void scsi_host_complete_all_commands(struct Scsi_Host *shost,
-				     enum scsi_host_status status)
-{
-	blk_mq_tagset_busy_iter(&shost->tag_set, complete_all_cmds_iter,
-				&status);
-}
-EXPORT_SYMBOL_GPL(scsi_host_complete_all_commands);
-
-struct scsi_host_busy_iter_data {
-	bool (*fn)(struct scsi_cmnd *, void *);
-	void *priv;
-};
-
-static bool __scsi_host_busy_iter_fn(struct request *req, void *priv)
-{
-	struct scsi_host_busy_iter_data *iter_data = priv;
-	struct scsi_cmnd *sc = blk_mq_rq_to_pdu(req);
-
-	return iter_data->fn(sc, iter_data->priv);
-}
-
-/**
- * scsi_host_busy_iter - Iterate over all busy commands
- * @shost:	Pointer to Scsi_Host.
- * @fn:		Function to call on each busy command
- * @priv:	Data pointer passed to @fn
- *
- * If locking against concurrent command completions is required
- * ithas to be provided by the caller
- **/
-void scsi_host_busy_iter(struct Scsi_Host *shost,
-			 bool (*fn)(struct scsi_cmnd *, void *),
-			 void *priv)
-{
-	struct scsi_host_busy_iter_data iter_data = {
-		.fn = fn,
-		.priv = priv,
-	};
-
-	blk_mq_tagset_busy_iter(&shost->tag_set, __scsi_host_busy_iter_fn,
-				&iter_data);
-}
-EXPORT_SYMBOL_GPL(scsi_host_busy_iter);

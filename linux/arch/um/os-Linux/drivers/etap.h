@@ -1,12 +1,9 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /* 
- * Copyright (C) 2001 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
+ * Copyright (C) 2001 Jeff Dike (jdike@karaya.com)
+ * Licensed under the GPL
  */
 
-#ifndef __DRIVERS_ETAP_H
-#define __DRIVERS_ETAP_H
-
-#include <net_user.h>
+#include "net_user.h"
 
 struct ethertap_data {
 	char *dev_name;
@@ -16,6 +13,15 @@ struct ethertap_data {
 	void *dev;
 };
 
-extern const struct net_user_info ethertap_user_info;
+extern struct net_user_info ethertap_user_info;
 
-#endif
+/*
+ * Overrides for Emacs so that we follow Linus's tabbing style.
+ * Emacs will notice this stuff at the end of the file and automatically
+ * adjust the settings for this buffer only.  This must remain at the end
+ * of the file.
+ * ---------------------------------------------------------------------------
+ * Local variables:
+ * c-file-style: "linux"
+ * End:
+ */

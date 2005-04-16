@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *	linux/mm/msync.c
  *
@@ -8,40 +7,184 @@
 /*
  * The msync() system call.
  */
-#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/pagemap.h>
 #include <linux/mm.h>
 #include <linux/mman.h>
-#include <linux/file.h>
+#include <linux/hugetlb.h>
 #include <linux/syscalls.h>
-#include <linux/sched.h>
+
+#include <asm/pgtable.h>
+#include <asm/tlbflush.h>
+
+/*
+ * Called with mm->page_table_lock held to protect against other
+ * threads/the swapper from ripping pte's out from under us.
+ */
+
+static void sync_pte_range(struct vm_area_struct *vma, pmd_t *pmd,
+				unsigned long addr, unsigned long end)
+{
+	pte_t *pte;
+
+	pte = pte_offset_map(pmd, addr);
+	do {
+		unsigned long pfn;
+		struct page *page;
+
+		if (!pte_present(*pte))
+			continue;
+		pfn = pte_pfn(*pte);
+		if (!pfn_valid(pfn))
+			continue;
+		page = pfn_to_page(pfn);
+		if (PageReserved(page))
+			continue;
+
+		if (ptep_clear_flush_dirty(vma, addr, pte) ||
+		    page_test_and_clear_dirty(page))
+			set_page_dirty(page);
+	} while (pte++, addr += PAGE_SIZE, addr != end);
+	pte_unmap(pte - 1);
+}
+
+static inline void sync_pmd_range(struct vm_area_struct *vma, pud_t *pud,
+				unsigned long addr, unsigned long end)
+{
+	pmd_t *pmd;
+	unsigned long next;
+
+	pmd = pmd_offset(pud, addr);
+	do {
+		next = pmd_addr_end(addr, end);
+		if (pmd_none_or_clear_bad(pmd))
+			continue;
+		sync_pte_range(vma, pmd, addr, next);
+	} while (pmd++, addr = next, addr != end);
+}
+
+static inline void sync_pud_range(struct vm_area_struct *vma, pgd_t *pgd,
+				unsigned long addr, unsigned long end)
+{
+	pud_t *pud;
+	unsigned long next;
+
+	pud = pud_offset(pgd, addr);
+	do {
+		next = pud_addr_end(addr, end);
+		if (pud_none_or_clear_bad(pud))
+			continue;
+		sync_pmd_range(vma, pud, addr, next);
+	} while (pud++, addr = next, addr != end);
+}
+
+static void sync_page_range(struct vm_area_struct *vma,
+				unsigned long addr, unsigned long end)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	pgd_t *pgd;
+	unsigned long next;
+
+	/* For hugepages we can't go walking the page table normally,
+	 * but that's ok, hugetlbfs is memory based, so we don't need
+	 * to do anything more on an msync() */
+	if (is_vm_hugetlb_page(vma))
+		return;
+
+	BUG_ON(addr >= end);
+	pgd = pgd_offset(mm, addr);
+	flush_cache_range(vma, addr, end);
+	spin_lock(&mm->page_table_lock);
+	do {
+		next = pgd_addr_end(addr, end);
+		if (pgd_none_or_clear_bad(pgd))
+			continue;
+		sync_pud_range(vma, pgd, addr, next);
+	} while (pgd++, addr = next, addr != end);
+	spin_unlock(&mm->page_table_lock);
+}
+
+#ifdef CONFIG_PREEMPT
+static inline void filemap_sync(struct vm_area_struct *vma,
+				unsigned long addr, unsigned long end)
+{
+	const size_t chunk = 64 * 1024;	/* bytes */
+	unsigned long next;
+
+	do {
+		next = addr + chunk;
+		if (next > end || next < addr)
+			next = end;
+		sync_page_range(vma, addr, next);
+		cond_resched();
+	} while (addr = next, addr != end);
+}
+#else
+static inline void filemap_sync(struct vm_area_struct *vma,
+				unsigned long addr, unsigned long end)
+{
+	sync_page_range(vma, addr, end);
+}
+#endif
 
 /*
  * MS_SYNC syncs the entire file - including mappings.
  *
- * MS_ASYNC does not start I/O (it used to, up to 2.5.67).
- * Nor does it marks the relevant pages dirty (it used to up to 2.6.17).
- * Now it doesn't do anything, since dirty pages are properly tracked.
- *
- * The application may now run fsync() to
+ * MS_ASYNC does not start I/O (it used to, up to 2.5.67).  Instead, it just
+ * marks the relevant pages dirty.  The application may now run fsync() to
  * write out the dirty pages and wait on the writeout and check the result.
  * Or the application may run fadvise(FADV_DONTNEED) against the fd to start
  * async writeout immediately.
- * So by _not_ starting I/O in MS_ASYNC we provide complete flexibility to
+ * So my _not_ starting I/O in MS_ASYNC we provide complete flexibility to
  * applications.
  */
-SYSCALL_DEFINE3(msync, unsigned long, start, size_t, len, int, flags)
+static int msync_interval(struct vm_area_struct *vma,
+			unsigned long addr, unsigned long end, int flags)
+{
+	int ret = 0;
+	struct file *file = vma->vm_file;
+
+	if ((flags & MS_INVALIDATE) && (vma->vm_flags & VM_LOCKED))
+		return -EBUSY;
+
+	if (file && (vma->vm_flags & VM_SHARED)) {
+		filemap_sync(vma, addr, end);
+
+		if (flags & MS_SYNC) {
+			struct address_space *mapping = file->f_mapping;
+			int err;
+
+			ret = filemap_fdatawrite(mapping);
+			if (file->f_op && file->f_op->fsync) {
+				/*
+				 * We don't take i_sem here because mmap_sem
+				 * is already held.
+				 */
+				err = file->f_op->fsync(file,file->f_dentry,1);
+				if (err && !ret)
+					ret = err;
+			}
+			err = filemap_fdatawait(mapping);
+			if (!ret)
+				ret = err;
+		}
+	}
+	return ret;
+}
+
+asmlinkage long sys_msync(unsigned long start, size_t len, int flags)
 {
 	unsigned long end;
-	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma;
-	int unmapped_error = 0;
-	int error = -EINVAL;
+	int unmapped_error, error = -EINVAL;
 
-	start = untagged_addr(start);
+	if (flags & MS_SYNC)
+		current->flags |= PF_SYNCWRITE;
 
+	down_read(&current->mm->mmap_sem);
 	if (flags & ~(MS_ASYNC | MS_INVALIDATE | MS_SYNC))
 		goto out;
-	if (offset_in_page(start))
+	if (start & ~PAGE_MASK)
 		goto out;
 	if ((flags & MS_ASYNC) && (flags & MS_SYNC))
 		goto out;
@@ -55,60 +198,39 @@ SYSCALL_DEFINE3(msync, unsigned long, start, size_t, len, int, flags)
 		goto out;
 	/*
 	 * If the interval [start,end) covers some unmapped address ranges,
-	 * just ignore them, but return -ENOMEM at the end. Besides, if the
-	 * flag is MS_ASYNC (w/o MS_INVALIDATE) the result would be -ENOMEM
-	 * anyway and there is nothing left to do, so return immediately.
+	 * just ignore them, but return -ENOMEM at the end.
 	 */
-	mmap_read_lock(mm);
-	vma = find_vma(mm, start);
+	vma = find_vma(current->mm, start);
+	unmapped_error = 0;
 	for (;;) {
-		struct file *file;
-		loff_t fstart, fend;
-
 		/* Still start < end. */
 		error = -ENOMEM;
 		if (!vma)
-			goto out_unlock;
+			goto out;
 		/* Here start < vma->vm_end. */
 		if (start < vma->vm_start) {
-			if (flags == MS_ASYNC)
-				goto out_unlock;
-			start = vma->vm_start;
-			if (start >= end)
-				goto out_unlock;
 			unmapped_error = -ENOMEM;
+			start = vma->vm_start;
 		}
 		/* Here vma->vm_start <= start < vma->vm_end. */
-		if ((flags & MS_INVALIDATE) &&
-				(vma->vm_flags & VM_LOCKED)) {
-			error = -EBUSY;
-			goto out_unlock;
-		}
-		file = vma->vm_file;
-		fstart = (start - vma->vm_start) +
-			 ((loff_t)vma->vm_pgoff << PAGE_SHIFT);
-		fend = fstart + (min(end, vma->vm_end) - start) - 1;
-		start = vma->vm_end;
-		if ((flags & MS_SYNC) && file &&
-				(vma->vm_flags & VM_SHARED)) {
-			get_file(file);
-			mmap_read_unlock(mm);
-			error = vfs_fsync_range(file, fstart, fend, 1);
-			fput(file);
-			if (error || start >= end)
-				goto out;
-			mmap_read_lock(mm);
-			vma = find_vma(mm, start);
-		} else {
-			if (start >= end) {
-				error = 0;
-				goto out_unlock;
+		if (end <= vma->vm_end) {
+			if (start < end) {
+				error = msync_interval(vma, start, end, flags);
+				if (error)
+					goto out;
 			}
-			vma = vma->vm_next;
+			error = unmapped_error;
+			goto out;
 		}
+		/* Here vma->vm_start <= start < vma->vm_end < end. */
+		error = msync_interval(vma, start, vma->vm_end, flags);
+		if (error)
+			goto out;
+		start = vma->vm_end;
+		vma = vma->vm_next;
 	}
-out_unlock:
-	mmap_read_unlock(mm);
 out:
-	return error ? : unmapped_error;
+	up_read(&current->mm->mmap_sem);
+	current->flags &= ~PF_SYNCWRITE;
+	return error;
 }

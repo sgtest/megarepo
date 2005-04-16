@@ -1,5 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
-/*
+/* $Id: idprom.c,v 1.22 1996/11/13 05:09:25 davem Exp $
  * idprom.c: Routines to load the idprom into kernel addresses and
  *           interpret the data contained within.
  *
@@ -7,7 +6,6 @@
  * Sun3/3x models added by David Monro (davidm@psrg.cs.usyd.edu.au)
  */
 
-#include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/types.h>
 #include <linux/init.h>
@@ -18,15 +16,13 @@
 #include <asm/machines.h>  /* Fun with Sun released architectures. */
 
 struct idprom *idprom;
-EXPORT_SYMBOL(idprom);
-
 static struct idprom idprom_buffer;
 
 /* Here is the master table of Sun machines which use some implementation
  * of the Sparc CPU and have a meaningful IDPROM machtype value that we
  * know about.  See asm-sparc/machines.h for empirical constants.
  */
-static struct Sun_Machine_Models Sun_Machines[NUM_SUN_MACHINES] = {
+struct Sun_Machine_Models Sun_Machines[NUM_SUN_MACHINES] = {
 /* First, Sun3's */
     { .name = "Sun 3/160 Series",	.id_machtype = (SM_SUN3 | SM_3_160) },
     { .name = "Sun 3/50",		.id_machtype = (SM_SUN3 | SM_3_50) },
@@ -65,14 +61,12 @@ static void __init display_system_type(unsigned char machtype)
 	for (i = 0; i < NUM_SUN_MACHINES; i++) {
 		if(Sun_Machines[i].id_machtype == machtype) {
 			if (machtype != (SM_SUN4M_OBP | 0x00))
-				pr_info("TYPE: %s\n", Sun_Machines[i].name);
+				printk("TYPE: %s\n", Sun_Machines[i].name);
 			else {
 #if 0
-				char sysname[128];
-
 				prom_getproperty(prom_root_node, "banner-name",
 						 sysname, sizeof(sysname));
-				pr_info("TYPE: %s\n", sysname);
+				printk("TYPE: %s\n", sysname);
 #endif
 			}
 			return;
@@ -128,5 +122,8 @@ void __init idprom_init(void)
 
 	display_system_type(idprom->id_machtype);
 
-	pr_info("Ethernet address: %pM\n", idprom->id_ethaddr);
+	printk("Ethernet address: %x:%x:%x:%x:%x:%x\n",
+		    idprom->id_ethaddr[0], idprom->id_ethaddr[1],
+		    idprom->id_ethaddr[2], idprom->id_ethaddr[3],
+		    idprom->id_ethaddr[4], idprom->id_ethaddr[5]);
 }

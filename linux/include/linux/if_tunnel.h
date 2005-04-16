@@ -1,17 +1,29 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _IF_TUNNEL_H_
 #define _IF_TUNNEL_H_
 
-#include <linux/ip.h>
-#include <linux/in6.h>
-#include <uapi/linux/if_tunnel.h>
-#include <linux/u64_stats_sync.h>
+#define SIOCGETTUNNEL   (SIOCDEVPRIVATE + 0)
+#define SIOCADDTUNNEL   (SIOCDEVPRIVATE + 1)
+#define SIOCDELTUNNEL   (SIOCDEVPRIVATE + 2)
+#define SIOCCHGTUNNEL   (SIOCDEVPRIVATE + 3)
 
-/*
- * Locking : hash tables are protected by RCU and RTNL
- */
+#define GRE_CSUM	__constant_htons(0x8000)
+#define GRE_ROUTING	__constant_htons(0x4000)
+#define GRE_KEY		__constant_htons(0x2000)
+#define GRE_SEQ		__constant_htons(0x1000)
+#define GRE_STRICT	__constant_htons(0x0800)
+#define GRE_REC		__constant_htons(0x0700)
+#define GRE_FLAGS	__constant_htons(0x00F8)
+#define GRE_VERSION	__constant_htons(0x0007)
 
-#define for_each_ip_tunnel_rcu(pos, start) \
-	for (pos = rcu_dereference(start); pos; pos = rcu_dereference(pos->next))
+struct ip_tunnel_parm
+{
+	char			name[IFNAMSIZ];
+	int			link;
+	__u16			i_flags;
+	__u16			o_flags;
+	__u32			i_key;
+	__u32			o_key;
+	struct iphdr		iph;
+};
 
 #endif /* _IF_TUNNEL_H_ */

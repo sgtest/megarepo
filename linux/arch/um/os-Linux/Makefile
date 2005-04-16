@@ -1,21 +1,13 @@
-# SPDX-License-Identifier: GPL-2.0
 # 
-# Copyright (C) 2000 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
+# Copyright (C) 2000 Jeff Dike (jdike@karaya.com)
+# Licensed under the GPL
 #
 
-# Don't instrument UML-specific code
-KCOV_INSTRUMENT                := n
+obj-y = elf_aux.o file.o process.o signal.o time.o tty.o user_syms.o drivers/ \
+	sys-$(SUBARCH)/
 
-obj-y = execvp.o file.o helper.o irq.o main.o mem.o process.o \
-	registers.o sigio.o signal.o start_up.o time.o tty.o \
-	umid.o user_syms.o util.o drivers/ skas/
+USER_OBJS := elf_aux.o file.o process.o signal.o time.o tty.o
 
-CFLAGS_signal.o += -Wframe-larger-than=4096
-
-obj-$(CONFIG_ARCH_REUSE_HOST_VSYSCALL_AREA) += elf_aux.o
-
-USER_OBJS := $(user-objs-y) elf_aux.o execvp.o file.o helper.o irq.o \
-	main.o mem.o process.o registers.o sigio.o signal.o start_up.o time.o \
-	tty.o umid.o util.o
+CFLAGS_user_syms.o += -DSUBARCH_$(SUBARCH)
 
 include arch/um/scripts/Makefile.rules

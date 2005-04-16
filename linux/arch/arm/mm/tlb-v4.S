@@ -1,8 +1,11 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  *  linux/arch/arm/mm/tlbv4.S
  *
  *  Copyright (C) 1997-2002 Russell King
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  *
  *  ARM architecture version 4 TLB handling functions.
  *  These assume a split I/D TLBs, and no write buffer.
@@ -11,8 +14,7 @@
  */
 #include <linux/linkage.h>
 #include <linux/init.h>
-#include <asm/assembler.h>
-#include <asm/asm-offsets.h>
+#include <asm/constants.h>
 #include <asm/tlbflush.h>
 #include "proc-macros.S"
 
@@ -31,7 +33,7 @@ ENTRY(v4_flush_user_tlb_range)
 	vma_vm_mm ip, r2
 	act_mm	r3				@ get current->active_mm
 	eors	r3, ip, r3				@ == mm ?
-	retne	lr				@ no, we dont do anything
+	movne	pc, lr				@ no, we dont do anything
 .v4_flush_kern_tlb_range:
 	bic	r0, r0, #0x0ff
 	bic	r0, r0, #0xf00
@@ -39,7 +41,7 @@ ENTRY(v4_flush_user_tlb_range)
 	add	r0, r0, #PAGE_SZ
 	cmp	r0, r1
 	blo	1b
-	ret	lr
+	mov	pc, lr
 
 /*
  *	v4_flush_kern_tlb_range(start, end)
@@ -55,5 +57,9 @@ ENTRY(v4_flush_user_tlb_range)
 
 	__INITDATA
 
-	/* define struct cpu_tlb_fns (see <asm/tlbflush.h> and proc-macros.S) */
-	define_tlb_functions v4, v4_tlb_flags
+	.type	v4_tlb_fns, #object
+ENTRY(v4_tlb_fns)
+	.long	v4_flush_user_tlb_range
+	.long	v4_flush_kern_tlb_range
+	.long	v4_tlb_flags
+	.size	v4_tlb_fns, . - v4_tlb_fns

@@ -1,6 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0+
-/*
- * Driver for Lexar "Jumpshot" Compact Flash reader
+/* Driver for Lexar "Jumpshot" Compact Flash reader
+ *
+ * $Id: jumpshot.c,v 1.7 2002/02/25 00:40:13 mdharm Exp $
  *
  * jumpshot driver v0.1:
  *
@@ -20,6 +20,20 @@
  * Developed with the assistance of:
  *
  *   (C) 2002 Alan Stern <stern@rowland.org>
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation; either version 2, or (at your option) any
+ * later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc.,
+ * 675 Mass Ave, Cambridge, MA 02139, USA.
  */
  
  /*
@@ -33,8 +47,8 @@
   * in that routine.
   */
 
+#include <linux/sched.h>
 #include <linux/errno.h>
-#include <linux/module.h>
 #include <linux/slab.h>
 
 #include <scsi/scsi.h>
@@ -44,63 +58,8 @@
 #include "transport.h"
 #include "protocol.h"
 #include "debug.h"
-#include "scsiglue.h"
+#include "jumpshot.h"
 
-#define DRV_NAME "ums-jumpshot"
-
-MODULE_DESCRIPTION("Driver for Lexar \"Jumpshot\" Compact Flash reader");
-MODULE_AUTHOR("Jimmie Mayfield <mayfield+usb@sackheads.org>");
-MODULE_LICENSE("GPL");
-MODULE_IMPORT_NS(USB_STORAGE);
-
-/*
- * The table of devices
- */
-#define UNUSUAL_DEV(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax, \
-		    vendorName, productName, useProtocol, useTransport, \
-		    initFunction, flags) \
-{ USB_DEVICE_VER(id_vendor, id_product, bcdDeviceMin, bcdDeviceMax), \
-  .driver_info = (flags) }
-
-static struct usb_device_id jumpshot_usb_ids[] = {
-#	include "unusual_jumpshot.h"
-	{ }		/* Terminating entry */
-};
-MODULE_DEVICE_TABLE(usb, jumpshot_usb_ids);
-
-#undef UNUSUAL_DEV
-
-/*
- * The flags table
- */
-#define UNUSUAL_DEV(idVendor, idProduct, bcdDeviceMin, bcdDeviceMax, \
-		    vendor_name, product_name, use_protocol, use_transport, \
-		    init_function, Flags) \
-{ \
-	.vendorName = vendor_name,	\
-	.productName = product_name,	\
-	.useProtocol = use_protocol,	\
-	.useTransport = use_transport,	\
-	.initFunction = init_function,	\
-}
-
-static struct us_unusual_dev jumpshot_unusual_dev_list[] = {
-#	include "unusual_jumpshot.h"
-	{ }		/* Terminating entry */
-};
-
-#undef UNUSUAL_DEV
-
-
-struct jumpshot_info {
-   unsigned long   sectors;     /* total sector count */
-   unsigned long   ssize;       /* sector size in bytes */
-
-   /* the following aren't used yet */
-   unsigned char   sense_key;
-   unsigned long   sense_asc;   /* additional sense code */
-   unsigned long   sense_ascq;  /* additional sense code qualifier */
-};
 
 static inline int jumpshot_bulk_read(struct us_data *us,
 				     unsigned char *data, 
@@ -109,7 +68,7 @@ static inline int jumpshot_bulk_read(struct us_data *us,
 	if (len == 0)
 		return USB_STOR_XFER_GOOD;
 
-	usb_stor_dbg(us, "len = %d\n", len);
+	US_DEBUGP("jumpshot_bulk_read:  len = %d\n", len);
 	return usb_stor_bulk_transfer_buf(us, us->recv_bulk_pipe,
 			data, len, NULL);
 }
@@ -122,7 +81,7 @@ static inline int jumpshot_bulk_write(struct us_data *us,
 	if (len == 0)
 		return USB_STOR_XFER_GOOD;
 
-	usb_stor_dbg(us, "len = %d\n", len);
+	US_DEBUGP("jumpshot_bulk_write:  len = %d\n", len);
 	return usb_stor_bulk_transfer_buf(us, us->send_bulk_pipe,
 			data, len, NULL);
 }
@@ -143,7 +102,8 @@ static int jumpshot_get_status(struct us_data  *us)
 		return USB_STOR_TRANSPORT_ERROR;
 
 	if (us->iobuf[0] != 0x50) {
-		usb_stor_dbg(us, "0x%2x\n", us->iobuf[0]);
+		US_DEBUGP("jumpshot_get_status:  0x%2x\n",
+			  us->iobuf[0]);
 		return USB_STOR_TRANSPORT_ERROR;
 	}
 
@@ -160,8 +120,7 @@ static int jumpshot_read_data(struct us_data *us,
 	unsigned char  thistime;
 	unsigned int totallen, alloclen;
 	int len, result;
-	unsigned int sg_offset = 0;
-	struct scatterlist *sg = NULL;
+	unsigned int sg_idx = 0, sg_offset = 0;
 
 	// we're working in LBA mode.  according to the ATA spec, 
 	// we can support up to 28-bit addressing.  I don't know if Jumpshot
@@ -208,11 +167,11 @@ static int jumpshot_read_data(struct us_data *us,
 		if (result != USB_STOR_XFER_GOOD)
 			goto leave;
 
-		usb_stor_dbg(us, "%d bytes\n", len);
+		US_DEBUGP("jumpshot_read_data:  %d bytes\n", len);
 
 		// Store the data in the transfer buffer
 		usb_stor_access_xfer_buf(buffer, len, us->srb,
-				 &sg, &sg_offset, TO_XFER_BUF);
+				 &sg_idx, &sg_offset, TO_XFER_BUF);
 
 		sector += thistime;
 		totallen -= len;
@@ -237,8 +196,7 @@ static int jumpshot_write_data(struct us_data *us,
 	unsigned char  thistime;
 	unsigned int totallen, alloclen;
 	int len, result, waitcount;
-	unsigned int sg_offset = 0;
-	struct scatterlist *sg = NULL;
+	unsigned int sg_idx = 0, sg_offset = 0;
 
 	// we're working in LBA mode.  according to the ATA spec, 
 	// we can support up to 28-bit addressing.  I don't know if Jumpshot
@@ -268,7 +226,7 @@ static int jumpshot_write_data(struct us_data *us,
 
 		// Get the data from the transfer buffer
 		usb_stor_access_xfer_buf(buffer, len, us->srb,
-				&sg, &sg_offset, FROM_XFER_BUF);
+				&sg_idx, &sg_offset, FROM_XFER_BUF);
 
 		command[0] = 0;
 		command[1] = thistime;
@@ -304,7 +262,7 @@ static int jumpshot_write_data(struct us_data *us,
 		} while ((result != USB_STOR_TRANSPORT_GOOD) && (waitcount < 10));
 
 		if (result != USB_STOR_TRANSPORT_GOOD)
-			usb_stor_dbg(us, "Gah!  Waitcount = 10.  Bad write!?\n");
+			US_DEBUGP("jumpshot_write_data:  Gah!  Waitcount = 10.  Bad write!?\n");
 
 		sector += thistime;
 		totallen -= len;
@@ -325,7 +283,7 @@ static int jumpshot_id_device(struct us_data *us,
 	unsigned char *reply;
 	int 	 rc;
 
-	if (!info)
+	if (!us || !info)
 		return USB_STOR_TRANSPORT_ERROR;
 
 	command[0] = 0xE0;
@@ -339,7 +297,8 @@ static int jumpshot_id_device(struct us_data *us,
 				   0, 0x20, 0, 6, command, 2);
 
 	if (rc != USB_STOR_XFER_GOOD) {
-		usb_stor_dbg(us, "Gah! send_control for read_capacity failed\n");
+		US_DEBUGP("jumpshot_id_device:  Gah! "
+			  "send_control for read_capacity failed\n");
 		rc = USB_STOR_TRANSPORT_ERROR;
 		goto leave;
 	}
@@ -389,17 +348,17 @@ static int jumpshot_handle_mode_sense(struct us_data *us,
 
 	switch (pc) {
 	   case 0x0:
-		   usb_stor_dbg(us, "Current values\n");
-		   break;
+		US_DEBUGP("jumpshot_handle_mode_sense:  Current values\n");
+		break;
 	   case 0x1:
-		   usb_stor_dbg(us, "Changeable values\n");
-		   break;
+		US_DEBUGP("jumpshot_handle_mode_sense:  Changeable values\n");
+		break;
 	   case 0x2:
-		   usb_stor_dbg(us, "Default values\n");
-		   break;
+		US_DEBUGP("jumpshot_handle_mode_sense:  Default values\n");
+		break;
 	   case 0x3:
-		   usb_stor_dbg(us, "Saves values\n");
-		   break;
+		US_DEBUGP("jumpshot_handle_mode_sense:  Saves values\n");
+		break;
 	}
 
 	memset(ptr, 0, 8);
@@ -471,7 +430,7 @@ static void jumpshot_info_destructor(void *extra)
 
 // Transport for the Lexar 'Jumpshot'
 //
-static int jumpshot_transport(struct scsi_cmnd *srb, struct us_data *us)
+int jumpshot_transport(struct scsi_cmnd * srb, struct us_data *us)
 {
 	struct jumpshot_info *info;
 	int rc;
@@ -482,17 +441,19 @@ static int jumpshot_transport(struct scsi_cmnd *srb, struct us_data *us)
 	};
 
 	if (!us->extra) {
-		us->extra = kzalloc(sizeof(struct jumpshot_info), GFP_NOIO);
-		if (!us->extra)
+		us->extra = kmalloc(sizeof(struct jumpshot_info), GFP_NOIO);
+		if (!us->extra) {
+			US_DEBUGP("jumpshot_transport:  Gah! Can't allocate storage for jumpshot info struct!\n");
 			return USB_STOR_TRANSPORT_ERROR;
-
+		}
+		memset(us->extra, 0, sizeof(struct jumpshot_info));
 		us->extra_destructor = jumpshot_info_destructor;
 	}
 
 	info = (struct jumpshot_info *) (us->extra);
 
 	if (srb->cmnd[0] == INQUIRY) {
-		usb_stor_dbg(us, "INQUIRY - Returning bogus response\n");
+		US_DEBUGP("jumpshot_transport:  INQUIRY.  Returning bogus response.\n");
 		memcpy(ptr, inquiry_response, sizeof(inquiry_response));
 		fill_inquiry_response(us, ptr, 36);
 		return USB_STOR_TRANSPORT_GOOD;
@@ -509,8 +470,8 @@ static int jumpshot_transport(struct scsi_cmnd *srb, struct us_data *us)
 		if (rc != USB_STOR_TRANSPORT_GOOD)
 			return rc;
 
-		usb_stor_dbg(us, "READ_CAPACITY:  %ld sectors, %ld bytes per sector\n",
-			     info->sectors, info->ssize);
+		US_DEBUGP("jumpshot_transport:  READ_CAPACITY:  %ld sectors, %ld bytes per sector\n",
+			  info->sectors, info->ssize);
 
 		// build the reply
 		//
@@ -522,7 +483,7 @@ static int jumpshot_transport(struct scsi_cmnd *srb, struct us_data *us)
 	}
 
 	if (srb->cmnd[0] == MODE_SELECT_10) {
-		usb_stor_dbg(us, "Gah! MODE_SELECT_10\n");
+		US_DEBUGP("jumpshot_transport:  Gah! MODE_SELECT_10.\n");
 		return USB_STOR_TRANSPORT_ERROR;
 	}
 
@@ -532,8 +493,7 @@ static int jumpshot_transport(struct scsi_cmnd *srb, struct us_data *us)
 
 		blocks = ((u32)(srb->cmnd[7]) << 8) | ((u32)(srb->cmnd[8]));
 
-		usb_stor_dbg(us, "READ_10: read block 0x%04lx  count %ld\n",
-			     block, blocks);
+		US_DEBUGP("jumpshot_transport:  READ_10: read block 0x%04lx  count %ld\n", block, blocks);
 		return jumpshot_read_data(us, info, block, blocks);
 	}
 
@@ -546,8 +506,7 @@ static int jumpshot_transport(struct scsi_cmnd *srb, struct us_data *us)
 		blocks = ((u32)(srb->cmnd[6]) << 24) | ((u32)(srb->cmnd[7]) << 16) |
 			 ((u32)(srb->cmnd[8]) <<  8) | ((u32)(srb->cmnd[9]));
 
-		usb_stor_dbg(us, "READ_12: read block 0x%04lx  count %ld\n",
-			     block, blocks);
+		US_DEBUGP("jumpshot_transport:  READ_12: read block 0x%04lx  count %ld\n", block, blocks);
 		return jumpshot_read_data(us, info, block, blocks);
 	}
 
@@ -557,8 +516,7 @@ static int jumpshot_transport(struct scsi_cmnd *srb, struct us_data *us)
 
 		blocks = ((u32)(srb->cmnd[7]) << 8) | ((u32)(srb->cmnd[8]));
 
-		usb_stor_dbg(us, "WRITE_10: write block 0x%04lx  count %ld\n",
-			     block, blocks);
+		US_DEBUGP("jumpshot_transport:  WRITE_10: write block 0x%04lx  count %ld\n", block, blocks);
 		return jumpshot_write_data(us, info, block, blocks);
 	}
 
@@ -571,19 +529,18 @@ static int jumpshot_transport(struct scsi_cmnd *srb, struct us_data *us)
 		blocks = ((u32)(srb->cmnd[6]) << 24) | ((u32)(srb->cmnd[7]) << 16) |
 			 ((u32)(srb->cmnd[8]) <<  8) | ((u32)(srb->cmnd[9]));
 
-		usb_stor_dbg(us, "WRITE_12: write block 0x%04lx  count %ld\n",
-			     block, blocks);
+		US_DEBUGP("jumpshot_transport:  WRITE_12: write block 0x%04lx  count %ld\n", block, blocks);
 		return jumpshot_write_data(us, info, block, blocks);
 	}
 
 
 	if (srb->cmnd[0] == TEST_UNIT_READY) {
-		usb_stor_dbg(us, "TEST_UNIT_READY\n");
+		US_DEBUGP("jumpshot_transport:  TEST_UNIT_READY.\n");
 		return jumpshot_get_status(us);
 	}
 
 	if (srb->cmnd[0] == REQUEST_SENSE) {
-		usb_stor_dbg(us, "REQUEST_SENSE\n");
+		US_DEBUGP("jumpshot_transport:  REQUEST_SENSE.\n");
 
 		memset(ptr, 0, 18);
 		ptr[0] = 0xF0;
@@ -597,33 +554,28 @@ static int jumpshot_transport(struct scsi_cmnd *srb, struct us_data *us)
 	}
 
 	if (srb->cmnd[0] == MODE_SENSE) {
-		usb_stor_dbg(us, "MODE_SENSE_6 detected\n");
+		US_DEBUGP("jumpshot_transport:  MODE_SENSE_6 detected\n");
 		return jumpshot_handle_mode_sense(us, srb, 1);
 	}
 
 	if (srb->cmnd[0] == MODE_SENSE_10) {
-		usb_stor_dbg(us, "MODE_SENSE_10 detected\n");
+		US_DEBUGP("jumpshot_transport:  MODE_SENSE_10 detected\n");
 		return jumpshot_handle_mode_sense(us, srb, 0);
 	}
 
 	if (srb->cmnd[0] == ALLOW_MEDIUM_REMOVAL) {
-		/*
-		 * sure.  whatever.  not like we can stop the user from popping
-		 * the media out of the device (no locking doors, etc)
-		 */
+		// sure.  whatever.  not like we can stop the user from popping
+		// the media out of the device (no locking doors, etc)
+		//
 		return USB_STOR_TRANSPORT_GOOD;
 	}
 
 	if (srb->cmnd[0] == START_STOP) {
-		/*
-		 * this is used by sd.c'check_scsidisk_media_change to detect
-		 * media change
-		 */
-		usb_stor_dbg(us, "START_STOP\n");
-		/*
-		 * the first jumpshot_id_device after a media change returns
-		 * an error (determined experimentally)
-		 */
+		/* this is used by sd.c'check_scsidisk_media_change to detect
+		   media change */
+		US_DEBUGP("jumpshot_transport:  START_STOP.\n");
+		/* the first jumpshot_id_device after a media change returns
+		   an error (determined experimentally) */
 		rc = jumpshot_id_device(us, info);
 		if (rc == USB_STOR_TRANSPORT_GOOD) {
 			info->sense_key = NO_SENSE;
@@ -635,49 +587,10 @@ static int jumpshot_transport(struct scsi_cmnd *srb, struct us_data *us)
 		return rc;
 	}
 
-	usb_stor_dbg(us, "Gah! Unknown command: %d (0x%x)\n",
-		     srb->cmnd[0], srb->cmnd[0]);
+	US_DEBUGP("jumpshot_transport:  Gah! Unknown command: %d (0x%x)\n",
+		  srb->cmnd[0], srb->cmnd[0]);
 	info->sense_key = 0x05;
 	info->sense_asc = 0x20;
 	info->sense_ascq = 0x00;
 	return USB_STOR_TRANSPORT_FAILED;
 }
-
-static struct scsi_host_template jumpshot_host_template;
-
-static int jumpshot_probe(struct usb_interface *intf,
-			 const struct usb_device_id *id)
-{
-	struct us_data *us;
-	int result;
-
-	result = usb_stor_probe1(&us, intf, id,
-			(id - jumpshot_usb_ids) + jumpshot_unusual_dev_list,
-			&jumpshot_host_template);
-	if (result)
-		return result;
-
-	us->transport_name  = "Lexar Jumpshot Control/Bulk";
-	us->transport = jumpshot_transport;
-	us->transport_reset = usb_stor_Bulk_reset;
-	us->max_lun = 1;
-
-	result = usb_stor_probe2(us);
-	return result;
-}
-
-static struct usb_driver jumpshot_driver = {
-	.name =		DRV_NAME,
-	.probe =	jumpshot_probe,
-	.disconnect =	usb_stor_disconnect,
-	.suspend =	usb_stor_suspend,
-	.resume =	usb_stor_resume,
-	.reset_resume =	usb_stor_reset_resume,
-	.pre_reset =	usb_stor_pre_reset,
-	.post_reset =	usb_stor_post_reset,
-	.id_table =	jumpshot_usb_ids,
-	.soft_unbind =	1,
-	.no_dynamic_id = 1,
-};
-
-module_usb_stor_driver(jumpshot_driver, jumpshot_host_template, DRV_NAME);

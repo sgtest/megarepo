@@ -1,10 +1,25 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- *  Copyright (c) by Jaroslav Kysela <perex@perex.cz>
+ *  Copyright (c) by Jaroslav Kysela <perex@suse.cz>
  *  Universal interface for Audio Codec '97
  *
  *  For more details look to AC '97 component specification revision 2.2
  *  by Intel Corporation (http://developer.intel.com).
+ *
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ *
  */
 
 #define AC97_ID_AK4540		0x414b4d00
@@ -37,9 +52,7 @@
 #define AC97_ID_ALC650F		0x414c4723
 #define AC97_ID_ALC655		0x414c4760
 #define AC97_ID_ALC658		0x414c4780
-#define AC97_ID_ALC658D		0x414c4781
 #define AC97_ID_ALC850		0x414c4790
-#define AC97_ID_YMF743		0x594d4800
 #define AC97_ID_YMF753		0x594d4803
 #define AC97_ID_VT1616		0x49434551
 #define AC97_ID_CM9738		0x434d4941
@@ -47,5 +60,3 @@
 #define AC97_ID_CM9761_78	0x434d4978
 #define AC97_ID_CM9761_82	0x434d4982
 #define AC97_ID_CM9761_83	0x434d4983
-#define AC97_ID_ST7597		0x53544d02
-#define AC97_ID_ST_AC97_ID4	0x53544d04

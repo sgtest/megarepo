@@ -3,19 +3,17 @@
  * License.  See the file "COPYING" in the main directory of this archive
  * for more details.
  *
- * Copyright (C) 1996, 1999 by Ralf Baechle
- * Copyright (C) 2011 MIPS Technologies, Inc.
+ * Copyright (c) 1996, 1999 by Ralf Baechle
  */
 #include <linux/errno.h>
 #include <asm/asm.h>
-#include <asm/asm-offsets.h>
-#include <asm/export.h>
+#include <asm/offset.h>
 #include <asm/regdef.h>
 
 #define EX(insn,reg,addr,handler)			\
 9:	insn	reg, addr;				\
 	.section __ex_table,"a";			\
-	PTR_WD	9b, handler;				\
+	PTR	9b, handler;				\
 	.previous
 
 /*
@@ -25,41 +23,36 @@
 
 /*
  * Ugly special case have to check: we might get passed a user space
- * pointer which wraps into the kernel space.  We don't deal with that.	 If
+ * pointer which wraps into the kernel space.  We don't deal with that.  If
  * it happens at most some bytes of the exceptions handlers will be copied.
  */
 
 LEAF(__strncpy_from_user_asm)
-	move		t0, zero
+	LONG_L		v0, TI_ADDR_LIMIT($28)	# pointer ok?
+	and		v0, a1
+	bnez		v0, fault
+
+FEXPORT(__strncpy_from_user_nocheck_asm)
+	move		v0, zero
 	move		v1, a1
-#ifdef CONFIG_EVA
-	.set push
-	.set eva
-1:	EX(lbue, v0, (v1), .Lfault)
-	.set pop
-#else
-1:	EX(lbu, v0, (v1), .Lfault)
-#endif
+	.set		noreorder
+1:	EX(lbu, t0, (v1), fault)
 	PTR_ADDIU	v1, 1
-	R10KCBARRIER(0(ra))
-	sb		v0, (a0)
-	beqz		v0, 2f
-	PTR_ADDIU	t0, 1
-	PTR_ADDIU	a0, 1
-	bne		t0, a2, 1b
-2:	PTR_ADDU	v0, a1, t0
-	xor		v0, a1
-	bltz		v0, .Lfault
-	move		v0, t0
+	beqz		t0, 2f
+	 sb		t0, (a0)
+	PTR_ADDIU	v0, 1
+	bne		v0, a2, 1b
+	 PTR_ADDIU	a0, 1
+	.set		reorder
+2:	PTR_ADDU	t0, a1, v0
+	xor		t0, a1
+	bltz		t0, fault
 	jr		ra			# return n
 	END(__strncpy_from_user_asm)
 
-.Lfault:
-	li		v0, -EFAULT
+fault:	li		v0, -EFAULT
 	jr		ra
 
 	.section	__ex_table,"a"
-	PTR_WD		1b, .Lfault
+	PTR		1b, fault
 	.previous
-
-	EXPORT_SYMBOL(__strncpy_from_user_asm)

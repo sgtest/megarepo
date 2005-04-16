@@ -220,12 +220,12 @@ static struct pi_protocol dstr = {
 
 static int __init dstr_init(void)
 {
-	return paride_register(&dstr);
+	return pi_register(&dstr)-1;
 }
 
 static void __exit dstr_exit(void)
 {
-	paride_unregister(&dstr);
+	pi_unregister(&dstr);
 }
 
 MODULE_LICENSE("GPL");

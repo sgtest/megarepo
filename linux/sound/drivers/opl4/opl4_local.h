@@ -131,7 +131,7 @@
 #define SNDRV_SEQ_DEV_ID_OPL4 "opl4-synth"
 
 
-struct opl4_sound {
+typedef struct opl4_sound {
 	u16 tone;
 	s16 pitch_offset;
 	u8 key_scaling;
@@ -144,92 +144,89 @@ struct opl4_sound {
 	u8 reg_level_decay2;
 	u8 reg_release_correction;
 	u8 reg_tremolo;
-};
+} opl4_sound_t;
 
-struct opl4_region {
+typedef struct opl4_region {
 	u8 key_min, key_max;
-	struct opl4_sound sound;
-};
+	opl4_sound_t sound;
+} opl4_region_t;
 
-struct opl4_region_ptr {
+typedef struct opl4_region_ptr {
 	int count;
-	const struct opl4_region *regions;
-};
+	const opl4_region_t *regions;
+} opl4_region_ptr_t;
 
-struct opl4_voice {
+typedef struct opl4_voice {
 	struct list_head list;
 	int number;
-	struct snd_midi_channel *chan;
+	snd_midi_channel_t *chan;
 	int note;
 	int velocity;
-	const struct opl4_sound *sound;
+	const opl4_sound_t *sound;
 	u8 level_direct;
 	u8 reg_f_number;
 	u8 reg_misc;
 	u8 reg_lfo_vibrato;
-};
+} opl4_voice_t;
 
-struct snd_opl4 {
+struct opl4 {
 	unsigned long fm_port;
 	unsigned long pcm_port;
 	struct resource *res_fm_port;
 	struct resource *res_pcm_port;
 	unsigned short hardware;
 	spinlock_t reg_lock;
-	struct snd_card *card;
+	snd_card_t *card;
 
-#ifdef CONFIG_SND_PROC_FS
-	struct snd_info_entry *proc_entry;
+#ifdef CONFIG_PROC_FS
+	snd_info_entry_t *proc_entry;
 	int memory_access;
 #endif
-	struct mutex access_mutex;
+	struct semaphore access_mutex;
 
-#if IS_ENABLED(CONFIG_SND_SEQUENCER)
+#if defined(CONFIG_SND_SEQUENCER) || defined(CONFIG_SND_SEQUENCER_MODULE)
 	int used;
 
 	int seq_dev_num;
 	int seq_client;
-	struct snd_seq_device *seq_dev;
+	snd_seq_device_t *seq_dev;
 
-	struct snd_midi_channel_set *chset;
-	struct opl4_voice voices[OPL4_MAX_VOICES];
+	snd_midi_channel_set_t *chset;
+	opl4_voice_t voices[OPL4_MAX_VOICES];
 	struct list_head off_voices;
 	struct list_head on_voices;
 #endif
 };
 
 /* opl4_lib.c */
-void snd_opl4_write(struct snd_opl4 *opl4, u8 reg, u8 value);
-u8 snd_opl4_read(struct snd_opl4 *opl4, u8 reg);
-void snd_opl4_read_memory(struct snd_opl4 *opl4, char *buf, int offset, int size);
-void snd_opl4_write_memory(struct snd_opl4 *opl4, const char *buf, int offset, int size);
+void snd_opl4_write(opl4_t *opl4, u8 reg, u8 value);
+u8 snd_opl4_read(opl4_t *opl4, u8 reg);
+void snd_opl4_read_memory(opl4_t *opl4, char *buf, int offset, int size);
+void snd_opl4_write_memory(opl4_t *opl4, const char *buf, int offset, int size);
 
 /* opl4_mixer.c */
-int snd_opl4_create_mixer(struct snd_opl4 *opl4);
+int snd_opl4_create_mixer(opl4_t *opl4);
 
-#ifdef CONFIG_SND_PROC_FS
+#ifdef CONFIG_PROC_FS
 /* opl4_proc.c */
-int snd_opl4_create_proc(struct snd_opl4 *opl4);
-void snd_opl4_free_proc(struct snd_opl4 *opl4);
-#else
-static inline int snd_opl4_create_proc(struct snd_opl4 *opl4) { return 0; }
-static inline void snd_opl4_free_proc(struct snd_opl4 *opl4) {}
+int snd_opl4_create_proc(opl4_t *opl4);
+void snd_opl4_free_proc(opl4_t *opl4);
 #endif
 
 /* opl4_seq.c */
 extern int volume_boost;
 
 /* opl4_synth.c */
-void snd_opl4_synth_reset(struct snd_opl4 *opl4);
-void snd_opl4_synth_shutdown(struct snd_opl4 *opl4);
-void snd_opl4_note_on(void *p, int note, int vel, struct snd_midi_channel *chan);
-void snd_opl4_note_off(void *p, int note, int vel, struct snd_midi_channel *chan);
-void snd_opl4_terminate_note(void *p, int note, struct snd_midi_channel *chan);
-void snd_opl4_control(void *p, int type, struct snd_midi_channel *chan);
-void snd_opl4_sysex(void *p, unsigned char *buf, int len, int parsed, struct snd_midi_channel_set *chset);
+void snd_opl4_synth_reset(opl4_t *opl4);
+void snd_opl4_synth_shutdown(opl4_t *opl4);
+void snd_opl4_note_on(void *p, int note, int vel, snd_midi_channel_t *chan);
+void snd_opl4_note_off(void *p, int note, int vel, snd_midi_channel_t *chan);
+void snd_opl4_terminate_note(void *p, int note, snd_midi_channel_t *chan);
+void snd_opl4_control(void *p, int type, snd_midi_channel_t *chan);
+void snd_opl4_sysex(void *p, unsigned char *buf, int len, int parsed, snd_midi_channel_set_t *chset);
 
 /* yrw801.c */
-int snd_yrw801_detect(struct snd_opl4 *opl4);
-extern const struct opl4_region_ptr snd_yrw801_regions[];
+int snd_yrw801_detect(opl4_t *opl4);
+extern const opl4_region_ptr_t snd_yrw801_regions[];
 
 #endif /* __OPL4_LOCAL_H */

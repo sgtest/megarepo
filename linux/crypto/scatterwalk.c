@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Cryptographic API.
  *
@@ -7,87 +6,110 @@
  * Copyright (c) 2002 James Morris <jmorris@intercode.com.au>
  *               2002 Adam J. Richter <adam@yggdrasil.com>
  *               2004 Jean-Luc Cooke <jlcooke@certainkey.com>
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation; either version 2 of the License, or (at your option)
+ * any later version.
+ *
  */
-
-#include <crypto/scatterwalk.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
-#include <linux/module.h>
-#include <linux/scatterlist.h>
+#include <linux/pagemap.h>
+#include <linux/highmem.h>
+#include <asm/bug.h>
+#include <asm/scatterlist.h>
+#include "internal.h"
+#include "scatterwalk.h"
 
-static inline void memcpy_dir(void *buf, void *sgdata, size_t nbytes, int out)
+enum km_type crypto_km_types[] = {
+	KM_USER0,
+	KM_USER1,
+	KM_SOFTIRQ0,
+	KM_SOFTIRQ1,
+};
+
+static void memcpy_dir(void *buf, void *sgdata, size_t nbytes, int out)
 {
-	void *src = out ? buf : sgdata;
-	void *dst = out ? sgdata : buf;
-
-	memcpy(dst, src, nbytes);
+	if (out)
+		memcpy(sgdata, buf, nbytes);
+	else
+		memcpy(buf, sgdata, nbytes);
 }
 
-void scatterwalk_copychunks(void *buf, struct scatter_walk *walk,
-			    size_t nbytes, int out)
+void scatterwalk_start(struct scatter_walk *walk, struct scatterlist *sg)
 {
-	for (;;) {
-		unsigned int len_this_page = scatterwalk_pagelen(walk);
-		u8 *vaddr;
+	unsigned int rest_of_page;
 
-		if (len_this_page > nbytes)
-			len_this_page = nbytes;
+	walk->sg = sg;
 
-		if (out != 2) {
-			vaddr = scatterwalk_map(walk);
-			memcpy_dir(buf, vaddr, len_this_page, out);
-			scatterwalk_unmap(vaddr);
+	walk->page = sg->page;
+	walk->len_this_segment = sg->length;
+
+	BUG_ON(!sg->length);
+
+	rest_of_page = PAGE_CACHE_SIZE - (sg->offset & (PAGE_CACHE_SIZE - 1));
+	walk->len_this_page = min(sg->length, rest_of_page);
+	walk->offset = sg->offset;
+}
+
+void scatterwalk_map(struct scatter_walk *walk, int out)
+{
+	walk->data = crypto_kmap(walk->page, out) + walk->offset;
+}
+
+static inline void scatterwalk_unmap(struct scatter_walk *walk, int out)
+{
+	/* walk->data may be pointing the first byte of the next page;
+	   however, we know we transfered at least one byte.  So,
+	   walk->data - 1 will be a virtual address in the mapped page. */
+	crypto_kunmap(walk->data - 1, out);
+}
+
+static void scatterwalk_pagedone(struct scatter_walk *walk, int out,
+				 unsigned int more)
+{
+	if (out)
+		flush_dcache_page(walk->page);
+
+	if (more) {
+		walk->len_this_segment -= walk->len_this_page;
+
+		if (walk->len_this_segment) {
+			walk->page++;
+			walk->len_this_page = min(walk->len_this_segment,
+						  (unsigned)PAGE_CACHE_SIZE);
+			walk->offset = 0;
 		}
-
-		scatterwalk_advance(walk, len_this_page);
-
-		if (nbytes == len_this_page)
-			break;
-
-		buf += len_this_page;
-		nbytes -= len_this_page;
-
-		scatterwalk_pagedone(walk, out & 1, 1);
+		else
+			scatterwalk_start(walk, sg_next(walk->sg));
 	}
 }
-EXPORT_SYMBOL_GPL(scatterwalk_copychunks);
 
-void scatterwalk_map_and_copy(void *buf, struct scatterlist *sg,
-			      unsigned int start, unsigned int nbytes, int out)
+void scatterwalk_done(struct scatter_walk *walk, int out, int more)
 {
-	struct scatter_walk walk;
-	struct scatterlist tmp[2];
-
-	if (!nbytes)
-		return;
-
-	sg = scatterwalk_ffwd(tmp, sg, start);
-
-	scatterwalk_start(&walk, sg);
-	scatterwalk_copychunks(buf, &walk, nbytes, out);
-	scatterwalk_done(&walk, out, 0);
+	scatterwalk_unmap(walk, out);
+	if (walk->len_this_page == 0 || !more)
+		scatterwalk_pagedone(walk, out, more);
 }
-EXPORT_SYMBOL_GPL(scatterwalk_map_and_copy);
 
-struct scatterlist *scatterwalk_ffwd(struct scatterlist dst[2],
-				     struct scatterlist *src,
-				     unsigned int len)
+/*
+ * Do not call this unless the total length of all of the fragments
+ * has been verified as multiple of the block size.
+ */
+int scatterwalk_copychunks(void *buf, struct scatter_walk *walk,
+			   size_t nbytes, int out)
 {
-	for (;;) {
-		if (!len)
-			return src;
+	do {
+		memcpy_dir(buf, walk->data, walk->len_this_page, out);
+		buf += walk->len_this_page;
+		nbytes -= walk->len_this_page;
 
-		if (src->length > len)
-			break;
+		scatterwalk_unmap(walk, out);
+		scatterwalk_pagedone(walk, out, 1);
+		scatterwalk_map(walk, out);
+	} while (nbytes > walk->len_this_page);
 
-		len -= src->length;
-		src = sg_next(src);
-	}
-
-	sg_init_table(dst, 2);
-	sg_set_page(dst, sg_page(src), src->length - len, src->offset + len);
-	scatterwalk_crypto_chain(dst, sg_next(src), 2);
-
-	return dst;
+	memcpy_dir(buf, walk->data, nbytes, out);
+	return nbytes;
 }
-EXPORT_SYMBOL_GPL(scatterwalk_ffwd);

@@ -1,12 +1,11 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
- * arch/alpha/lib/dbg_stackcheck.S
+ * arch/alpha/lib/stackcheck.S
  * Contributed by Richard Henderson (rth@tamu.edu)
  *
  * Verify that we have not overflowed the stack.  Oops if we have.
  */
 
-#include <asm/asm-offsets.h>
+#include <asm/asm_offsets.h>
 
 	.text
 	.set noat

@@ -84,7 +84,7 @@
 			the slower the port i/o.  In some cases, setting
 			this to zero will speed up the device. (default -1)
 
-	    major	You may use this parameter to override the
+	    major	You may use this parameter to overide the
 			default major number (97) that this driver
 			will use.  Be sure to change the device
 			name as well.
@@ -130,14 +130,13 @@
 #define PI_PG	4
 #endif
 
-#include <linux/types.h>
 /* Here are things one can override from the insmod command.
    Most are autoprobed by paride unless set here.  Verbose is 0
    by default.
 
 */
 
-static int verbose;
+static int verbose = 0;
 static int major = PG_MAJOR;
 static char *name = PG_NAME;
 static int disable = 0;
@@ -157,18 +156,16 @@ enum {D_PRT, D_PRO, D_UNI, D_MOD, D_SLV, D_DLY};
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/fs.h>
+#include <linux/devfs_fs_kernel.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/mtio.h>
 #include <linux/pg.h>
 #include <linux/device.h>
-#include <linux/sched.h>	/* current, TASK_* */
-#include <linux/mutex.h>
-#include <linux/jiffies.h>
 
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
 
-module_param(verbose, int, 0644);
+module_param(verbose, bool, 0644);
 module_param(major, int, 0);
 module_param(name, charp, 0);
 module_param_array(drive0, int, NULL, 0);
@@ -194,7 +191,6 @@ module_param_array(drive3, int, NULL, 0);
 
 #define ATAPI_IDENTIFY		0x12
 
-static DEFINE_MUTEX(pg_mutex);
 static int pg_open(struct inode *inode, struct file *file);
 static int pg_release(struct inode *inode, struct file *file);
 static ssize_t pg_read(struct file *filp, char __user *buf,
@@ -226,18 +222,16 @@ static int pg_identify(struct pg *dev, int log);
 
 static char pg_scratch[512];	/* scratch block buffer */
 
-static struct class *pg_class;
-static void *par_drv;		/* reference of parport driver */
+static struct class_simple *pg_class;
 
 /* kernel glue structures */
 
-static const struct file_operations pg_fops = {
+static struct file_operations pg_fops = {
 	.owner = THIS_MODULE,
 	.read = pg_read,
 	.write = pg_write,
 	.open = pg_open,
 	.release = pg_release,
-	.llseek = noop_llseek,
 };
 
 static void pg_init_units(void)
@@ -282,7 +276,8 @@ static inline u8 DRIVE(struct pg *dev)
 
 static void pg_sleep(int cs)
 {
-	schedule_timeout_interruptible(cs);
+	current->state = TASK_INTERRUPTIBLE;
+	schedule_timeout(cs);
 }
 
 static int pg_wait(struct pg *dev, int go, int stop, unsigned long tmo, char *msg)
@@ -426,7 +421,7 @@ static void xs(char *buf, char *targ, int len)
 
 	for (k = 0; k < len; k++) {
 		char c = *buf++;
-		if (c != ' ' && c != l)
+		if (c != ' ' || c != l)
 			l = *targ++ = c;
 	}
 	if (l == ' ')
@@ -482,12 +477,6 @@ static int pg_detect(void)
 
 	printk("%s: %s version %s, major %d\n", name, name, PG_VERSION, major);
 
-	par_drv = pi_register_driver(name);
-	if (!par_drv) {
-		pr_err("failed to register %s driver\n", name);
-		return -1;
-	}
-
 	k = 0;
 	if (pg_drive_count == 0) {
 		if (pi_init(dev->pi, 1, -1, -1, -1, -1, -1, pg_scratch,
@@ -518,7 +507,6 @@ static int pg_detect(void)
 	if (k)
 		return 0;
 
-	pi_unregister_driver(par_drv);
 	printk("%s: No ATAPI device detected\n", name);
 	return -1;
 }
@@ -527,18 +515,12 @@ static int pg_open(struct inode *inode, struct file *file)
 {
 	int unit = iminor(inode) & 0x7f;
 	struct pg *dev = &devices[unit];
-	int ret = 0;
 
-	mutex_lock(&pg_mutex);
-	if ((unit >= PG_UNITS) || (!dev->present)) {
-		ret = -ENODEV;
-		goto out;
-	}
+	if ((unit >= PG_UNITS) || (!dev->present))
+		return -ENODEV;
 
-	if (test_and_set_bit(0, &dev->access)) {
-		ret = -EBUSY;
-		goto out;
-	}
+	if (test_and_set_bit(0, &dev->access))
+		return -EBUSY;
 
 	if (dev->busy) {
 		pg_reset(dev);
@@ -551,15 +533,12 @@ static int pg_open(struct inode *inode, struct file *file)
 	if (dev->bufptr == NULL) {
 		clear_bit(0, &dev->access);
 		printk("%s: buffer allocation failed\n", dev->name);
-		ret = -ENOMEM;
-		goto out;
+		return -ENOMEM;
 	}
 
 	file->private_data = dev;
 
-out:
-	mutex_unlock(&pg_mutex);
-	return ret;
+	return 0;
 }
 
 static int pg_release(struct inode *inode, struct file *file)
@@ -589,7 +568,7 @@ static ssize_t pg_write(struct file *filp, const char __user *buf, size_t count,
 
 	if (hdr.magic != PG_MAGIC)
 		return -EINVAL;
-	if (hdr.dlen < 0 || hdr.dlen > PG_MAX_DATA)
+	if (hdr.dlen > PG_MAX_DATA)
 		return -EINVAL;
 	if ((count - hs) > PG_MAX_DATA)
 		return -EINVAL;
@@ -639,7 +618,6 @@ static ssize_t pg_read(struct file *filp, char __user *buf, size_t count, loff_t
 		if (dev->status & 0x10)
 			return -ETIME;
 
-	memset(&hdr, 0, sizeof(hdr));
 	hdr.magic = PG_MAGIC;
 	hdr.dlen = dev->dlen;
 	copy = 0;
@@ -664,46 +642,54 @@ static ssize_t pg_read(struct file *filp, char __user *buf, size_t count, loff_t
 
 static int __init pg_init(void)
 {
-	int unit;
-	int err;
+	int unit, err = 0;
 
 	if (disable){
-		err = -EINVAL;
+		err = -1;
 		goto out;
 	}
 
 	pg_init_units();
 
 	if (pg_detect()) {
-		err = -ENODEV;
+		err = -1;
 		goto out;
 	}
 
-	err = register_chrdev(major, name, &pg_fops);
-	if (err < 0) {
+	if (register_chrdev(major, name, &pg_fops)) {
 		printk("pg_init: unable to get major number %d\n", major);
 		for (unit = 0; unit < PG_UNITS; unit++) {
 			struct pg *dev = &devices[unit];
 			if (dev->present)
 				pi_release(dev->pi);
 		}
+		err = -1;
 		goto out;
 	}
-	major = err;	/* In case the user specified `major=0' (dynamic) */
-	pg_class = class_create(THIS_MODULE, "pg");
+	pg_class = class_simple_create(THIS_MODULE, "pg");
 	if (IS_ERR(pg_class)) {
 		err = PTR_ERR(pg_class);
 		goto out_chrdev;
 	}
+	devfs_mk_dir("pg");
 	for (unit = 0; unit < PG_UNITS; unit++) {
 		struct pg *dev = &devices[unit];
-		if (dev->present)
-			device_create(pg_class, NULL, MKDEV(major, unit), NULL,
-				      "pg%u", unit);
+		if (dev->present) {
+			class_simple_device_add(pg_class, MKDEV(major, unit), 
+					NULL, "pg%u", unit);
+			err = devfs_mk_cdev(MKDEV(major, unit),
+				      S_IFCHR | S_IRUSR | S_IWUSR, "pg/%u",
+				      unit);
+			if (err) 
+				goto out_class;
+		}
 	}
 	err = 0;
 	goto out;
 
+out_class:
+	class_simple_device_remove(MKDEV(major, unit));
+	class_simple_destroy(pg_class);
 out_chrdev:
 	unregister_chrdev(major, "pg");
 out:
@@ -716,10 +702,13 @@ static void __exit pg_exit(void)
 
 	for (unit = 0; unit < PG_UNITS; unit++) {
 		struct pg *dev = &devices[unit];
-		if (dev->present)
-			device_destroy(pg_class, MKDEV(major, unit));
+		if (dev->present) {
+			class_simple_device_remove(MKDEV(major, unit));
+			devfs_remove("pg/%u", unit);
+		}
 	}
-	class_destroy(pg_class);
+	class_simple_destroy(pg_class);
+	devfs_remove("pg");
 	unregister_chrdev(major, name);
 
 	for (unit = 0; unit < PG_UNITS; unit++) {

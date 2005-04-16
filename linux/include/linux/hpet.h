@@ -1,9 +1,7 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef	__HPET__
 #define	__HPET__ 1
 
-#include <uapi/linux/hpet.h>
-
+#include <linux/compiler.h>
 
 /*
  * Offsets into HPET Registers
@@ -37,7 +35,6 @@ struct hpet {
 #define	hpet_compare	_u1._hpet_compare
 
 #define	HPET_MAX_TIMERS	(32)
-#define	HPET_MAX_IRQ	(32)
 
 /*
  * HPET general capabilities register
@@ -65,7 +62,7 @@ struct hpet {
  */
 
 #define	Tn_INT_ROUTE_CAP_MASK		(0xffffffff00000000ULL)
-#define	Tn_INT_ROUTE_CAP_SHIFT		(32UL)
+#define	Tn_INI_ROUTE_CAP_SHIFT		(32UL)
 #define	Tn_FSB_INT_DELCAP_MASK		(0x8000UL)
 #define	Tn_FSB_INT_DELCAP_SHIFT		(15)
 #define	Tn_FSB_EN_CNF_MASK		(0x4000UL)
@@ -88,17 +85,42 @@ struct hpet {
 #define	Tn_FSB_INT_ADDR_SHIFT		(32UL)
 #define	Tn_FSB_INT_VAL_MASK		(0x00000000ffffffffULL)
 
+struct hpet_info {
+	unsigned long hi_ireqfreq;	/* Hz */
+	unsigned long hi_flags;	/* information */
+	unsigned short hi_hpet;
+	unsigned short hi_timer;
+};
+
+#define	HPET_INFO_PERIODIC	0x0001	/* timer is periodic */
+
+#define	HPET_IE_ON	_IO('h', 0x01)	/* interrupt on */
+#define	HPET_IE_OFF	_IO('h', 0x02)	/* interrupt off */
+#define	HPET_INFO	_IOR('h', 0x03, struct hpet_info)
+#define	HPET_EPI	_IO('h', 0x04)	/* enable periodic */
+#define	HPET_DPI	_IO('h', 0x05)	/* disable periodic */
+#define	HPET_IRQFREQ	_IOW('h', 0x6, unsigned long)	/* IRQFREQ usec */
+
 /*
  * exported interfaces
  */
+
+struct hpet_task {
+	void (*ht_func) (void *);
+	void *ht_data;
+	void *ht_opaque;
+};
 
 struct hpet_data {
 	unsigned long hd_phys_address;
 	void __iomem *hd_address;
 	unsigned short hd_nirqs;
+	unsigned short hd_flags;
 	unsigned int hd_state;	/* timer allocated */
 	unsigned int hd_irq[HPET_MAX_TIMERS];
 };
+
+#define	HPET_DATA_PLATFORM	0x0001	/* platform call to hpet_alloc */
 
 static inline void hpet_reserve_timer(struct hpet_data *hd, int timer)
 {
@@ -107,5 +129,8 @@ static inline void hpet_reserve_timer(struct hpet_data *hd, int timer)
 }
 
 int hpet_alloc(struct hpet_data *);
+int hpet_register(struct hpet_task *, int);
+int hpet_unregister(struct hpet_task *);
+int hpet_control(struct hpet_task *, unsigned int, unsigned long);
 
 #endif				/* !__HPET__ */

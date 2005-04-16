@@ -1,18 +1,75 @@
-// SPDX-License-Identifier: GPL-2.0+
 /*
- * USB Keyspan PDA / Xircom / Entrega Converter driver
+ * USB Keyspan PDA / Xircom / Entregra Converter driver
  *
  * Copyright (C) 1999 - 2001 Greg Kroah-Hartman	<greg@kroah.com>
  * Copyright (C) 1999, 2000 Brian Warner	<warner@lothar.com>
  * Copyright (C) 2000 Al Borchers		<borchers@steinerpoint.com>
- * Copyright (C) 2020 Johan Hovold <johan@kernel.org>
  *
- * See Documentation/usb/usb-serial.rst for more information on using this
- * driver
+ *	This program is free software; you can redistribute it and/or modify
+ *	it under the terms of the GNU General Public License as published by
+ *	the Free Software Foundation; either version 2 of the License, or
+ *	(at your option) any later version.
+ *
+ * See Documentation/usb/usb-serial.txt for more information on using this driver
+ * 
+ * (09/07/2001) gkh
+ *	cleaned up the Xircom support.  Added ids for Entregra device which is
+ *	the same as the Xircom device.  Enabled the code to be compiled for
+ *	either Xircom or Keyspan devices.
+ *
+ * (08/11/2001) Cristian M. Craciunescu
+ *	support for Xircom PGSDB9
+ *
+ * (05/31/2001) gkh
+ *	switched from using spinlock to a semaphore, which fixes lots of problems.
+ *
+ * (04/08/2001) gb
+ *	Identify version on module load.
+ * 
+ * (11/01/2000) Adam J. Richter
+ *	usb_device_id table support
+ * 
+ * (10/05/2000) gkh
+ *	Fixed bug with urb->dev not being set properly, now that the usb
+ *	core needs it.
+ * 
+ * (08/28/2000) gkh
+ *	Added locks for SMP safeness.
+ *	Fixed MOD_INC and MOD_DEC logic and the ability to open a port more 
+ *	than once.
+ * 
+ * (07/20/2000) borchers
+ *	- keyspan_pda_write no longer sleeps if it is called on interrupt time;
+ *	  PPP and the line discipline with stty echo on can call write on
+ *	  interrupt time and this would cause an oops if write slept
+ *	- if keyspan_pda_write is in an interrupt, it will not call
+ *	  usb_control_msg (which sleeps) to query the room in the device
+ *	  buffer, it simply uses the current room value it has
+ *	- if the urb is busy or if it is throttled keyspan_pda_write just
+ *	  returns 0, rather than sleeping to wait for this to change; the
+ *	  write_chan code in n_tty.c will sleep if needed before calling
+ *	  keyspan_pda_write again
+ *	- if the device needs to be unthrottled, write now queues up the
+ *	  call to usb_control_msg (which sleeps) to unthrottle the device
+ *	- the wakeups from keyspan_pda_write_bulk_callback are queued rather
+ *	  than done directly from the callback to avoid the race in write_chan
+ *	- keyspan_pda_chars_in_buffer also indicates its buffer is full if the
+ *	  urb status is -EINPROGRESS, meaning it cannot write at the moment
+ *      
+ * (07/19/2000) gkh
+ *	Added module_init and module_exit functions to handle the fact that this
+ *	driver is a loadable module now.
+ *
+ * (03/26/2000) gkh
+ *	Split driver up into device specific pieces.
+ * 
  */
 
+
+#include <linux/config.h>
 #include <linux/kernel.h>
 #include <linux/errno.h>
+#include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/tty.h>
 #include <linux/tty_driver.h>
@@ -20,141 +77,152 @@
 #include <linux/module.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
 #include <linux/usb.h>
-#include <linux/usb/serial.h>
-#include <linux/usb/ezusb.h>
 
-#define DRIVER_AUTHOR "Brian Warner <warner@lothar.com>, Johan Hovold <johan@kernel.org>"
+static int debug;
+
+struct ezusb_hex_record {
+	__u16 address;
+	__u8 data_size;
+	__u8 data[16];
+};
+
+/* make a simple define to handle if we are compiling keyspan_pda or xircom support */
+#if defined(CONFIG_USB_SERIAL_KEYSPAN_PDA) || defined(CONFIG_USB_SERIAL_KEYSPAN_PDA_MODULE)
+	#define KEYSPAN
+#else
+	#undef KEYSPAN
+#endif
+#if defined(CONFIG_USB_SERIAL_XIRCOM) || defined(CONFIG_USB_SERIAL_XIRCOM_MODULE)
+	#define XIRCOM
+#else
+	#undef XIRCOM
+#endif
+
+#ifdef KEYSPAN
+#include "keyspan_pda_fw.h"
+#endif
+
+#ifdef XIRCOM
+#include "xircom_pgs_fw.h"
+#endif
+
+#include "usb-serial.h"
+
+/*
+ * Version Information
+ */
+#define DRIVER_VERSION "v1.1"
+#define DRIVER_AUTHOR "Brian Warner <warner@lothar.com>"
 #define DRIVER_DESC "USB Keyspan PDA Converter driver"
-
-#define KEYSPAN_TX_THRESHOLD	128
 
 struct keyspan_pda_private {
 	int			tx_room;
-	struct work_struct	unthrottle_work;
-	struct usb_serial	*serial;
-	struct usb_serial_port	*port;
+	int			tx_throttled;
+	struct work_struct			wakeup_work;
+	struct work_struct			unthrottle_work;
 };
 
-static int keyspan_pda_write_start(struct usb_serial_port *port);
 
 #define KEYSPAN_VENDOR_ID		0x06cd
 #define KEYSPAN_PDA_FAKE_ID		0x0103
 #define KEYSPAN_PDA_ID			0x0104 /* no clue */
 
-/* For Xircom PGSDB9 and older Entrega version of the same device */
+/* For Xircom PGSDB9 and older Entregra version of the same device */
 #define XIRCOM_VENDOR_ID		0x085a
 #define XIRCOM_FAKE_ID			0x8027
-#define XIRCOM_FAKE_ID_2		0x8025 /* "PGMFHUB" serial */
-#define ENTREGA_VENDOR_ID		0x1645
-#define ENTREGA_FAKE_ID			0x8093
+#define ENTREGRA_VENDOR_ID		0x1645
+#define ENTREGRA_FAKE_ID		0x8093
 
-static const struct usb_device_id id_table_combined[] = {
+static struct usb_device_id id_table_combined [] = {
+#ifdef KEYSPAN
 	{ USB_DEVICE(KEYSPAN_VENDOR_ID, KEYSPAN_PDA_FAKE_ID) },
+#endif
+#ifdef XIRCOM
 	{ USB_DEVICE(XIRCOM_VENDOR_ID, XIRCOM_FAKE_ID) },
-	{ USB_DEVICE(XIRCOM_VENDOR_ID, XIRCOM_FAKE_ID_2) },
-	{ USB_DEVICE(ENTREGA_VENDOR_ID, ENTREGA_FAKE_ID) },
-	{ USB_DEVICE(KEYSPAN_VENDOR_ID, KEYSPAN_PDA_ID) },
-	{ }						/* Terminating entry */
-};
-MODULE_DEVICE_TABLE(usb, id_table_combined);
-
-static const struct usb_device_id id_table_std[] = {
+	{ USB_DEVICE(ENTREGRA_VENDOR_ID, ENTREGRA_FAKE_ID) },
+#endif
 	{ USB_DEVICE(KEYSPAN_VENDOR_ID, KEYSPAN_PDA_ID) },
 	{ }						/* Terminating entry */
 };
 
-static const struct usb_device_id id_table_fake[] = {
-	{ USB_DEVICE(KEYSPAN_VENDOR_ID, KEYSPAN_PDA_FAKE_ID) },
-	{ USB_DEVICE(XIRCOM_VENDOR_ID, XIRCOM_FAKE_ID) },
-	{ USB_DEVICE(XIRCOM_VENDOR_ID, XIRCOM_FAKE_ID_2) },
-	{ USB_DEVICE(ENTREGA_VENDOR_ID, ENTREGA_FAKE_ID) },
+MODULE_DEVICE_TABLE (usb, id_table_combined);
+
+static struct usb_driver keyspan_pda_driver = {
+	.owner =	THIS_MODULE,
+	.name =		"keyspan_pda",
+	.probe =	usb_serial_probe,
+	.disconnect =	usb_serial_disconnect,
+	.id_table =	id_table_combined,
+};
+
+static struct usb_device_id id_table_std [] = {
+	{ USB_DEVICE(KEYSPAN_VENDOR_ID, KEYSPAN_PDA_ID) },
 	{ }						/* Terminating entry */
 };
 
-static int keyspan_pda_get_write_room(struct keyspan_pda_private *priv)
+#ifdef KEYSPAN
+static struct usb_device_id id_table_fake [] = {
+	{ USB_DEVICE(KEYSPAN_VENDOR_ID, KEYSPAN_PDA_FAKE_ID) },
+	{ }						/* Terminating entry */
+};
+#endif
+
+#ifdef XIRCOM
+static struct usb_device_id id_table_fake_xircom [] = {
+        { USB_DEVICE(XIRCOM_VENDOR_ID, XIRCOM_FAKE_ID) },
+        { USB_DEVICE(ENTREGRA_VENDOR_ID, ENTREGRA_FAKE_ID) },
+        { }                                             
+};
+#endif
+
+static void keyspan_pda_wakeup_write( struct usb_serial_port *port )
 {
-	struct usb_serial_port *port = priv->port;
-	struct usb_serial *serial = port->serial;
-	u8 room;
-	int rc;
 
-	rc = usb_control_msg_recv(serial->dev,
-				  0,
-				  6, /* write_room */
-				  USB_TYPE_VENDOR | USB_RECIP_INTERFACE | USB_DIR_IN,
-				  0, /* value: 0 means "remaining room" */
-				  0, /* index */
-				  &room,
-				  1,
-				  2000,
-				  GFP_KERNEL);
-	if (rc) {
-		dev_dbg(&port->dev, "roomquery failed: %d\n", rc);
-		return rc;
-	}
+	struct tty_struct *tty = port->tty;
 
-	dev_dbg(&port->dev, "roomquery says %d\n", room);
+	/* wake up port processes */
+	wake_up_interruptible( &port->write_wait );
 
-	return room;
+	/* wake up line discipline */
+	tty_wakeup(tty);
 }
 
-static void keyspan_pda_request_unthrottle(struct work_struct *work)
+static void keyspan_pda_request_unthrottle( struct usb_serial *serial )
 {
-	struct keyspan_pda_private *priv =
-		container_of(work, struct keyspan_pda_private, unthrottle_work);
-	struct usb_serial_port *port = priv->port;
-	struct usb_serial *serial = port->serial;
-	unsigned long flags;
 	int result;
 
-	dev_dbg(&port->dev, "%s\n", __func__);
-
-	/*
-	 * Ask the device to tell us when the tx buffer becomes
-	 * sufficiently empty.
-	 */
-	result = usb_control_msg(serial->dev,
+	dbg(" request_unthrottle");
+	/* ask the device to tell us when the tx buffer becomes
+	   sufficiently empty */
+	result = usb_control_msg(serial->dev, 
 				 usb_sndctrlpipe(serial->dev, 0),
 				 7, /* request_unthrottle */
 				 USB_TYPE_VENDOR | USB_RECIP_INTERFACE
 				 | USB_DIR_OUT,
-				 KEYSPAN_TX_THRESHOLD,
+				 16, /* value: threshold */
 				 0, /* index */
 				 NULL,
 				 0,
 				 2000);
 	if (result < 0)
-		dev_dbg(&serial->dev->dev, "%s - error %d from usb_control_msg\n",
-			__func__, result);
-	/*
-	 * Need to check available space after requesting notification in case
-	 * buffer is already empty so that no notification is sent.
-	 */
-	result = keyspan_pda_get_write_room(priv);
-	if (result > KEYSPAN_TX_THRESHOLD) {
-		spin_lock_irqsave(&port->lock, flags);
-		priv->tx_room = max(priv->tx_room, result);
-		spin_unlock_irqrestore(&port->lock, flags);
-
-		usb_serial_port_softint(port);
-	}
+		dbg("%s - error %d from usb_control_msg", 
+		    __FUNCTION__, result);
 }
 
-static void keyspan_pda_rx_interrupt(struct urb *urb)
-{
-	struct usb_serial_port *port = urb->context;
-	unsigned char *data = urb->transfer_buffer;
-	unsigned int len = urb->actual_length;
-	int retval;
-	int status = urb->status;
-	struct keyspan_pda_private *priv;
-	unsigned long flags;
 
+static void keyspan_pda_rx_interrupt (struct urb *urb, struct pt_regs *regs)
+{
+	struct usb_serial_port *port = (struct usb_serial_port *)urb->context;
+       	struct tty_struct *tty = port->tty;
+	unsigned char *data = urb->transfer_buffer;
+	int i;
+	int status;
+	struct keyspan_pda_private *priv;
 	priv = usb_get_serial_port_data(port);
 
-	switch (status) {
+	switch (urb->status) {
 	case 0:
 		/* success */
 		break;
@@ -162,45 +230,34 @@ static void keyspan_pda_rx_interrupt(struct urb *urb)
 	case -ENOENT:
 	case -ESHUTDOWN:
 		/* this urb is terminated, clean up */
-		dev_dbg(&urb->dev->dev, "%s - urb shutting down with status: %d\n", __func__, status);
+		dbg("%s - urb shutting down with status: %d", __FUNCTION__, urb->status);
 		return;
 	default:
-		dev_dbg(&urb->dev->dev, "%s - nonzero urb status received: %d\n", __func__, status);
+		dbg("%s - nonzero urb status received: %d", __FUNCTION__, urb->status);
 		goto exit;
 	}
 
-	if (len < 1) {
-		dev_warn(&port->dev, "short message received\n");
-		goto exit;
-	}
-
-	/* see if the message is data or a status interrupt */
+ 	/* see if the message is data or a status interrupt */
 	switch (data[0]) {
 	case 0:
-		 /* rest of message is rx data */
-		if (len < 2)
-			break;
-		tty_insert_flip_string(&port->port, data + 1, len - 1);
-		tty_flip_buffer_push(&port->port);
+		/* rest of message is rx data */
+		if (urb->actual_length) {
+			for (i = 1; i < urb->actual_length ; ++i) {
+				tty_insert_flip_char(tty, data[i], 0);
+			}
+			tty_flip_buffer_push(tty);
+		}
 		break;
 	case 1:
 		/* status interrupt */
-		if (len < 2) {
-			dev_warn(&port->dev, "short interrupt message received\n");
-			break;
-		}
-		dev_dbg(&port->dev, "rx int, d1=%d\n", data[1]);
+		dbg(" rx int, d1=%d, d2=%d", data[1], data[2]);
 		switch (data[1]) {
 		case 1: /* modemline change */
 			break;
 		case 2: /* tx unthrottle interrupt */
-			spin_lock_irqsave(&port->lock, flags);
-			priv->tx_room = max(priv->tx_room, KEYSPAN_TX_THRESHOLD);
-			spin_unlock_irqrestore(&port->lock, flags);
-
-			keyspan_pda_write_start(port);
-
-			usb_serial_port_softint(port);
+			priv->tx_throttled = 0;
+			/* queue up a wakeup at scheduler time */
+			schedule_work(&priv->wakeup_work);
 			break;
 		default:
 			break;
@@ -211,81 +268,62 @@ static void keyspan_pda_rx_interrupt(struct urb *urb)
 	}
 
 exit:
-	retval = usb_submit_urb(urb, GFP_ATOMIC);
-	if (retval)
-		dev_err(&port->dev,
-			"%s - usb_submit_urb failed with result %d\n",
-			__func__, retval);
+	status = usb_submit_urb (urb, GFP_ATOMIC);
+	if (status)
+		err ("%s - usb_submit_urb failed with result %d",
+		     __FUNCTION__, status);
 }
 
-static void keyspan_pda_rx_throttle(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
 
-	/*
-	 * Stop receiving characters. We just turn off the URB request, and
-	 * let chars pile up in the device. If we're doing hardware
-	 * flowcontrol, the device will signal the other end when its buffer
-	 * fills up. If we're doing XON/XOFF, this would be a good time to
-	 * send an XOFF, although it might make sense to foist that off upon
-	 * the device too.
-	 */
+static void keyspan_pda_rx_throttle (struct usb_serial_port *port)
+{
+	/* stop receiving characters. We just turn off the URB request, and
+	   let chars pile up in the device. If we're doing hardware
+	   flowcontrol, the device will signal the other end when its buffer
+	   fills up. If we're doing XON/XOFF, this would be a good time to
+	   send an XOFF, although it might make sense to foist that off
+	   upon the device too. */
+
+	dbg("keyspan_pda_rx_throttle port %d", port->number);
 	usb_kill_urb(port->interrupt_in_urb);
 }
 
-static void keyspan_pda_rx_unthrottle(struct tty_struct *tty)
-{
-	struct usb_serial_port *port = tty->driver_data;
 
+static void keyspan_pda_rx_unthrottle (struct usb_serial_port *port)
+{
 	/* just restart the receive interrupt URB */
-	if (usb_submit_urb(port->interrupt_in_urb, GFP_KERNEL))
-		dev_dbg(&port->dev, "usb_submit_urb(read urb) failed\n");
+	dbg("keyspan_pda_rx_unthrottle port %d", port->number);
+	port->interrupt_in_urb->dev = port->serial->dev;
+	if (usb_submit_urb(port->interrupt_in_urb, GFP_ATOMIC))
+		dbg(" usb_submit_urb(read urb) failed");
+	return;
 }
 
-static speed_t keyspan_pda_setbaud(struct usb_serial *serial, speed_t baud)
+
+static int keyspan_pda_setbaud (struct usb_serial *serial, int baud)
 {
 	int rc;
 	int bindex;
 
-	switch (baud) {
-	case 110:
-		bindex = 0;
-		break;
-	case 300:
-		bindex = 1;
-		break;
-	case 1200:
-		bindex = 2;
-		break;
-	case 2400:
-		bindex = 3;
-		break;
-	case 4800:
-		bindex = 4;
-		break;
-	case 9600:
-		bindex = 5;
-		break;
-	case 19200:
-		bindex = 6;
-		break;
-	case 38400:
-		bindex = 7;
-		break;
-	case 57600:
-		bindex = 8;
-		break;
-	case 115200:
-		bindex = 9;
-		break;
-	default:
-		bindex = 5;	/* Default to 9600 */
-		baud = 9600;
+	switch(baud) {
+		case 110: bindex = 0; break;
+		case 300: bindex = 1; break;
+		case 1200: bindex = 2; break;
+		case 2400: bindex = 3; break;
+		case 4800: bindex = 4; break;
+		case 9600: bindex = 5; break;
+		case 19200: bindex = 6; break;
+		case 38400: bindex = 7; break;
+		case 57600: bindex = 8; break;
+		case 115200: bindex = 9; break;
+		default: return -EINVAL;
 	}
 
+	/* rather than figure out how to sleep while waiting for this
+	   to complete, I just use the "legacy" API. */
 	rc = usb_control_msg(serial->dev, usb_sndctrlpipe(serial->dev, 0),
 			     0, /* set baud */
-			     USB_TYPE_VENDOR
+			     USB_TYPE_VENDOR 
 			     | USB_RECIP_INTERFACE
 			     | USB_DIR_OUT, /* type */
 			     bindex, /* value */
@@ -293,15 +331,12 @@ static speed_t keyspan_pda_setbaud(struct usb_serial *serial, speed_t baud)
 			     NULL, /* &data */
 			     0, /* size */
 			     2000); /* timeout */
-	if (rc < 0)
-		return 0;
-
-	return baud;
+	return(rc);
 }
 
-static void keyspan_pda_break_ctl(struct tty_struct *tty, int break_state)
+
+static void keyspan_pda_break_ctl (struct usb_serial_port *port, int break_state)
 {
-	struct usb_serial_port *port = tty->driver_data;
 	struct usb_serial *serial = port->serial;
 	int value;
 	int result;
@@ -310,84 +345,83 @@ static void keyspan_pda_break_ctl(struct tty_struct *tty, int break_state)
 		value = 1; /* start break */
 	else
 		value = 0; /* clear break */
-
 	result = usb_control_msg(serial->dev, usb_sndctrlpipe(serial->dev, 0),
-			4, /* set break */
-			USB_TYPE_VENDOR | USB_RECIP_INTERFACE | USB_DIR_OUT,
-			value, 0, NULL, 0, 2000);
+				4, /* set break */
+				USB_TYPE_VENDOR | USB_RECIP_INTERFACE | USB_DIR_OUT,
+				value, 0, NULL, 0, 2000);
 	if (result < 0)
-		dev_dbg(&port->dev, "%s - error %d from usb_control_msg\n",
-			__func__, result);
+		dbg("%s - error %d from usb_control_msg", 
+		    __FUNCTION__, result);
+	/* there is something funky about this.. the TCSBRK that 'cu' performs
+	   ought to translate into a break_ctl(-1),break_ctl(0) pair HZ/4
+	   seconds apart, but it feels like the break sent isn't as long as it
+	   is on /dev/ttyS0 */
 }
 
-static void keyspan_pda_set_termios(struct tty_struct *tty,
-		struct usb_serial_port *port, struct ktermios *old_termios)
+
+static void keyspan_pda_set_termios (struct usb_serial_port *port, 
+				     struct termios *old_termios)
 {
 	struct usb_serial *serial = port->serial;
-	speed_t speed;
+	unsigned int cflag = port->tty->termios->c_cflag;
 
-	/*
-	 * cflag specifies lots of stuff: number of stop bits, parity, number
-	 * of data bits, baud. What can the device actually handle?:
-	 * CSTOPB (1 stop bit or 2)
-	 * PARENB (parity)
-	 * CSIZE (5bit .. 8bit)
-	 * There is minimal hw support for parity (a PSW bit seems to hold the
-	 * parity of whatever is in the accumulator). The UART either deals
-	 * with 10 bits (start, 8 data, stop) or 11 bits (start, 8 data,
-	 * 1 special, stop). So, with firmware changes, we could do:
-	 * 8N1: 10 bit
-	 * 8N2: 11 bit, extra bit always (mark?)
-	 * 8[EOMS]1: 11 bit, extra bit is parity
-	 * 7[EOMS]1: 10 bit, b0/b7 is parity
-	 * 7[EOMS]2: 11 bit, b0/b7 is parity, extra bit always (mark?)
-	 *
-	 * HW flow control is dictated by the tty->termios.c_cflags & CRTSCTS
-	 * bit.
-	 *
-	 * For now, just do baud.
-	 */
-	speed = tty_get_baud_rate(tty);
-	speed = keyspan_pda_setbaud(serial, speed);
+	/* cflag specifies lots of stuff: number of stop bits, parity, number
+	   of data bits, baud. What can the device actually handle?:
+	   CSTOPB (1 stop bit or 2)
+	   PARENB (parity)
+	   CSIZE (5bit .. 8bit)
+	   There is minimal hw support for parity (a PSW bit seems to hold the
+	   parity of whatever is in the accumulator). The UART either deals
+	   with 10 bits (start, 8 data, stop) or 11 bits (start, 8 data,
+	   1 special, stop). So, with firmware changes, we could do:
+	   8N1: 10 bit
+	   8N2: 11 bit, extra bit always (mark?)
+	   8[EOMS]1: 11 bit, extra bit is parity
+	   7[EOMS]1: 10 bit, b0/b7 is parity
+	   7[EOMS]2: 11 bit, b0/b7 is parity, extra bit always (mark?)
 
-	if (speed == 0) {
-		dev_dbg(&port->dev, "can't handle requested baud rate\n");
-		/* It hasn't changed so.. */
-		speed = tty_termios_baud_rate(old_termios);
+	   HW flow control is dictated by the tty->termios->c_cflags & CRTSCTS
+	   bit.
+
+	   For now, just do baud. */
+
+	switch (cflag & CBAUD) {
+		/* we could support more values here, just need to calculate
+		   the necessary divisors in the firmware. <asm/termbits.h>
+		   has the Bnnn constants. */
+		case B110: keyspan_pda_setbaud(serial, 110); break;
+		case B300: keyspan_pda_setbaud(serial, 300); break;
+		case B1200: keyspan_pda_setbaud(serial, 1200); break;
+		case B2400: keyspan_pda_setbaud(serial, 2400); break;
+		case B4800: keyspan_pda_setbaud(serial, 4800); break;
+		case B9600: keyspan_pda_setbaud(serial, 9600); break;
+		case B19200: keyspan_pda_setbaud(serial, 19200); break;
+		case B38400: keyspan_pda_setbaud(serial, 38400); break;
+		case B57600: keyspan_pda_setbaud(serial, 57600); break;
+		case B115200: keyspan_pda_setbaud(serial, 115200); break;
+		default: dbg("can't handle requested baud rate"); break;
 	}
-	/*
-	 * Only speed can change so copy the old h/w parameters then encode
-	 * the new speed.
-	 */
-	tty_termios_copy_hw(&tty->termios, old_termios);
-	tty_encode_baud_rate(tty, speed, speed);
 }
 
-/*
- * Modem control pins: DTR and RTS are outputs and can be controlled.
- * DCD, RI, DSR, CTS are inputs and can be read. All outputs can also be
- * read. The byte passed is: DTR(b7) DCD RI DSR CTS RTS(b2) unused unused.
- */
+
+/* modem control pins: DTR and RTS are outputs and can be controlled.
+   DCD, RI, DSR, CTS are inputs and can be read. All outputs can also be
+   read. The byte passed is: DTR(b7) DCD RI DSR CTS RTS(b2) unused unused */
+
 static int keyspan_pda_get_modem_info(struct usb_serial *serial,
 				      unsigned char *value)
 {
 	int rc;
-	u8 data;
-
-	rc = usb_control_msg_recv(serial->dev, 0,
-				  3, /* get pins */
-				  USB_TYPE_VENDOR | USB_RECIP_INTERFACE | USB_DIR_IN,
-				  0,
-				  0,
-				  &data,
-				  1,
-				  2000,
-				  GFP_KERNEL);
-	if (rc == 0)
+	unsigned char data;
+	rc = usb_control_msg(serial->dev, usb_rcvctrlpipe(serial->dev, 0),
+			     3, /* get pins */
+			     USB_TYPE_VENDOR|USB_RECIP_INTERFACE|USB_DIR_IN,
+			     0, 0, &data, 1, 2000);
+	if (rc > 0)
 		*value = data;
-
 	return rc;
 }
+
 
 static int keyspan_pda_set_modem_info(struct usb_serial *serial,
 				      unsigned char value)
@@ -400,9 +434,8 @@ static int keyspan_pda_set_modem_info(struct usb_serial *serial,
 	return rc;
 }
 
-static int keyspan_pda_tiocmget(struct tty_struct *tty)
+static int keyspan_pda_tiocmget(struct usb_serial_port *port, struct file *file)
 {
-	struct usb_serial_port *port = tty->driver_data;
 	struct usb_serial *serial = port->serial;
 	int rc;
 	unsigned char status;
@@ -411,21 +444,19 @@ static int keyspan_pda_tiocmget(struct tty_struct *tty)
 	rc = keyspan_pda_get_modem_info(serial, &status);
 	if (rc < 0)
 		return rc;
-
-	value = ((status & BIT(7)) ? TIOCM_DTR : 0) |
-		((status & BIT(6)) ? TIOCM_CAR : 0) |
-		((status & BIT(5)) ? TIOCM_RNG : 0) |
-		((status & BIT(4)) ? TIOCM_DSR : 0) |
-		((status & BIT(3)) ? TIOCM_CTS : 0) |
-		((status & BIT(2)) ? TIOCM_RTS : 0);
-
+	value =
+		((status & (1<<7)) ? TIOCM_DTR : 0) |
+		((status & (1<<6)) ? TIOCM_CAR : 0) |
+		((status & (1<<5)) ? TIOCM_RNG : 0) |
+		((status & (1<<4)) ? TIOCM_DSR : 0) |
+		((status & (1<<3)) ? TIOCM_CTS : 0) |
+		((status & (1<<2)) ? TIOCM_RTS : 0);
 	return value;
 }
 
-static int keyspan_pda_tiocmset(struct tty_struct *tty,
+static int keyspan_pda_tiocmset(struct usb_serial_port *port, struct file *file,
 				unsigned int set, unsigned int clear)
 {
-	struct usb_serial_port *port = tty->driver_data;
 	struct usb_serial *serial = port->serial;
 	int rc;
 	unsigned char status;
@@ -435,285 +466,429 @@ static int keyspan_pda_tiocmset(struct tty_struct *tty,
 		return rc;
 
 	if (set & TIOCM_RTS)
-		status |= BIT(2);
+		status |= (1<<2);
 	if (set & TIOCM_DTR)
-		status |= BIT(7);
+		status |= (1<<7);
 
 	if (clear & TIOCM_RTS)
-		status &= ~BIT(2);
+		status &= ~(1<<2);
 	if (clear & TIOCM_DTR)
-		status &= ~BIT(7);
+		status &= ~(1<<7);
 	rc = keyspan_pda_set_modem_info(serial, status);
 	return rc;
 }
 
-static int keyspan_pda_write_start(struct usb_serial_port *port)
+static int keyspan_pda_ioctl(struct usb_serial_port *port, struct file *file,
+			     unsigned int cmd, unsigned long arg)
 {
-	struct keyspan_pda_private *priv = usb_get_serial_port_data(port);
-	unsigned long flags;
-	struct urb *urb;
-	int count;
-	int room;
-	int rc;
-
-	/*
-	 * Guess how much room is left in the device's ring buffer. If our
-	 * write will result in no room left, ask the device to give us an
-	 * interrupt when the room available rises above a threshold but also
-	 * query how much room is currently available (in case our guess was
-	 * too conservative and the buffer is already empty when the
-	 * unthrottle work is scheduled).
-	 */
-
-	/*
-	 * We might block because of:
-	 * the TX urb is in-flight (wait until it completes)
-	 * the device is full (wait until it says there is room)
-	 */
-	spin_lock_irqsave(&port->lock, flags);
-
-	room = priv->tx_room;
-	count = kfifo_len(&port->write_fifo);
-
-	if (!test_bit(0, &port->write_urbs_free) || count == 0 || room == 0) {
-		spin_unlock_irqrestore(&port->lock, flags);
-		return 0;
+	switch (cmd) {
+	case TIOCMIWAIT:
+		/* wait for any of the 4 modem inputs (DCD,RI,DSR,CTS)*/
+		/* TODO */
+	case TIOCGICOUNT:
+		/* return count of modemline transitions */
+		return 0; /* TODO */
 	}
-	__clear_bit(0, &port->write_urbs_free);
-
-	if (count > room)
-		count = room;
-	if (count > port->bulk_out_size)
-		count = port->bulk_out_size;
-
-	urb = port->write_urb;
-	count = kfifo_out(&port->write_fifo, urb->transfer_buffer, count);
-	urb->transfer_buffer_length = count;
-
-	port->tx_bytes += count;
-	priv->tx_room -= count;
-
-	spin_unlock_irqrestore(&port->lock, flags);
-
-	dev_dbg(&port->dev, "%s - count = %d, txroom = %d\n", __func__, count, room);
-
-	rc = usb_submit_urb(urb, GFP_ATOMIC);
-	if (rc) {
-		dev_dbg(&port->dev, "usb_submit_urb(write bulk) failed\n");
-
-		spin_lock_irqsave(&port->lock, flags);
-		port->tx_bytes -= count;
-		priv->tx_room = max(priv->tx_room, room + count);
-		__set_bit(0, &port->write_urbs_free);
-		spin_unlock_irqrestore(&port->lock, flags);
-
-		return rc;
-	}
-
-	if (count == room)
-		schedule_work(&priv->unthrottle_work);
-
-	return count;
+	
+	return -ENOIOCTLCMD;
 }
 
-static void keyspan_pda_write_bulk_callback(struct urb *urb)
-{
-	struct usb_serial_port *port = urb->context;
-	unsigned long flags;
-
-	spin_lock_irqsave(&port->lock, flags);
-	port->tx_bytes -= urb->transfer_buffer_length;
-	__set_bit(0, &port->write_urbs_free);
-	spin_unlock_irqrestore(&port->lock, flags);
-
-	keyspan_pda_write_start(port);
-
-	usb_serial_port_softint(port);
-}
-
-static int keyspan_pda_write(struct tty_struct *tty, struct usb_serial_port *port,
-		const unsigned char *buf, int count)
-{
-	int rc;
-
-	dev_dbg(&port->dev, "%s - count = %d\n", __func__, count);
-
-	if (!count)
-		return 0;
-
-	count = kfifo_in_locked(&port->write_fifo, buf, count, &port->lock);
-
-	rc = keyspan_pda_write_start(port);
-	if (rc)
-		return rc;
-
-	return count;
-}
-
-static void keyspan_pda_dtr_rts(struct usb_serial_port *port, int on)
+static int keyspan_pda_write(struct usb_serial_port *port, 
+			     const unsigned char *buf, int count)
 {
 	struct usb_serial *serial = port->serial;
-
-	if (on)
-		keyspan_pda_set_modem_info(serial, BIT(7) | BIT(2));
-	else
-		keyspan_pda_set_modem_info(serial, 0);
-}
-
-
-static int keyspan_pda_open(struct tty_struct *tty,
-					struct usb_serial_port *port)
-{
-	struct keyspan_pda_private *priv = usb_get_serial_port_data(port);
-	int rc;
-
-	/* find out how much room is in the Tx ring */
-	rc = keyspan_pda_get_write_room(priv);
-	if (rc < 0)
-		return rc;
-
-	spin_lock_irq(&port->lock);
-	priv->tx_room = rc;
-	spin_unlock_irq(&port->lock);
-
-	rc = usb_submit_urb(port->interrupt_in_urb, GFP_KERNEL);
-	if (rc) {
-		dev_dbg(&port->dev, "%s - usb_submit_urb(read int) failed\n", __func__);
-		return rc;
-	}
-
-	return 0;
-}
-
-static void keyspan_pda_close(struct usb_serial_port *port)
-{
-	struct keyspan_pda_private *priv = usb_get_serial_port_data(port);
-
-	/*
-	 * Stop the interrupt URB first as its completion handler may submit
-	 * the write URB.
-	 */
-	usb_kill_urb(port->interrupt_in_urb);
-	usb_kill_urb(port->write_urb);
-
-	cancel_work_sync(&priv->unthrottle_work);
-
-	spin_lock_irq(&port->lock);
-	kfifo_reset(&port->write_fifo);
-	spin_unlock_irq(&port->lock);
-}
-
-/* download the firmware to a "fake" device (pre-renumeration) */
-static int keyspan_pda_fake_startup(struct usb_serial *serial)
-{
-	unsigned int vid = le16_to_cpu(serial->dev->descriptor.idVendor);
-	const char *fw_name;
-
-	/* download the firmware here ... */
-	ezusb_fx1_set_reset(serial->dev, 1);
-
-	switch (vid) {
-	case KEYSPAN_VENDOR_ID:
-		fw_name = "keyspan_pda/keyspan_pda.fw";
-		break;
-	case XIRCOM_VENDOR_ID:
-	case ENTREGA_VENDOR_ID:
-		fw_name = "keyspan_pda/xircom_pgs.fw";
-		break;
-	default:
-		dev_err(&serial->dev->dev, "%s: unknown vendor, aborting.\n",
-			__func__);
-		return -ENODEV;
-	}
-
-	if (ezusb_fx1_ihex_firmware_download(serial->dev, fw_name) < 0) {
-		dev_err(&serial->dev->dev, "failed to load firmware \"%s\"\n",
-			fw_name);
-		return -ENOENT;
-	}
-
-	/*
-	 * After downloading firmware renumeration will occur in a moment and
-	 * the new device will bind to the real driver.
-	 */
-
-	/* We want this device to fail to have a driver assigned to it. */
-	return 1;
-}
-
-MODULE_FIRMWARE("keyspan_pda/keyspan_pda.fw");
-MODULE_FIRMWARE("keyspan_pda/xircom_pgs.fw");
-
-static int keyspan_pda_port_probe(struct usb_serial_port *port)
-{
-
+	int request_unthrottle = 0;
+	int rc = 0;
 	struct keyspan_pda_private *priv;
 
-	priv = kmalloc(sizeof(struct keyspan_pda_private), GFP_KERNEL);
-	if (!priv)
-		return -ENOMEM;
+	priv = usb_get_serial_port_data(port);
+	/* guess how much room is left in the device's ring buffer, and if we
+	   want to send more than that, check first, updating our notion of
+	   what is left. If our write will result in no room left, ask the
+	   device to give us an interrupt when the room available rises above
+	   a threshold, and hold off all writers (eventually, those using
+	   select() or poll() too) until we receive that unthrottle interrupt.
+	   Block if we can't write anything at all, otherwise write as much as
+	   we can. */
+	dbg("keyspan_pda_write(%d)",count);
+	if (count == 0) {
+		dbg(" write request of 0 bytes");
+		return (0);
+	}
 
-	INIT_WORK(&priv->unthrottle_work, keyspan_pda_request_unthrottle);
-	priv->port = port;
+	/* we might block because of:
+	   the TX urb is in-flight (wait until it completes)
+	   the device is full (wait until it says there is room)
+	*/
+	if (port->write_urb->status == -EINPROGRESS || priv->tx_throttled ) {
+		return( 0 );
+	}
 
-	usb_set_serial_port_data(port, priv);
+	/* At this point the URB is in our control, nobody else can submit it
+	   again (the only sudden transition was the one from EINPROGRESS to
+	   finished).  Also, the tx process is not throttled. So we are
+	   ready to write. */
 
-	return 0;
+	count = (count > port->bulk_out_size) ? port->bulk_out_size : count;
+
+	/* Check if we might overrun the Tx buffer.   If so, ask the
+	   device how much room it really has.  This is done only on
+	   scheduler time, since usb_control_msg() sleeps. */
+	if (count > priv->tx_room && !in_interrupt()) {
+		unsigned char room;
+		rc = usb_control_msg(serial->dev, 
+				     usb_rcvctrlpipe(serial->dev, 0),
+				     6, /* write_room */
+				     USB_TYPE_VENDOR | USB_RECIP_INTERFACE
+				     | USB_DIR_IN,
+				     0, /* value: 0 means "remaining room" */
+				     0, /* index */
+				     &room,
+				     1,
+				     2000);
+		if (rc < 0) {
+			dbg(" roomquery failed");
+			goto exit;
+		}
+		if (rc == 0) {
+			dbg(" roomquery returned 0 bytes");
+			rc = -EIO; /* device didn't return any data */
+			goto exit;
+		}
+		dbg(" roomquery says %d", room);
+		priv->tx_room = room;
+	}
+	if (count > priv->tx_room) {
+		/* we're about to completely fill the Tx buffer, so
+		   we'll be throttled afterwards. */
+		count = priv->tx_room;
+		request_unthrottle = 1;
+	}
+
+	if (count) {
+		/* now transfer data */
+		memcpy (port->write_urb->transfer_buffer, buf, count);
+		/* send the data out the bulk port */
+		port->write_urb->transfer_buffer_length = count;
+		
+		priv->tx_room -= count;
+
+		port->write_urb->dev = port->serial->dev;
+		rc = usb_submit_urb(port->write_urb, GFP_ATOMIC);
+		if (rc) {
+			dbg(" usb_submit_urb(write bulk) failed");
+			goto exit;
+		}
+	}
+	else {
+		/* There wasn't any room left, so we are throttled until
+		   the buffer empties a bit */
+		request_unthrottle = 1;
+	}
+
+	if (request_unthrottle) {
+		priv->tx_throttled = 1; /* block writers */
+		schedule_work(&priv->unthrottle_work);
+	}
+
+	rc = count;
+exit:
+	return rc;
 }
 
-static void keyspan_pda_port_remove(struct usb_serial_port *port)
+
+static void keyspan_pda_write_bulk_callback (struct urb *urb, struct pt_regs *regs)
+{
+	struct usb_serial_port *port = (struct usb_serial_port *)urb->context;
+	struct keyspan_pda_private *priv;
+
+	priv = usb_get_serial_port_data(port);
+
+	/* queue up a wakeup at scheduler time */
+	schedule_work(&priv->wakeup_work);
+}
+
+
+static int keyspan_pda_write_room (struct usb_serial_port *port)
 {
 	struct keyspan_pda_private *priv;
 
 	priv = usb_get_serial_port_data(port);
-	kfree(priv);
+
+	/* used by n_tty.c for processing of tabs and such. Giving it our
+	   conservative guess is probably good enough, but needs testing by
+	   running a console through the device. */
+
+	return (priv->tx_room);
 }
 
-static struct usb_serial_driver keyspan_pda_fake_device = {
-	.driver = {
-		.owner =	THIS_MODULE,
-		.name =		"keyspan_pda_pre",
-	},
-	.description =		"Keyspan PDA - (prerenumeration)",
+
+static int keyspan_pda_chars_in_buffer (struct usb_serial_port *port)
+{
+	struct keyspan_pda_private *priv;
+	
+	priv = usb_get_serial_port_data(port);
+	
+	/* when throttled, return at least WAKEUP_CHARS to tell select() (via
+	   n_tty.c:normal_poll() ) that we're not writeable. */
+	if( port->write_urb->status == -EINPROGRESS || priv->tx_throttled )
+		return 256;
+	return 0;
+}
+
+
+static int keyspan_pda_open (struct usb_serial_port *port, struct file *filp)
+{
+	struct usb_serial *serial = port->serial;
+	unsigned char room;
+	int rc = 0;
+	struct keyspan_pda_private *priv;
+
+	/* find out how much room is in the Tx ring */
+	rc = usb_control_msg(serial->dev, usb_rcvctrlpipe(serial->dev, 0),
+			     6, /* write_room */
+			     USB_TYPE_VENDOR | USB_RECIP_INTERFACE
+			     | USB_DIR_IN,
+			     0, /* value */
+			     0, /* index */
+			     &room,
+			     1,
+			     2000);
+	if (rc < 0) {
+		dbg("%s - roomquery failed", __FUNCTION__);
+		goto error;
+	}
+	if (rc == 0) {
+		dbg("%s - roomquery returned 0 bytes", __FUNCTION__);
+		rc = -EIO;
+		goto error;
+	}
+	priv = usb_get_serial_port_data(port);
+	priv->tx_room = room;
+	priv->tx_throttled = room ? 0 : 1;
+
+	/* the normal serial device seems to always turn on DTR and RTS here,
+	   so do the same */
+	if (port->tty->termios->c_cflag & CBAUD)
+		keyspan_pda_set_modem_info(serial, (1<<7) | (1<<2) );
+	else
+		keyspan_pda_set_modem_info(serial, 0);
+
+	/*Start reading from the device*/
+	port->interrupt_in_urb->dev = serial->dev;
+	rc = usb_submit_urb(port->interrupt_in_urb, GFP_KERNEL);
+	if (rc) {
+		dbg("%s - usb_submit_urb(read int) failed", __FUNCTION__);
+		goto error;
+	}
+
+error:
+	return rc;
+}
+
+
+static void keyspan_pda_close(struct usb_serial_port *port, struct file *filp)
+{
+	struct usb_serial *serial = port->serial;
+
+	if (serial->dev) {
+		/* the normal serial device seems to always shut off DTR and RTS now */
+		if (port->tty->termios->c_cflag & HUPCL)
+			keyspan_pda_set_modem_info(serial, 0);
+
+		/* shutdown our bulk reads and writes */
+		usb_kill_urb(port->write_urb);
+		usb_kill_urb(port->interrupt_in_urb);
+	}
+}
+
+
+/* download the firmware to a "fake" device (pre-renumeration) */
+static int keyspan_pda_fake_startup (struct usb_serial *serial)
+{
+	int response;
+	const struct ezusb_hex_record *record = NULL;
+
+	/* download the firmware here ... */
+	response = ezusb_set_reset(serial, 1);
+
+#ifdef KEYSPAN
+	if (le16_to_cpu(serial->dev->descriptor.idVendor) == KEYSPAN_VENDOR_ID)
+		record = &keyspan_pda_firmware[0];
+#endif
+#ifdef XIRCOM
+	if ((le16_to_cpu(serial->dev->descriptor.idVendor) == XIRCOM_VENDOR_ID) ||
+	    (le16_to_cpu(serial->dev->descriptor.idVendor) == ENTREGRA_VENDOR_ID))
+		record = &xircom_pgs_firmware[0];
+#endif
+	if (record == NULL) {
+		err("%s: unknown vendor, aborting.", __FUNCTION__);
+		return -ENODEV;
+	}
+
+	while(record->address != 0xffff) {
+		response = ezusb_writememory(serial, record->address,
+					     (unsigned char *)record->data,
+					     record->data_size, 0xa0);
+		if (response < 0) {
+			err("ezusb_writememory failed for Keyspan PDA "
+			    "firmware (%d %04X %p %d)",
+			    response, 
+			    record->address, record->data, record->data_size);
+			break;
+		}
+		record++;
+	}
+	/* bring device out of reset. Renumeration will occur in a moment
+	   and the new device will bind to the real driver */
+	response = ezusb_set_reset(serial, 0);
+
+	/* we want this device to fail to have a driver assigned to it. */
+	return (1);
+}
+
+static int keyspan_pda_startup (struct usb_serial *serial)
+{
+
+	struct keyspan_pda_private *priv;
+
+	/* allocate the private data structures for all ports. Well, for all
+	   one ports. */
+
+	priv = kmalloc(sizeof(struct keyspan_pda_private), GFP_KERNEL);
+	if (!priv)
+		return (1); /* error */
+	usb_set_serial_port_data(serial->port[0], priv);
+	init_waitqueue_head(&serial->port[0]->write_wait);
+	INIT_WORK(&priv->wakeup_work, (void *)keyspan_pda_wakeup_write,
+			(void *)(serial->port[0]));
+	INIT_WORK(&priv->unthrottle_work,
+			(void *)keyspan_pda_request_unthrottle,
+			(void *)(serial));
+	return (0);
+}
+
+static void keyspan_pda_shutdown (struct usb_serial *serial)
+{
+	dbg("%s", __FUNCTION__);
+	
+	kfree(usb_get_serial_port_data(serial->port[0]));
+}
+
+#ifdef KEYSPAN
+static struct usb_serial_device_type keyspan_pda_fake_device = {
+	.owner =		THIS_MODULE,
+	.name =			"Keyspan PDA - (prerenumeration)",
+	.short_name =		"keyspan_pda_pre",
 	.id_table =		id_table_fake,
+	.num_interrupt_in =	NUM_DONT_CARE,
+	.num_bulk_in =		NUM_DONT_CARE,
+	.num_bulk_out =		NUM_DONT_CARE,
 	.num_ports =		1,
 	.attach =		keyspan_pda_fake_startup,
 };
+#endif
 
-static struct usb_serial_driver keyspan_pda_device = {
-	.driver = {
-		.owner =	THIS_MODULE,
-		.name =		"keyspan_pda",
-	},
-	.description =		"Keyspan PDA",
-	.id_table =		id_table_std,
+#ifdef XIRCOM
+static struct usb_serial_device_type xircom_pgs_fake_device = {
+	.owner =		THIS_MODULE,
+	.name =			"Xircom / Entregra PGS - (prerenumeration)",
+	.short_name =		"xircom_no_firm",
+	.id_table =		id_table_fake_xircom,
+	.num_interrupt_in =	NUM_DONT_CARE,
+	.num_bulk_in =		NUM_DONT_CARE,
+	.num_bulk_out =		NUM_DONT_CARE,
 	.num_ports =		1,
-	.num_bulk_out =		1,
+	.attach =		keyspan_pda_fake_startup,
+};
+#endif
+
+static struct usb_serial_device_type keyspan_pda_device = {
+	.owner =		THIS_MODULE,
+	.name =			"Keyspan PDA",
+	.short_name =		"keyspan_pda",
+	.id_table =		id_table_std,
 	.num_interrupt_in =	1,
-	.dtr_rts =		keyspan_pda_dtr_rts,
+	.num_bulk_in =		0,
+	.num_bulk_out =		1,
+	.num_ports =		1,
 	.open =			keyspan_pda_open,
 	.close =		keyspan_pda_close,
 	.write =		keyspan_pda_write,
-	.write_bulk_callback =	keyspan_pda_write_bulk_callback,
+	.write_room =		keyspan_pda_write_room,
+	.write_bulk_callback = 	keyspan_pda_write_bulk_callback,
 	.read_int_callback =	keyspan_pda_rx_interrupt,
+	.chars_in_buffer =	keyspan_pda_chars_in_buffer,
 	.throttle =		keyspan_pda_rx_throttle,
 	.unthrottle =		keyspan_pda_rx_unthrottle,
+	.ioctl =		keyspan_pda_ioctl,
 	.set_termios =		keyspan_pda_set_termios,
 	.break_ctl =		keyspan_pda_break_ctl,
 	.tiocmget =		keyspan_pda_tiocmget,
 	.tiocmset =		keyspan_pda_tiocmset,
-	.port_probe =		keyspan_pda_port_probe,
-	.port_remove =		keyspan_pda_port_remove,
+	.attach =		keyspan_pda_startup,
+	.shutdown =		keyspan_pda_shutdown,
 };
 
-static struct usb_serial_driver * const serial_drivers[] = {
-	&keyspan_pda_device,
-	&keyspan_pda_fake_device,
-	NULL
-};
 
-module_usb_serial_driver(serial_drivers, id_table_combined);
+static int __init keyspan_pda_init (void)
+{
+	int retval;
+	retval = usb_serial_register(&keyspan_pda_device);
+	if (retval)
+		goto failed_pda_register;
+#ifdef KEYSPAN
+	retval = usb_serial_register(&keyspan_pda_fake_device);
+	if (retval)
+		goto failed_pda_fake_register;
+#endif
+#ifdef XIRCOM
+	retval = usb_serial_register(&xircom_pgs_fake_device);
+	if (retval)
+		goto failed_xircom_register;
+#endif
+	retval = usb_register(&keyspan_pda_driver);
+	if (retval)
+		goto failed_usb_register;
+	info(DRIVER_DESC " " DRIVER_VERSION);
+	return 0;
+failed_usb_register:	
+#ifdef XIRCOM
+	usb_serial_deregister(&xircom_pgs_fake_device);
+failed_xircom_register:
+#endif /* XIRCOM */
+#ifdef KEYSPAN
+	usb_serial_deregister(&keyspan_pda_fake_device);
+#endif
+#ifdef KEYSPAN
+failed_pda_fake_register:
+#endif
+	usb_serial_deregister(&keyspan_pda_device);
+failed_pda_register:
+	return retval;
+}
 
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
+
+static void __exit keyspan_pda_exit (void)
+{
+	usb_deregister (&keyspan_pda_driver);
+	usb_serial_deregister (&keyspan_pda_device);
+#ifdef KEYSPAN
+	usb_serial_deregister (&keyspan_pda_fake_device);
+#endif
+#ifdef XIRCOM
+	usb_serial_deregister (&xircom_pgs_fake_device);
+#endif
+}
+
+
+module_init(keyspan_pda_init);
+module_exit(keyspan_pda_exit);
+
+MODULE_AUTHOR( DRIVER_AUTHOR );
+MODULE_DESCRIPTION( DRIVER_DESC );
 MODULE_LICENSE("GPL");
+
+module_param(debug, bool, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(debug, "Debug enabled or not");
+

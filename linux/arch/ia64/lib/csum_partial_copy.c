@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Network Checksum & Copy routine
  *
@@ -12,7 +11,7 @@
 #include <linux/types.h>
 #include <linux/string.h>
 
-#include <net/checksum.h>
+#include <asm/uaccess.h>
 
 /*
  * XXX Fixme: those 2 inlines are meant for debugging and will go away
@@ -96,3 +95,57 @@ unsigned long do_csum_c(const unsigned char * buff, int len, unsigned int psum)
 out:
 	return result;
 }
+
+/*
+ * XXX Fixme
+ *
+ * This is very ugly but temporary. THIS NEEDS SERIOUS ENHANCEMENTS.
+ * But it's very tricky to get right even in C.
+ */
+extern unsigned long do_csum(const unsigned char *, long);
+
+static unsigned int
+do_csum_partial_copy_from_user (const unsigned char __user *src, unsigned char *dst,
+				int len, unsigned int psum, int *errp)
+{
+	unsigned long result;
+
+	/* XXX Fixme
+	 * for now we separate the copy from checksum for obvious
+	 * alignment difficulties. Look at the Alpha code and you'll be
+	 * scared.
+	 */
+
+	if (__copy_from_user(dst, src, len) != 0 && errp)
+		*errp = -EFAULT;
+
+	result = do_csum(dst, len);
+
+	/* add in old sum, and carry.. */
+	result += psum;
+	/* 32+c bits -> 32 bits */
+	result = (result & 0xffffffff) + (result >> 32);
+	return result;
+}
+
+unsigned int
+csum_partial_copy_from_user (const unsigned char __user *src, unsigned char *dst,
+			     int len, unsigned int sum, int *errp)
+{
+	if (!access_ok(VERIFY_READ, src, len)) {
+		*errp = -EFAULT;
+		memset(dst, 0, len);
+		return sum;
+	}
+
+	return do_csum_partial_copy_from_user(src, dst, len, sum, errp);
+}
+
+unsigned int
+csum_partial_copy_nocheck(const unsigned char __user *src, unsigned char *dst,
+			  int len, unsigned int sum)
+{
+	return do_csum_partial_copy_from_user(src, dst, len, sum, NULL);
+}
+
+EXPORT_SYMBOL(csum_partial_copy_nocheck);

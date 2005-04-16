@@ -1,4 +1,4 @@
-/*
+/* 
    CMTP implementation for Linux Bluetooth stack (BlueZ).
    Copyright (C) 2002-2003 Marcel Holtmann <marcel@holtmann.org>
 
@@ -10,13 +10,13 @@
    OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF THIRD PARTY RIGHTS.
    IN NO EVENT SHALL THE COPYRIGHT HOLDER(S) AND AUTHOR(S) BE LIABLE FOR ANY
-   CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES, OR ANY DAMAGES
-   WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
-   ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+   CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES, OR ANY DAMAGES 
+   WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN 
+   ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF 
    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-   ALL LIABILITY, INCLUDING LIABILITY FOR INFRINGEMENT OF ANY PATENTS,
-   COPYRIGHTS, TRADEMARKS OR OTHER RIGHTS, RELATING TO USE OF THIS
+   ALL LIABILITY, INCLUDING LIABILITY FOR INFRINGEMENT OF ANY PATENTS, 
+   COPYRIGHTS, TRADEMARKS OR OTHER RIGHTS, RELATING TO USE OF THIS 
    SOFTWARE IS DISCLAIMED.
 */
 
@@ -26,7 +26,7 @@
 #include <linux/types.h>
 #include <net/bluetooth/bluetooth.h>
 
-#define BTNAMSIZ 21
+#define BTNAMSIZ 18
 
 /* CMTP ioctl defines */
 #define CMTPCONNADD	_IOW('C', 200, int)
@@ -37,7 +37,7 @@
 #define CMTP_LOOPBACK	0
 
 struct cmtp_connadd_req {
-	int   sock;	/* Connected socket */
+	int   sock;	// Connected socket
 	__u32 flags;
 };
 
@@ -82,7 +82,6 @@ struct cmtp_session {
 	char name[BTNAMSIZ];
 
 	atomic_t terminate;
-	struct task_struct *task;
 
 	wait_queue_head_t wait;
 
@@ -121,6 +120,13 @@ int  cmtp_attach_device(struct cmtp_session *session);
 void cmtp_detach_device(struct cmtp_session *session);
 
 void cmtp_recv_capimsg(struct cmtp_session *session, struct sk_buff *skb);
+
+static inline void cmtp_schedule(struct cmtp_session *session)
+{
+	struct sock *sk = session->sock->sk;
+
+	wake_up_interruptible(sk->sk_sleep);
+}
 
 /* CMTP init defines */
 int cmtp_init_sockets(void);

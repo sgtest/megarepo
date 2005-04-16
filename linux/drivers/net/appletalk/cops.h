@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*      cops.h: LocalTalk driver for Linux.
  *
  *      Authors:
@@ -52,7 +51,7 @@
 struct ltfirmware
 {
         unsigned int length;
-        const unsigned char *data;
+        unsigned char * data;
 };
 
 #define DAYNA 1

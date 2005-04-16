@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * arch/alpha/lib/ev6-csum_ipv6_magic.S
  * 21264 version contributed by Rick Gorton <rick.gorton@alpha-processor.com>
@@ -47,13 +46,8 @@
  * add the 3 low ushorts together, generating a uint
  * a final add of the 2 lower ushorts
  * truncating the result.
- *
- * Misalignment handling added by Ivan Kokshaysky <ink@jurassic.park.msu.ru>
- * The cost is 16 instructions (~8 cycles), including two extra loads which
- * may cause additional delay in rare cases (load-load replay traps).
  */
 
-#include <asm/export.h>
 	.globl csum_ipv6_magic
 	.align 4
 	.ent csum_ipv6_magic
@@ -61,45 +55,25 @@
 csum_ipv6_magic:
 	.prologue 0
 
-	ldq_u	$0,0($16)	# L : Latency: 3
+	ldq	$0,0($16)	# L : Latency: 3
 	inslh	$18,7,$4	# U : 0000000000AABBCC
-	ldq_u	$1,8($16)	# L : Latency: 3
+	ldq	$1,8($16)	# L : Latency: 3
 	sll	$19,8,$7	# U : U L U L : 0x00000000 00aabb00
 
-	and	$16,7,$6	# E : src misalignment
-	ldq_u	$5,15($16)	# L : Latency: 3
 	zapnot	$20,15,$20	# U : zero extend incoming csum
-	ldq_u	$2,0($17)	# L : U L U L : Latency: 3
-
-	extql	$0,$6,$0	# U :
-	extqh	$1,$6,$22	# U :
-	ldq_u	$3,8($17)	# L : Latency: 3
-	sll	$19,24,$19	# U : U U L U : 0x000000aa bb000000
-
-	cmoveq	$6,$31,$22	# E : src aligned?
-	ldq_u	$23,15($17)	# L : Latency: 3
+	ldq	$2,0($17)	# L : Latency: 3
+	sll	$19,24,$19	# U : U L L U : 0x000000aa bb000000
 	inswl	$18,3,$18	# U : 000000CCDD000000
-	addl	$19,$7,$19	# E : U L U L : <sign bits>bbaabb00
 
-	or	$0,$22,$0	# E : 1st src word complete
-	extql	$1,$6,$1	# U :
-	or	$18,$4,$18	# E : 000000CCDDAABBCC
-	extqh	$5,$6,$5	# U : L U L U
+	ldq	$3,8($17)	# L : Latency: 3
+	bis	$18,$4,$18	# E : 000000CCDDAABBCC
+	addl	$19,$7,$19	# E : <sign bits>bbaabb00
+	nop			# E : U L U L
 
-	and	$17,7,$6	# E : dst misalignment
-	extql	$2,$6,$2	# U :
-	or	$1,$5,$1	# E : 2nd src word complete
-	extqh	$3,$6,$22	# U : L U L U :
-
-	cmoveq	$6,$31,$22	# E : dst aligned?
-	extql	$3,$6,$3	# U :
 	addq	$20,$0,$20	# E : begin summing the words
-	extqh	$23,$6,$23	# U : L U L U :
-
 	srl	$18,16,$4	# U : 0000000000CCDDAA
-	or	$2,$22,$2	# E : 1st dst word complete
 	zap	$19,0x3,$19	# U : <sign bits>bbaa0000
-	or	$3,$23,$3	# E : U L U L : 2nd dst word complete
+	nop			# E : L U U L
 
 	cmpult	$20,$0,$0	# E :
 	addq	$20,$1,$20	# E :
@@ -150,4 +124,3 @@ csum_ipv6_magic:
 	ret			# L0 : L U L U
 
 	.end csum_ipv6_magic
-	EXPORT_SYMBOL(csum_ipv6_magic)

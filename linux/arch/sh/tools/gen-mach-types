@@ -1,7 +1,6 @@
 #!/bin/awk
-# SPDX-License-Identifier: GPL-2.0
 #
-# Awk script to generate include/generated/machtypes.h
+# Awk script to generate include/asm-sh/machtypes.h
 # Heavily based on arch/arm/tools/gen-mach-types
 #
 BEGIN	{ nr = 0 }
@@ -20,6 +19,8 @@ END	{
 	  printf(" */\n");
 	  printf("#ifndef __ASM_SH_MACHTYPES_H\n");
 	  printf("#define __ASM_SH_MACHTYPES_H\n");
+	  printf("\n");
+	  printf("#include <linux/config.h>\n");
 	  printf("\n");
 	  printf("/*\n");
 	  printf(" * We'll use the following MACH_xxx defs for placeholders for the time\n");

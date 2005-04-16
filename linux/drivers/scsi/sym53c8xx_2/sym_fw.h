@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Device driver for the SYMBIOS/LSILOGIC 53C8XX and 53C1010 family 
  * of PCI-SCSI IO processors.
@@ -22,6 +21,20 @@
  * Copyright (C) 1997 Richard Waltham <dormouse@farsrobt.demon.co.uk>
  *
  *-----------------------------------------------------------------------------
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
 #ifndef	SYM_FW_H
@@ -79,6 +92,9 @@ struct sym_fwa_ofs {
 };
 struct sym_fwb_ofs {
 	SYM_GEN_FW_B(u_short)
+#ifdef SYM_OPT_HANDLE_DIR_UNKNOWN
+	SYM_GEN_B(u_short, data_io)
+#endif
 	SYM_GEN_B(u_short, start64)
 	SYM_GEN_B(u_short, pm_handle)
 };
@@ -95,6 +111,9 @@ struct sym_fwa_ba {
 };
 struct sym_fwb_ba {
 	SYM_GEN_FW_B(u32)
+#ifdef SYM_OPT_HANDLE_DIR_UNKNOWN
+	SYM_GEN_B(u32, data_io)
+#endif
 	SYM_GEN_B(u32, start64);
 	SYM_GEN_B(u32, pm_handle);
 };
@@ -130,7 +149,7 @@ struct sym_fw {
 		*z_ofs;		/* Useful offsets in script Z	*/
 	/* Setup and patch methods for this firmware */
 	void	(*setup)(struct sym_hcb *, struct sym_fw *);
-	void	(*patch)(struct Scsi_Host *);
+	void	(*patch)(struct sym_hcb *);
 };
 
 /*

@@ -4,7 +4,7 @@
 |M68060 Software Package
 |Production Release P1.00 -- October 10, 1994
 |
-|M68060 Software Package Copyright Â© 1993, 1994 Motorola Inc.  All rights reserved.
+|M68060 Software Package Copyright © 1993, 1994 Motorola Inc.  All rights reserved.
 |
 |THE SOFTWARE is provided on an "AS IS" basis and without warranty.
 |To the maximum extent permitted by applicable law,
@@ -36,7 +36,7 @@
 
 #include <linux/linkage.h>
 #include <asm/entry.h>
-#include <asm/asm-offsets.h>
+#include <asm/offsets.h>
 
 
 |################################
@@ -75,8 +75,10 @@ _060_isp_done:
 .Lnotkern:
 	SAVE_ALL_INT
 	GET_CURRENT(%d0)
-	| deliver signals, reschedule etc..
-	jra	ret_from_exception
+	tstb	%curptr@(TASK_NEEDRESCHED)
+	jne	ret_from_exception	| deliver signals,
+					| reschedule etc..
+	RESTORE_ALL
 
 |
 | _060_real_chk():

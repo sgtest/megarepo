@@ -1,5 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * $Id: interact.c,v 1.16 2002/01/22 20:28:25 vojtech Exp $
+ *
  *  Copyright (c) 2001 Vojtech Pavlik
  *
  *  Based on the work of:
@@ -11,15 +12,32 @@
  */
 
 /*
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ *
+ * Should you need to contact me, the author, you can do so either by
+ * e-mail - mail your message to <vojtech@ucw.cz>, or by paper mail:
+ * Vojtech Pavlik, Simunkova 1594, Prague 8, 182 00 Czech Republic
  */
 
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/delay.h>
+#include <linux/init.h>
 #include <linux/gameport.h>
 #include <linux/input.h>
-#include <linux/jiffies.h>
 
 #define DRIVER_DESC	"InterAct digital joystick driver"
 
@@ -36,7 +54,7 @@ MODULE_LICENSE("GPL");
 
 struct interact {
 	struct gameport *gameport;
-	struct input_dev *dev;
+	struct input_dev dev;
 	int bads;
 	int reads;
 	unsigned char type;
@@ -112,7 +130,7 @@ static int interact_read_packet(struct gameport *gameport, int length, u32 *data
 static void interact_poll(struct gameport *gameport)
 {
 	struct interact *interact = gameport_get_drvdata(gameport);
-	struct input_dev *dev = interact->dev;
+	struct input_dev *dev = &interact->dev;
 	u32 data[3];
 	int i;
 
@@ -166,7 +184,7 @@ static void interact_poll(struct gameport *gameport)
 
 static int interact_open(struct input_dev *dev)
 {
-	struct interact *interact = input_get_drvdata(dev);
+	struct interact *interact = dev->private;
 
 	gameport_start_polling(interact->gameport);
 	return 0;
@@ -178,7 +196,7 @@ static int interact_open(struct input_dev *dev)
 
 static void interact_close(struct input_dev *dev)
 {
-	struct interact *interact = input_get_drvdata(dev);
+	struct interact *interact = dev->private;
 
 	gameport_stop_polling(interact->gameport);
 }
@@ -190,20 +208,14 @@ static void interact_close(struct input_dev *dev)
 static int interact_connect(struct gameport *gameport, struct gameport_driver *drv)
 {
 	struct interact *interact;
-	struct input_dev *input_dev;
 	__u32 data[3];
 	int i, t;
 	int err;
 
-	interact = kzalloc(sizeof(struct interact), GFP_KERNEL);
-	input_dev = input_allocate_device();
-	if (!interact || !input_dev) {
-		err = -ENOMEM;
-		goto fail1;
-	}
+	if (!(interact = kcalloc(1, sizeof(struct interact), GFP_KERNEL)))
+		return -ENOMEM;
 
 	interact->gameport = gameport;
-	interact->dev = input_dev;
 
 	gameport_set_drvdata(gameport, interact);
 
@@ -232,45 +244,46 @@ static int interact_connect(struct gameport *gameport, struct gameport_driver *d
 	gameport_set_poll_handler(gameport, interact_poll);
 	gameport_set_poll_interval(gameport, 20);
 
-	snprintf(interact->phys, sizeof(interact->phys), "%s/input0", gameport->phys);
+	sprintf(interact->phys, "%s/input0", gameport->phys);
 
 	interact->type = i;
 	interact->length = interact_type[i].length;
 
-	input_dev->name = interact_type[i].name;
-	input_dev->phys = interact->phys;
-	input_dev->id.bustype = BUS_GAMEPORT;
-	input_dev->id.vendor = GAMEPORT_ID_VENDOR_INTERACT;
-	input_dev->id.product = interact_type[i].id;
-	input_dev->id.version = 0x0100;
-	input_dev->dev.parent = &gameport->dev;
+	interact->dev.private = interact;
+	interact->dev.open = interact_open;
+	interact->dev.close = interact_close;
 
-	input_set_drvdata(input_dev, interact);
+	interact->dev.name = interact_type[i].name;
+	interact->dev.phys = interact->phys;
+	interact->dev.id.bustype = BUS_GAMEPORT;
+	interact->dev.id.vendor = GAMEPORT_ID_VENDOR_INTERACT;
+	interact->dev.id.product = interact_type[i].id;
+	interact->dev.id.version = 0x0100;
 
-	input_dev->open = interact_open;
-	input_dev->close = interact_close;
-
-	input_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_ABS);
+	interact->dev.evbit[0] = BIT(EV_KEY) | BIT(EV_ABS);
 
 	for (i = 0; (t = interact_type[interact->type].abs[i]) >= 0; i++) {
-		if (i < interact_type[interact->type].b8)
-			input_set_abs_params(input_dev, t, 0, 255, 0, 0);
-		else
-			input_set_abs_params(input_dev, t, -1, 1, 0, 0);
+		set_bit(t, interact->dev.absbit);
+		if (i < interact_type[interact->type].b8) {
+			interact->dev.absmin[t] = 0;
+			interact->dev.absmax[t] = 255;
+		} else {
+			interact->dev.absmin[t] = -1;
+			interact->dev.absmax[t] = 1;
+		}
 	}
 
 	for (i = 0; (t = interact_type[interact->type].btn[i]) >= 0; i++)
-		__set_bit(t, input_dev->keybit);
+		set_bit(t, interact->dev.keybit);
 
-	err = input_register_device(interact->dev);
-	if (err)
-		goto fail2;
+	input_register_device(&interact->dev);
+	printk(KERN_INFO "input: %s on %s\n",
+		interact_type[interact->type].name, gameport->phys);
 
 	return 0;
 
 fail2:	gameport_close(gameport);
 fail1:  gameport_set_drvdata(gameport, NULL);
-	input_free_device(input_dev);
 	kfree(interact);
 	return err;
 }
@@ -279,7 +292,7 @@ static void interact_disconnect(struct gameport *gameport)
 {
 	struct interact *interact = gameport_get_drvdata(gameport);
 
-	input_unregister_device(interact->dev);
+	input_unregister_device(&interact->dev);
 	gameport_close(gameport);
 	gameport_set_drvdata(gameport, NULL);
 	kfree(interact);
@@ -294,4 +307,16 @@ static struct gameport_driver interact_drv = {
 	.disconnect	= interact_disconnect,
 };
 
-module_gameport_driver(interact_drv);
+static int __init interact_init(void)
+{
+	gameport_register_driver(&interact_drv);
+	return 0;
+}
+
+static void __exit interact_exit(void)
+{
+	gameport_unregister_driver(&interact_drv);
+}
+
+module_init(interact_init);
+module_exit(interact_exit);

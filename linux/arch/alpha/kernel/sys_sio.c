@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *	linux/arch/alpha/kernel/sys_sio.c
  *
@@ -11,20 +10,23 @@
  * Kenetics's Platform 2000, Avanti (AlphaStation), XL, and AlphaBook1.
  */
 
+#include <linux/config.h>
 #include <linux/kernel.h>
 #include <linux/types.h>
 #include <linux/mm.h>
 #include <linux/sched.h>
 #include <linux/pci.h>
 #include <linux/init.h>
-#include <linux/screen_info.h>
+#include <linux/tty.h>
 
 #include <asm/compiler.h>
 #include <asm/ptrace.h>
+#include <asm/system.h>
 #include <asm/dma.h>
 #include <asm/irq.h>
 #include <asm/mmu_context.h>
 #include <asm/io.h>
+#include <asm/pgtable.h>
 #include <asm/core_apecs.h>
 #include <asm/core_lca.h>
 #include <asm/tlbflush.h>
@@ -33,7 +35,6 @@
 #include "irq_impl.h"
 #include "pci_impl.h"
 #include "machvec_impl.h"
-#include "pc873xx.h"
 
 #if defined(ALPHA_RESTORE_SRM_SETUP)
 /* Save LCA configuration data as the console had it set up.  */
@@ -78,36 +79,23 @@ alphabook1_init_arch(void)
  * example, sound boards seem to like using IRQ 9.
  *
  * This is NOT how we should do it. PIRQ0-X should have
- * their own IRQs, the way intel uses the IO-APIC IRQs.
+ * their own IRQ's, the way intel uses the IO-APIC irq's.
  */
 
 static void __init
 sio_pci_route(void)
 {
-	unsigned int orig_route_tab;
-
-	/* First, ALWAYS read and print the original setting. */
-	pci_bus_read_config_dword(pci_isa_hose->bus, PCI_DEVFN(7, 0), 0x60,
-				  &orig_route_tab);
-	printk("%s: PIRQ original 0x%x new 0x%x\n", __func__,
-	       orig_route_tab, alpha_mv.sys.sio.route_tab);
-
 #if defined(ALPHA_RESTORE_SRM_SETUP)
-	saved_config.orig_route_tab = orig_route_tab;
+	/* First, read and save the original setting. */
+	pci_bus_read_config_dword(pci_isa_hose->bus, PCI_DEVFN(7, 0), 0x60,
+				  &saved_config.orig_route_tab);
+	printk("%s: PIRQ original 0x%x new 0x%x\n", __FUNCTION__,
+	       saved_config.orig_route_tab, alpha_mv.sys.sio.route_tab);
 #endif
 
 	/* Now override with desired setting. */
 	pci_bus_write_config_dword(pci_isa_hose->bus, PCI_DEVFN(7, 0), 0x60,
 				   alpha_mv.sys.sio.route_tab);
-}
-
-static bool sio_pci_dev_irq_needs_level(const struct pci_dev *dev)
-{
-	if ((dev->class >> 16 == PCI_BASE_CLASS_BRIDGE) &&
-	    (dev->class >> 8 != PCI_CLASS_BRIDGE_PCMCIA))
-		return false;
-
-	return true;
 }
 
 static unsigned int __init
@@ -117,8 +105,9 @@ sio_collect_irq_levels(void)
 	struct pci_dev *dev = NULL;
 
 	/* Iterate through the devices, collecting IRQ levels.  */
-	for_each_pci_dev(dev) {
-		if (!sio_pci_dev_irq_needs_level(dev))
+	while ((dev = pci_find_device(PCI_ANY_ID, PCI_ANY_ID, dev)) != NULL) {
+		if ((dev->class >> 16 == PCI_BASE_CLASS_BRIDGE) &&
+		    (dev->class >> 8 != PCI_CLASS_BRIDGE_PCMCIA))
 			continue;
 
 		if (dev->irq)
@@ -127,7 +116,8 @@ sio_collect_irq_levels(void)
 	return level_bits;
 }
 
-static void __sio_fixup_irq_levels(unsigned int level_bits, bool reset)
+static void __init
+sio_fixup_irq_levels(unsigned int level_bits)
 {
 	unsigned int old_level_bits;
 
@@ -145,23 +135,14 @@ static void __sio_fixup_irq_levels(unsigned int level_bits, bool reset)
 	 */
 	old_level_bits = inb(0x4d0) | (inb(0x4d1) << 8);
 
-	if (reset)
-		old_level_bits &= 0x71ff;
-
-	level_bits |= old_level_bits;
+	level_bits |= (old_level_bits & 0x71ff);
 
 	outb((level_bits >> 0) & 0xff, 0x4d0);
 	outb((level_bits >> 8) & 0xff, 0x4d1);
 }
 
-static inline void
-sio_fixup_irq_levels(unsigned int level_bits)
-{
-	__sio_fixup_irq_levels(level_bits, true);
-}
-
-static inline int
-noname_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
+static inline int __init
+noname_map_irq(struct pci_dev *dev, u8 slot, u8 pin)
 {
 	/*
 	 * The Noname board has 5 PCI slots with each of the 4
@@ -181,7 +162,7 @@ noname_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 	 * that they use the default INTA line, if they are interrupt
 	 * driven at all).
 	 */
-	static char irq_tab[][5] = {
+	static char irq_tab[][5] __initdata = {
 		/*INT A   B   C   D */
 		{ 3,  3,  3,  3,  3}, /* idsel  6 (53c810) */ 
 		{-1, -1, -1, -1, -1}, /* idsel  7 (SIO: PCI/ISA bridge) */
@@ -196,20 +177,13 @@ noname_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 	const long min_idsel = 6, max_idsel = 14, irqs_per_slot = 5;
 	int irq = COMMON_TABLE_LOOKUP, tmp;
 	tmp = __kernel_extbl(alpha_mv.sys.sio.route_tab, irq);
-
-	irq = irq >= 0 ? tmp : -1;
-
-	/* Fixup IRQ level if an actual IRQ mapping is detected */
-	if (sio_pci_dev_irq_needs_level(dev) && irq >= 0)
-		__sio_fixup_irq_levels(1 << irq, false);
-
-	return irq;
+	return irq >= 0 ? tmp : -1;
 }
 
-static inline int
-p2k_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
+static inline int __init
+p2k_map_irq(struct pci_dev *dev, u8 slot, u8 pin)
 {
-	static char irq_tab[][5] = {
+	static char irq_tab[][5] __initdata = {
 		/*INT A   B   C   D */
 		{ 0,  0, -1, -1, -1}, /* idsel  6 (53c810) */
 		{-1, -1, -1, -1, -1}, /* idsel  7 (SIO: PCI/ISA bridge) */
@@ -231,27 +205,7 @@ noname_init_pci(void)
 	common_init_pci();
 	sio_pci_route();
 	sio_fixup_irq_levels(sio_collect_irq_levels());
-
-	if (pc873xx_probe() == -1) {
-		printk(KERN_ERR "Probing for PC873xx Super IO chip failed.\n");
-	} else {
-		printk(KERN_INFO "Found %s Super IO chip at 0x%x\n",
-			pc873xx_get_model(), pc873xx_get_base());
-
-		/* Enabling things in the Super IO chip doesn't actually
-		 * configure and enable things, the legacy drivers still
-		 * need to do the actual configuration and enabling.
-		 * This only unblocks them.
-		 */
-
-#if !defined(CONFIG_ALPHA_AVANTI)
-		/* Don't bother on the Avanti family.
-		 * None of them had on-board IDE.
-		 */
-		pc873xx_enable_ide();
-#endif
-		pc873xx_enable_epp19();
-	}
+	ns87312_enable_ide(0x26e);
 }
 
 static inline void __init
@@ -275,8 +229,8 @@ alphabook1_init_pci(void)
 	 */
 
 	dev = NULL;
-	while ((dev = pci_get_device(PCI_VENDOR_ID_NCR, PCI_ANY_ID, dev))) {
-		if (dev->device == PCI_DEVICE_ID_NCR_53C810
+	while ((dev = pci_find_device(PCI_VENDOR_ID_NCR, PCI_ANY_ID, dev))) {
+                if (dev->device == PCI_DEVICE_ID_NCR_53C810
 		    || dev->device == PCI_DEVICE_ID_NCR_53C815
 		    || dev->device == PCI_DEVICE_ID_NCR_53C820
 		    || dev->device == PCI_DEVICE_ID_NCR_53C825) {
@@ -381,7 +335,7 @@ struct alpha_machine_vector avanti_mv __initmv = {
 	.pci_swizzle		= common_swizzle,
 
 	.sys = { .sio = {
-		.route_tab	= 0x0b0a050f, /* leave 14 for IDE, 9 for SND */
+		.route_tab	= 0x0b0a0e0f,
 	}}
 };
 ALIAS_MV(avanti)

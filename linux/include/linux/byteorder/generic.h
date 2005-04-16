@@ -1,14 +1,9 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _LINUX_BYTEORDER_GENERIC_H
 #define _LINUX_BYTEORDER_GENERIC_H
 
 /*
- * linux/byteorder/generic.h
+ * linux/byteorder_generic.h
  * Generic Byte-reordering support
- *
- * The "... p" macros, like le64_to_cpup, can be used with pointers
- * to unaligned data, but there will be a performance penalty on 
- * some architectures.  Use get_unaligned for unaligned data.
  *
  * Francois-Rene Rideau <fare@tunes.org> 19970707
  *    gathered all the good ideas from all asm-foo/byteorder.h into one file,
@@ -83,6 +78,12 @@
  *
  */
 
+
+#if defined(__KERNEL__)
+/*
+ * inside the kernel, we can use nicknames;
+ * outside of it, we must avoid POSIX namespace pollution...
+ */
 #define cpu_to_le64 __cpu_to_le64
 #define le64_to_cpu __le64_to_cpu
 #define cpu_to_le32 __cpu_to_le32
@@ -119,8 +120,19 @@
 #define be32_to_cpus __be32_to_cpus
 #define cpu_to_be16s __cpu_to_be16s
 #define be16_to_cpus __be16_to_cpus
+#endif
 
+
+#if defined(__KERNEL__)
 /*
+ * Handle ntohl and suches. These have various compatibility
+ * issues - like we want to give the prototype even though we
+ * also have a macro for them in case some strange program
+ * wants to take the address of the thing or something..
+ *
+ * Note that these used to return a "long" in libc5, even though
+ * long is often 64-bit these days.. Thus the casts.
+ *
  * They have to be macros in order to do the constant folding
  * correctly - if the argument passed into a inline function
  * it is no longer constant according to gcc..
@@ -130,6 +142,17 @@
 #undef ntohs
 #undef htonl
 #undef htons
+
+/*
+ * Do the prototypes. Somebody might want to take the
+ * address or some such sick thing..
+ */
+extern __u32			ntohl(__be32);
+extern __be32			htonl(__u32);
+extern __u16			ntohs(__be16);
+extern __be16			htons(__u16);
+
+#if defined(__GNUC__) && (__GNUC__ >= 2) && defined(__OPTIMIZE__)
 
 #define ___htonl(x) __cpu_to_be32(x)
 #define ___htons(x) __cpu_to_be16(x)
@@ -141,67 +164,9 @@
 #define htons(x) ___htons(x)
 #define ntohs(x) ___ntohs(x)
 
-static inline void le16_add_cpu(__le16 *var, u16 val)
-{
-	*var = cpu_to_le16(le16_to_cpu(*var) + val);
-}
+#endif /* OPTIMIZE */
 
-static inline void le32_add_cpu(__le32 *var, u32 val)
-{
-	*var = cpu_to_le32(le32_to_cpu(*var) + val);
-}
+#endif /* KERNEL */
 
-static inline void le64_add_cpu(__le64 *var, u64 val)
-{
-	*var = cpu_to_le64(le64_to_cpu(*var) + val);
-}
-
-/* XXX: this stuff can be optimized */
-static inline void le32_to_cpu_array(u32 *buf, unsigned int words)
-{
-	while (words--) {
-		__le32_to_cpus(buf);
-		buf++;
-	}
-}
-
-static inline void cpu_to_le32_array(u32 *buf, unsigned int words)
-{
-	while (words--) {
-		__cpu_to_le32s(buf);
-		buf++;
-	}
-}
-
-static inline void be16_add_cpu(__be16 *var, u16 val)
-{
-	*var = cpu_to_be16(be16_to_cpu(*var) + val);
-}
-
-static inline void be32_add_cpu(__be32 *var, u32 val)
-{
-	*var = cpu_to_be32(be32_to_cpu(*var) + val);
-}
-
-static inline void be64_add_cpu(__be64 *var, u64 val)
-{
-	*var = cpu_to_be64(be64_to_cpu(*var) + val);
-}
-
-static inline void cpu_to_be32_array(__be32 *dst, const u32 *src, size_t len)
-{
-	size_t i;
-
-	for (i = 0; i < len; i++)
-		dst[i] = cpu_to_be32(src[i]);
-}
-
-static inline void be32_to_cpu_array(u32 *dst, const __be32 *src, size_t len)
-{
-	size_t i;
-
-	for (i = 0; i < len; i++)
-		dst[i] = be32_to_cpu(src[i]);
-}
 
 #endif /* _LINUX_BYTEORDER_GENERIC_H */

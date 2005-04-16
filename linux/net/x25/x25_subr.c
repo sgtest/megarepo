@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *	X.25 Packet Layer release 002
  *
@@ -8,24 +7,25 @@
  *
  *	This code REQUIRES 2.1.15 or higher
  *
+ *	This module:
+ *		This module is free software; you can redistribute it and/or
+ *		modify it under the terms of the GNU General Public License
+ *		as published by the Free Software Foundation; either version
+ *		2 of the License, or (at your option) any later version.
+ *
  *	History
  *	X.25 001	Jonathan Naylor	  Started coding.
  *	X.25 002	Jonathan Naylor	  Centralised disconnection processing.
  *	mar/20/00	Daniela Squassoni Disabling/enabling of facilities
  *					  negotiation.
  *	jun/24/01	Arnaldo C. Melo	  use skb_queue_purge, cleanups
- *	apr/04/15	Shaun Pereira		Fast select with no
- *						restriction on response.
  */
 
-#define pr_fmt(fmt) "X25: " fmt
-
-#include <linux/slab.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/skbuff.h>
 #include <net/sock.h>
-#include <net/tcp_states.h>
+#include <net/tcp.h>
 #include <net/x25.h>
 
 /*
@@ -78,7 +78,7 @@ void x25_requeue_frames(struct sock *sk)
 		if (!skb_prev)
 			skb_queue_head(&sk->sk_write_queue, skb);
 		else
-			skb_append(skb_prev, skb, &sk->sk_write_queue);
+			skb_append(skb_prev, skb);
 		skb_prev = skb;
 	}
 }
@@ -123,30 +123,28 @@ void x25_write_internal(struct sock *sk, int frametype)
 	 *	Adjust frame size.
 	 */
 	switch (frametype) {
-	case X25_CALL_REQUEST:
-		len += 1 + X25_ADDR_LEN + X25_MAX_FAC_LEN + X25_MAX_CUD_LEN;
-		break;
-	case X25_CALL_ACCEPTED: /* fast sel with no restr on resp */
-		if (x25->facilities.reverse & 0x80) {
+		case X25_CALL_REQUEST:
+			len += 1 + X25_ADDR_LEN + X25_MAX_FAC_LEN +
+			       X25_MAX_CUD_LEN;
+			break;
+		case X25_CALL_ACCEPTED:
 			len += 1 + X25_MAX_FAC_LEN + X25_MAX_CUD_LEN;
-		} else {
-			len += 1 + X25_MAX_FAC_LEN;
-		}
-		break;
-	case X25_CLEAR_REQUEST:
-	case X25_RESET_REQUEST:
-		len += 2;
-		break;
-	case X25_RR:
-	case X25_RNR:
-	case X25_REJ:
-	case X25_CLEAR_CONFIRMATION:
-	case X25_INTERRUPT_CONFIRMATION:
-	case X25_RESET_CONFIRMATION:
-		break;
-	default:
-		pr_err("invalid frame type %02X\n", frametype);
-		return;
+			break;
+		case X25_CLEAR_REQUEST:
+		case X25_RESET_REQUEST:
+			len += 2;
+			break;
+		case X25_RR:
+		case X25_RNR:
+		case X25_REJ:
+		case X25_CLEAR_CONFIRMATION:
+		case X25_INTERRUPT_CONFIRMATION:
+		case X25_RESET_CONFIRMATION:
+			break;
+		default:
+			printk(KERN_ERR "X.25: invalid frame type %02X\n",
+			       frametype);
+			return;
 	}
 
 	if ((skb = alloc_skb(len, GFP_ATOMIC)) == NULL)
@@ -183,14 +181,16 @@ void x25_write_internal(struct sock *sk, int frametype)
 			*dptr++ = X25_CALL_REQUEST;
 			len     = x25_addr_aton(addresses, &x25->dest_addr,
 						&x25->source_addr);
-			skb_put_data(skb, addresses, len);
+			dptr    = skb_put(skb, len);
+			memcpy(dptr, addresses, len);
 			len     = x25_create_facilities(facilities,
-					&x25->facilities,
-					&x25->dte_facilities,
-					x25->neighbour->global_facil_mask);
-			skb_put_data(skb, facilities, len);
-			skb_put_data(skb, x25->calluserdata.cuddata,
-				     x25->calluserdata.cudlength);
+							&x25->facilities,
+					     x25->neighbour->global_facil_mask);
+			dptr    = skb_put(skb, len);
+			memcpy(dptr, facilities, len);
+			dptr = skb_put(skb, x25->calluserdata.cudlength);
+			memcpy(dptr, x25->calluserdata.cuddata,
+			       x25->calluserdata.cudlength);
 			x25->calluserdata.cudlength = 0;
 			break;
 
@@ -200,28 +200,16 @@ void x25_write_internal(struct sock *sk, int frametype)
 			*dptr++ = 0x00;		/* Address lengths */
 			len     = x25_create_facilities(facilities,
 							&x25->facilities,
-							&x25->dte_facilities,
 							x25->vc_facil_mask);
-			skb_put_data(skb, facilities, len);
-
-			/* fast select with no restriction on response
-				allows call user data. Userland must
-				ensure it is ours and not theirs */
-			if(x25->facilities.reverse & 0x80) {
-				skb_put_data(skb,
-					     x25->calluserdata.cuddata,
-					     x25->calluserdata.cudlength);
-			}
+			dptr    = skb_put(skb, len);
+			memcpy(dptr, facilities, len);
+			dptr = skb_put(skb, x25->calluserdata.cudlength);
+			memcpy(dptr, x25->calluserdata.cuddata,
+			       x25->calluserdata.cudlength);
 			x25->calluserdata.cudlength = 0;
 			break;
 
 		case X25_CLEAR_REQUEST:
-			dptr    = skb_put(skb, 3);
-			*dptr++ = frametype;
-			*dptr++ = x25->causediag.cause;
-			*dptr++ = x25->causediag.diagnostic;
-			break;
-
 		case X25_RESET_REQUEST:
 			dptr    = skb_put(skb, 3);
 			*dptr++ = frametype;
@@ -261,39 +249,31 @@ int x25_decode(struct sock *sk, struct sk_buff *skb, int *ns, int *nr, int *q,
 	       int *d, int *m)
 {
 	struct x25_sock *x25 = x25_sk(sk);
-	unsigned char *frame;
-
-	if (!pskb_may_pull(skb, X25_STD_MIN_LEN))
-		return X25_ILLEGAL;
-	frame = skb->data;
+	unsigned char *frame = skb->data;
 
 	*ns = *nr = *q = *d = *m = 0;
 
 	switch (frame[2]) {
-	case X25_CALL_REQUEST:
-	case X25_CALL_ACCEPTED:
-	case X25_CLEAR_REQUEST:
-	case X25_CLEAR_CONFIRMATION:
-	case X25_INTERRUPT:
-	case X25_INTERRUPT_CONFIRMATION:
-	case X25_RESET_REQUEST:
-	case X25_RESET_CONFIRMATION:
-	case X25_RESTART_REQUEST:
-	case X25_RESTART_CONFIRMATION:
-	case X25_REGISTRATION_REQUEST:
-	case X25_REGISTRATION_CONFIRMATION:
-	case X25_DIAGNOSTIC:
-		return frame[2];
+		case X25_CALL_REQUEST:
+		case X25_CALL_ACCEPTED:
+		case X25_CLEAR_REQUEST:
+		case X25_CLEAR_CONFIRMATION:
+		case X25_INTERRUPT:
+		case X25_INTERRUPT_CONFIRMATION:
+		case X25_RESET_REQUEST:
+		case X25_RESET_CONFIRMATION:
+		case X25_RESTART_REQUEST:
+		case X25_RESTART_CONFIRMATION:
+		case X25_REGISTRATION_REQUEST:
+		case X25_REGISTRATION_CONFIRMATION:
+		case X25_DIAGNOSTIC:
+			return frame[2];
 	}
 
 	if (x25->neighbour->extended) {
 		if (frame[2] == X25_RR  ||
 		    frame[2] == X25_RNR ||
 		    frame[2] == X25_REJ) {
-			if (!pskb_may_pull(skb, X25_EXT_MIN_LEN))
-				return X25_ILLEGAL;
-			frame = skb->data;
-
 			*nr = (frame[3] >> 1) & 0x7F;
 			return frame[2];
 		}
@@ -308,10 +288,6 @@ int x25_decode(struct sock *sk, struct sk_buff *skb, int *ns, int *nr, int *q,
 
 	if (x25->neighbour->extended) {
 		if ((frame[2] & 0x01) == X25_DATA) {
-			if (!pskb_may_pull(skb, X25_EXT_MIN_LEN))
-				return X25_ILLEGAL;
-			frame = skb->data;
-
 			*q  = (frame[0] & X25_Q_BIT) == X25_Q_BIT;
 			*d  = (frame[0] & X25_D_BIT) == X25_D_BIT;
 			*m  = (frame[3] & X25_EXT_M_BIT) == X25_EXT_M_BIT;
@@ -330,7 +306,8 @@ int x25_decode(struct sock *sk, struct sk_buff *skb, int *ns, int *nr, int *q,
 		}
 	}
 
-	pr_debug("invalid PLP frame %3ph\n", frame);
+	printk(KERN_DEBUG "X.25: invalid PLP frame %02X %02X %02X\n",
+	       frame[0], frame[1], frame[2]);
 
 	return X25_ILLEGAL;
 }
@@ -357,12 +334,6 @@ void x25_disconnect(struct sock *sk, int reason, unsigned char cause,
 		sk->sk_state_change(sk);
 		sock_set_flag(sk, SOCK_DEAD);
 	}
-	if (x25->neighbour) {
-		read_lock_bh(&x25_list_lock);
-		x25_neigh_put(x25->neighbour);
-		x25->neighbour = NULL;
-		read_unlock_bh(&x25_list_lock);
-	}
 }
 
 /*
@@ -373,7 +344,7 @@ void x25_check_rbuf(struct sock *sk)
 {
 	struct x25_sock *x25 = x25_sk(sk);
 
-	if (atomic_read(&sk->sk_rmem_alloc) < (sk->sk_rcvbuf >> 1) &&
+	if (atomic_read(&sk->sk_rmem_alloc) < (sk->sk_rcvbuf / 2) &&
 	    (x25->condition & X25_COND_OWN_RX_BUSY)) {
 		x25->condition &= ~X25_COND_OWN_RX_BUSY;
 		x25->condition &= ~X25_COND_ACK_PENDING;
@@ -382,3 +353,22 @@ void x25_check_rbuf(struct sock *sk)
 		x25_stop_timer(sk);
 	}
 }
+
+/*
+ * Compare 2 calluserdata structures, used to find correct listening sockets
+ * when call user data is used.
+ */
+int x25_check_calluserdata(struct x25_calluserdata *ours, struct x25_calluserdata *theirs)
+{
+	int i;
+	if (ours->cudlength != theirs->cudlength)
+		return 0;
+
+	for (i=0;i<ours->cudlength;i++) {
+		if (ours->cuddata[i] != theirs->cuddata[i]) {
+			return 0;
+		}
+	}
+	return 1;
+}
+

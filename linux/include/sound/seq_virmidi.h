@@ -1,15 +1,31 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef __SOUND_SEQ_VIRMIDI_H
 #define __SOUND_SEQ_VIRMIDI_H
 
 /*
  *  Virtual Raw MIDI client on Sequencer
  *  Copyright (c) 2000 by Takashi Iwai <tiwai@suse.de>,
- *                        Jaroslav Kysela <perex@perex.cz>
+ *                        Jaroslav Kysela <perex@suse.cz>
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ *
  */
 
-#include <sound/rawmidi.h>
-#include <sound/seq_midi_event.h>
+#include "rawmidi.h"
+#include "seq_midi_event.h"
+
+typedef struct _snd_virmidi_dev snd_virmidi_dev_t;
 
 /*
  * device file instance:
@@ -17,18 +33,17 @@
  * opened.  Each instance has its own input buffer and MIDI parser
  * (buffer), and is associated with the device instance.
  */
-struct snd_virmidi {
+typedef struct _snd_virmidi {
 	struct list_head list;
 	int seq_mode;
 	int client;
 	int port;
-	bool trigger;
-	struct snd_midi_event *parser;
-	struct snd_seq_event event;
-	struct snd_virmidi_dev *rdev;
-	struct snd_rawmidi_substream *substream;
-	struct work_struct output_work;
-};
+	unsigned int trigger: 1;
+	snd_midi_event_t *parser;
+	snd_seq_event_t event;
+	snd_virmidi_dev_t *rdev;
+	snd_rawmidi_substream_t *substream;
+} snd_virmidi_t;
 
 #define SNDRV_VIRMIDI_SUBSCRIBE		(1<<0)
 #define SNDRV_VIRMIDI_USE		(1<<1)
@@ -38,16 +53,15 @@ struct snd_virmidi {
  * Each virtual midi device has one device instance.  It contains
  * common information and the linked-list of opened files, 
  */
-struct snd_virmidi_dev {
-	struct snd_card *card;		/* associated card */
-	struct snd_rawmidi *rmidi;		/* rawmidi device */
+struct _snd_virmidi_dev {
+	snd_card_t *card;		/* associated card */
+	snd_rawmidi_t *rmidi;		/* rawmidi device */
 	int seq_mode;			/* SNDRV_VIRMIDI_XXX */
 	int device;			/* sequencer device */
 	int client;			/* created/attached client */
 	int port;			/* created/attached port */
 	unsigned int flags;		/* SNDRV_VIRMIDI_* */
 	rwlock_t filelist_lock;
-	struct rw_semaphore filelist_sem;
 	struct list_head filelist;
 };
 
@@ -64,6 +78,7 @@ struct snd_virmidi_dev {
 #define SNDRV_VIRMIDI_SEQ_ATTACH	1
 #define SNDRV_VIRMIDI_SEQ_DISPATCH	2
 
-int snd_virmidi_new(struct snd_card *card, int device, struct snd_rawmidi **rrmidi);
+int snd_virmidi_new(snd_card_t *card, int device, snd_rawmidi_t **rrmidi);
+int snd_virmidi_receive(snd_rawmidi_t *rmidi, snd_seq_event_t *ev);
 
 #endif /* __SOUND_SEQ_VIRMIDI */

@@ -90,6 +90,23 @@
 #define PCI_CHIP_NM2360 0x0006
 #define PCI_CHIP_NM2380 0x0016
 
+
+struct xtimings {
+	unsigned int pixclock;
+	unsigned int HDisplay;
+	unsigned int HSyncStart;
+	unsigned int HSyncEnd;
+	unsigned int HTotal;
+	unsigned int VDisplay;
+	unsigned int VSyncStart;
+	unsigned int VSyncEnd;
+	unsigned int VTotal;
+	unsigned int sync;
+	int dblscan;
+	int interlaced;
+};
+
+
 /* --------------------------------------------------------------------- */
 
 typedef volatile struct {
@@ -123,13 +140,13 @@ typedef volatile struct {
 
 struct neofb_par {
 	struct vgastate state;
-	unsigned int ref_count;
+	atomic_t ref_count;
 
 	unsigned char MiscOutReg;	/* Misc */
 	unsigned char CRTC[25];		/* Crtc Controller */
 	unsigned char Sequencer[5];	/* Video Sequencer */
 	unsigned char Graphics[9];	/* Video Graphics */
-	unsigned char Attribute[21];	/* Video Attribute */
+	unsigned char Attribute[21];	/* Video Atribute */
 
 	unsigned char GeneralLockReg;
 	unsigned char ExtCRTDispAddr;
@@ -142,7 +159,6 @@ struct neofb_par {
 	unsigned char PanelDispCntlReg1;
 	unsigned char PanelDispCntlReg2;
 	unsigned char PanelDispCntlReg3;
-	unsigned char PanelDispCntlRegRead;
 	unsigned char PanelVertCenterReg1;
 	unsigned char PanelVertCenterReg2;
 	unsigned char PanelVertCenterReg3;
@@ -159,7 +175,10 @@ struct neofb_par {
 	unsigned char VCLK3NumeratorHigh;
 	unsigned char VCLK3Denominator;
 	unsigned char VerticalExt;
-	int wc_cookie;
+
+#ifdef CONFIG_MTRR
+	int mtrr;
+#endif
 	u8 __iomem *mmio_vbase;
 	u8 cursorOff;
 	u8 *cursorPad;		/* Must die !! */
@@ -177,7 +196,6 @@ struct neofb_par {
 	int internal_display;
 	int external_display;
 	int libretto;
-	u32 palette[16];
 };
 
 typedef struct {

@@ -1,11 +1,21 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
 /* ------------------------------------------------------------------------- */
 /* i2c-iop3xx.h algorithm driver definitions private to i2c-iop3xx.c         */
 /* ------------------------------------------------------------------------- */
 /*   Copyright (C) 2003 Peter Milne, D-TACQ Solutions Ltd
  *                      <Peter dot Milne at D hyphen TACQ dot com>
 
- */
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, version 2.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.                */
 /* ------------------------------------------------------------------------- */
 
 
@@ -70,7 +80,7 @@
 #define IOP3XX_GPOD_I2C0	0x00c0	/* clear these bits to enable ch0 */
 #define IOP3XX_GPOD_I2C1	0x0030	/* clear these bits to enable ch1 */
 
-#define MYSAR			0	/* default slave address */
+#define MYSAR			0x02	/* SWAG a suitable slave address */
 
 #define I2C_ERR			321
 #define I2C_ERR_BERR		(I2C_ERR+0)
@@ -87,13 +97,11 @@
 #define	IOP3XX_I2C_IO_SIZE	0x18
 
 struct i2c_algo_iop3xx_data {
-	void __iomem *ioaddr;
+	u32 ioaddr;
 	wait_queue_head_t waitq;
 	spinlock_t lock;
 	u32 SR_enabled, SR_received;
 	int id;
-	struct gpio_desc *gpio_scl;
-	struct gpio_desc *gpio_sda;
 };
 
 #endif /* I2C_IOP3XX_H */

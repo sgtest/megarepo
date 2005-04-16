@@ -1,29 +1,27 @@
-#! /usr/bin/env perl
-# SPDX-License-Identifier: GPL-2.0
+#! /usr/bin/perl
 #
-# checkversion finds uses of all macros in <linux/version.h>
-# where the source files do not #include <linux/version.h>; or cases
-# of including <linux/version.h> where it is not needed.
-# Copyright (C) 2003, Randy Dunlap <rdunlap@infradead.org>
-
-use strict;
+# checkversion find uses of LINUX_VERSION_CODE, KERNEL_VERSION, or
+# UTS_RELEASE without including <linux/version.h>, or cases of
+# including <linux/version.h> that don't need it.
+# Copyright (C) 2003, Randy Dunlap <rddunlap@osdl.org>
 
 $| = 1;
 
-my $debugging;
+my $debugging = 0;
 
-foreach my $file (@ARGV) {
-    next if $file =~ "include/generated/uapi/linux/version\.h";
-    next if $file =~ "usr/include/linux/version\.h";
+foreach $file (@ARGV)
+{
     # Open this file.
-    open( my $f, '<', $file )
-      or die "Can't open $file: $!\n";
+    open(FILE, $file) || die "Can't open $file: $!\n";
 
     # Initialize variables.
-    my ($fInComment, $fInString, $fUseVersion);
+    my $fInComment   = 0;
+    my $fInString    = 0;
+    my $fUseVersion   = 0;
     my $iLinuxVersion = 0;
 
-    while (<$f>) {
+    LINE: while ( <FILE> )
+    {
 	# Strip comments.
 	$fInComment && (s+^.*?\*/+ +o ? ($fInComment = 0) : next);
 	m+/\*+o && (s+/\*.*?\*/+ +go, (s+/\*.*$+ +o && ($fInComment = 1)));
@@ -42,14 +40,12 @@ foreach my $file (@ARGV) {
 	    $iLinuxVersion      = $. if m/^\s*#\s*include\s*<linux\/version\.h>/o;
 	}
 
-	# Look for uses: LINUX_VERSION_CODE, KERNEL_VERSION,
-	# LINUX_VERSION_MAJOR, LINUX_VERSION_PATCHLEVEL, LINUX_VERSION_SUBLEVEL
+	# Look for uses: LINUX_VERSION_CODE, KERNEL_VERSION, UTS_RELEASE
 	if (($_ =~ /LINUX_VERSION_CODE/) || ($_ =~ /\WKERNEL_VERSION/) ||
-	    ($_ =~ /LINUX_VERSION_MAJOR/) || ($_ =~ /LINUX_VERSION_PATCHLEVEL/) ||
-	    ($_ =~ /LINUX_VERSION_SUBLEVEL/)) {
+		($_ =~ /UTS_RELEASE/)) {
 	    $fUseVersion = 1;
-            last if $iLinuxVersion;
-        }
+	    last LINE if $iLinuxVersion;
+	}
     }
 
     # Report used version IDs without include?
@@ -72,5 +68,5 @@ foreach my $file (@ARGV) {
         }
     }
 
-    close($f);
+    close(FILE);
 }

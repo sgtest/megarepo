@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * pcic.c: MicroSPARC-IIep PCI controller support
  *
@@ -11,6 +10,7 @@
  * CP-1200 by Eric Brower.
  */
 
+#include <linux/config.h>
 #include <linux/kernel.h>
 #include <linux/types.h>
 #include <linux/init.h>
@@ -18,6 +18,8 @@
 #include <linux/slab.h>
 #include <linux/jiffies.h>
 
+#include <asm/ebus.h>
+#include <asm/sbus.h> /* for sanity check... */
 #include <asm/swift.h> /* for cache flushing. */
 #include <asm/io.h>
 
@@ -26,19 +28,15 @@
 #include <linux/time.h>
 #include <linux/timex.h>
 #include <linux/interrupt.h>
-#include <linux/export.h>
 
 #include <asm/irq.h>
 #include <asm/oplib.h>
-#include <asm/prom.h>
 #include <asm/pcic.h>
-#include <asm/timex.h>
 #include <asm/timer.h>
-#include <linux/uaccess.h>
-#include <asm/irq_regs.h>
+#include <asm/uaccess.h>
 
-#include "kernel.h"
-#include "irq.h"
+
+unsigned int pcic_pin_to_irq(unsigned int pin, char *name);
 
 /*
  * I studied different documents and many live PROMs both from 2.30
@@ -145,7 +143,7 @@ static struct pcic_ca2irq pcic_i_jk[] = {
  * as several PROMs may be installed on the same physical board.
  */
 #define SN2L_INIT(name, map)	\
-  { name, map, ARRAY_SIZE(map) }
+  { name, map, sizeof(map)/sizeof(struct pcic_ca2irq) }
 
 static struct pcic_sn2list pcic_known_sysnames[] = {
 	SN2L_INIT("SUNW,JavaEngine1", pcic_i_je1a),	/* JE1, PROM 2.32 */
@@ -163,13 +161,12 @@ static struct pcic_sn2list pcic_known_sysnames[] = {
 static int pcic0_up;
 static struct linux_pcic pcic0;
 
-void __iomem *pcic_regs;
-static volatile int pcic_speculative;
-static volatile int pcic_trapped;
+void * __iomem pcic_regs;
+volatile int pcic_speculative;
+volatile int pcic_trapped;
 
-/* forward */
-unsigned int pcic_build_device_irq(struct platform_device *op,
-                                   unsigned int real_irq);
+static void pci_do_gettimeofday(struct timeval *tv);
+static int pci_do_settimeofday(struct timespec *tv);
 
 #define CONFIG_CMD(bus, device_fn, where) (0x80000000 | (((unsigned int)bus) << 16) | (((unsigned int)device_fn) << 8) | (where & ~3))
 
@@ -290,7 +287,7 @@ int __init pcic_probe(void)
 	struct linux_prom_registers regs[PROMREG_MAX];
 	struct linux_pbm_info* pbm;
 	char namebuf[64];
-	phandle node;
+	int node;
 	int err;
 
 	if (pcic0_up) {
@@ -331,8 +328,8 @@ int __init pcic_probe(void)
 
 	pcic->pcic_res_cfg_addr.name = "pcic_cfg_addr";
 	if ((pcic->pcic_config_space_addr =
-	    ioremap(regs[2].phys_addr, regs[2].reg_size * 2)) == NULL) {
-		prom_printf("PCIC: Error, cannot map "
+	    ioremap(regs[2].phys_addr, regs[2].reg_size * 2)) == 0) {
+		prom_printf("PCIC: Error, cannot map" 
 			    "PCI Configuration Space Address.\n");
 		prom_halt();
 	}
@@ -343,8 +340,8 @@ int __init pcic_probe(void)
 	 */
 	pcic->pcic_res_cfg_data.name = "pcic_cfg_data";
 	if ((pcic->pcic_config_space_data =
-	    ioremap(regs[3].phys_addr, regs[3].reg_size * 2)) == NULL) {
-		prom_printf("PCIC: Error, cannot map "
+	    ioremap(regs[3].phys_addr, regs[3].reg_size * 2)) == 0) {
+		prom_printf("PCIC: Error, cannot map" 
 			    "PCI Configuration Space Data.\n");
 		prom_halt();
 	}
@@ -355,7 +352,8 @@ int __init pcic_probe(void)
 	strcpy(pbm->prom_name, namebuf);
 
 	{
-		extern int pcic_nmi_trap_patch[4];
+		extern volatile int t_nmi[1];
+		extern int pcic_nmi_trap_patch[1];
 
 		t_nmi[0] = pcic_nmi_trap_patch[0];
 		t_nmi[1] = pcic_nmi_trap_patch[1];
@@ -392,16 +390,12 @@ static void __init pcic_pbm_scan_bus(struct linux_pcic *pcic)
 	struct linux_pbm_info *pbm = &pcic->pbm;
 
 	pbm->pci_bus = pci_scan_bus(pbm->pci_first_busno, &pcic_ops, pbm);
-	if (!pbm->pci_bus)
-		return;
-
 #if 0 /* deadwood transplanted from sparc64 */
 	pci_fill_in_pbm_cookies(pbm->pci_bus, pbm, pbm->prom_node);
 	pci_record_assignments(pbm, pbm->pci_bus);
 	pci_assign_unassigned(pbm, pbm->pci_bus);
 	pci_fixup_irq(pbm, pbm->pci_bus);
 #endif
-	pci_bus_add_devices(pbm->pci_bus);
 }
 
 /*
@@ -436,6 +430,7 @@ static int __init pcic_init(void)
 
 	pcic_pbm_scan_bus(pcic);
 
+	ebus_init();
 	return 0;
 }
 
@@ -444,11 +439,12 @@ int pcic_present(void)
 	return pcic0_up;
 }
 
-static int pdev_to_pnode(struct linux_pbm_info *pbm, struct pci_dev *pdev)
+static int __init pdev_to_pnode(struct linux_pbm_info *pbm, 
+				    struct pci_dev *pdev)
 {
 	struct linux_prom_pci_registers regs[PROMREG_MAX];
 	int err;
-	phandle node = prom_getchild(pbm->prom_node);
+	int node = prom_getchild(pbm->prom_node);
 
 	while(node) {
 		err = prom_getproperty(node, "reg", 
@@ -497,8 +493,12 @@ static void pcic_map_pci_device(struct linux_pcic *pcic,
 				 * do ioremap() before accessing PC-style I/O,
 				 * we supply virtual, ready to access address.
 				 *
-				 * Note that request_region()
-				 * works for these devices.
+				 * Ebus devices do not come here even if
+				 * CheerIO makes a similar conversion.
+				 * See ebus.c for details.
+				 *
+				 * Note that check_region()/request_region()
+				 * work for these devices.
 				 *
 				 * XXX Neat trick, but it's a *bad* idea
 				 * to shit into regions like that.
@@ -518,10 +518,10 @@ static void pcic_map_pci_device(struct linux_pcic *pcic,
 				 * board in a PCI slot. We must remap it
 				 * under 64K but it is not done yet. XXX
 				 */
-				pci_info(dev, "PCIC: Skipping I/O space at "
-					 "0x%lx, this will Oops if a driver "
-					 "attaches device '%s'\n", address,
-					 namebuf);
+				printk("PCIC: Skipping I/O space at 0x%lx,"
+				    "this will Oops if a driver attaches;"
+				    "device '%s' at %02x:%02x)\n", address,
+				    namebuf, dev->bus->number, dev->devfn);
 			}
 		}
 	}
@@ -531,7 +531,6 @@ static void
 pcic_fill_irq(struct linux_pcic *pcic, struct pci_dev *dev, int node)
 {
 	struct pcic_ca2irq *p;
-	unsigned int real_irq;
 	int i, ivec;
 	char namebuf[64];
 
@@ -541,7 +540,7 @@ pcic_fill_irq(struct linux_pcic *pcic, struct pci_dev *dev, int node)
 		prom_getstring(node, "name", namebuf, sizeof(namebuf));
 	}
 
-	if ((p = pcic->pcic_imap) == NULL) {
+	if ((p = pcic->pcic_imap) == 0) {
 		dev->irq = 0;
 		return;
 	}
@@ -551,8 +550,8 @@ pcic_fill_irq(struct linux_pcic *pcic, struct pci_dev *dev, int node)
 		p++;
 	}
 	if (i >= pcic->pcic_imdim) {
-		pci_info(dev, "PCIC: device %s not found in %d\n", namebuf,
-			 pcic->pcic_imdim);
+		printk("PCIC: device %s devfn %02x:%02x not found in %d\n",
+		    namebuf, dev->bus->number, dev->devfn, pcic->pcic_imdim);
 		dev->irq = 0;
 		return;
 	}
@@ -560,25 +559,26 @@ pcic_fill_irq(struct linux_pcic *pcic, struct pci_dev *dev, int node)
 	i = p->pin;
 	if (i >= 0 && i < 4) {
 		ivec = readw(pcic->pcic_regs+PCI_INT_SELECT_LO);
-		real_irq = ivec >> (i << 2) & 0xF;
+		dev->irq = ivec >> (i << 2) & 0xF;
 	} else if (i >= 4 && i < 8) {
 		ivec = readw(pcic->pcic_regs+PCI_INT_SELECT_HI);
-		real_irq = ivec >> ((i-4) << 2) & 0xF;
+		dev->irq = ivec >> ((i-4) << 2) & 0xF;
 	} else {					/* Corrupted map */
-		pci_info(dev, "PCIC: BAD PIN %d\n", i); for (;;) {}
+		printk("PCIC: BAD PIN %d\n", i); for (;;) {}
 	}
 /* P3 */ /* printk("PCIC: device %s pin %d ivec 0x%x irq %x\n", namebuf, i, ivec, dev->irq); */
 
-	/* real_irq means PROM did not bother to program the upper
+	/*
+	 * dev->irq=0 means PROM did not bother to program the upper
 	 * half of PCIC. This happens on JS-E with PROM 3.11, for instance.
 	 */
-	if (real_irq == 0 || p->force) {
+	if (dev->irq == 0 || p->force) {
 		if (p->irq == 0 || p->irq >= 15) {	/* Corrupted map */
-			pci_info(dev, "PCIC: BAD IRQ %d\n", p->irq); for (;;) {}
+			printk("PCIC: BAD IRQ %d\n", p->irq); for (;;) {}
 		}
-		pci_info(dev, "PCIC: setting irq %d at pin %d\n", p->irq,
-			 p->pin);
-		real_irq = p->irq;
+		printk("PCIC: setting irq %d at pin %d for device %02x:%02x\n",
+		    p->irq, p->pin, dev->bus->number, dev->devfn);
+		dev->irq = p->irq;
 
 		i = p->pin;
 		if (i >= 4) {
@@ -592,23 +592,26 @@ pcic_fill_irq(struct linux_pcic *pcic, struct pci_dev *dev, int node)
 			ivec |= p->irq << (i << 2);
 			writew(ivec, pcic->pcic_regs+PCI_INT_SELECT_LO);
 		}
-	}
-	dev->irq = pcic_build_device_irq(NULL, real_irq);
+ 	}
+
+	return;
 }
 
 /*
  * Normally called from {do_}pci_scan_bus...
  */
-void pcibios_fixup_bus(struct pci_bus *bus)
+void __init pcibios_fixup_bus(struct pci_bus *bus)
 {
 	struct pci_dev *dev;
+	int i, has_io, has_mem;
+	unsigned int cmd;
 	struct linux_pcic *pcic;
 	/* struct linux_pbm_info* pbm = &pcic->pbm; */
 	int node;
 	struct pcidev_cookie *pcp;
 
 	if (!pcic0_up) {
-		pci_info(bus, "pcibios_fixup_bus: no PCIC\n");
+		printk("pcibios_fixup_bus: no PCIC\n");
 		return;
 	}
 	pcic = &pcic0;
@@ -617,12 +620,44 @@ void pcibios_fixup_bus(struct pci_bus *bus)
 	 * Next crud is an equivalent of pbm = pcic_bus_to_pbm(bus);
 	 */
 	if (bus->number != 0) {
-		pci_info(bus, "pcibios_fixup_bus: nonzero bus 0x%x\n",
-			 bus->number);
+		printk("pcibios_fixup_bus: nonzero bus 0x%x\n", bus->number);
 		return;
 	}
 
 	list_for_each_entry(dev, &bus->devices, bus_list) {
+
+		/*
+		 * Comment from i386 branch:
+		 *     There are buggy BIOSes that forget to enable I/O and memory
+		 *     access to PCI devices. We try to fix this, but we need to
+		 *     be sure that the BIOS didn't forget to assign an address
+		 *     to the device. [mj]
+		 * OBP is a case of such BIOS :-)
+		 */
+		has_io = has_mem = 0;
+		for(i=0; i<6; i++) {
+			unsigned long f = dev->resource[i].flags;
+			if (f & IORESOURCE_IO) {
+				has_io = 1;
+			} else if (f & IORESOURCE_MEM)
+				has_mem = 1;
+		}
+		pcic_read_config(dev->bus, dev->devfn, PCI_COMMAND, 2, &cmd);
+		if (has_io && !(cmd & PCI_COMMAND_IO)) {
+			printk("PCIC: Enabling I/O for device %02x:%02x\n",
+				dev->bus->number, dev->devfn);
+			cmd |= PCI_COMMAND_IO;
+			pcic_write_config(dev->bus, dev->devfn,
+			    PCI_COMMAND, 2, cmd);
+		}
+		if (has_mem && !(cmd & PCI_COMMAND_MEMORY)) {
+			printk("PCIC: Enabling memory for device %02x:%02x\n",
+				dev->bus->number, dev->devfn);
+			cmd |= PCI_COMMAND_MEMORY;
+			pcic_write_config(dev->bus, dev->devfn,
+			    PCI_COMMAND, 2, cmd);
+		}
+
 		node = pdev_to_pnode(&pcic->pbm, dev);
 		if(node == 0)
 			node = -1;
@@ -630,7 +665,7 @@ void pcibios_fixup_bus(struct pci_bus *bus)
 		/* cookies */
 		pcp = pci_devcookie_alloc();
 		pcp->pbm = &pcic->pbm;
-		pcp->prom_node = of_find_node_by_phandle(node);
+		pcp->prom_node = node;
 		dev->sysdata = pcp;
 
 		/* fixing I/O to look like memory */
@@ -641,32 +676,28 @@ void pcibios_fixup_bus(struct pci_bus *bus)
 	}
 }
 
-int pcibios_enable_device(struct pci_dev *dev, int mask)
+/*
+ * pcic_pin_to_irq() is exported to ebus.c.
+ */
+unsigned int
+pcic_pin_to_irq(unsigned int pin, char *name)
 {
-	u16 cmd, oldcmd;
-	int i;
+	struct linux_pcic *pcic = &pcic0;
+	unsigned int irq;
+	unsigned int ivec;
 
-	pci_read_config_word(dev, PCI_COMMAND, &cmd);
-	oldcmd = cmd;
-
-	for (i = 0; i < PCI_NUM_RESOURCES; i++) {
-		struct resource *res = &dev->resource[i];
-
-		/* Only set up the requested stuff */
-		if (!(mask & (1<<i)))
-			continue;
-
-		if (res->flags & IORESOURCE_IO)
-			cmd |= PCI_COMMAND_IO;
-		if (res->flags & IORESOURCE_MEM)
-			cmd |= PCI_COMMAND_MEMORY;
+	if (pin < 4) {
+		ivec = readw(pcic->pcic_regs+PCI_INT_SELECT_LO);
+		irq = ivec >> (pin << 2) & 0xF;
+	} else if (pin < 8) {
+		ivec = readw(pcic->pcic_regs+PCI_INT_SELECT_HI);
+		irq = ivec >> ((pin-4) << 2) & 0xF;
+	} else {					/* Corrupted map */
+		printk("PCIC: BAD PIN %d FOR %s\n", pin, name);
+		for (;;) {}	/* XXX Cannot panic properly in case of PROLL */
 	}
-
-	if (cmd != oldcmd) {
-		pci_info(dev, "enabling device (%04x -> %04x)\n", oldcmd, cmd);
-		pci_write_config_word(dev, PCI_COMMAND, cmd);
-	}
-	return 0;
+/* P3 */ /* printk("PCIC: dev %s pin %d ivec 0x%x irq %x\n", name, pin, ivec, irq); */
+	return irq;
 }
 
 /* Makes compiler happy */
@@ -677,46 +708,35 @@ static void pcic_clear_clock_irq(void)
 	pcic_timer_dummy = readl(pcic0.pcic_regs+PCI_SYS_LIMIT);
 }
 
-/* CPU frequency is 100 MHz, timer increments every 4 CPU clocks */
-#define USECS_PER_JIFFY  (1000000 / HZ)
-#define TICK_TIMER_LIMIT ((100 * 1000000 / 4) / HZ)
-
-static unsigned int pcic_cycles_offset(void)
+static irqreturn_t pcic_timer_handler (int irq, void *h, struct pt_regs *regs)
 {
-	u32 value, count;
-
-	value = readl(pcic0.pcic_regs + PCI_SYS_COUNTER);
-	count = value & ~PCI_SYS_COUNTER_OVERFLOW;
-
-	if (value & PCI_SYS_COUNTER_OVERFLOW)
-		count += TICK_TIMER_LIMIT;
-	/*
-	 * We divide all by HZ
-	 * to have microsecond resolution and to avoid overflow
-	 */
-	count = ((count / HZ) * USECS_PER_JIFFY) / (TICK_TIMER_LIMIT / HZ);
-
-	/* Coordinate with the sparc_config.clock_rate setting */
-	return count * 2;
+	write_seqlock(&xtime_lock);	/* Dummy, to show that we remember */
+	pcic_clear_clock_irq();
+	do_timer(regs);
+#ifndef CONFIG_SMP
+	update_process_times(user_mode(regs));
+#endif
+	write_sequnlock(&xtime_lock);
+	return IRQ_HANDLED;
 }
+
+#define USECS_PER_JIFFY  10000  /* We have 100HZ "standard" timer for sparc */
+#define TICK_TIMER_LIMIT ((100*1000000/4)/100)
 
 void __init pci_time_init(void)
 {
 	struct linux_pcic *pcic = &pcic0;
 	unsigned long v;
 	int timer_irq, irq;
-	int err;
 
-#ifndef CONFIG_SMP
-	/*
-	 * The clock_rate is in SBUS dimension.
-	 * We take into account this in pcic_cycles_offset()
-	 */
-	sparc_config.clock_rate = SBUS_CLOCK_RATE / HZ;
-	sparc_config.features |= FEAT_L10_CLOCKEVENT;
-#endif
-	sparc_config.features |= FEAT_L10_CLOCKSOURCE;
-	sparc_config.get_cycles_offset = pcic_cycles_offset;
+	/* A hack until do_gettimeofday prototype is moved to arch specific headers
+	   and btfixupped. Patch do_gettimeofday with ba pci_do_gettimeofday; nop */
+	((unsigned int *)do_gettimeofday)[0] = 
+	    0x10800000 | ((((unsigned long)pci_do_gettimeofday -
+	     (unsigned long)do_gettimeofday) >> 2) & 0x003fffff);
+	((unsigned int *)do_gettimeofday)[1] = 0x01000000;
+	BTFIXUPSET_CALL(bus_do_settimeofday, pci_do_settimeofday, BTFIXUPCALL_NORM);
+	btfixup();
 
 	writel (TICK_TIMER_LIMIT, pcic->pcic_regs+PCI_SYS_LIMIT);
 	/* PROM should set appropriate irq */
@@ -724,16 +744,108 @@ void __init pci_time_init(void)
 	timer_irq = PCI_COUNTER_IRQ_SYS(v);
 	writel (PCI_COUNTER_IRQ_SET(timer_irq, 0),
 		pcic->pcic_regs+PCI_COUNTER_IRQ);
-	irq = pcic_build_device_irq(NULL, timer_irq);
-	err = request_irq(irq, timer_interrupt,
-			  IRQF_TIMER, "timer", NULL);
-	if (err) {
+	irq = request_irq(timer_irq, pcic_timer_handler,
+			  (SA_INTERRUPT | SA_STATIC_ALLOC), "timer", NULL);
+	if (irq) {
 		prom_printf("time_init: unable to attach IRQ%d\n", timer_irq);
 		prom_halt();
 	}
 	local_irq_enable();
 }
 
+static __inline__ unsigned long do_gettimeoffset(void)
+{
+	/*
+	 * We devide all to 100
+	 * to have microsecond resolution and to avoid overflow
+	 */
+	unsigned long count =
+	    readl(pcic0.pcic_regs+PCI_SYS_COUNTER) & ~PCI_SYS_COUNTER_OVERFLOW;
+	count = ((count/100)*USECS_PER_JIFFY) / (TICK_TIMER_LIMIT/100);
+	return count;
+}
+
+extern unsigned long wall_jiffies;
+
+static void pci_do_gettimeofday(struct timeval *tv)
+{
+	unsigned long flags;
+	unsigned long seq;
+	unsigned long usec, sec;
+	unsigned long max_ntp_tick = tick_usec - tickadj;
+
+	do {
+		unsigned long lost;
+
+		seq = read_seqbegin_irqsave(&xtime_lock, flags);
+		usec = do_gettimeoffset();
+		lost = jiffies - wall_jiffies;
+
+		/*
+		 * If time_adjust is negative then NTP is slowing the clock
+		 * so make sure not to go into next possible interval.
+		 * Better to lose some accuracy than have time go backwards..
+		 */
+		if (unlikely(time_adjust < 0)) {
+			usec = min(usec, max_ntp_tick);
+
+			if (lost)
+				usec += lost * max_ntp_tick;
+		}
+		else if (unlikely(lost))
+			usec += lost * tick_usec;
+
+		sec = xtime.tv_sec;
+		usec += (xtime.tv_nsec / 1000);
+	} while (read_seqretry_irqrestore(&xtime_lock, seq, flags));
+
+	while (usec >= 1000000) {
+		usec -= 1000000;
+		sec++;
+	}
+
+	tv->tv_sec = sec;
+	tv->tv_usec = usec;
+}
+
+static int pci_do_settimeofday(struct timespec *tv)
+{
+	if ((unsigned long)tv->tv_nsec >= NSEC_PER_SEC)
+		return -EINVAL;
+
+	/*
+	 * This is revolting. We need to set "xtime" correctly. However, the
+	 * value in this location is the value at the most recent update of
+	 * wall time.  Discover what correction gettimeofday() would have
+	 * made, and then undo it!
+	 */
+	tv->tv_nsec -= 1000 * (do_gettimeoffset() + 
+				(jiffies - wall_jiffies) * (USEC_PER_SEC / HZ));
+	while (tv->tv_nsec < 0) {
+		tv->tv_nsec += NSEC_PER_SEC;
+		tv->tv_sec--;
+	}
+
+	wall_to_monotonic.tv_sec += xtime.tv_sec - tv->tv_sec;
+	wall_to_monotonic.tv_nsec += xtime.tv_nsec - tv->tv_nsec;
+
+	if (wall_to_monotonic.tv_nsec > NSEC_PER_SEC) {
+		wall_to_monotonic.tv_nsec -= NSEC_PER_SEC;
+		wall_to_monotonic.tv_sec++;
+	}
+	if (wall_to_monotonic.tv_nsec < 0) {
+		wall_to_monotonic.tv_nsec += NSEC_PER_SEC;
+		wall_to_monotonic.tv_sec--;
+	}
+
+	xtime.tv_sec = tv->tv_sec;
+	xtime.tv_nsec = tv->tv_nsec;
+	time_adjust = 0;		/* stop active adjtime() */
+	time_status |= STA_UNSYNC;
+	time_maxerror = NTP_PHASE_LIMIT;
+	time_esterror = NTP_PHASE_LIMIT;
+	return 0;
+}
 
 #if 0
 static void watchdog_reset() {
@@ -742,11 +854,30 @@ static void watchdog_reset() {
 #endif
 
 /*
+ * Other archs parse arguments here.
+ */
+char * __init pcibios_setup(char *str)
+{
+	return str;
+}
+
+void pcibios_align_resource(void *data, struct resource *res,
+			    unsigned long size, unsigned long align)
+{
+}
+
+int pcibios_enable_device(struct pci_dev *pdev, int mask)
+{
+	return 0;
+}
+
+/*
  * NMI
  */
 void pcic_nmi(unsigned int pend, struct pt_regs *regs)
 {
-	pend = swab32(pend);
+
+	pend = flip_dword(pend);
 
 	if (!pcic_speculative || (pend & PCI_SYS_INT_PENDING_PIO) == 0) {
 		/*
@@ -768,74 +899,143 @@ static inline unsigned long get_irqmask(int irq_nr)
 	return 1 << irq_nr;
 }
 
-static void pcic_mask_irq(struct irq_data *data)
+static inline char *pcic_irq_itoa(unsigned int irq)
+{
+	static char buff[16];
+	sprintf(buff, "%d", irq);
+	return buff;
+}
+
+static void pcic_disable_irq(unsigned int irq_nr)
 {
 	unsigned long mask, flags;
 
-	mask = (unsigned long)data->chip_data;
+	mask = get_irqmask(irq_nr);
 	local_irq_save(flags);
 	writel(mask, pcic0.pcic_regs+PCI_SYS_INT_TARGET_MASK_SET);
 	local_irq_restore(flags);
 }
 
-static void pcic_unmask_irq(struct irq_data *data)
+static void pcic_enable_irq(unsigned int irq_nr)
 {
 	unsigned long mask, flags;
 
-	mask = (unsigned long)data->chip_data;
+	mask = get_irqmask(irq_nr);
 	local_irq_save(flags);
 	writel(mask, pcic0.pcic_regs+PCI_SYS_INT_TARGET_MASK_CLEAR);
 	local_irq_restore(flags);
 }
 
-static unsigned int pcic_startup_irq(struct irq_data *data)
+static void pcic_clear_profile_irq(int cpu)
 {
-	irq_link(data->irq);
-	pcic_unmask_irq(data);
-	return 0;
+	printk("PCIC: unimplemented code: FILE=%s LINE=%d", __FILE__, __LINE__);
 }
-
-static struct irq_chip pcic_irq = {
-	.name		= "pcic",
-	.irq_startup	= pcic_startup_irq,
-	.irq_mask	= pcic_mask_irq,
-	.irq_unmask	= pcic_unmask_irq,
-};
-
-unsigned int pcic_build_device_irq(struct platform_device *op,
-                                   unsigned int real_irq)
-{
-	unsigned int irq;
-	unsigned long mask;
-
-	irq = 0;
-	mask = get_irqmask(real_irq);
-	if (mask == 0)
-		goto out;
-
-	irq = irq_alloc(real_irq, real_irq);
-	if (irq == 0)
-		goto out;
-
-	irq_set_chip_and_handler_name(irq, &pcic_irq,
-	                              handle_level_irq, "PCIC");
-	irq_set_chip_data(irq, (void *)mask);
-
-out:
-	return irq;
-}
-
 
 static void pcic_load_profile_irq(int cpu, unsigned int limit)
 {
 	printk("PCIC: unimplemented code: FILE=%s LINE=%d", __FILE__, __LINE__);
 }
 
+/* We assume the caller has disabled local interrupts when these are called,
+ * or else very bizarre behavior will result.
+ */
+static void pcic_disable_pil_irq(unsigned int pil)
+{
+	writel(get_irqmask(pil), pcic0.pcic_regs+PCI_SYS_INT_TARGET_MASK_SET);
+}
+
+static void pcic_enable_pil_irq(unsigned int pil)
+{
+	writel(get_irqmask(pil), pcic0.pcic_regs+PCI_SYS_INT_TARGET_MASK_CLEAR);
+}
+
 void __init sun4m_pci_init_IRQ(void)
 {
-	sparc_config.build_device_irq = pcic_build_device_irq;
-	sparc_config.clear_clock_irq  = pcic_clear_clock_irq;
-	sparc_config.load_profile_irq = pcic_load_profile_irq;
+	BTFIXUPSET_CALL(enable_irq, pcic_enable_irq, BTFIXUPCALL_NORM);
+	BTFIXUPSET_CALL(disable_irq, pcic_disable_irq, BTFIXUPCALL_NORM);
+	BTFIXUPSET_CALL(enable_pil_irq, pcic_enable_pil_irq, BTFIXUPCALL_NORM);
+	BTFIXUPSET_CALL(disable_pil_irq, pcic_disable_pil_irq, BTFIXUPCALL_NORM);
+	BTFIXUPSET_CALL(clear_clock_irq, pcic_clear_clock_irq, BTFIXUPCALL_NORM);
+	BTFIXUPSET_CALL(clear_profile_irq, pcic_clear_profile_irq, BTFIXUPCALL_NORM);
+	BTFIXUPSET_CALL(load_profile_irq, pcic_load_profile_irq, BTFIXUPCALL_NORM);
+	BTFIXUPSET_CALL(__irq_itoa, pcic_irq_itoa, BTFIXUPCALL_NORM);
+}
+
+int pcibios_assign_resource(struct pci_dev *pdev, int resource)
+{
+	return -ENXIO;
+}
+
+/*
+ * This probably belongs here rather than ioport.c because
+ * we do not want this crud linked into SBus kernels.
+ * Also, think for a moment about likes of floppy.c that
+ * include architecture specific parts. They may want to redefine ins/outs.
+ *
+ * We do not use horroble macroses here because we want to
+ * advance pointer by sizeof(size).
+ */
+void outsb(unsigned long addr, const void *src, unsigned long count)
+{
+	while (count) {
+		count -= 1;
+		outb(*(const char *)src, addr);
+		src += 1;
+		/* addr += 1; */
+	}
+}
+
+void outsw(unsigned long addr, const void *src, unsigned long count)
+{
+	while (count) {
+		count -= 2;
+		outw(*(const short *)src, addr);
+		src += 2;
+		/* addr += 2; */
+	}
+}
+
+void outsl(unsigned long addr, const void *src, unsigned long count)
+{
+	while (count) {
+		count -= 4;
+		outl(*(const long *)src, addr);
+		src += 4;
+		/* addr += 4; */
+	}
+}
+
+void insb(unsigned long addr, void *dst, unsigned long count)
+{
+	while (count) {
+		count -= 1;
+		*(unsigned char *)dst = inb(addr);
+		dst += 1;
+		/* addr += 1; */
+	}
+}
+
+void insw(unsigned long addr, void *dst, unsigned long count)
+{
+	while (count) {
+		count -= 2;
+		*(unsigned short *)dst = inw(addr);
+		dst += 2;
+		/* addr += 2; */
+	}
+}
+
+void insl(unsigned long addr, void *dst, unsigned long count)
+{
+	while (count) {
+		count -= 4;
+		/*
+		 * XXX I am sure we are in for an unaligned trap here.
+		 */
+		*(unsigned long *)dst = inl(addr);
+		dst += 4;
+		/* addr += 4; */
+	}
 }
 
 subsys_initcall(pcic_init);

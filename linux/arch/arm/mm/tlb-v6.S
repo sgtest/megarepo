@@ -1,16 +1,17 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  *  linux/arch/arm/mm/tlb-v6.S
  *
  *  Copyright (C) 1997-2002 Russell King
  *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
  *  ARM architecture version 6 TLB handling functions.
  *  These assume a split I/D TLB.
  */
-#include <linux/init.h>
 #include <linux/linkage.h>
-#include <asm/asm-offsets.h>
-#include <asm/assembler.h>
+#include <asm/constants.h>
 #include <asm/page.h>
 #include <asm/tlbflush.h>
 #include "proc-macros.S"
@@ -24,7 +25,7 @@
  *
  *	- start - start address (may not be aligned)
  *	- end   - end address (exclusive, may not be aligned)
- *	- vma   - vm_area_struct describing address range
+ *	- vma   - vma_struct describing address range
  *
  *	It is assumed that:
  *	- the "Invalidate single entry" instruction will invalidate
@@ -52,8 +53,7 @@ ENTRY(v6wbi_flush_user_tlb_range)
 	add	r0, r0, #PAGE_SZ
 	cmp	r0, r1
 	blo	1b
-	mcr	p15, 0, ip, c7, c10, 4		@ data synchronization barrier
-	ret	lr
+	mov	pc, lr
 
 /*
  *	v6wbi_flush_kern_tlb_range(start,end)
@@ -80,11 +80,13 @@ ENTRY(v6wbi_flush_kern_tlb_range)
 	add	r0, r0, #PAGE_SZ
 	cmp	r0, r1
 	blo	1b
-	mcr	p15, 0, r2, c7, c10, 4		@ data synchronization barrier
-	mcr	p15, 0, r2, c7, c5, 4		@ prefetch flush (isb)
-	ret	lr
+	mov	pc, lr
 
-	__INIT
+	.section ".text.init", #alloc, #execinstr
 
-	/* define struct cpu_tlb_fns (see <asm/tlbflush.h> and proc-macros.S) */
-	define_tlb_functions v6wbi, v6wbi_tlb_flags
+	.type	v6wbi_tlb_fns, #object
+ENTRY(v6wbi_tlb_fns)
+	.long	v6wbi_flush_user_tlb_range
+	.long	v6wbi_flush_kern_tlb_range
+	.long	v6wbi_tlb_flags
+	.size	v6wbi_tlb_fns, . - v6wbi_tlb_fns

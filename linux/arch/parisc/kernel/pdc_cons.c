@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /* 
  *    PDC Console support - ie use firmware to dump text via boot console
  *
@@ -13,57 +12,82 @@
  *    Copyright (C) 2001 Helge Deller <deller at parisc-linux.org>
  *    Copyright (C) 2001 Thomas Bogendoerfer <tsbogend at parisc-linux.org>
  *    Copyright (C) 2002 Randolph Chung <tausq with parisc-linux.org>
- *    Copyright (C) 2010 Guy Martin <gmsoft at tuxicoman.be>
+ *
+ *
+ *    This program is free software; you can redistribute it and/or modify
+ *    it under the terms of the GNU General Public License as published by
+ *    the Free Software Foundation; either version 2 of the License, or
+ *    (at your option) any later version.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU General Public License for more details.
+ *
+ *    You should have received a copy of the GNU General Public License
+ *    along with this program; if not, write to the Free Software
+ *    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
 /*
  *  The PDC console is a simple console, which can be used for debugging 
- *  boot related problems on HP PA-RISC machines. It is also useful when no
- *  other console works.
+ *  boot related problems on HP PA-RISC machines.
  *
  *  This code uses the ROM (=PDC) based functions to read and write characters
  *  from and to PDC's boot path.
+ *  Since all character read from that path must be polled, this code never
+ *  can or will be a fully functional linux console.
  */
 
 /* Define EARLY_BOOTUP_DEBUG to debug kernel related boot problems. 
  * On production kernels EARLY_BOOTUP_DEBUG should be undefined. */
-#define EARLY_BOOTUP_DEBUG
+#undef EARLY_BOOTUP_DEBUG
 
 
+#include <linux/config.h>
 #include <linux/kernel.h>
 #include <linux/console.h>
 #include <linux/string.h>
 #include <linux/init.h>
+#include <linux/delay.h>
+#include <linux/sched.h>
+#include <linux/interrupt.h>
 #include <linux/major.h>
 #include <linux/tty.h>
-#include <asm/page.h>		/* for PAGE0 */
+#include <asm/page.h>
+#include <asm/types.h>
+#include <asm/system.h>
 #include <asm/pdc.h>		/* for iodc_call() proto and friends */
 
-static DEFINE_SPINLOCK(pdc_console_lock);
-static struct console pdc_cons;
 
 static void pdc_console_write(struct console *co, const char *s, unsigned count)
 {
-	int i = 0;
-	unsigned long flags;
+	while(count--)
+		pdc_iodc_putc(*s++);
+}
 
-	spin_lock_irqsave(&pdc_console_lock, flags);
-	do {
-		i += pdc_iodc_print(s + i, count - i);
-	} while (i < count);
-	spin_unlock_irqrestore(&pdc_console_lock, flags);
+void pdc_outc(unsigned char c)
+{
+	pdc_iodc_outc(c);
+}
+
+void pdc_printf(const char *fmt, ...)
+{
+	va_list args;
+	char buf[1024];
+	int i, len;
+
+	va_start(args, fmt);
+	len = vscnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+
+	for (i = 0; i < len; i++)
+		pdc_iodc_outc(buf[i]);
 }
 
 int pdc_console_poll_key(struct console *co)
 {
-	int c;
-	unsigned long flags;
-
-	spin_lock_irqsave(&pdc_console_lock, flags);
-	c = pdc_iodc_getc();
-	spin_unlock_irqrestore(&pdc_console_lock, flags);
-
-	return c;
+	return pdc_iodc_getc();
 }
 
 static int pdc_console_setup(struct console *co, char *options)
@@ -72,144 +96,30 @@ static int pdc_console_setup(struct console *co, char *options)
 }
 
 #if defined(CONFIG_PDC_CONSOLE)
-#include <linux/vt_kern.h>
-#include <linux/tty_flip.h>
-
-#define PDC_CONS_POLL_DELAY (30 * HZ / 1000)
-
-static void pdc_console_poll(struct timer_list *unused);
-static DEFINE_TIMER(pdc_console_timer, pdc_console_poll);
-static struct tty_port tty_port;
-
-static int pdc_console_tty_open(struct tty_struct *tty, struct file *filp)
-{
-	tty_port_tty_set(&tty_port, tty);
-	mod_timer(&pdc_console_timer, jiffies + PDC_CONS_POLL_DELAY);
-
-	return 0;
-}
-
-static void pdc_console_tty_close(struct tty_struct *tty, struct file *filp)
-{
-	if (tty->count == 1) {
-		del_timer_sync(&pdc_console_timer);
-		tty_port_tty_set(&tty_port, NULL);
-	}
-}
-
-static int pdc_console_tty_write(struct tty_struct *tty, const unsigned char *buf, int count)
-{
-	pdc_console_write(NULL, buf, count);
-	return count;
-}
-
-static unsigned int pdc_console_tty_write_room(struct tty_struct *tty)
-{
-	return 32768; /* no limit, no buffer used */
-}
-
-static const struct tty_operations pdc_console_tty_ops = {
-	.open = pdc_console_tty_open,
-	.close = pdc_console_tty_close,
-	.write = pdc_console_tty_write,
-	.write_room = pdc_console_tty_write_room,
-};
-
-static void pdc_console_poll(struct timer_list *unused)
-{
-	int data, count = 0;
-
-	while (1) {
-		data = pdc_console_poll_key(NULL);
-		if (data == -1)
-			break;
-		tty_insert_flip_char(&tty_port, data & 0xFF, TTY_NORMAL);
-		count ++;
-	}
-
-	if (count)
-		tty_flip_buffer_push(&tty_port);
-
-	if (pdc_cons.flags & CON_ENABLED)
-		mod_timer(&pdc_console_timer, jiffies + PDC_CONS_POLL_DELAY);
-}
-
-static struct tty_driver *pdc_console_tty_driver;
-
-static int __init pdc_console_tty_driver_init(void)
-{
-	struct tty_driver *driver;
-	int err;
-
-	/* Check if the console driver is still registered.
-	 * It is unregistered if the pdc console was not selected as the
-	 * primary console. */
-
-	struct console *tmp;
-
-	console_lock();
-	for_each_console(tmp)
-		if (tmp == &pdc_cons)
-			break;
-	console_unlock();
-
-	if (!tmp) {
-		printk(KERN_INFO "PDC console driver not registered anymore, not creating %s\n", pdc_cons.name);
-		return -ENODEV;
-	}
-
-	printk(KERN_INFO "The PDC console driver is still registered, removing CON_BOOT flag\n");
-	pdc_cons.flags &= ~CON_BOOT;
-
-	driver = tty_alloc_driver(1, TTY_DRIVER_REAL_RAW |
-			TTY_DRIVER_RESET_TERMIOS);
-	if (IS_ERR(driver))
-		return PTR_ERR(driver);
-
-	tty_port_init(&tty_port);
-
-	driver->driver_name = "pdc_cons";
-	driver->name = "ttyB";
-	driver->major = MUX_MAJOR;
-	driver->minor_start = 0;
-	driver->type = TTY_DRIVER_TYPE_SYSTEM;
-	driver->init_termios = tty_std_termios;
-	tty_set_operations(driver, &pdc_console_tty_ops);
-	tty_port_link_device(&tty_port, driver, 0);
-
-	err = tty_register_driver(driver);
-	if (err) {
-		printk(KERN_ERR "Unable to register the PDC console TTY driver\n");
-		tty_port_destroy(&tty_port);
-		tty_driver_kref_put(driver);
-		return err;
-	}
-
-	pdc_console_tty_driver = driver;
-
-	return 0;
-}
-device_initcall(pdc_console_tty_driver_init);
-
+#define PDC_CONSOLE_DEVICE pdc_console_device
 static struct tty_driver * pdc_console_device (struct console *c, int *index)
 {
-	*index = c->index;
-	return pdc_console_tty_driver;
+	extern struct tty_driver console_driver;
+	*index = c->index ? c->index-1 : fg_console;
+	return &console_driver;
 }
 #else
-#define pdc_console_device NULL
+#define PDC_CONSOLE_DEVICE NULL
 #endif
 
 static struct console pdc_cons = {
 	.name =		"ttyB",
 	.write =	pdc_console_write,
-	.device =	pdc_console_device,
+	.device =	PDC_CONSOLE_DEVICE,
 	.setup =	pdc_console_setup,
-	.flags =	CON_BOOT | CON_PRINTBUFFER,
+	.flags =	CON_BOOT|CON_PRINTBUFFER|CON_ENABLED,
 	.index =	-1,
 };
 
 static int pdc_console_initialized;
+extern unsigned long con_start;	/* kernel/printk.c */
+extern unsigned long log_end;	/* kernel/printk.c */
+
 
 static void pdc_console_init_force(void)
 {
@@ -236,11 +146,27 @@ void __init pdc_console_init(void)
 }
 
 
+/* Unregister the pdc console with the printk console layer */
+void pdc_console_die(void)
+{
+	if (!pdc_console_initialized)
+		return;
+	--pdc_console_initialized;
+
+	printk(KERN_INFO "Switching from PDC console\n");
+
+	/* Don't repeat what we've already printed */
+	con_start = log_end;
+
+	unregister_console(&pdc_cons);
+}
+
+
 /*
  * Used for emergencies. Currently only used if an HPMC occurs. If an
  * HPMC occurs, it is possible that the current console may not be
- * properly initialised after the PDC IO reset. This routine unregisters
- * all of the current consoles, reinitializes the pdc console and
+ * properly initialed after the PDC IO reset. This routine unregisters all
+ * of the current consoles, reinitializes the pdc console and
  * registers it.
  */
 
@@ -251,13 +177,13 @@ void pdc_console_restart(void)
 	if (pdc_console_initialized)
 		return;
 
-	/* If we've already seen the output, don't bother to print it again */
-	if (console_drivers != NULL)
-		pdc_cons.flags &= ~CON_PRINTBUFFER;
-
 	while ((console = console_drivers) != NULL)
 		unregister_console(console_drivers);
 
+	/* Don't repeat what we've already printed */
+	con_start = log_end;
+	
 	/* force registering the pdc console */
 	pdc_console_init_force();
 }
+

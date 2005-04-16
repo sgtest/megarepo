@@ -1,13 +1,12 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
- *  Copyright (c) 2000-2008 LSI Corporation.
+ *  Copyright (c) 2000-2003 LSI Logic Corporation.
  *
  *
  *           Name:  mpi_lan.h
  *          Title:  MPI LAN messages and structures
  *  Creation Date:  June 30, 2000
  *
- *    mpi_lan.h Version:  01.05.01
+ *    mpi_lan.h Version:  01.05.xx
  *
  *  Version History
  *  ---------------
@@ -29,8 +28,6 @@
  *  02-20-01  01.01.02  Started using MPI_POINTER.
  *  03-27-01  01.01.03  Added structure offset comments.
  *  08-08-01  01.02.01  Original release for v1.2 work.
- *  05-11-04  01.03.01  Original release for MPI v1.3.
- *  08-19-04  01.05.01  Original release for MPI v1.5.
  *  --------------------------------------------------------------------------
  */
 

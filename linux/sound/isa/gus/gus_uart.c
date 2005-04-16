@@ -1,20 +1,35 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- *  Copyright (c) by Jaroslav Kysela <perex@perex.cz>
+ *  Copyright (c) by Jaroslav Kysela <perex@suse.cz>
  *  Routines for the GF1 MIDI interface - like UART 6850
+ *
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ *
  */
 
+#include <sound/driver.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/time.h>
 #include <sound/core.h>
 #include <sound/gus.h>
 
-static void snd_gf1_interrupt_midi_in(struct snd_gus_card * gus)
+static void snd_gf1_interrupt_midi_in(snd_gus_card_t * gus)
 {
 	int count;
-	unsigned char stat, byte;
-	__always_unused unsigned char data;
+	unsigned char stat, data, byte;
 	unsigned long flags;
 
 	count = 10;
@@ -46,7 +61,7 @@ static void snd_gf1_interrupt_midi_in(struct snd_gus_card * gus)
 	}
 }
 
-static void snd_gf1_interrupt_midi_out(struct snd_gus_card * gus)
+static void snd_gf1_interrupt_midi_out(snd_gus_card_t * gus)
 {
 	char byte;
 	unsigned long flags;
@@ -66,7 +81,7 @@ static void snd_gf1_interrupt_midi_out(struct snd_gus_card * gus)
 	spin_unlock_irqrestore(&gus->uart_cmd_lock, flags);
 }
 
-static void snd_gf1_uart_reset(struct snd_gus_card * gus, int close)
+static void snd_gf1_uart_reset(snd_gus_card_t * gus, int close)
 {
 	snd_gf1_uart_cmd(gus, 0x03);	/* reset */
 	if (!close && gus->uart_enable) {
@@ -75,10 +90,10 @@ static void snd_gf1_uart_reset(struct snd_gus_card * gus, int close)
 	}
 }
 
-static int snd_gf1_uart_output_open(struct snd_rawmidi_substream *substream)
+static int snd_gf1_uart_output_open(snd_rawmidi_substream_t * substream)
 {
 	unsigned long flags;
-	struct snd_gus_card *gus;
+	snd_gus_card_t *gus;
 
 	gus = substream->rmidi->private_data;
 	spin_lock_irqsave(&gus->uart_cmd_lock, flags);
@@ -89,15 +104,15 @@ static int snd_gf1_uart_output_open(struct snd_rawmidi_substream *substream)
 	gus->midi_substream_output = substream;
 	spin_unlock_irqrestore(&gus->uart_cmd_lock, flags);
 #if 0
-	snd_printk(KERN_DEBUG "write init - cmd = 0x%x, stat = 0x%x\n", gus->gf1.uart_cmd, snd_gf1_uart_stat(gus));
+	snd_printk("write init - cmd = 0x%x, stat = 0x%x\n", gus->gf1.uart_cmd, snd_gf1_uart_stat(gus));
 #endif
 	return 0;
 }
 
-static int snd_gf1_uart_input_open(struct snd_rawmidi_substream *substream)
+static int snd_gf1_uart_input_open(snd_rawmidi_substream_t * substream)
 {
 	unsigned long flags;
-	struct snd_gus_card *gus;
+	snd_gus_card_t *gus;
 	int i;
 
 	gus = substream->rmidi->private_data;
@@ -111,26 +126,20 @@ static int snd_gf1_uart_input_open(struct snd_rawmidi_substream *substream)
 		for (i = 0; i < 1000 && (snd_gf1_uart_stat(gus) & 0x01); i++)
 			snd_gf1_uart_get(gus);	/* clean Rx */
 		if (i >= 1000)
-			snd_printk(KERN_ERR "gus midi uart init read - cleanup error\n");
+			snd_printk("gus midi uart init read - cleanup error\n");
 	}
 	spin_unlock_irqrestore(&gus->uart_cmd_lock, flags);
 #if 0
-	snd_printk(KERN_DEBUG
-		   "read init - enable = %i, cmd = 0x%x, stat = 0x%x\n",
-		   gus->uart_enable, gus->gf1.uart_cmd, snd_gf1_uart_stat(gus));
-	snd_printk(KERN_DEBUG
-		   "[0x%x] reg (ctrl/status) = 0x%x, reg (data) = 0x%x "
-		   "(page = 0x%x)\n",
-		   gus->gf1.port + 0x100, inb(gus->gf1.port + 0x100),
-		   inb(gus->gf1.port + 0x101), inb(gus->gf1.port + 0x102));
+	snd_printk("read init - enable = %i, cmd = 0x%x, stat = 0x%x\n", gus->uart_enable, gus->gf1.uart_cmd, snd_gf1_uart_stat(gus));
+	snd_printk("[0x%x] reg (ctrl/status) = 0x%x, reg (data) = 0x%x (page = 0x%x)\n", gus->gf1.port + 0x100, inb(gus->gf1.port + 0x100), inb(gus->gf1.port + 0x101), inb(gus->gf1.port + 0x102));
 #endif
 	return 0;
 }
 
-static int snd_gf1_uart_output_close(struct snd_rawmidi_substream *substream)
+static int snd_gf1_uart_output_close(snd_rawmidi_substream_t * substream)
 {
 	unsigned long flags;
-	struct snd_gus_card *gus;
+	snd_gus_card_t *gus;
 
 	gus = substream->rmidi->private_data;
 	spin_lock_irqsave(&gus->uart_cmd_lock, flags);
@@ -142,10 +151,10 @@ static int snd_gf1_uart_output_close(struct snd_rawmidi_substream *substream)
 	return 0;
 }
 
-static int snd_gf1_uart_input_close(struct snd_rawmidi_substream *substream)
+static int snd_gf1_uart_input_close(snd_rawmidi_substream_t * substream)
 {
 	unsigned long flags;
-	struct snd_gus_card *gus;
+	snd_gus_card_t *gus;
 
 	gus = substream->rmidi->private_data;
 	spin_lock_irqsave(&gus->uart_cmd_lock, flags);
@@ -157,9 +166,9 @@ static int snd_gf1_uart_input_close(struct snd_rawmidi_substream *substream)
 	return 0;
 }
 
-static void snd_gf1_uart_input_trigger(struct snd_rawmidi_substream *substream, int up)
+static void snd_gf1_uart_input_trigger(snd_rawmidi_substream_t * substream, int up)
 {
-	struct snd_gus_card *gus;
+	snd_gus_card_t *gus;
 	unsigned long flags;
 
 	gus = substream->rmidi->private_data;
@@ -175,10 +184,10 @@ static void snd_gf1_uart_input_trigger(struct snd_rawmidi_substream *substream, 
 	spin_unlock_irqrestore(&gus->uart_cmd_lock, flags);
 }
 
-static void snd_gf1_uart_output_trigger(struct snd_rawmidi_substream *substream, int up)
+static void snd_gf1_uart_output_trigger(snd_rawmidi_substream_t * substream, int up)
 {
 	unsigned long flags;
-	struct snd_gus_card *gus;
+	snd_gus_card_t *gus;
 	char byte;
 	int timeout;
 
@@ -213,27 +222,28 @@ static void snd_gf1_uart_output_trigger(struct snd_rawmidi_substream *substream,
 	spin_unlock_irqrestore(&gus->uart_cmd_lock, flags);
 }
 
-static const struct snd_rawmidi_ops snd_gf1_uart_output =
+static snd_rawmidi_ops_t snd_gf1_uart_output =
 {
 	.open =		snd_gf1_uart_output_open,
 	.close =	snd_gf1_uart_output_close,
 	.trigger =	snd_gf1_uart_output_trigger,
 };
 
-static const struct snd_rawmidi_ops snd_gf1_uart_input =
+static snd_rawmidi_ops_t snd_gf1_uart_input =
 {
 	.open =		snd_gf1_uart_input_open,
 	.close =	snd_gf1_uart_input_close,
 	.trigger =	snd_gf1_uart_input_trigger,
 };
 
-int snd_gf1_rawmidi_new(struct snd_gus_card *gus, int device)
+int snd_gf1_rawmidi_new(snd_gus_card_t * gus, int device, snd_rawmidi_t ** rrawmidi)
 {
-	struct snd_rawmidi *rmidi;
+	snd_rawmidi_t *rmidi;
 	int err;
 
-	err = snd_rawmidi_new(gus->card, "GF1", device, 1, 1, &rmidi);
-	if (err < 0)
+	if (rrawmidi)
+		*rrawmidi = NULL;
+	if ((err = snd_rawmidi_new(gus->card, "GF1", device, 1, 1, &rmidi)) < 0)
 		return err;
 	strcpy(rmidi->name, gus->interwave ? "AMD InterWave" : "GF1");
 	snd_rawmidi_set_ops(rmidi, SNDRV_RAWMIDI_STREAM_OUTPUT, &snd_gf1_uart_output);
@@ -241,5 +251,7 @@ int snd_gf1_rawmidi_new(struct snd_gus_card *gus, int device)
 	rmidi->info_flags |= SNDRV_RAWMIDI_INFO_OUTPUT | SNDRV_RAWMIDI_INFO_INPUT | SNDRV_RAWMIDI_INFO_DUPLEX;
 	rmidi->private_data = gus;
 	gus->midi_uart = rmidi;
+	if (rrawmidi)
+		*rrawmidi = rmidi;
 	return err;
 }

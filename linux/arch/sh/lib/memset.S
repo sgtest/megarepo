@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /* $Id: memset.S,v 1.1 2000/04/14 16:49:01 mjd Exp $
  *
  * "memset" implementation of SuperH
@@ -30,7 +29,6 @@ ENTRY(memset)
 	bf/s	1b
 	 mov.b	r5,@-r4
 2:				! make VVVV
-	extu.b	r5,r5
 	swap.b	r5,r0		!   V0
 	or	r0,r5		!   VV
 	swap.w	r5,r0		! VV00

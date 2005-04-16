@@ -42,172 +42,178 @@
 #include "aic79xx_osm.h"
 #include "aic79xx_inline.h"
 
+static void	copy_mem_info(struct info_str *info, char *data, int len);
+static int	copy_info(struct info_str *info, char *fmt, ...);
 static void	ahd_dump_target_state(struct ahd_softc *ahd,
-				      struct seq_file *m,
+				      struct info_str *info,
 				      u_int our_id, char channel,
-				      u_int target_id);
-static void	ahd_dump_device_state(struct seq_file *m,
-				      struct scsi_device *sdev);
-
-/*
- * Table of syncrates that don't follow the "divisible by 4"
- * rule. This table will be expanded in future SCSI specs.
- */
-static const struct {
-	u_int period_factor;
-	u_int period;	/* in 100ths of ns */
-} scsi_syncrates[] = {
-	{ 0x08, 625 },	/* FAST-160 */
-	{ 0x09, 1250 },	/* FAST-80 */
-	{ 0x0a, 2500 },	/* FAST-40 40MHz */
-	{ 0x0b, 3030 },	/* FAST-40 33MHz */
-	{ 0x0c, 5000 }	/* FAST-20 */
-};
-
-/*
- * Return the frequency in kHz corresponding to the given
- * sync period factor.
- */
-static u_int
-ahd_calc_syncsrate(u_int period_factor)
-{
-	int i;
-
-	/* See if the period is in the "exception" table */
-	for (i = 0; i < ARRAY_SIZE(scsi_syncrates); i++) {
-
-		if (period_factor == scsi_syncrates[i].period_factor) {
-			/* Period in kHz */
-			return (100000000 / scsi_syncrates[i].period);
-		}
-	}
-
-	/*
-	 * Wasn't in the table, so use the standard
-	 * 4 times conversion.
-	 */
-	return (10000000 / (period_factor * 4 * 10));
-}
+				      u_int target_id, u_int target_offset);
+static void	ahd_dump_device_state(struct info_str *info,
+				      struct ahd_linux_device *dev);
+static int	ahd_proc_write_seeprom(struct ahd_softc *ahd,
+				       char *buffer, int length);
 
 static void
-ahd_format_transinfo(struct seq_file *m, struct ahd_transinfo *tinfo)
+copy_mem_info(struct info_str *info, char *data, int len)
+{
+	if (info->pos + len > info->offset + info->length)
+		len = info->offset + info->length - info->pos;
+
+	if (info->pos + len < info->offset) {
+		info->pos += len;
+		return;
+	}
+
+	if (info->pos < info->offset) {
+		off_t partial;
+
+		partial = info->offset - info->pos;
+		data += partial;
+		info->pos += partial;
+		len  -= partial;
+	}
+
+	if (len > 0) {
+		memcpy(info->buffer, data, len);
+		info->pos += len;
+		info->buffer += len;
+	}
+}
+
+static int
+copy_info(struct info_str *info, char *fmt, ...)
+{
+	va_list args;
+	char buf[256];
+	int len;
+
+	va_start(args, fmt);
+	len = vsprintf(buf, fmt, args);
+	va_end(args);
+
+	copy_mem_info(info, buf, len);
+	return (len);
+}
+
+void
+ahd_format_transinfo(struct info_str *info, struct ahd_transinfo *tinfo)
 {
 	u_int speed;
 	u_int freq;
 	u_int mb;
 
 	if (tinfo->period == AHD_PERIOD_UNKNOWN) {
-		seq_puts(m, "Renegotiation Pending\n");
+		copy_info(info, "Renegotiation Pending\n");
 		return;
 	}
-	speed = 3300;
-	freq = 0;
+        speed = 3300;
+        freq = 0;
 	if (tinfo->offset != 0) {
-		freq = ahd_calc_syncsrate(tinfo->period);
+		freq = aic_calc_syncsrate(tinfo->period);
 		speed = freq;
 	}
 	speed *= (0x01 << tinfo->width);
-	mb = speed / 1000;
-	if (mb > 0)
-		seq_printf(m, "%d.%03dMB/s transfers", mb, speed % 1000);
-	else
-		seq_printf(m, "%dKB/s transfers", speed);
+        mb = speed / 1000;
+        if (mb > 0)
+		copy_info(info, "%d.%03dMB/s transfers", mb, speed % 1000);
+        else
+		copy_info(info, "%dKB/s transfers", speed);
 
 	if (freq != 0) {
 		int	printed_options;
 
 		printed_options = 0;
-		seq_printf(m, " (%d.%03dMHz", freq / 1000, freq % 1000);
+		copy_info(info, " (%d.%03dMHz", freq / 1000, freq % 1000);
 		if ((tinfo->ppr_options & MSG_EXT_PPR_RD_STRM) != 0) {
-			seq_puts(m, " RDSTRM");
+			copy_info(info, " RDSTRM");
 			printed_options++;
 		}
 		if ((tinfo->ppr_options & MSG_EXT_PPR_DT_REQ) != 0) {
-			seq_puts(m, printed_options ? "|DT" : " DT");
+			copy_info(info, "%s", printed_options ? "|DT" : " DT");
 			printed_options++;
 		}
 		if ((tinfo->ppr_options & MSG_EXT_PPR_IU_REQ) != 0) {
-			seq_puts(m, printed_options ? "|IU" : " IU");
+			copy_info(info, "%s", printed_options ? "|IU" : " IU");
 			printed_options++;
 		}
 		if ((tinfo->ppr_options & MSG_EXT_PPR_RTI) != 0) {
-			seq_puts(m, printed_options ? "|RTI" : " RTI");
+			copy_info(info, "%s",
+				  printed_options ? "|RTI" : " RTI");
 			printed_options++;
 		}
 		if ((tinfo->ppr_options & MSG_EXT_PPR_QAS_REQ) != 0) {
-			seq_puts(m, printed_options ? "|QAS" : " QAS");
+			copy_info(info, "%s",
+				  printed_options ? "|QAS" : " QAS");
 			printed_options++;
 		}
 	}
 
 	if (tinfo->width > 0) {
 		if (freq != 0) {
-			seq_puts(m, ", ");
+			copy_info(info, ", ");
 		} else {
-			seq_puts(m, " (");
+			copy_info(info, " (");
 		}
-		seq_printf(m, "%dbit)", 8 * (0x01 << tinfo->width));
+		copy_info(info, "%dbit)", 8 * (0x01 << tinfo->width));
 	} else if (freq != 0) {
-		seq_putc(m, ')');
+		copy_info(info, ")");
 	}
-	seq_putc(m, '\n');
+	copy_info(info, "\n");
 }
 
 static void
-ahd_dump_target_state(struct ahd_softc *ahd, struct seq_file *m,
-		      u_int our_id, char channel, u_int target_id)
+ahd_dump_target_state(struct ahd_softc *ahd, struct info_str *info,
+		      u_int our_id, char channel, u_int target_id,
+		      u_int target_offset)
 {
-	struct  scsi_target *starget;
+	struct	ahd_linux_target *targ;
 	struct	ahd_initiator_tinfo *tinfo;
 	struct	ahd_tmode_tstate *tstate;
 	int	lun;
 
 	tinfo = ahd_fetch_transinfo(ahd, channel, our_id,
 				    target_id, &tstate);
-	seq_printf(m, "Target %d Negotiation Settings\n", target_id);
-	seq_puts(m, "\tUser: ");
-	ahd_format_transinfo(m, &tinfo->user);
-	starget = ahd->platform_data->starget[target_id];
-	if (starget == NULL)
+	copy_info(info, "Target %d Negotiation Settings\n", target_id);
+	copy_info(info, "\tUser: ");
+	ahd_format_transinfo(info, &tinfo->user);
+	targ = ahd->platform_data->targets[target_offset];
+	if (targ == NULL)
 		return;
 
-	seq_puts(m, "\tGoal: ");
-	ahd_format_transinfo(m, &tinfo->goal);
-	seq_puts(m, "\tCurr: ");
-	ahd_format_transinfo(m, &tinfo->curr);
+	copy_info(info, "\tGoal: ");
+	ahd_format_transinfo(info, &tinfo->goal);
+	copy_info(info, "\tCurr: ");
+	ahd_format_transinfo(info, &tinfo->curr);
+	copy_info(info, "\tTransmission Errors %ld\n", targ->errors_detected);
 
 	for (lun = 0; lun < AHD_NUM_LUNS; lun++) {
-		struct scsi_device *dev;
+		struct ahd_linux_device *dev;
 
-		dev = scsi_device_lookup_by_target(starget, lun);
+		dev = targ->devices[lun];
 
 		if (dev == NULL)
 			continue;
 
-		ahd_dump_device_state(m, dev);
+		ahd_dump_device_state(info, dev);
 	}
 }
 
 static void
-ahd_dump_device_state(struct seq_file *m, struct scsi_device *sdev)
+ahd_dump_device_state(struct info_str *info, struct ahd_linux_device *dev)
 {
-	struct ahd_linux_device *dev = scsi_transport_device_data(sdev);
+	copy_info(info, "\tChannel %c Target %d Lun %d Settings\n",
+		  dev->target->channel + 'A', dev->target->target, dev->lun);
 
-	seq_printf(m, "\tChannel %c Target %d Lun %d Settings\n",
-		  sdev->sdev_target->channel + 'A',
-		   sdev->sdev_target->id, (u8)sdev->lun);
-
-	seq_printf(m, "\t\tCommands Queued %ld\n", dev->commands_issued);
-	seq_printf(m, "\t\tCommands Active %d\n", dev->active);
-	seq_printf(m, "\t\tCommand Openings %d\n", dev->openings);
-	seq_printf(m, "\t\tMax Tagged Openings %d\n", dev->maxtags);
-	seq_printf(m, "\t\tDevice Queue Frozen Count %d\n", dev->qfrozen);
+	copy_info(info, "\t\tCommands Queued %ld\n", dev->commands_issued);
+	copy_info(info, "\t\tCommands Active %d\n", dev->active);
+	copy_info(info, "\t\tCommand Openings %d\n", dev->openings);
+	copy_info(info, "\t\tMax Tagged Openings %d\n", dev->maxtags);
+	copy_info(info, "\t\tDevice Queue Frozen Count %d\n", dev->qfrozen);
 }
 
-int
-ahd_proc_write_seeprom(struct Scsi_Host *shost, char *buffer, int length)
+static int
+ahd_proc_write_seeprom(struct ahd_softc *ahd, char *buffer, int length)
 {
-	struct	ahd_softc *ahd = *(struct ahd_softc **)shost->hostdata;
 	ahd_mode_state saved_modes;
 	int have_seeprom;
 	u_long s;
@@ -224,33 +230,33 @@ ahd_proc_write_seeprom(struct Scsi_Host *shost, char *buffer, int length)
 	saved_modes = ahd_save_modes(ahd);
 	ahd_set_modes(ahd, AHD_MODE_SCSI, AHD_MODE_SCSI);
 	if (length != sizeof(struct seeprom_config)) {
-		printk("ahd_proc_write_seeprom: incorrect buffer size\n");
+		printf("ahd_proc_write_seeprom: incorrect buffer size\n");
 		goto done;
 	}
 
 	have_seeprom = ahd_verify_cksum((struct seeprom_config*)buffer);
 	if (have_seeprom == 0) {
-		printk("ahd_proc_write_seeprom: cksum verification failed\n");
+		printf("ahd_proc_write_seeprom: cksum verification failed\n");
 		goto done;
 	}
 
 	have_seeprom = ahd_acquire_seeprom(ahd);
 	if (!have_seeprom) {
-		printk("ahd_proc_write_seeprom: No Serial EEPROM\n");
+		printf("ahd_proc_write_seeprom: No Serial EEPROM\n");
 		goto done;
 	} else {
 		u_int start_addr;
 
 		if (ahd->seep_config == NULL) {
-			ahd->seep_config = kmalloc(sizeof(*ahd->seep_config),
-						   GFP_ATOMIC);
+			ahd->seep_config = malloc(sizeof(*ahd->seep_config),
+						  M_DEVBUF, M_NOWAIT);
 			if (ahd->seep_config == NULL) {
-				printk("aic79xx: Unable to allocate serial "
+				printf("aic79xx: Unable to allocate serial "
 				       "eeprom buffer.  Write failing\n");
 				goto done;
 			}
 		}
-		printk("aic79xx: Writing Serial EEPROM\n");
+		printf("aic79xx: Writing Serial EEPROM\n");
 		start_addr = 32 * (ahd->channel - 'A');
 		ahd_write_seeprom(ahd, (u_int16_t *)buffer, start_addr,
 				  sizeof(struct seeprom_config)/2);
@@ -272,45 +278,85 @@ done:
  * Return information to handle /proc support for the driver.
  */
 int
-ahd_linux_show_info(struct seq_file *m, struct Scsi_Host *shost)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,5,0)
+ahd_linux_proc_info(char *buffer, char **start, off_t offset,
+		    int length, int hostno, int inout)
+#else
+ahd_linux_proc_info(struct Scsi_Host *shost, char *buffer, char **start,
+		    off_t offset, int length, int inout)
+#endif
 {
-	struct	ahd_softc *ahd = *(struct ahd_softc **)shost->hostdata;
+	struct	ahd_softc *ahd;
+	struct	info_str info;
 	char	ahd_info[256];
+	u_long	l;
 	u_int	max_targ;
 	u_int	i;
+	int	retval;
 
-	seq_printf(m, "Adaptec AIC79xx driver version: %s\n",
+	retval = -EINVAL;
+	ahd_list_lock(&l);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,5,0)
+	TAILQ_FOREACH(ahd, &ahd_tailq, links) {
+		if (ahd->platform_data->host->host_no == hostno)
+			break;
+	}
+#else
+	ahd = ahd_find_softc(*(struct ahd_softc **)shost->hostdata);
+#endif
+
+	if (ahd == NULL)
+		goto done;
+
+	 /* Has data been written to the file? */ 
+	if (inout == TRUE) {
+		retval = ahd_proc_write_seeprom(ahd, buffer, length);
+		goto done;
+	}
+
+	if (start)
+		*start = buffer;
+
+	info.buffer	= buffer;
+	info.length	= length;
+	info.offset	= offset;
+	info.pos	= 0;
+
+	copy_info(&info, "Adaptec AIC79xx driver version: %s\n",
 		  AIC79XX_DRIVER_VERSION);
-	seq_printf(m, "%s\n", ahd->description);
+	copy_info(&info, "%s\n", ahd->description);
 	ahd_controller_info(ahd, ahd_info);
-	seq_printf(m, "%s\n", ahd_info);
-	seq_printf(m, "Allocated SCBs: %d, SG List Length: %d\n\n",
+	copy_info(&info, "%s\n", ahd_info);
+	copy_info(&info, "Allocated SCBs: %d, SG List Length: %d\n\n",
 		  ahd->scb_data.numscbs, AHD_NSEG);
 
-	max_targ = 16;
+	max_targ = 15;
 
 	if (ahd->seep_config == NULL)
-		seq_puts(m, "No Serial EEPROM\n");
+		copy_info(&info, "No Serial EEPROM\n");
 	else {
-		seq_puts(m, "Serial EEPROM:\n");
+		copy_info(&info, "Serial EEPROM:\n");
 		for (i = 0; i < sizeof(*ahd->seep_config)/2; i++) {
 			if (((i % 8) == 0) && (i != 0)) {
-				seq_putc(m, '\n');
+				copy_info(&info, "\n");
 			}
-			seq_printf(m, "0x%.4x ",
+			copy_info(&info, "0x%.4x ",
 				  ((uint16_t*)ahd->seep_config)[i]);
 		}
-		seq_putc(m, '\n');
+		copy_info(&info, "\n");
 	}
-	seq_putc(m, '\n');
+	copy_info(&info, "\n");
 
 	if ((ahd->features & AHD_WIDE) == 0)
-		max_targ = 8;
+		max_targ = 7;
 
-	for (i = 0; i < max_targ; i++) {
+	for (i = 0; i <= max_targ; i++) {
 
-		ahd_dump_target_state(ahd, m, ahd->our_id, 'A',
-				      /*target_id*/i);
+		ahd_dump_target_state(ahd, &info, ahd->our_id, 'A',
+				      /*target_id*/i, /*target_offset*/i);
 	}
-	return 0;
+	retval = info.pos > info.offset ? info.pos - info.offset : 0;
+done:
+	ahd_list_unlock(&l);
+	return (retval);
 }

@@ -1,11 +1,10 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
   File: fs/ext2/acl.h
 
   (C) 2001 Andreas Gruenbacher, <a.gruenbacher@computer.org>
 */
 
-#include <linux/posix_acl_xattr.h>
+#include <linux/xattr_acl.h>
 
 #define EXT2_ACL_VERSION	0x0001
 
@@ -54,16 +53,26 @@ static inline int ext2_acl_count(size_t size)
 
 #ifdef CONFIG_EXT2_FS_POSIX_ACL
 
+/* Value for inode->u.ext2_i.i_acl and inode->u.ext2_i.i_default_acl
+   if the ACL has not been cached */
+#define EXT2_ACL_NOT_CACHED ((void *)-1)
+
 /* acl.c */
-extern struct posix_acl *ext2_get_acl(struct inode *inode, int type, bool rcu);
-extern int ext2_set_acl(struct user_namespace *mnt_userns, struct inode *inode,
-			struct posix_acl *acl, int type);
+extern int ext2_permission (struct inode *, int, struct nameidata *);
+extern int ext2_acl_chmod (struct inode *);
 extern int ext2_init_acl (struct inode *, struct inode *);
 
 #else
 #include <linux/sched.h>
+#define ext2_permission NULL
 #define ext2_get_acl	NULL
 #define ext2_set_acl	NULL
+
+static inline int
+ext2_acl_chmod (struct inode *inode)
+{
+	return 0;
+}
 
 static inline int ext2_init_acl (struct inode *inode, struct inode *dir)
 {

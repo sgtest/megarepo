@@ -1,31 +1,43 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * IP Payload Compression Protocol (IPComp) for IPv6 - RFC3173
  *
  * Copyright (C)2003 USAGI/WIDE Project
  *
  * Author	Mitsuru KANDA  <mk@linux-ipv6.org>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
-/*
+/* 
  * [Memo]
  *
  * Outbound:
- *  The compression of IP datagram MUST be done before AH/ESP processing,
- *  fragmentation, and the addition of Hop-by-Hop/Routing header.
+ *  The compression of IP datagram MUST be done before AH/ESP processing, 
+ *  fragmentation, and the addition of Hop-by-Hop/Routing header. 
  *
  * Inbound:
- *  The decompression of IP datagram MUST be done after the reassembly,
+ *  The decompression of IP datagram MUST be done after the reassembly, 
  *  AH/ESP processing.
  */
-
-#define pr_fmt(fmt) "IPv6: " fmt
-
+#include <linux/config.h>
 #include <linux/module.h>
 #include <net/ip.h>
 #include <net/xfrm.h>
 #include <net/ipcomp.h>
+#include <asm/scatterlist.h>
+#include <asm/semaphore.h>
 #include <linux/crypto.h>
-#include <linux/err.h>
 #include <linux/pfkeyv2.h>
 #include <linux/random.h>
 #include <linux/percpu.h>
@@ -33,92 +45,222 @@
 #include <linux/list.h>
 #include <linux/vmalloc.h>
 #include <linux/rtnetlink.h>
-#include <net/ip6_route.h>
 #include <net/icmp.h>
 #include <net/ipv6.h>
-#include <net/protocol.h>
 #include <linux/ipv6.h>
 #include <linux/icmpv6.h>
-#include <linux/mutex.h>
 
-static int ipcomp6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
-				u8 type, u8 code, int offset, __be32 info)
+struct ipcomp6_tfms {
+	struct list_head list;
+	struct crypto_tfm **tfms;
+	int users;
+};
+
+static DECLARE_MUTEX(ipcomp6_resource_sem);
+static void **ipcomp6_scratches;
+static int ipcomp6_scratch_users;
+static LIST_HEAD(ipcomp6_tfms_list);
+
+static int ipcomp6_input(struct xfrm_state *x, struct xfrm_decap_state *decap, struct sk_buff *skb)
 {
-	struct net *net = dev_net(skb->dev);
-	__be32 spi;
-	const struct ipv6hdr *iph = (const struct ipv6hdr *)skb->data;
-	struct ip_comp_hdr *ipcomph =
-		(struct ip_comp_hdr *)(skb->data + offset);
+	int err = 0;
+	u8 nexthdr = 0;
+	int hdr_len = skb->h.raw - skb->nh.raw;
+	unsigned char *tmp_hdr = NULL;
+	struct ipv6hdr *iph;
+	int plen, dlen;
+	struct ipcomp_data *ipcd = x->data;
+	u8 *start, *scratch;
+	struct crypto_tfm *tfm;
+	int cpu;
+
+	if ((skb_is_nonlinear(skb) || skb_cloned(skb)) &&
+		skb_linearize(skb, GFP_ATOMIC) != 0) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	skb->ip_summed = CHECKSUM_NONE;
+
+	/* Remove ipcomp header and decompress original payload */
+	iph = skb->nh.ipv6h;
+	tmp_hdr = kmalloc(hdr_len, GFP_ATOMIC);
+	if (!tmp_hdr)
+		goto out;
+	memcpy(tmp_hdr, iph, hdr_len);
+	nexthdr = *(u8 *)skb->data;
+	skb_pull(skb, sizeof(struct ipv6_comp_hdr)); 
+	skb->nh.raw += sizeof(struct ipv6_comp_hdr);
+	memcpy(skb->nh.raw, tmp_hdr, hdr_len);
+	iph = skb->nh.ipv6h;
+	iph->payload_len = htons(ntohs(iph->payload_len) - sizeof(struct ipv6_comp_hdr));
+	skb->h.raw = skb->data;
+
+	/* decompression */
+	plen = skb->len;
+	dlen = IPCOMP_SCRATCH_SIZE;
+	start = skb->data;
+
+	cpu = get_cpu();
+	scratch = *per_cpu_ptr(ipcomp6_scratches, cpu);
+	tfm = *per_cpu_ptr(ipcd->tfms, cpu);
+
+	err = crypto_comp_decompress(tfm, start, plen, scratch, &dlen);
+	if (err) {
+		err = -EINVAL;
+		goto out_put_cpu;
+	}
+
+	if (dlen < (plen + sizeof(struct ipv6_comp_hdr))) {
+		err = -EINVAL;
+		goto out_put_cpu;
+	}
+
+	err = pskb_expand_head(skb, 0, dlen - plen, GFP_ATOMIC);
+	if (err) {
+		goto out_put_cpu;
+	}
+
+	skb_put(skb, dlen - plen);
+	memcpy(skb->data, scratch, dlen);
+
+	iph = skb->nh.ipv6h;
+	iph->payload_len = htons(skb->len);
+	
+out_put_cpu:
+	put_cpu();
+out:
+	if (tmp_hdr)
+		kfree(tmp_hdr);
+	if (err)
+		goto error_out;
+	return nexthdr;
+error_out:
+	return err;
+}
+
+static int ipcomp6_output(struct xfrm_state *x, struct sk_buff *skb)
+{
+	int err;
+	struct ipv6hdr *top_iph;
+	int hdr_len;
+	struct ipv6_comp_hdr *ipch;
+	struct ipcomp_data *ipcd = x->data;
+	int plen, dlen;
+	u8 *start, *scratch;
+	struct crypto_tfm *tfm;
+	int cpu;
+
+	hdr_len = skb->h.raw - skb->data;
+
+	/* check whether datagram len is larger than threshold */
+	if ((skb->len - hdr_len) < ipcd->threshold) {
+		goto out_ok;
+	}
+
+	if ((skb_is_nonlinear(skb) || skb_cloned(skb)) &&
+		skb_linearize(skb, GFP_ATOMIC) != 0) {
+		goto out_ok;
+	}
+
+	/* compression */
+	plen = skb->len - hdr_len;
+	dlen = IPCOMP_SCRATCH_SIZE;
+	start = skb->h.raw;
+
+	cpu = get_cpu();
+	scratch = *per_cpu_ptr(ipcomp6_scratches, cpu);
+	tfm = *per_cpu_ptr(ipcd->tfms, cpu);
+
+	err = crypto_comp_compress(tfm, start, plen, scratch, &dlen);
+	if (err || (dlen + sizeof(struct ipv6_comp_hdr)) >= plen) {
+		put_cpu();
+		goto out_ok;
+	}
+	memcpy(start + sizeof(struct ip_comp_hdr), scratch, dlen);
+	put_cpu();
+	pskb_trim(skb, hdr_len + dlen + sizeof(struct ip_comp_hdr));
+
+	/* insert ipcomp header and replace datagram */
+	top_iph = (struct ipv6hdr *)skb->data;
+
+	top_iph->payload_len = htons(skb->len - sizeof(struct ipv6hdr));
+
+	ipch = (struct ipv6_comp_hdr *)start;
+	ipch->nexthdr = *skb->nh.raw;
+	ipch->flags = 0;
+	ipch->cpi = htons((u16 )ntohl(x->id.spi));
+	*skb->nh.raw = IPPROTO_COMP;
+
+out_ok:
+	return 0;
+}
+
+static void ipcomp6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
+		                int type, int code, int offset, __u32 info)
+{
+	u32 spi;
+	struct ipv6hdr *iph = (struct ipv6hdr*)skb->data;
+	struct ipv6_comp_hdr *ipcomph = (struct ipv6_comp_hdr*)(skb->data+offset);
 	struct xfrm_state *x;
 
-	if (type != ICMPV6_PKT_TOOBIG &&
-	    type != NDISC_REDIRECT)
-		return 0;
+	if (type != ICMPV6_DEST_UNREACH && type != ICMPV6_PKT_TOOBIG)
+		return;
 
-	spi = htonl(ntohs(ipcomph->cpi));
-	x = xfrm_state_lookup(net, skb->mark, (const xfrm_address_t *)&iph->daddr,
-			      spi, IPPROTO_COMP, AF_INET6);
+	spi = ntohl(ntohs(ipcomph->cpi));
+	x = xfrm_state_lookup((xfrm_address_t *)&iph->daddr, spi, IPPROTO_COMP, AF_INET6);
 	if (!x)
-		return 0;
+		return;
 
-	if (type == NDISC_REDIRECT)
-		ip6_redirect(skb, net, skb->dev->ifindex, 0,
-			     sock_net_uid(net, NULL));
-	else
-		ip6_update_pmtu(skb, net, info, 0, 0, sock_net_uid(net, NULL));
+	printk(KERN_DEBUG "pmtu discovery on SA IPCOMP/%08x/"
+			"%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x\n",
+			spi, NIP6(iph->daddr));
 	xfrm_state_put(x);
-
-	return 0;
 }
 
 static struct xfrm_state *ipcomp6_tunnel_create(struct xfrm_state *x)
 {
-	struct net *net = xs_net(x);
 	struct xfrm_state *t = NULL;
 
-	t = xfrm_state_alloc(net);
+	t = xfrm_state_alloc();
 	if (!t)
 		goto out;
 
 	t->id.proto = IPPROTO_IPV6;
-	t->id.spi = xfrm6_tunnel_alloc_spi(net, (xfrm_address_t *)&x->props.saddr);
-	if (!t->id.spi)
-		goto error;
-
+	t->id.spi = xfrm6_tunnel_alloc_spi((xfrm_address_t *)&x->props.saddr);
 	memcpy(t->id.daddr.a6, x->id.daddr.a6, sizeof(struct in6_addr));
 	memcpy(&t->sel, &x->sel, sizeof(t->sel));
 	t->props.family = AF_INET6;
-	t->props.mode = x->props.mode;
+	t->props.mode = 1;
 	memcpy(t->props.saddr.a6, x->props.saddr.a6, sizeof(struct in6_addr));
-	memcpy(&t->mark, &x->mark, sizeof(t->mark));
-	t->if_id = x->if_id;
 
-	if (xfrm_init_state(t))
+	t->type = xfrm_get_type(IPPROTO_IPV6, t->props.family);
+	if (t->type == NULL)
 		goto error;
 
+	if (t->type->init_state(t, NULL))
+		goto error;
+
+	t->km.state = XFRM_STATE_VALID;
 	atomic_set(&t->tunnel_users, 1);
 
 out:
 	return t;
 
 error:
-	t->km.state = XFRM_STATE_DEAD;
 	xfrm_state_put(t);
-	t = NULL;
 	goto out;
 }
 
 static int ipcomp6_tunnel_attach(struct xfrm_state *x)
 {
-	struct net *net = xs_net(x);
 	int err = 0;
 	struct xfrm_state *t = NULL;
-	__be32 spi;
-	u32 mark = x->mark.m & x->mark.v;
+	u32 spi;
 
-	spi = xfrm6_tunnel_spi_lookup(net, (xfrm_address_t *)&x->props.saddr);
+	spi = xfrm6_tunnel_spi_lookup((xfrm_address_t *)&x->props.saddr);
 	if (spi)
-		t = xfrm_state_lookup(net, mark, (xfrm_address_t *)&x->id.daddr,
+		t = xfrm_state_lookup((xfrm_address_t *)&x->id.daddr,
 					      spi, IPPROTO_IPV6, AF_INET6);
 	if (!t) {
 		t = ipcomp6_tunnel_create(x);
@@ -136,66 +278,229 @@ out:
 	return err;
 }
 
-static int ipcomp6_init_state(struct xfrm_state *x)
+static void ipcomp6_free_scratches(void)
 {
-	int err = -EINVAL;
+	int i;
+	void **scratches;
 
-	x->props.header_len = 0;
-	switch (x->props.mode) {
-	case XFRM_MODE_TRANSPORT:
-		break;
-	case XFRM_MODE_TUNNEL:
-		x->props.header_len += sizeof(struct ipv6hdr);
-		break;
-	default:
-		goto out;
+	if (--ipcomp6_scratch_users)
+		return;
+
+	scratches = ipcomp6_scratches;
+	if (!scratches)
+		return;
+
+	for_each_cpu(i) {
+		void *scratch = *per_cpu_ptr(scratches, i);
+		if (scratch)
+			vfree(scratch);
 	}
 
-	err = ipcomp_init_state(x);
-	if (err)
+	free_percpu(scratches);
+}
+
+static void **ipcomp6_alloc_scratches(void)
+{
+	int i;
+	void **scratches;
+
+	if (ipcomp6_scratch_users++)
+		return ipcomp6_scratches;
+
+	scratches = alloc_percpu(void *);
+	if (!scratches)
+		return NULL;
+
+	ipcomp6_scratches = scratches;
+
+	for_each_cpu(i) {
+		void *scratch = vmalloc(IPCOMP_SCRATCH_SIZE);
+		if (!scratch)
+			return NULL;
+		*per_cpu_ptr(scratches, i) = scratch;
+	}
+
+	return scratches;
+}
+
+static void ipcomp6_free_tfms(struct crypto_tfm **tfms)
+{
+	struct ipcomp6_tfms *pos;
+	int cpu;
+
+	list_for_each_entry(pos, &ipcomp6_tfms_list, list) {
+		if (pos->tfms == tfms)
+			break;
+	}
+
+	BUG_TRAP(pos);
+
+	if (--pos->users)
+		return;
+
+	list_del(&pos->list);
+	kfree(pos);
+
+	if (!tfms)
+		return;
+
+	for_each_cpu(cpu) {
+		struct crypto_tfm *tfm = *per_cpu_ptr(tfms, cpu);
+		if (tfm)
+			crypto_free_tfm(tfm);
+	}
+	free_percpu(tfms);
+}
+
+static struct crypto_tfm **ipcomp6_alloc_tfms(const char *alg_name)
+{
+	struct ipcomp6_tfms *pos;
+	struct crypto_tfm **tfms;
+	int cpu;
+
+	/* This can be any valid CPU ID so we don't need locking. */
+	cpu = smp_processor_id();
+
+	list_for_each_entry(pos, &ipcomp6_tfms_list, list) {
+		struct crypto_tfm *tfm;
+
+		tfms = pos->tfms;
+		tfm = *per_cpu_ptr(tfms, cpu);
+
+		if (!strcmp(crypto_tfm_alg_name(tfm), alg_name)) {
+			pos->users++;
+			return tfms;
+		}
+	}
+
+	pos = kmalloc(sizeof(*pos), GFP_KERNEL);
+	if (!pos)
+		return NULL;
+
+	pos->users = 1;
+	INIT_LIST_HEAD(&pos->list);
+	list_add(&pos->list, &ipcomp6_tfms_list);
+
+	pos->tfms = tfms = alloc_percpu(struct crypto_tfm *);
+	if (!tfms)
+		goto error;
+
+	for_each_cpu(cpu) {
+		struct crypto_tfm *tfm = crypto_alloc_tfm(alg_name, 0);
+		if (!tfm)
+			goto error;
+		*per_cpu_ptr(tfms, cpu) = tfm;
+	}
+
+	return tfms;
+
+error:
+	ipcomp6_free_tfms(tfms);
+	return NULL;
+}
+
+static void ipcomp6_free_data(struct ipcomp_data *ipcd)
+{
+	if (ipcd->tfms)
+		ipcomp6_free_tfms(ipcd->tfms);
+	ipcomp6_free_scratches();
+}
+
+static void ipcomp6_destroy(struct xfrm_state *x)
+{
+	struct ipcomp_data *ipcd = x->data;
+	if (!ipcd)
+		return;
+	xfrm_state_delete_tunnel(x);
+	down(&ipcomp6_resource_sem);
+	ipcomp6_free_data(ipcd);
+	up(&ipcomp6_resource_sem);
+	kfree(ipcd);
+
+	xfrm6_tunnel_free_spi((xfrm_address_t *)&x->props.saddr);
+}
+
+static int ipcomp6_init_state(struct xfrm_state *x, void *args)
+{
+	int err;
+	struct ipcomp_data *ipcd;
+	struct xfrm_algo_desc *calg_desc;
+
+	err = -EINVAL;
+	if (!x->calg)
 		goto out;
 
-	if (x->props.mode == XFRM_MODE_TUNNEL) {
+	if (x->encap)
+		goto out;
+
+	err = -ENOMEM;
+	ipcd = kmalloc(sizeof(*ipcd), GFP_KERNEL);
+	if (!ipcd)
+		goto out;
+
+	memset(ipcd, 0, sizeof(*ipcd));
+	x->props.header_len = 0;
+	if (x->props.mode)
+		x->props.header_len += sizeof(struct ipv6hdr);
+	
+	down(&ipcomp6_resource_sem);
+	if (!ipcomp6_alloc_scratches())
+		goto error;
+
+	ipcd->tfms = ipcomp6_alloc_tfms(x->calg->alg_name);
+	if (!ipcd->tfms)
+		goto error;
+	up(&ipcomp6_resource_sem);
+
+	if (x->props.mode) {
 		err = ipcomp6_tunnel_attach(x);
 		if (err)
-			goto out;
+			goto error_tunnel;
 	}
 
+	calg_desc = xfrm_calg_get_byname(x->calg->alg_name, 0);
+	BUG_ON(!calg_desc);
+	ipcd->threshold = calg_desc->uinfo.comp.threshold;
+	x->data = ipcd;
 	err = 0;
 out:
 	return err;
+error_tunnel:
+	down(&ipcomp6_resource_sem);
+error:
+	ipcomp6_free_data(ipcd);
+	up(&ipcomp6_resource_sem);
+	kfree(ipcd);
+
+	goto out;
 }
 
-static int ipcomp6_rcv_cb(struct sk_buff *skb, int err)
+static struct xfrm_type ipcomp6_type = 
 {
-	return 0;
-}
-
-static const struct xfrm_type ipcomp6_type = {
+	.description	= "IPCOMP6",
 	.owner		= THIS_MODULE,
 	.proto		= IPPROTO_COMP,
 	.init_state	= ipcomp6_init_state,
-	.destructor	= ipcomp_destroy,
-	.input		= ipcomp_input,
-	.output		= ipcomp_output,
+	.destructor	= ipcomp6_destroy,
+	.input		= ipcomp6_input,
+	.output		= ipcomp6_output,
 };
 
-static struct xfrm6_protocol ipcomp6_protocol = {
+static struct inet6_protocol ipcomp6_protocol = 
+{
 	.handler	= xfrm6_rcv,
-	.input_handler	= xfrm_input,
-	.cb_handler	= ipcomp6_rcv_cb,
 	.err_handler	= ipcomp6_err,
-	.priority	= 0,
+	.flags		= INET6_PROTO_NOPOLICY,
 };
 
 static int __init ipcomp6_init(void)
 {
 	if (xfrm_register_type(&ipcomp6_type, AF_INET6) < 0) {
-		pr_info("%s: can't add xfrm type\n", __func__);
+		printk(KERN_INFO "ipcomp6 init: can't add xfrm type\n");
 		return -EAGAIN;
 	}
-	if (xfrm6_protocol_register(&ipcomp6_protocol, IPPROTO_COMP) < 0) {
-		pr_info("%s: can't add protocol\n", __func__);
+	if (inet6_add_protocol(&ipcomp6_protocol, IPPROTO_COMP) < 0) {
+		printk(KERN_INFO "ipcomp6 init: can't add protocol\n");
 		xfrm_unregister_type(&ipcomp6_type, AF_INET6);
 		return -EAGAIN;
 	}
@@ -204,9 +509,10 @@ static int __init ipcomp6_init(void)
 
 static void __exit ipcomp6_fini(void)
 {
-	if (xfrm6_protocol_deregister(&ipcomp6_protocol, IPPROTO_COMP) < 0)
-		pr_info("%s: can't remove protocol\n", __func__);
-	xfrm_unregister_type(&ipcomp6_type, AF_INET6);
+	if (inet6_del_protocol(&ipcomp6_protocol, IPPROTO_COMP) < 0) 
+		printk(KERN_INFO "ipv6 ipcomp close: can't remove protocol\n");
+	if (xfrm_unregister_type(&ipcomp6_type, AF_INET6) < 0)
+		printk(KERN_INFO "ipv6 ipcomp close: can't remove xfrm type\n");
 }
 
 module_init(ipcomp6_init);
@@ -215,4 +521,4 @@ MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("IP Payload Compression Protocol (IPComp) for IPv6 - RFC3173");
 MODULE_AUTHOR("Mitsuru KANDA <mk@linux-ipv6.org>");
 
-MODULE_ALIAS_XFRM_TYPE(AF_INET6, XFRM_PROTO_COMP);
+

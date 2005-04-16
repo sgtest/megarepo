@@ -23,10 +23,11 @@
  *      - Jay Schulist <jschlst@samba.org>
  */
  
+#include <linux/config.h>
 
 #ifdef CONFIG_COPS_TANGENT
 
-static const unsigned char ltdrv_code[] = {
+unsigned char ltdrv_code[] = {
 	58,3,0,50,148,10,33,143,15,62,85,119,
 	190,32,9,62,170,119,190,32,3,35,24,241,
 	34,146,10,249,17,150,10,33,143,15,183,237,

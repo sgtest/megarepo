@@ -1,6 +1,19 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- *   Copyright (C) International Business Machines Corp., 2000-2002
+ *   Copyright (c) International Business Machines Corp., 2000-2002
+ *
+ *   This program is free software;  you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or 
+ *   (at your option) any later version.
+ * 
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY;  without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See
+ *   the GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program;  if not, write to the Free Software 
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
  */
 #ifndef _H_JFS_DTREE
 #define	_H_JFS_DTREE
@@ -22,7 +35,7 @@ typedef union {
 
 
 /*
- *	entry segment/slot
+ *      entry segment/slot
  *
  * an entry consists of type dependent head/only segment/slot and
  * additional segments/slots linked vi next field;
@@ -61,13 +74,13 @@ struct idtentry {
 #define DTIHDRDATALEN	11
 
 /* compute number of slots for entry */
-#define	NDTINTERNAL(klen) (DIV_ROUND_UP((4 + (klen)), 15))
+#define	NDTINTERNAL(klen) ( ((4 + (klen)) + (15 - 1)) / 15 )
 
 
 /*
  *	leaf node entry head/only segment
  *
- *	For legacy filesystems, name contains 13 wchars -- no index field
+ * 	For legacy filesystems, name contains 13 wchars -- no index field
  */
 struct ldtentry {
 	__le32 inumber;		/* 4: 4-byte aligned */
@@ -120,7 +133,7 @@ struct dir_table_slot {
 	( ((s64)((dts)->addr1)) << 32 | __le32_to_cpu((dts)->addr2) )
 
 /* compute number of slots for entry */
-#define	NDTLEAF_LEGACY(klen)	(DIV_ROUND_UP((2 + (klen)), 15))
+#define	NDTLEAF_LEGACY(klen)	( ((2 + (klen)) + (15 - 1)) / 15 )
 #define	NDTLEAF	NDTINTERNAL
 
 
@@ -230,6 +243,9 @@ typedef union {
 #define JFS_REMOVE 3
 #define JFS_RENAME 4
 
+#define DIRENTSIZ(namlen) \
+    ( (sizeof(struct dirent) - 2*(JFS_NAME_MAX+1) + 2*((namlen)+1) + 3) &~ 3 )
+
 /*
  * Maximum file offset for directories.
  */
@@ -252,5 +268,12 @@ extern int dtDelete(tid_t tid, struct inode *ip, struct component_name * key,
 extern int dtModify(tid_t tid, struct inode *ip, struct component_name * key,
 		    ino_t * orig_ino, ino_t new_ino, int flag);
 
-extern int jfs_readdir(struct file *file, struct dir_context *ctx);
+extern int jfs_readdir(struct file *filp, void *dirent, filldir_t filldir);
+
+#ifdef  _JFS_DEBUG_DTREE
+extern int dtDisplayTree(struct inode *ip);
+
+extern int dtDisplayPage(struct inode *ip, s64 bn, dtpage_t * p);
+#endif				/* _JFS_DEBUG_DTREE */
+
 #endif				/* !_H_JFS_DTREE */

@@ -3,11 +3,24 @@
  *      Fusion MPT misc device (ioctl) driver.
  *      For use with PCI chip/adapter(s):
  *          LSIFC9xx/LSI409xx Fibre Channel
- *      running LSI Fusion MPT (Message Passing Technology) firmware.
+ *      running LSI Logic Fusion MPT (Message Passing Technology) firmware.
  *
- *  Copyright (c) 1999-2008 LSI Corporation
- *  (mailto:DL-MPTFusionLinux@lsi.com)
+ *  Credits:
+ *      This driver would not exist if not for Alan Cox's development
+ *      of the linux i2o driver.
  *
+ *      A huge debt of gratitude is owed to David S. Miller (DaveM)
+ *      for fixing much of the stupid and broken stuff in the early
+ *      driver while porting to sparc64 platform.  THANK YOU!
+ *
+ *      (see also mptbase.c)
+ *
+ *  Copyright (c) 1999-2004 LSI Logic Corporation
+ *  Originally By: Steven J. Ralston
+ *  (mailto:sjralston1@netscape.net)
+ *  (mailto:mpt_linux_developer@lsil.com)
+ *
+ *  $Id: mptctl.h,v 1.13 2002/12/03 21:26:33 pdelaney Exp $
  */
 /*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
 /*
@@ -49,6 +62,7 @@
 #define MPTCTL_H_INCLUDED
 /*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
 
+#include "linux/version.h"
 
 
 /*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
@@ -169,10 +183,8 @@ struct mpt_ioctl_pci_info2 {
  *  Read only.
  *  Data starts at offset 0xC
  */
-#define MPT_IOCTL_INTERFACE_SCSI	(0x00)
 #define MPT_IOCTL_INTERFACE_FC		(0x01)
-#define MPT_IOCTL_INTERFACE_FC_IP	(0x02)
-#define MPT_IOCTL_INTERFACE_SAS		(0x03)
+#define MPT_IOCTL_INTERFACE_SCSI	(0x00)
 #define MPT_IOCTL_VERSION_LENGTH	(32)
 
 struct mpt_ioctl_iocinfo {
@@ -354,6 +366,9 @@ struct mpt_ioctl_command32 {
 
 
 /*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
+/*
+ *	HP Specific IOCTL Defines and Structures
+ */
 
 #define CPQFCTS_IOC_MAGIC 'Z'
 #define HP_IOC_MAGIC 'Z'
@@ -361,6 +376,8 @@ struct mpt_ioctl_command32 {
 #define HP_GETHOSTINFO1		_IOR(HP_IOC_MAGIC, 20, hp_host_info_rev0_t)
 #define HP_GETTARGETINFO	_IOR(HP_IOC_MAGIC, 21, hp_target_info_t)
 
+/* All HP IOCTLs must include this header
+ */
 typedef struct _hp_header {
 	unsigned int iocnum;
 	unsigned int host;

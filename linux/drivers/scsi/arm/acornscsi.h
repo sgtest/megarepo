@@ -1,8 +1,11 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  *  linux/drivers/acorn/scsi/acornscsi.h
  *
  *  Copyright (C) 1997 Russell King
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  *
  *  Acorn SCSI driver
  */
@@ -176,6 +179,7 @@
 
 /* miscellaneous internal variables */
 
+#define POD_SPACE(x)	((x) + 0xd0000)
 #define MASK_ON		(MASKREG_M3|MASKREG_M2|MASKREG_M1|MASKREG_M0)
 #define MASK_OFF	(MASKREG_M3|MASKREG_M2|MASKREG_M1)
 
@@ -220,8 +224,8 @@ typedef enum {
  * Synchronous transfer state
  */
 typedef enum {					/* Synchronous transfer state		*/
-    SYNC_ASYNCHRONOUS,				/* don't negotiate synchronous transfers*/
-    SYNC_NEGOCIATE,				/* start negotiation			*/
+    SYNC_ASYNCHRONOUS,				/* don't negociate synchronous transfers*/
+    SYNC_NEGOCIATE,				/* start negociation			*/
     SYNC_SENT_REQUEST,				/* sent SDTR message			*/
     SYNC_COMPLETED,				/* received SDTR reply			*/
 } syncxfer_t;
@@ -273,13 +277,12 @@ struct status_entry {
 typedef struct acornscsi_hostdata {
     /* miscellaneous */
     struct Scsi_Host	*host;			/* host					*/
-    struct scsi_cmnd	*SCpnt;			/* currently processing command		*/
-    struct scsi_cmnd	*origSCpnt;		/* original connecting command		*/
-    void __iomem	*base;			/* memc base address 			*/
-    void __iomem	*fast;			/* fast ioc base address		*/
+    Scsi_Cmnd		*SCpnt;			/* currently processing command		*/
+    Scsi_Cmnd		*origSCpnt;		/* original connecting command		*/
 
     /* driver information */
     struct {
+	unsigned int	io_port;		/* base address of WD33C93		*/
 	unsigned int	irq;			/* interrupt				*/
 	phase_t		phase;			/* current phase			*/
 
@@ -289,7 +292,7 @@ typedef struct acornscsi_hostdata {
 	    unsigned char	tag;		/* reconnected tag			*/
 	} reconnected;
 
-	struct scsi_pointer	SCp;			/* current commands data pointer	*/
+	Scsi_Pointer	SCp;			/* current commands data pointer	*/
 
 	MsgQueue_t	msgs;
 
@@ -319,13 +322,15 @@ typedef struct acornscsi_hostdata {
     /* per-device info */
     struct {
 	unsigned char	sync_xfer;		/* synchronous transfer (SBIC value)	*/
-	syncxfer_t	sync_state;		/* sync xfer negotiation state		*/
+	syncxfer_t	sync_state;		/* sync xfer negociation state		*/
 	unsigned char	disconnect_ok:1;	/* device can disconnect		*/
     } device[8];
     unsigned long	busyluns[64 / sizeof(unsigned long)];/* array of bits indicating LUNs busy	*/
 
     /* DMA info */
     struct {
+	unsigned int	io_port;		/* base address of DMA controller	*/
+	unsigned int	io_intr_clear;		/* address of DMA interrupt clear	*/
 	unsigned int	free_addr;		/* next free address			*/
 	unsigned int	start_addr;		/* start address of current transfer	*/
 	dmadir_t	direction;		/* dma direction			*/
@@ -340,6 +345,9 @@ typedef struct acornscsi_hostdata {
 
     /* card info */
     struct {
+	unsigned int	io_intr;		/* base address of interrupt id reg	*/
+	unsigned int	io_page;		/* base address of page reg		*/
+	unsigned int	io_ram;			/* base address of RAM access		*/
 	unsigned char	page_reg;		/* current setting of page reg		*/
     } card;
 

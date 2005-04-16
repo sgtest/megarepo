@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *  linux/fs/sysv/file.c
  *
@@ -20,40 +19,31 @@
  * We have mostly NULLs here: the current defaults are OK for
  * the coh filesystem.
  */
-const struct file_operations sysv_file_operations = {
+struct file_operations sysv_file_operations = {
 	.llseek		= generic_file_llseek,
-	.read_iter	= generic_file_read_iter,
-	.write_iter	= generic_file_write_iter,
+	.read		= generic_file_read,
+	.write		= generic_file_write,
 	.mmap		= generic_file_mmap,
-	.fsync		= generic_file_fsync,
-	.splice_read	= generic_file_splice_read,
+	.fsync		= sysv_sync_file,
+	.sendfile	= generic_file_sendfile,
 };
 
-static int sysv_setattr(struct user_namespace *mnt_userns,
-			struct dentry *dentry, struct iattr *attr)
-{
-	struct inode *inode = d_inode(dentry);
-	int error;
-
-	error = setattr_prepare(&init_user_ns, dentry, attr);
-	if (error)
-		return error;
-
-	if ((attr->ia_valid & ATTR_SIZE) &&
-	    attr->ia_size != i_size_read(inode)) {
-		error = inode_newsize_ok(inode, attr->ia_size);
-		if (error)
-			return error;
-		truncate_setsize(inode, attr->ia_size);
-		sysv_truncate(inode);
-	}
-
-	setattr_copy(&init_user_ns, inode, attr);
-	mark_inode_dirty(inode);
-	return 0;
-}
-
-const struct inode_operations sysv_file_inode_operations = {
-	.setattr	= sysv_setattr,
+struct inode_operations sysv_file_inode_operations = {
+	.truncate	= sysv_truncate,
 	.getattr	= sysv_getattr,
 };
+
+int sysv_sync_file(struct file * file, struct dentry *dentry, int datasync)
+{
+	struct inode *inode = dentry->d_inode;
+	int err;
+
+	err = sync_mapping_buffers(inode->i_mapping);
+	if (!(inode->i_state & I_DIRTY))
+		return err;
+	if (datasync && !(inode->i_state & I_DIRTY_DATASYNC))
+		return err;
+	
+	err |= sysv_sync_inode(inode);
+	return err ? -EIO : 0;
+}

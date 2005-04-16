@@ -1,14 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
+ * drivers/s390/char/monreader.c
+ *
  * Character device driver for reading z/VM *MONITOR service records.
  *
- * Copyright IBM Corp. 2004, 2009
+ * Copyright (C) 2004 IBM Corporation, IBM Deutschland Entwicklung GmbH.
  *
- * Author: Gerald Schaefer <gerald.schaefer@de.ibm.com>
+ * Author: Gerald Schaefer <geraldsc@de.ibm.com>
  */
-
-#define KMSG_COMPONENT "monreader"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
 
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -20,13 +18,26 @@
 #include <linux/ctype.h>
 #include <linux/spinlock.h>
 #include <linux/interrupt.h>
-#include <linux/poll.h>
-#include <linux/slab.h>
-#include <net/iucv/iucv.h>
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
 #include <asm/ebcdic.h>
 #include <asm/extmem.h>
+#include <linux/poll.h>
+#include "../net/iucv.h"
 
+
+//#define MON_DEBUG			/* Debug messages on/off */
+
+#define MON_NAME "monreader"
+
+#define P_INFO(x...)	printk(KERN_INFO MON_NAME " info: " x)
+#define P_ERROR(x...)	printk(KERN_ERR MON_NAME " error: " x)
+#define P_WARNING(x...)	printk(KERN_WARNING MON_NAME " warning: " x)
+
+#ifdef MON_DEBUG
+#define P_DEBUG(x...)   printk(KERN_DEBUG MON_NAME " debug: " x)
+#else
+#define P_DEBUG(x...)   do {} while (0)
+#endif
 
 #define MON_COLLECT_SAMPLE 0x80
 #define MON_COLLECT_EVENT  0x40
@@ -39,13 +50,14 @@ static char mon_dcss_name[9] = "MONDCSS\0";
 struct mon_msg {
 	u32 pos;
 	u32 mca_offset;
-	struct iucv_message msg;
+	iucv_MessagePending local_eib;
 	char msglim_reached;
 	char replied_msglim;
 };
 
 struct mon_private {
-	struct iucv_path *path;
+	u16 pathid;
+	iucv_handle_t iucv_handle;
 	struct mon_msg *msg_array[MON_MSGLIM];
 	unsigned int   write_index;
 	unsigned int   read_index;
@@ -63,6 +75,8 @@ static unsigned long mon_dcss_end;
 static DECLARE_WAIT_QUEUE_HEAD(mon_read_wait_queue);
 static DECLARE_WAIT_QUEUE_HEAD(mon_conn_wait_queue);
 
+static u8 iucv_host[8] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
 static u8 user_data_connect[16] = {
 	/* Version code, must be 0x01 for shared mode */
 	0x01,
@@ -78,6 +92,7 @@ static u8 user_data_sever[16] = {
 	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 };
 
+
 /******************************************************************************
  *                             helper functions                               *
  *****************************************************************************/
@@ -85,7 +100,8 @@ static u8 user_data_sever[16] = {
  * Create the 8 bytes EBCDIC DCSS segment name from
  * an ASCII name, incl. padding
  */
-static void dcss_mkname(char *ascii_name, char *ebcdic_name)
+static inline void
+dcss_mkname(char *ascii_name, char *ebcdic_name)
 {
 	int i;
 
@@ -93,43 +109,101 @@ static void dcss_mkname(char *ascii_name, char *ebcdic_name)
 		if (ascii_name[i] == '\0')
 			break;
 		ebcdic_name[i] = toupper(ascii_name[i]);
-	}
+	};
 	for (; i < 8; i++)
 		ebcdic_name[i] = ' ';
 	ASCEBC(ebcdic_name, 8);
 }
 
-static inline unsigned long mon_mca_start(struct mon_msg *monmsg)
+/*
+ * print appropriate error message for segment_load()/segment_type()
+ * return code
+ */
+static void
+mon_segment_warn(int rc, char* seg_name)
 {
-	return *(u32 *) &monmsg->msg.rmmsg;
+	switch (rc) {
+	case -ENOENT:
+		P_WARNING("cannot load/query segment %s, does not exist\n",
+			  seg_name);
+		break;
+	case -ENOSYS:
+		P_WARNING("cannot load/query segment %s, not running on VM\n",
+			  seg_name);
+		break;
+	case -EIO:
+		P_WARNING("cannot load/query segment %s, hardware error\n",
+			  seg_name);
+		break;
+	case -ENOTSUPP:
+		P_WARNING("cannot load/query segment %s, is a multi-part "
+			  "segment\n", seg_name);
+		break;
+	case -ENOSPC:
+		P_WARNING("cannot load/query segment %s, overlaps with "
+			  "storage\n", seg_name);
+		break;
+	case -EBUSY:
+		P_WARNING("cannot load/query segment %s, overlaps with "
+			  "already loaded dcss\n", seg_name);
+		break;
+	case -EPERM:
+		P_WARNING("cannot load/query segment %s, already loaded in "
+			  "incompatible mode\n", seg_name);
+		break;
+	case -ENOMEM:
+		P_WARNING("cannot load/query segment %s, out of memory\n",
+			  seg_name);
+		break;
+	case -ERANGE:
+		P_WARNING("cannot load/query segment %s, exceeds kernel "
+			  "mapping range\n", seg_name);
+		break;
+	default:
+		P_WARNING("cannot load/query segment %s, return value %i\n",
+			  seg_name, rc);
+		break;
+	}
 }
 
-static inline unsigned long mon_mca_end(struct mon_msg *monmsg)
+static inline unsigned long
+mon_mca_start(struct mon_msg *monmsg)
 {
-	return *(u32 *) &monmsg->msg.rmmsg[4];
+	return monmsg->local_eib.ln1msg1.iprmmsg1_u32;
 }
 
-static inline u8 mon_mca_type(struct mon_msg *monmsg, u8 index)
+static inline unsigned long
+mon_mca_end(struct mon_msg *monmsg)
+{
+	return monmsg->local_eib.ln1msg2.ipbfln1f;
+}
+
+static inline u8
+mon_mca_type(struct mon_msg *monmsg, u8 index)
 {
 	return *((u8 *) mon_mca_start(monmsg) + monmsg->mca_offset + index);
 }
 
-static inline u32 mon_mca_size(struct mon_msg *monmsg)
+static inline u32
+mon_mca_size(struct mon_msg *monmsg)
 {
 	return mon_mca_end(monmsg) - mon_mca_start(monmsg) + 1;
 }
 
-static inline u32 mon_rec_start(struct mon_msg *monmsg)
+static inline u32
+mon_rec_start(struct mon_msg *monmsg)
 {
 	return *((u32 *) (mon_mca_start(monmsg) + monmsg->mca_offset + 4));
 }
 
-static inline u32 mon_rec_end(struct mon_msg *monmsg)
+static inline u32
+mon_rec_end(struct mon_msg *monmsg)
 {
 	return *((u32 *) (mon_mca_start(monmsg) + monmsg->mca_offset + 8));
 }
 
-static int mon_check_mca(struct mon_msg *monmsg)
+static inline int
+mon_check_mca(struct mon_msg *monmsg)
 {
 	if ((mon_rec_end(monmsg) <= mon_rec_start(monmsg)) ||
 	    (mon_rec_start(monmsg) < mon_dcss_start) ||
@@ -140,17 +214,27 @@ static int mon_check_mca(struct mon_msg *monmsg)
 	    (mon_mca_end(monmsg) > mon_dcss_end) ||
 	    (mon_mca_start(monmsg) < mon_dcss_start) ||
 	    ((mon_mca_type(monmsg, 1) == 0) && (mon_mca_type(monmsg, 2) == 0)))
+	{
+		P_DEBUG("READ, IGNORED INVALID MCA\n\n");
 		return -EINVAL;
+	}
 	return 0;
 }
 
-static int mon_send_reply(struct mon_msg *monmsg,
-			  struct mon_private *monpriv)
+static inline int
+mon_send_reply(struct mon_msg *monmsg, struct mon_private *monpriv)
 {
+	u8 prmmsg[8];
 	int rc;
 
-	rc = iucv_message_reply(monpriv->path, &monmsg->msg,
-				IUCV_IPRMDATA, NULL, 0);
+	P_DEBUG("read, REPLY: pathid = 0x%04X, msgid = 0x%08X, trgcls = "
+		"0x%08X\n\n",
+		monmsg->local_eib.ippathid, monmsg->local_eib.ipmsgid,
+		monmsg->local_eib.iptrgcls);
+	rc = iucv_reply_prmmsg(monmsg->local_eib.ippathid,
+				monmsg->local_eib.ipmsgid,
+				monmsg->local_eib.iptrgcls,
+				0, prmmsg);
 	atomic_dec(&monpriv->msglim_count);
 	if (likely(!monmsg->msglim_reached)) {
 		monmsg->pos = 0;
@@ -161,49 +245,81 @@ static int mon_send_reply(struct mon_msg *monmsg,
 	} else
 		monmsg->replied_msglim = 1;
 	if (rc) {
-		pr_err("Reading monitor data failed with rc=%i\n", rc);
+		P_ERROR("read, IUCV reply failed with rc = %i\n\n", rc);
 		return -EIO;
 	}
 	return 0;
 }
 
-static void mon_free_mem(struct mon_private *monpriv)
+static inline struct mon_private *
+mon_alloc_mem(void)
 {
-	int i;
-
-	for (i = 0; i < MON_MSGLIM; i++)
-		kfree(monpriv->msg_array[i]);
-	kfree(monpriv);
-}
-
-static struct mon_private *mon_alloc_mem(void)
-{
-	int i;
+	int i,j;
 	struct mon_private *monpriv;
 
-	monpriv = kzalloc(sizeof(struct mon_private), GFP_KERNEL);
-	if (!monpriv)
+	monpriv = kmalloc(sizeof(struct mon_private), GFP_KERNEL);
+	if (!monpriv) {
+		P_ERROR("no memory for monpriv\n");
 		return NULL;
+	}
+	memset(monpriv, 0, sizeof(struct mon_private));
 	for (i = 0; i < MON_MSGLIM; i++) {
-		monpriv->msg_array[i] = kzalloc(sizeof(struct mon_msg),
+		monpriv->msg_array[i] = kmalloc(sizeof(struct mon_msg),
 						    GFP_KERNEL);
 		if (!monpriv->msg_array[i]) {
-			mon_free_mem(monpriv);
+			P_ERROR("open, no memory for msg_array\n");
+			for (j = 0; j < i; j++)
+				kfree(monpriv->msg_array[j]);
 			return NULL;
 		}
+		memset(monpriv->msg_array[i], 0, sizeof(struct mon_msg));
 	}
 	return monpriv;
 }
 
-static inline void mon_next_mca(struct mon_msg *monmsg)
+static inline void
+mon_read_debug(struct mon_msg *monmsg, struct mon_private *monpriv)
+{
+#ifdef MON_DEBUG
+	u8 msg_type[2], mca_type;
+	unsigned long records_len;
+
+	records_len = mon_rec_end(monmsg) - mon_rec_start(monmsg) + 1;
+
+	memcpy(msg_type, &monmsg->local_eib.iptrgcls, 2);
+	EBCASC(msg_type, 2);
+	mca_type = mon_mca_type(monmsg, 0);
+	EBCASC(&mca_type, 1);
+
+	P_DEBUG("read, mon_read_index = %i, mon_write_index = %i\n",
+		monpriv->read_index, monpriv->write_index);
+	P_DEBUG("read, pathid = 0x%04X, msgid = 0x%08X, trgcls = 0x%08X\n",
+		monmsg->local_eib.ippathid, monmsg->local_eib.ipmsgid,
+		monmsg->local_eib.iptrgcls);
+	P_DEBUG("read, msg_type = '%c%c', mca_type = '%c' / 0x%X / 0x%X\n",
+		msg_type[0], msg_type[1], mca_type ? mca_type : 'X',
+		mon_mca_type(monmsg, 1), mon_mca_type(monmsg, 2));
+	P_DEBUG("read, MCA: start = 0x%lX, end = 0x%lX\n",
+		mon_mca_start(monmsg), mon_mca_end(monmsg));
+	P_DEBUG("read, REC: start = 0x%X, end = 0x%X, len = %lu\n\n",
+		mon_rec_start(monmsg), mon_rec_end(monmsg), records_len);
+	if (mon_mca_size(monmsg) > 12)
+		P_DEBUG("READ, MORE THAN ONE MCA\n\n");
+#endif
+}
+
+static inline void
+mon_next_mca(struct mon_msg *monmsg)
 {
 	if (likely((mon_mca_size(monmsg) - monmsg->mca_offset) == 12))
 		return;
+	P_DEBUG("READ, NEXT MCA\n\n");
 	monmsg->mca_offset += 12;
 	monmsg->pos = 0;
 }
 
-static struct mon_msg *mon_next_message(struct mon_private *monpriv)
+static inline struct mon_msg *
+mon_next_message(struct mon_private *monpriv)
 {
 	struct mon_msg *monmsg;
 
@@ -215,6 +331,7 @@ static struct mon_msg *mon_next_message(struct mon_private *monpriv)
 		monmsg->msglim_reached = 0;
 		monmsg->pos = 0;
 		monmsg->mca_offset = 0;
+		P_WARNING("read, message limit reached\n");
 		monpriv->read_index = (monpriv->read_index + 1) %
 				      MON_MSGLIM;
 		atomic_dec(&monpriv->read_ready);
@@ -227,35 +344,42 @@ static struct mon_msg *mon_next_message(struct mon_private *monpriv)
 /******************************************************************************
  *                               IUCV handler                                 *
  *****************************************************************************/
-static void mon_iucv_path_complete(struct iucv_path *path, u8 *ipuser)
+static void
+mon_iucv_ConnectionComplete(iucv_ConnectionComplete *eib, void *pgm_data)
 {
-	struct mon_private *monpriv = path->private;
+	struct mon_private *monpriv = (struct mon_private *) pgm_data;
 
+	P_DEBUG("IUCV connection completed\n");
+	P_DEBUG("IUCV ACCEPT (from *MONITOR): Version = 0x%02X, Event = "
+		"0x%02X, Sample = 0x%02X\n",
+		eib->ipuser[0], eib->ipuser[1], eib->ipuser[2]);
 	atomic_set(&monpriv->iucv_connected, 1);
 	wake_up(&mon_conn_wait_queue);
 }
 
-static void mon_iucv_path_severed(struct iucv_path *path, u8 *ipuser)
+static void
+mon_iucv_ConnectionSevered(iucv_ConnectionSevered *eib, void *pgm_data)
 {
-	struct mon_private *monpriv = path->private;
+	struct mon_private *monpriv = (struct mon_private *) pgm_data;
 
-	pr_err("z/VM *MONITOR system service disconnected with rc=%i\n",
-	       ipuser[0]);
-	iucv_path_sever(path, NULL);
+	P_ERROR("IUCV connection severed with rc = 0x%X\n",
+		(u8) eib->ipuser[0]);
 	atomic_set(&monpriv->iucv_severed, 1);
 	wake_up(&mon_conn_wait_queue);
 	wake_up_interruptible(&mon_read_wait_queue);
 }
 
-static void mon_iucv_message_pending(struct iucv_path *path,
-				     struct iucv_message *msg)
+static void
+mon_iucv_MessagePending(iucv_MessagePending *eib, void *pgm_data)
 {
-	struct mon_private *monpriv = path->private;
+	struct mon_private *monpriv = (struct mon_private *) pgm_data;
 
-	memcpy(&monpriv->msg_array[monpriv->write_index]->msg,
-	       msg, sizeof(*msg));
+	P_DEBUG("IUCV message pending\n");
+	memcpy(&monpriv->msg_array[monpriv->write_index]->local_eib, eib,
+	       sizeof(iucv_MessagePending));
 	if (atomic_inc_return(&monpriv->msglim_count) == MON_MSGLIM) {
-		pr_warn("The read queue for monitor data is full\n");
+		P_WARNING("IUCV message pending, message limit (%i) reached\n",
+			  MON_MSGLIM);
 		monpriv->msg_array[monpriv->write_index]->msglim_reached = 1;
 	}
 	monpriv->write_index = (monpriv->write_index + 1) % MON_MSGLIM;
@@ -263,45 +387,54 @@ static void mon_iucv_message_pending(struct iucv_path *path,
 	wake_up_interruptible(&mon_read_wait_queue);
 }
 
-static struct iucv_handler monreader_iucv_handler = {
-	.path_complete	 = mon_iucv_path_complete,
-	.path_severed	 = mon_iucv_path_severed,
-	.message_pending = mon_iucv_message_pending,
+static iucv_interrupt_ops_t mon_iucvops = {
+	.ConnectionComplete = mon_iucv_ConnectionComplete,
+	.ConnectionSevered  = mon_iucv_ConnectionSevered,
+	.MessagePending     = mon_iucv_MessagePending,
 };
 
 /******************************************************************************
  *                               file operations                              *
  *****************************************************************************/
-static int mon_open(struct inode *inode, struct file *filp)
+static int
+mon_open(struct inode *inode, struct file *filp)
 {
+	int rc, i;
 	struct mon_private *monpriv;
-	int rc;
 
 	/*
 	 * only one user allowed
 	 */
-	rc = -EBUSY;
 	if (test_and_set_bit(MON_IN_USE, &mon_in_use))
-		goto out;
+		return -EBUSY;
 
-	rc = -ENOMEM;
 	monpriv = mon_alloc_mem();
 	if (!monpriv)
-		goto out_use;
+		return -ENOMEM;
 
 	/*
-	 * Connect to *MONITOR service
+	 * Register with IUCV and connect to *MONITOR service
 	 */
-	monpriv->path = iucv_path_alloc(MON_MSGLIM, IUCV_IPRMDATA, GFP_KERNEL);
-	if (!monpriv->path)
-		goto out_priv;
-	rc = iucv_path_connect(monpriv->path, &monreader_iucv_handler,
-			       MON_SERVICE, NULL, user_data_connect, monpriv);
-	if (rc) {
-		pr_err("Connecting to the z/VM *MONITOR system service "
-		       "failed with rc=%i\n", rc);
+	monpriv->iucv_handle = iucv_register_program("my_monreader    ",
+							MON_SERVICE,
+							NULL,
+							&mon_iucvops,
+							monpriv);
+	if (!monpriv->iucv_handle) {
+		P_ERROR("failed to register with iucv driver\n");
 		rc = -EIO;
-		goto out_path;
+		goto out_error;
+	}
+	P_INFO("open, registered with IUCV\n");
+
+	rc = iucv_connect(&monpriv->pathid, MON_MSGLIM, user_data_connect,
+			  MON_SERVICE, iucv_host, IPRMDATA, NULL, NULL,
+			  monpriv->iucv_handle, NULL);
+	if (rc) {
+		P_ERROR("iucv connection to *MONITOR failed with "
+			"IPUSER SEVER code = %i\n", rc);
+		rc = -EIO;
+		goto out_unregister;
 	}
 	/*
 	 * Wait for connection confirmation
@@ -313,22 +446,24 @@ static int mon_open(struct inode *inode, struct file *filp)
 		atomic_set(&monpriv->iucv_severed, 0);
 		atomic_set(&monpriv->iucv_connected, 0);
 		rc = -EIO;
-		goto out_path;
+		goto out_unregister;
 	}
+	P_INFO("open, established connection to *MONITOR service\n\n");
 	filp->private_data = monpriv;
 	return nonseekable_open(inode, filp);
 
-out_path:
-	iucv_path_free(monpriv->path);
-out_priv:
-	mon_free_mem(monpriv);
-out_use:
+out_unregister:
+	iucv_unregister_program(monpriv->iucv_handle);
+out_error:
+	for (i = 0; i < MON_MSGLIM; i++)
+		kfree(monpriv->msg_array[i]);
+	kfree(monpriv);
 	clear_bit(MON_IN_USE, &mon_in_use);
-out:
 	return rc;
 }
 
-static int mon_close(struct inode *inode, struct file *filp)
+static int
+mon_close(struct inode *inode, struct file *filp)
 {
 	int rc, i;
 	struct mon_private *monpriv = filp->private_data;
@@ -336,13 +471,17 @@ static int mon_close(struct inode *inode, struct file *filp)
 	/*
 	 * Close IUCV connection and unregister
 	 */
-	if (monpriv->path) {
-		rc = iucv_path_sever(monpriv->path, user_data_sever);
-		if (rc)
-			pr_warn("Disconnecting the z/VM *MONITOR system service failed with rc=%i\n",
-				rc);
-		iucv_path_free(monpriv->path);
-	}
+	rc = iucv_sever(monpriv->pathid, user_data_sever);
+	if (rc)
+		P_ERROR("close, iucv_sever failed with rc = %i\n", rc);
+	else
+		P_INFO("close, terminated connection to *MONITOR service\n");
+
+	rc = iucv_unregister_program(monpriv->iucv_handle);
+	if (rc)
+		P_ERROR("close, iucv_unregister failed with rc = %i\n", rc);
+	else
+		P_INFO("close, unregistered with IUCV\n");
 
 	atomic_set(&monpriv->iucv_severed, 0);
 	atomic_set(&monpriv->iucv_connected, 0);
@@ -358,8 +497,8 @@ static int mon_close(struct inode *inode, struct file *filp)
 	return 0;
 }
 
-static ssize_t mon_read(struct file *filp, char __user *data,
-			size_t count, loff_t *ppos)
+static ssize_t
+mon_read(struct file *filp, char __user *data, size_t count, loff_t *ppos)
 {
 	struct mon_private *monpriv = filp->private_data;
 	struct mon_msg *monmsg;
@@ -383,8 +522,10 @@ static ssize_t mon_read(struct file *filp, char __user *data,
 		monmsg = monpriv->msg_array[monpriv->read_index];
 	}
 
-	if (!monmsg->pos)
+	if (!monmsg->pos) {
 		monmsg->pos = mon_mca_start(monmsg) + monmsg->mca_offset;
+		mon_read_debug(monmsg, monpriv);
+	}
 	if (mon_check_mca(monmsg))
 		goto reply;
 
@@ -424,29 +565,30 @@ out_copy:
 	return count;
 }
 
-static __poll_t mon_poll(struct file *filp, struct poll_table_struct *p)
+static unsigned int
+mon_poll(struct file *filp, struct poll_table_struct *p)
 {
 	struct mon_private *monpriv = filp->private_data;
 
 	poll_wait(filp, &mon_read_wait_queue, p);
 	if (unlikely(atomic_read(&monpriv->iucv_severed)))
-		return EPOLLERR;
+		return POLLERR;
 	if (atomic_read(&monpriv->read_ready))
-		return EPOLLIN | EPOLLRDNORM;
+		return POLLIN | POLLRDNORM;
 	return 0;
 }
 
-static const struct file_operations mon_fops = {
+static struct file_operations mon_fops = {
 	.owner   = THIS_MODULE,
 	.open    = &mon_open,
 	.release = &mon_close,
 	.read    = &mon_read,
 	.poll    = &mon_poll,
-	.llseek  = noop_llseek,
 };
 
 static struct miscdevice mon_dev = {
 	.name       = "monreader",
+	.devfs_name = "monreader",
 	.fops       = &mon_fops,
 	.minor      = MISC_DYNAMIC_MINOR,
 };
@@ -454,68 +596,55 @@ static struct miscdevice mon_dev = {
 /******************************************************************************
  *                              module init/exit                              *
  *****************************************************************************/
-static int __init mon_init(void)
+static int __init
+mon_init(void)
 {
 	int rc;
 
 	if (!MACHINE_IS_VM) {
-		pr_err("The z/VM *MONITOR record device driver cannot be "
-		       "loaded without z/VM\n");
+		P_ERROR("not running under z/VM, driver not loaded\n");
 		return -ENODEV;
-	}
-
-	/*
-	 * Register with IUCV and connect to *MONITOR service
-	 */
-	rc = iucv_register(&monreader_iucv_handler, 1);
-	if (rc) {
-		pr_err("The z/VM *MONITOR record device driver failed to "
-		       "register with IUCV\n");
-		return rc;
 	}
 
 	rc = segment_type(mon_dcss_name);
 	if (rc < 0) {
-		segment_warning(rc, mon_dcss_name);
-		goto out_iucv;
+		mon_segment_warn(rc, mon_dcss_name);
+		return rc;
 	}
 	if (rc != SEG_TYPE_SC) {
-		pr_err("The specified *MONITOR DCSS %s does not have the "
-		       "required type SC\n", mon_dcss_name);
-		rc = -EINVAL;
-		goto out_iucv;
+		P_ERROR("segment %s has unsupported type, should be SC\n",
+			mon_dcss_name);
+		return -EINVAL;
 	}
 
 	rc = segment_load(mon_dcss_name, SEGMENT_SHARED,
 			  &mon_dcss_start, &mon_dcss_end);
 	if (rc < 0) {
-		segment_warning(rc, mon_dcss_name);
-		rc = -EINVAL;
-		goto out_iucv;
+		mon_segment_warn(rc, mon_dcss_name);
+		return -EINVAL;
 	}
 	dcss_mkname(mon_dcss_name, &user_data_connect[8]);
 
-	/*
-	 * misc_register() has to be the last action in module_init(), because
-	 * file operations will be available right after this.
-	 */
 	rc = misc_register(&mon_dev);
-	if (rc < 0 )
+	if (rc < 0 ) {
+		P_ERROR("misc_register failed, rc = %i\n", rc);
 		goto out;
+	}
+	P_INFO("Loaded segment %s from %p to %p, size = %lu Byte\n",
+		mon_dcss_name, (void *) mon_dcss_start, (void *) mon_dcss_end,
+		mon_dcss_end - mon_dcss_start + 1);
 	return 0;
 
 out:
 	segment_unload(mon_dcss_name);
-out_iucv:
-	iucv_unregister(&monreader_iucv_handler, 1);
 	return rc;
 }
 
-static void __exit mon_exit(void)
+static void __exit
+mon_exit(void)
 {
 	segment_unload(mon_dcss_name);
-	misc_deregister(&mon_dev);
-	iucv_unregister(&monreader_iucv_handler, 1);
+	WARN_ON(misc_deregister(&mon_dev) != 0);
 	return;
 }
 

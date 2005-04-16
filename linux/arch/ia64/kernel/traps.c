@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Architecture-specific trap handling.
  *
@@ -8,25 +7,22 @@
  * 05/12/00 grao <goutham.rao@intel.com> : added isr in siginfo for SIGFPE
  */
 
+#include <linux/config.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
-#include <linux/sched/signal.h>
-#include <linux/sched/debug.h>
+#include <linux/sched.h>
 #include <linux/tty.h>
 #include <linux/vt_kern.h>		/* For unblank_screen() */
-#include <linux/export.h>
-#include <linux/extable.h>
+#include <linux/module.h>       /* for EXPORT_SYMBOL */
 #include <linux/hardirq.h>
-#include <linux/kprobes.h>
-#include <linux/delay.h>		/* for ssleep() */
-#include <linux/kdebug.h>
-#include <linux/uaccess.h>
 
 #include <asm/fpswa.h>
+#include <asm/ia32.h>
 #include <asm/intrinsics.h>
 #include <asm/processor.h>
-#include <asm/exception.h>
-#include <asm/setup.h>
+#include <asm/uaccess.h>
+
+extern spinlock_t timerlist_lock;
 
 fpswa_interface_t *fpswa_interface;
 EXPORT_SYMBOL(fpswa_interface);
@@ -39,7 +35,35 @@ trap_init (void)
 		fpswa_interface = __va(ia64_boot_param->fpswa);
 }
 
-int
+/*
+ * Unlock any spinlocks which will prevent us from getting the message out (timerlist_lock
+ * is acquired through the console unblank code)
+ */
+void
+bust_spinlocks (int yes)
+{
+	int loglevel_save = console_loglevel;
+
+	if (yes) {
+		oops_in_progress = 1;
+		return;
+	}
+
+#ifdef CONFIG_VT
+	unblank_screen();
+#endif
+	oops_in_progress = 0;
+	/*
+	 * OK, the message is on the console.  Now we call printk() without
+	 * oops_in_progress set so that printk will give klogd a poke.  Hold onto
+	 * your hats...
+	 */
+	console_loglevel = 15;		/* NMI oopser may have shut the console up */
+	printk(" ");
+	console_loglevel = loglevel_save;
+}
+
+void
 die (const char *str, struct pt_regs *regs, long err)
 {
 	static struct {
@@ -47,68 +71,55 @@ die (const char *str, struct pt_regs *regs, long err)
 		u32 lock_owner;
 		int lock_owner_depth;
 	} die = {
-		.lock =	__SPIN_LOCK_UNLOCKED(die.lock),
-		.lock_owner = -1,
-		.lock_owner_depth = 0
+		.lock =			SPIN_LOCK_UNLOCKED,
+		.lock_owner =		-1,
+		.lock_owner_depth =	0
 	};
 	static int die_counter;
-	int cpu = get_cpu();
 
-	if (die.lock_owner != cpu) {
+	if (die.lock_owner != smp_processor_id()) {
 		console_verbose();
 		spin_lock_irq(&die.lock);
-		die.lock_owner = cpu;
+		die.lock_owner = smp_processor_id();
 		die.lock_owner_depth = 0;
 		bust_spinlocks(1);
 	}
-	put_cpu();
 
 	if (++die.lock_owner_depth < 3) {
 		printk("%s[%d]: %s %ld [%d]\n",
-		current->comm, task_pid_nr(current), str, err, ++die_counter);
-		if (notify_die(DIE_OOPS, str, regs, err, 255, SIGSEGV)
-	            != NOTIFY_STOP)
-			show_regs(regs);
-		else
-			regs = NULL;
+			current->comm, current->pid, str, err, ++die_counter);
+		show_regs(regs);
   	} else
 		printk(KERN_ERR "Recursive die() failure, output suppressed\n");
 
 	bust_spinlocks(0);
 	die.lock_owner = -1;
-	add_taint(TAINT_DIE, LOCKDEP_NOW_UNRELIABLE);
 	spin_unlock_irq(&die.lock);
-
-	if (!regs)
-		return 1;
-
-	if (panic_on_oops)
-		panic("Fatal exception");
-
-	make_task_dead(SIGSEGV);
-	return 0;
-}
-
-int
-die_if_kernel (char *str, struct pt_regs *regs, long err)
-{
-	if (!user_mode(regs))
-		return die(str, regs, err);
-	return 0;
+  	do_exit(SIGSEGV);
 }
 
 void
-__kprobes ia64_bad_break (unsigned long break_num, struct pt_regs *regs)
+die_if_kernel (char *str, struct pt_regs *regs, long err)
 {
+	if (!user_mode(regs))
+		die(str, regs, err);
+}
+
+void
+ia64_bad_break (unsigned long break_num, struct pt_regs *regs)
+{
+	siginfo_t siginfo;
 	int sig, code;
+
+	/* SIGILL, SIGFPE, SIGSEGV, and SIGBUS want these field initialized: */
+	siginfo.si_addr = (void __user *) (regs->cr_iip + ia64_psr(regs)->ri);
+	siginfo.si_imm = break_num;
+	siginfo.si_flags = 0;		/* clear __ISR_VALID */
+	siginfo.si_isr = 0;
 
 	switch (break_num) {
 	      case 0: /* unknown error (used by GCC for __builtin_abort()) */
-		if (notify_die(DIE_BREAK, "break 0", regs, break_num, TRAP_BRKPT, SIGTRAP)
-			       	== NOTIFY_STOP)
-			return;
-		if (die_if_kernel("bugcheck!", regs, break_num))
-			return;
+		die_if_kernel("bugcheck!", regs, break_num);
 		sig = SIGILL; code = ILL_ILLOPC;
 		break;
 
@@ -161,22 +172,19 @@ __kprobes ia64_bad_break (unsigned long break_num, struct pt_regs *regs)
 		break;
 
 	      default:
-		if ((break_num < 0x40000 || break_num > 0x100000)
-		    && die_if_kernel("Bad break", regs, break_num))
-			return;
+		if (break_num < 0x40000 || break_num > 0x100000)
+			die_if_kernel("Bad break", regs, break_num);
 
 		if (break_num < 0x80000) {
 			sig = SIGILL; code = __ILL_BREAK;
 		} else {
-			if (notify_die(DIE_BREAK, "bad break", regs, break_num, TRAP_BRKPT, SIGTRAP)
-					== NOTIFY_STOP)
-				return;
 			sig = SIGTRAP; code = TRAP_BRKPT;
 		}
 	}
-	force_sig_fault(sig, code,
-			(void __user *) (regs->cr_iip + ia64_psr(regs)->ri),
-			break_num, 0 /* clear __ISR_VALID */, 0);
+	siginfo.si_signo = sig;
+	siginfo.si_errno = 0;
+	siginfo.si_code = code;
+	force_sig_info(sig, &siginfo, current);
 }
 
 /*
@@ -194,21 +202,13 @@ disabled_fph_fault (struct pt_regs *regs)
 
 	/* first, grant user-level access to fph partition: */
 	psr->dfh = 0;
-
-	/*
-	 * Make sure that no other task gets in on this processor
-	 * while we're claiming the FPU
-	 */
-	preempt_disable();
 #ifndef CONFIG_SMP
 	{
 		struct task_struct *fpu_owner
 			= (struct task_struct *)ia64_get_kr(IA64_KR_FPU_OWNER);
 
-		if (ia64_is_local_fpu_owner(current)) {
-			preempt_enable_no_resched();
+		if (ia64_is_local_fpu_owner(current))
 			return;
-		}
 
 		if (fpu_owner)
 			ia64_flush_fph(fpu_owner);
@@ -226,7 +226,6 @@ disabled_fph_fault (struct pt_regs *regs)
 		 */
 		psr->mfh = 1;
 	}
-	preempt_enable_no_resched();
 }
 
 static inline int
@@ -268,15 +267,6 @@ fp_emulate (int fp_fault, void *bundle, long *ipsr, long *fpsr, long *isr, long 
 	return ret.status;
 }
 
-struct fpu_swa_msg {
-	unsigned long count;
-	unsigned long time;
-};
-static DEFINE_PER_CPU(struct fpu_swa_msg, cpulast);
-DECLARE_PER_CPU(struct fpu_swa_msg, cpulast);
-static struct fpu_swa_msg last __cacheline_aligned;
-
-
 /*
  * Handle floating-point assist faults and traps.
  */
@@ -285,6 +275,9 @@ handle_fpu_swa (int fp_fault, struct pt_regs *regs, unsigned long isr)
 {
 	long exception, bundle[2];
 	unsigned long fault_ip;
+	struct siginfo siginfo;
+	static int fpu_swa_count = 0;
+	static unsigned long last_time;
 
 	fault_ip = regs->cr_iip;
 	if (!fp_fault && (ia64_psr(regs)->ri == 0))
@@ -292,37 +285,14 @@ handle_fpu_swa (int fp_fault, struct pt_regs *regs, unsigned long isr)
 	if (copy_from_user(bundle, (void __user *) fault_ip, sizeof(bundle)))
 		return -1;
 
-	if (!(current->thread.flags & IA64_THREAD_FPEMU_NOPRINT))  {
-		unsigned long count, current_jiffies = jiffies;
-		struct fpu_swa_msg *cp = this_cpu_ptr(&cpulast);
-
-		if (unlikely(current_jiffies > cp->time))
-			cp->count = 0;
-		if (unlikely(cp->count < 5)) {
-			cp->count++;
-			cp->time = current_jiffies + 5 * HZ;
-
-			/* minimize races by grabbing a copy of count BEFORE checking last.time. */
-			count = last.count;
-			barrier();
-
-			/*
-			 * Lower 4 bits are used as a count. Upper bits are a sequence
-			 * number that is updated when count is reset. The cmpxchg will
-			 * fail is seqno has changed. This minimizes multiple cpus
-			 * resetting the count.
-			 */
-			if (current_jiffies > last.time)
-				(void) cmpxchg_acq(&last.count, count, 16 + (count & ~15));
-
-			/* used fetchadd to atomically update the count */
-			if ((last.count & 15) < 5 && (ia64_fetchadd(1, &last.count, acq) & 15) < 5) {
-				last.time = current_jiffies + 5 * HZ;
-				printk(KERN_WARNING
-		       			"%s(%d): floating-point assist fault at ip %016lx, isr %016lx\n",
-		       			current->comm, task_pid_nr(current), regs->cr_iip + ia64_psr(regs)->ri, isr);
-			}
-		}
+	if (jiffies - last_time > 5*HZ)
+		fpu_swa_count = 0;
+	if ((fpu_swa_count < 4) && !(current->thread.flags & IA64_THREAD_FPEMU_NOPRINT)) {
+		last_time = jiffies;
+		++fpu_swa_count;
+		printk(KERN_WARNING
+		       "%s(%d): floating-point assist fault at ip %016lx, isr %016lx\n",
+		       current->comm, current->pid, regs->cr_iip + ia64_psr(regs)->ri, isr);
 	}
 
 	exception = fp_emulate(fp_fault, bundle, &regs->cr_ipsr, &regs->ar_fpsr, &isr, &regs->pr,
@@ -336,24 +306,26 @@ handle_fpu_swa (int fp_fault, struct pt_regs *regs, unsigned long isr)
 			return -1;
 		} else {
 			/* is next instruction a trap? */
-			int si_code;
-
 			if (exception & 2) {
 				ia64_increment_ip(regs);
 			}
-			si_code = FPE_FLTUNK;	/* default code */
+			siginfo.si_signo = SIGFPE;
+			siginfo.si_errno = 0;
+			siginfo.si_code = __SI_FAULT;	/* default code */
+			siginfo.si_addr = (void __user *) (regs->cr_iip + ia64_psr(regs)->ri);
 			if (isr & 0x11) {
-				si_code = FPE_FLTINV;
+				siginfo.si_code = FPE_FLTINV;
 			} else if (isr & 0x22) {
 				/* denormal operand gets the same si_code as underflow 
 				* see arch/i386/kernel/traps.c:math_error()  */
-				si_code = FPE_FLTUND;
+				siginfo.si_code = FPE_FLTUND;
 			} else if (isr & 0x44) {
-				si_code = FPE_FLTDIV;
+				siginfo.si_code = FPE_FLTDIV;
 			}
-			force_sig_fault(SIGFPE, si_code,
-					(void __user *) (regs->cr_iip + ia64_psr(regs)->ri),
-					0, __ISR_VALID, isr);
+			siginfo.si_isr = isr;
+			siginfo.si_flags = __ISR_VALID;
+			siginfo.si_imm = 0;
+			force_sig_info(SIGFPE, &siginfo, current);
 		}
 	} else {
 		if (exception == -1) {
@@ -361,19 +333,21 @@ handle_fpu_swa (int fp_fault, struct pt_regs *regs, unsigned long isr)
 			return -1;
 		} else if (exception != 0) {
 			/* raise exception */
-			int si_code;
-
-			si_code = FPE_FLTUNK;	/* default code */
+			siginfo.si_signo = SIGFPE;
+			siginfo.si_errno = 0;
+			siginfo.si_code = __SI_FAULT;	/* default code */
+			siginfo.si_addr = (void __user *) (regs->cr_iip + ia64_psr(regs)->ri);
 			if (isr & 0x880) {
-				si_code = FPE_FLTOVF;
+				siginfo.si_code = FPE_FLTOVF;
 			} else if (isr & 0x1100) {
-				si_code = FPE_FLTUND;
+				siginfo.si_code = FPE_FLTUND;
 			} else if (isr & 0x2200) {
-				si_code = FPE_FLTRES;
+				siginfo.si_code = FPE_FLTRES;
 			}
-			force_sig_fault(SIGFPE, si_code,
-					(void __user *) (regs->cr_iip + ia64_psr(regs)->ri),
-					0, __ISR_VALID, isr);
+			siginfo.si_isr = isr;
+			siginfo.si_flags = __ISR_VALID;
+			siginfo.si_imm = 0;
+			force_sig_info(SIGFPE, &siginfo, current);
 		}
 	}
 	return 0;
@@ -389,6 +363,7 @@ ia64_illegal_op_fault (unsigned long ec, long arg1, long arg2, long arg3,
 		       struct pt_regs regs)
 {
 	struct illegal_op_return rv;
+	struct siginfo si;
 	char buf[128];
 
 #ifdef CONFIG_IA64_BRL_EMU
@@ -402,24 +377,26 @@ ia64_illegal_op_fault (unsigned long ec, long arg1, long arg2, long arg3,
 #endif
 
 	sprintf(buf, "IA-64 Illegal operation fault");
-	rv.fkt = 0;
-	if (die_if_kernel(buf, &regs, 0))
-		return rv;
+	die_if_kernel(buf, &regs, 0);
 
-	force_sig_fault(SIGILL, ILL_ILLOPC,
-			(void __user *) (regs.cr_iip + ia64_psr(&regs)->ri),
-			0, 0, 0);
+	memset(&si, 0, sizeof(si));
+	si.si_signo = SIGILL;
+	si.si_code = ILL_ILLOPC;
+	si.si_addr = (void __user *) (regs.cr_iip + ia64_psr(&regs)->ri);
+	force_sig_info(SIGILL, &si, current);
+	rv.fkt = 0;
 	return rv;
 }
 
-void __kprobes
+void
 ia64_fault (unsigned long vector, unsigned long isr, unsigned long ifa,
 	    unsigned long iim, unsigned long itir, long arg5, long arg6,
 	    long arg7, struct pt_regs regs)
 {
 	unsigned long code, error = isr, iip;
+	struct siginfo siginfo;
 	char buf[128];
-	int result, sig, si_code;
+	int result, sig;
 	static const char *reason[] = {
 		"IA-64 Illegal Operation fault",
 		"IA-64 Privileged Operation fault",
@@ -451,7 +428,7 @@ ia64_fault (unsigned long vector, unsigned long isr, unsigned long ifa,
 		if (code == 8) {
 # ifdef CONFIG_IA64_PRINT_HAZARDS
 			printk("%s[%d]: possible hazard @ ip=%016lx (pr = %016lx)\n",
-			       current->comm, task_pid_nr(current),
+			       current->comm, current->pid,
 			       regs.cr_iip + ia64_psr(&regs)->ri, regs.pr);
 # endif
 			return;
@@ -482,8 +459,14 @@ ia64_fault (unsigned long vector, unsigned long isr, unsigned long ifa,
 				addr = (void __user *) (regs.cr_iip
 							+ ia64_psr(&regs)->ri);
 			}
-			force_sig_fault(sig, code, addr,
-					vector, __ISR_VALID, isr);
+			siginfo.si_signo = sig;
+			siginfo.si_code = code;
+			siginfo.si_errno = 0;
+			siginfo.si_addr = addr;
+			siginfo.si_imm = vector;
+			siginfo.si_flags = __ISR_VALID;
+			siginfo.si_isr = isr;
+			force_sig_info(sig, &siginfo, current);
 			return;
 		} else if (ia64_done_with_exception(&regs))
 			return;
@@ -492,8 +475,14 @@ ia64_fault (unsigned long vector, unsigned long isr, unsigned long ifa,
 
 	      case 31: /* Unsupported Data Reference */
 		if (user_mode(&regs)) {
-			force_sig_fault(SIGILL, ILL_ILLOPN, (void __user *) iip,
-					vector, __ISR_VALID, isr);
+			siginfo.si_signo = SIGILL;
+			siginfo.si_code = ILL_ILLOPN;
+			siginfo.si_errno = 0;
+			siginfo.si_addr = (void __user *) iip;
+			siginfo.si_imm = vector;
+			siginfo.si_flags = __ISR_VALID;
+			siginfo.si_isr = isr;
+			force_sig_info(SIGILL, &siginfo, current);
 			return;
 		}
 		sprintf(buf, "Unsupported data reference");
@@ -505,15 +494,12 @@ ia64_fault (unsigned long vector, unsigned long isr, unsigned long ifa,
 		if (fsys_mode(current, &regs)) {
 			extern char __kernel_syscall_via_break[];
 			/*
-			 * Got a trap in fsys-mode: Taken Branch Trap
-			 * and Single Step trap need special handling;
-			 * Debug trap is ignored (we disable it here
-			 * and re-enable it in the lower-privilege trap).
+			 * Got a trap in fsys-mode: Taken Branch Trap and Single Step trap
+			 * need special handling; Debug trap is not supposed to happen.
 			 */
 			if (unlikely(vector == 29)) {
-				set_thread_flag(TIF_DB_DISABLED);
-				ia64_psr(&regs)->db = 0;
-				ia64_psr(&regs)->lp = 1;
+				die("Got debug trap in fsys-mode---not supposed to happen!",
+				    &regs, 0);
 				return;
 			}
 			/* re-do the system call via break 0x100000: */
@@ -523,9 +509,8 @@ ia64_fault (unsigned long vector, unsigned long isr, unsigned long ifa,
 			return;
 		}
 		switch (vector) {
-		      default:
 		      case 29:
-			si_code = TRAP_HWBKPT;
+			siginfo.si_code = TRAP_HWBKPT;
 #ifdef CONFIG_ITANIUM
 			/*
 			 * Erratum 10 (IFA may contain incorrect address) now has
@@ -535,50 +520,54 @@ ia64_fault (unsigned long vector, unsigned long isr, unsigned long ifa,
 			  ifa = regs.cr_iip;
 #endif
 			break;
-		      case 35: si_code = TRAP_BRANCH; ifa = 0; break;
-		      case 36: si_code = TRAP_TRACE; ifa = 0; break;
+		      case 35: siginfo.si_code = TRAP_BRANCH; ifa = 0; break;
+		      case 36: siginfo.si_code = TRAP_TRACE; ifa = 0; break;
 		}
-		if (notify_die(DIE_FAULT, "ia64_fault", &regs, vector, si_code, SIGTRAP)
-			       	== NOTIFY_STOP)
-			return;
-		force_sig_fault(SIGTRAP, si_code, (void __user *) ifa,
-				0, __ISR_VALID, isr);
+		siginfo.si_signo = SIGTRAP;
+		siginfo.si_errno = 0;
+		siginfo.si_addr  = (void __user *) ifa;
+		siginfo.si_imm   = 0;
+		siginfo.si_flags = __ISR_VALID;
+		siginfo.si_isr   = isr;
+		force_sig_info(SIGTRAP, &siginfo, current);
 		return;
 
 	      case 32: /* fp fault */
 	      case 33: /* fp trap */
 		result = handle_fpu_swa((vector == 32) ? 1 : 0, &regs, isr);
 		if ((result < 0) || (current->thread.flags & IA64_THREAD_FPEMU_SIGFPE)) {
-			force_sig_fault(SIGFPE, FPE_FLTINV, (void __user *) iip,
-					0, __ISR_VALID, isr);
+			siginfo.si_signo = SIGFPE;
+			siginfo.si_errno = 0;
+			siginfo.si_code = FPE_FLTINV;
+			siginfo.si_addr = (void __user *) iip;
+			siginfo.si_flags = __ISR_VALID;
+			siginfo.si_isr = isr;
+			siginfo.si_imm = 0;
+			force_sig_info(SIGFPE, &siginfo, current);
 		}
 		return;
 
 	      case 34:
 		if (isr & 0x2) {
 			/* Lower-Privilege Transfer Trap */
-
-			/* If we disabled debug traps during an fsyscall,
-			 * re-enable them here.
-			 */
-			if (test_thread_flag(TIF_DB_DISABLED)) {
-				clear_thread_flag(TIF_DB_DISABLED);
-				ia64_psr(&regs)->db = 1;
-			}
-
 			/*
-			 * Just clear PSR.lp and then return immediately:
-			 * all the interesting work (e.g., signal delivery)
-			 * is done in the kernel exit path.
+			 * Just clear PSR.lp and then return immediately: all the
+			 * interesting work (e.g., signal delivery is done in the kernel
+			 * exit path).
 			 */
 			ia64_psr(&regs)->lp = 0;
 			return;
 		} else {
 			/* Unimplemented Instr. Address Trap */
 			if (user_mode(&regs)) {
-				force_sig_fault(SIGILL, ILL_BADIADDR,
-						(void __user *) iip,
-						0, 0, 0);
+				siginfo.si_signo = SIGILL;
+				siginfo.si_code = ILL_BADIADDR;
+				siginfo.si_errno = 0;
+				siginfo.si_flags = 0;
+				siginfo.si_isr = 0;
+				siginfo.si_imm = 0;
+				siginfo.si_addr = (void __user *) iip;
+				force_sig_info(SIGILL, &siginfo, current);
 				return;
 			}
 			sprintf(buf, "Unimplemented Instruction Address fault");
@@ -586,17 +575,25 @@ ia64_fault (unsigned long vector, unsigned long isr, unsigned long ifa,
 		break;
 
 	      case 45:
+#ifdef CONFIG_IA32_SUPPORT
+		if (ia32_exception(&regs, isr) == 0)
+			return;
+#endif
 		printk(KERN_ERR "Unexpected IA-32 exception (Trap 45)\n");
 		printk(KERN_ERR "  iip - 0x%lx, ifa - 0x%lx, isr - 0x%lx\n",
 		       iip, ifa, isr);
-		force_sig(SIGSEGV);
-		return;
+		force_sig(SIGSEGV, current);
+		break;
 
 	      case 46:
+#ifdef CONFIG_IA32_SUPPORT
+		if (ia32_intercept(&regs, isr) == 0)
+			return;
+#endif
 		printk(KERN_ERR "Unexpected IA-32 intercept trap (Trap 46)\n");
 		printk(KERN_ERR "  iip - 0x%lx, ifa - 0x%lx, isr - 0x%lx, iim - 0x%lx\n",
 		       iip, ifa, isr, iim);
-		force_sig(SIGSEGV);
+		force_sig(SIGSEGV, current);
 		return;
 
 	      case 47:
@@ -607,6 +604,6 @@ ia64_fault (unsigned long vector, unsigned long isr, unsigned long ifa,
 		sprintf(buf, "Fault %lu", vector);
 		break;
 	}
-	if (!die_if_kernel(buf, &regs, error))
-		force_sig(SIGILL);
+	die_if_kernel(buf, &regs, error);
+	force_sig(SIGILL, current);
 }

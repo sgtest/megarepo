@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *	linux/arch/alpha/kernel/sys_eiger.c
  *
@@ -19,10 +18,13 @@
 #include <linux/bitops.h>
 
 #include <asm/ptrace.h>
+#include <asm/system.h>
 #include <asm/dma.h>
 #include <asm/irq.h>
 #include <asm/mmu_context.h>
 #include <asm/io.h>
+#include <asm/pci.h>
+#include <asm/pgtable.h>
 #include <asm/core_tsunami.h>
 #include <asm/hwrpb.h>
 #include <asm/tlbflush.h>
@@ -49,32 +51,47 @@ eiger_update_irq_hw(unsigned long irq, unsigned long mask)
 }
 
 static inline void
-eiger_enable_irq(struct irq_data *d)
+eiger_enable_irq(unsigned int irq)
 {
-	unsigned int irq = d->irq;
 	unsigned long mask;
 	mask = (cached_irq_mask[irq >= 64] &= ~(1UL << (irq & 63)));
 	eiger_update_irq_hw(irq, mask);
 }
 
 static void
-eiger_disable_irq(struct irq_data *d)
+eiger_disable_irq(unsigned int irq)
 {
-	unsigned int irq = d->irq;
 	unsigned long mask;
 	mask = (cached_irq_mask[irq >= 64] |= 1UL << (irq & 63));
 	eiger_update_irq_hw(irq, mask);
 }
 
-static struct irq_chip eiger_irq_type = {
-	.name		= "EIGER",
-	.irq_unmask	= eiger_enable_irq,
-	.irq_mask	= eiger_disable_irq,
-	.irq_mask_ack	= eiger_disable_irq,
+static unsigned int
+eiger_startup_irq(unsigned int irq)
+{
+	eiger_enable_irq(irq);
+	return 0; /* never anything pending */
+}
+
+static void
+eiger_end_irq(unsigned int irq)
+{
+	if (!(irq_desc[irq].status & (IRQ_DISABLED|IRQ_INPROGRESS)))
+		eiger_enable_irq(irq);
+}
+
+static struct hw_interrupt_type eiger_irq_type = {
+	.typename	= "EIGER",
+	.startup	= eiger_startup_irq,
+	.shutdown	= eiger_disable_irq,
+	.enable		= eiger_enable_irq,
+	.disable	= eiger_disable_irq,
+	.ack		= eiger_disable_irq,
+	.end		= eiger_end_irq,
 };
 
 static void
-eiger_device_interrupt(unsigned long vector)
+eiger_device_interrupt(unsigned long vector, struct pt_regs * regs)
 {
 	unsigned intstatus;
 
@@ -101,20 +118,20 @@ eiger_device_interrupt(unsigned long vector)
 		 * despatch an interrupt if it's set.
 		 */
 
-		if (intstatus & 8) handle_irq(16+3);
-		if (intstatus & 4) handle_irq(16+2);
-		if (intstatus & 2) handle_irq(16+1);
-		if (intstatus & 1) handle_irq(16+0);
+		if (intstatus & 8) handle_irq(16+3, regs);
+		if (intstatus & 4) handle_irq(16+2, regs);
+		if (intstatus & 2) handle_irq(16+1, regs);
+		if (intstatus & 1) handle_irq(16+0, regs);
 	} else {
-		isa_device_interrupt(vector);
+		isa_device_interrupt(vector, regs);
 	}
 }
 
 static void
-eiger_srm_device_interrupt(unsigned long vector)
+eiger_srm_device_interrupt(unsigned long vector, struct pt_regs * regs)
 {
 	int irq = (vector - 0x800) >> 4;
-	handle_irq(irq);
+	handle_irq(irq, regs);
 }
 
 static void __init
@@ -136,13 +153,13 @@ eiger_init_irq(void)
 	init_i8259a_irqs();
 
 	for (i = 16; i < 128; ++i) {
-		irq_set_chip_and_handler(i, &eiger_irq_type, handle_level_irq);
-		irq_set_status_flags(i, IRQ_LEVEL);
+		irq_desc[i].status = IRQ_DISABLED | IRQ_LEVEL;
+		irq_desc[i].handler = &eiger_irq_type;
 	}
 }
 
-static int
-eiger_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
+static int __init
+eiger_map_irq(struct pci_dev *dev, u8 slot, u8 pin)
 {
 	u8 irq_orig;
 
@@ -158,7 +175,7 @@ eiger_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 	return irq_orig - 0x80;
 }
 
-static u8
+static u8 __init
 eiger_swizzle(struct pci_dev *dev, u8 *pinp)
 {
 	struct pci_controller *hose = dev->sysdata;
@@ -175,7 +192,7 @@ eiger_swizzle(struct pci_dev *dev, u8 *pinp)
 	   case 0x03: bridge_count = 2; break; /* 2 */
 	   case 0x07: bridge_count = 3; break; /* 3 */
 	   case 0x0f: bridge_count = 4; break; /* 4 */
-	}
+	};
 
 	slot = PCI_SLOT(dev->devfn);
 	while (dev->bus->self) {
@@ -187,7 +204,7 @@ eiger_swizzle(struct pci_dev *dev, u8 *pinp)
 			break;
 		}
 		/* Must be a card-based bridge.  */
-		pin = pci_swizzle_interrupt_pin(dev, pin);
+		pin = bridge_swizzle(pin, PCI_SLOT(dev->devfn));
 
 		/* Move up the chain of bridges.  */
 		dev = dev->bus->self;

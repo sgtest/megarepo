@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *      linux/arch/alpha/kernel/irq_i8259.c
  *
@@ -8,6 +7,7 @@
  * Started hacking from linux-2.3.30pre6/arch/i386/kernel/i8259.c.
  */
 
+#include <linux/config.h>
 #include <linux/init.h>
 #include <linux/cache.h>
 #include <linux/sched.h>
@@ -34,10 +34,10 @@ i8259_update_irq_hw(unsigned int irq, unsigned long mask)
 }
 
 inline void
-i8259a_enable_irq(struct irq_data *d)
+i8259a_enable_irq(unsigned int irq)
 {
 	spin_lock(&i8259_irq_lock);
-	i8259_update_irq_hw(d->irq, cached_irq_mask &= ~(1 << d->irq));
+	i8259_update_irq_hw(irq, cached_irq_mask &= ~(1 << irq));
 	spin_unlock(&i8259_irq_lock);
 }
 
@@ -48,18 +48,16 @@ __i8259a_disable_irq(unsigned int irq)
 }
 
 void
-i8259a_disable_irq(struct irq_data *d)
+i8259a_disable_irq(unsigned int irq)
 {
 	spin_lock(&i8259_irq_lock);
-	__i8259a_disable_irq(d->irq);
+	__i8259a_disable_irq(irq);
 	spin_unlock(&i8259_irq_lock);
 }
 
 void
-i8259a_mask_and_ack_irq(struct irq_data *d)
+i8259a_mask_and_ack_irq(unsigned int irq)
 {
-	unsigned int irq = d->irq;
-
 	spin_lock(&i8259_irq_lock);
 	__i8259a_disable_irq(irq);
 
@@ -72,27 +70,49 @@ i8259a_mask_and_ack_irq(struct irq_data *d)
 	spin_unlock(&i8259_irq_lock);
 }
 
-struct irq_chip i8259a_irq_type = {
-	.name		= "XT-PIC",
-	.irq_unmask	= i8259a_enable_irq,
-	.irq_mask	= i8259a_disable_irq,
-	.irq_mask_ack	= i8259a_mask_and_ack_irq,
+unsigned int
+i8259a_startup_irq(unsigned int irq)
+{
+	i8259a_enable_irq(irq);
+	return 0; /* never anything pending */
+}
+
+void
+i8259a_end_irq(unsigned int irq)
+{
+	if (!(irq_desc[irq].status & (IRQ_DISABLED|IRQ_INPROGRESS)))
+		i8259a_enable_irq(irq);
+}
+
+struct hw_interrupt_type i8259a_irq_type = {
+	.typename	= "XT-PIC",
+	.startup	= i8259a_startup_irq,
+	.shutdown	= i8259a_disable_irq,
+	.enable		= i8259a_enable_irq,
+	.disable	= i8259a_disable_irq,
+	.ack		= i8259a_mask_and_ack_irq,
+	.end		= i8259a_end_irq,
 };
 
 void __init
 init_i8259a_irqs(void)
 {
+	static struct irqaction cascade = {
+		.handler	= no_action,
+		.name		= "cascade",
+	};
+
 	long i;
 
 	outb(0xff, 0x21);	/* mask all of 8259A-1 */
 	outb(0xff, 0xA1);	/* mask all of 8259A-2 */
 
 	for (i = 0; i < 16; i++) {
-		irq_set_chip_and_handler(i, &i8259a_irq_type, handle_level_irq);
+		irq_desc[i].status = IRQ_DISABLED;
+		irq_desc[i].handler = &i8259a_irq_type;
 	}
 
-	if (request_irq(2, no_action, 0, "cascade", NULL))
-		pr_err("Failed to request irq 2 (cascade)\n");
+	setup_irq(2, &cascade);
 }
 
 
@@ -118,7 +138,7 @@ init_i8259a_irqs(void)
 
 #if defined(IACK_SC)
 void
-isa_device_interrupt(unsigned long vector)
+isa_device_interrupt(unsigned long vector, struct pt_regs *regs)
 {
 	/*
 	 * Generate a PCI interrupt acknowledge cycle.  The PIC will
@@ -128,13 +148,13 @@ isa_device_interrupt(unsigned long vector)
 	 */
 	int j = *(vuip) IACK_SC;
 	j &= 0xff;
-	handle_irq(j);
+	handle_irq(j, regs);
 }
 #endif
 
 #if defined(CONFIG_ALPHA_GENERIC) || !defined(IACK_SC)
 void
-isa_no_iack_sc_device_interrupt(unsigned long vector)
+isa_no_iack_sc_device_interrupt(unsigned long vector, struct pt_regs *regs)
 {
 	unsigned long pic;
 
@@ -157,7 +177,7 @@ isa_no_iack_sc_device_interrupt(unsigned long vector)
 	while (pic) {
 		int j = ffz(~pic);
 		pic &= pic - 1;
-		handle_irq(j);
+		handle_irq(j, regs);
 	}
 }
 #endif

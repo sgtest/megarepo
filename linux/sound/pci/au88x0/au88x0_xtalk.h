@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /***************************************************************************
  *            au88x0_cxtalk.h
  *
@@ -8,6 +7,19 @@
  ****************************************************************************/
 
 /*
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU Library General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, write to the Free Software
+ *  Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
  */
 
 /* The crosstalk canceler supports 5 stereo input channels. The result is 
@@ -27,16 +39,16 @@
 #define XT_SPEAKER1		3
 #define XT_DIAMOND		4
 
-typedef u32 xtalk_dline_t[XTDLINE_SZ];
-typedef u16 xtalk_gains_t[XTGAINS_SZ];
-typedef u16 xtalk_instate_t[XTINST_SZ];
-typedef u16 xtalk_coefs_t[5][5];
-typedef u16 xtalk_state_t[5][4];
+typedef long xtalk_dline_t[XTDLINE_SZ];
+typedef short xtalk_gains_t[XTGAINS_SZ];
+typedef short xtalk_instate_t[XTINST_SZ];
+typedef short xtalk_coefs_t[5][5];
+typedef short xtalk_state_t[5][4];
 
 static void vortex_XtalkHw_SetGains(vortex_t * vortex,
 				    xtalk_gains_t const gains);
 static void vortex_XtalkHw_SetGainsAllChan(vortex_t * vortex);
-static void vortex_XtalkHw_SetSampleRate(vortex_t * vortex, u32 sr);
+static void vortex_XtalkHw_SetSampleRate(vortex_t * vortex, int sr);
 static void vortex_XtalkHw_ProgramPipe(vortex_t * vortex);
 static void vortex_XtalkHw_ProgramPipe(vortex_t * vortex);
 static void vortex_XtalkHw_ProgramXtalkWide(vortex_t * vortex);

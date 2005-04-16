@@ -1,46 +1,81 @@
-// SPDX-License-Identifier: GPL-2.0
-#include "reiserfs.h"
-#include <linux/capability.h>
+#include <linux/reiserfs_fs.h>
 #include <linux/errno.h>
 #include <linux/fs.h>
 #include <linux/pagemap.h>
 #include <linux/xattr.h>
-#include "xattr.h"
-#include <linux/uaccess.h>
+#include <linux/reiserfs_xattr.h>
+#include <asm/uaccess.h>
+
+#define XATTR_TRUSTED_PREFIX "trusted."
 
 static int
-trusted_get(const struct xattr_handler *handler, struct dentry *unused,
-	    struct inode *inode, const char *name, void *buffer, size_t size)
+trusted_get (struct inode *inode, const char *name, void *buffer, size_t size)
 {
-	if (!capable(CAP_SYS_ADMIN) || IS_PRIVATE(inode))
-		return -EPERM;
+    if (strlen(name) < sizeof(XATTR_TRUSTED_PREFIX))
+        return -EINVAL;
 
-	return reiserfs_xattr_get(inode, xattr_full_name(handler, name),
-				  buffer, size);
+    if (!reiserfs_xattrs (inode->i_sb))
+        return -EOPNOTSUPP;
+
+    if (!(capable(CAP_SYS_ADMIN) || is_reiserfs_priv_object(inode)))
+        return -EPERM;
+
+    return reiserfs_xattr_get (inode, name, buffer, size);
 }
 
 static int
-trusted_set(const struct xattr_handler *handler,
-	    struct user_namespace *mnt_userns, struct dentry *unused,
-	    struct inode *inode, const char *name, const void *buffer,
-	    size_t size, int flags)
+trusted_set (struct inode *inode, const char *name, const void *buffer,
+          size_t size, int flags)
 {
-	if (!capable(CAP_SYS_ADMIN) || IS_PRIVATE(inode))
-		return -EPERM;
+    if (strlen(name) < sizeof(XATTR_TRUSTED_PREFIX))
+        return -EINVAL;
 
-	return reiserfs_xattr_set(inode,
-				  xattr_full_name(handler, name),
-				  buffer, size, flags);
+    if (!reiserfs_xattrs (inode->i_sb))
+        return -EOPNOTSUPP;
+
+    if (!(capable(CAP_SYS_ADMIN) || is_reiserfs_priv_object(inode)))
+        return -EPERM;
+
+    return reiserfs_xattr_set (inode, name, buffer, size, flags);
 }
 
-static bool trusted_list(struct dentry *dentry)
+static int
+trusted_del (struct inode *inode, const char *name)
 {
-	return capable(CAP_SYS_ADMIN) && !IS_PRIVATE(d_inode(dentry));
+    if (strlen(name) < sizeof(XATTR_TRUSTED_PREFIX))
+        return -EINVAL;
+
+    if (!reiserfs_xattrs (inode->i_sb))
+        return -EOPNOTSUPP;
+
+    if (!(capable(CAP_SYS_ADMIN) || is_reiserfs_priv_object(inode)))
+        return -EPERM;
+
+    return 0;
 }
 
-const struct xattr_handler reiserfs_xattr_trusted_handler = {
+static int
+trusted_list (struct inode *inode, const char *name, int namelen, char *out)
+{
+    int len = namelen;
+
+    if (!reiserfs_xattrs (inode->i_sb))
+        return 0;
+
+    if (!(capable(CAP_SYS_ADMIN) || is_reiserfs_priv_object(inode)))
+        return 0;
+
+    if (out)
+        memcpy (out, name, len);
+
+    return len;
+}
+
+
+struct reiserfs_xattr_handler trusted_handler = {
 	.prefix = XATTR_TRUSTED_PREFIX,
 	.get = trusted_get,
 	.set = trusted_set,
+	.del = trusted_del,
 	.list = trusted_list,
 };

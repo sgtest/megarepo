@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *  linux/fs/hfs/bfind.c
  *
@@ -23,21 +22,8 @@ int hfs_find_init(struct hfs_btree *tree, struct hfs_find_data *fd)
 		return -ENOMEM;
 	fd->search_key = ptr;
 	fd->key = ptr + tree->max_key_len + 2;
-	hfs_dbg(BNODE_REFS, "find_init: %d (%p)\n",
-		tree->cnid, __builtin_return_address(0));
-	switch (tree->cnid) {
-	case HFS_CAT_CNID:
-		mutex_lock_nested(&tree->tree_lock, CATALOG_BTREE_MUTEX);
-		break;
-	case HFS_EXT_CNID:
-		mutex_lock_nested(&tree->tree_lock, EXTENTS_BTREE_MUTEX);
-		break;
-	case HFS_ATTR_CNID:
-		mutex_lock_nested(&tree->tree_lock, ATTR_BTREE_MUTEX);
-		break;
-	default:
-		return -EINVAL;
-	}
+	dprint(DBG_BNODE_REFS, "find_init: %d (%p)\n", tree->cnid, __builtin_return_address(0));
+	down(&tree->tree_lock);
 	return 0;
 }
 
@@ -45,9 +31,8 @@ void hfs_find_exit(struct hfs_find_data *fd)
 {
 	hfs_bnode_put(fd->bnode);
 	kfree(fd->search_key);
-	hfs_dbg(BNODE_REFS, "find_exit: %d (%p)\n",
-		fd->tree->cnid, __builtin_return_address(0));
-	mutex_unlock(&fd->tree->tree_lock);
+	dprint(DBG_BNODE_REFS, "find_exit: %d (%p)\n", fd->tree->cnid, __builtin_return_address(0));
+	up(&fd->tree->tree_lock);
 	fd->tree = NULL;
 }
 
@@ -67,10 +52,6 @@ int __hfs_brec_find(struct hfs_bnode *bnode, struct hfs_find_data *fd)
 		rec = (e + b) / 2;
 		len = hfs_brec_lenoff(bnode, rec, &off);
 		keylen = hfs_brec_keylen(bnode, rec);
-		if (keylen == 0) {
-			res = -EINVAL;
-			goto fail;
-		}
 		hfs_bnode_read(bnode, fd->key, off, keylen);
 		cmpval = bnode->tree->keycmp(fd->key, fd->search_key);
 		if (!cmpval) {
@@ -83,13 +64,10 @@ int __hfs_brec_find(struct hfs_bnode *bnode, struct hfs_find_data *fd)
 		else
 			e = rec - 1;
 	} while (b <= e);
+	//printk("%d: %d,%d,%d\n", bnode->this, b, e, rec);
 	if (rec != e && e >= 0) {
 		len = hfs_brec_lenoff(bnode, e, &off);
 		keylen = hfs_brec_keylen(bnode, e);
-		if (keylen == 0) {
-			res = -EINVAL;
-			goto fail;
-		}
 		hfs_bnode_read(bnode, fd->key, off, keylen);
 	}
 done:
@@ -98,7 +76,6 @@ done:
 	fd->keylength = keylen;
 	fd->entryoffset = off + keylen;
 	fd->entrylength = len - keylen;
-fail:
 	return res;
 }
 
@@ -150,8 +127,8 @@ int hfs_brec_find(struct hfs_find_data *fd)
 	return res;
 
 invalid:
-	pr_err("inconsistency in B*Tree (%d,%d,%d,%u,%u)\n",
-	       height, bnode->height, bnode->type, nidx, parent);
+	printk("HFS: inconsistency in B*Tree (%d,%d,%d,%u,%u)\n",
+		height, bnode->height, bnode->type, nidx, parent);
 	res = -EIO;
 release:
 	hfs_bnode_put(bnode);
@@ -222,10 +199,6 @@ int hfs_brec_goto(struct hfs_find_data *fd, int cnt)
 
 	len = hfs_brec_lenoff(bnode, fd->record, &off);
 	keylen = hfs_brec_keylen(bnode, fd->record);
-	if (keylen == 0) {
-		res = -EINVAL;
-		goto out;
-	}
 	fd->keyoffset = off;
 	fd->keylength = keylen;
 	fd->entryoffset = off + keylen;

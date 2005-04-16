@@ -37,7 +37,7 @@
  * IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGES.
  *
- * $Id: //depot/aic7xxx/aic7xxx/aic7xxx.h#85 $
+ * $Id: //depot/aic7xxx/aic7xxx/aic7xxx.h#79 $
  *
  * $FreeBSD$
  */
@@ -54,12 +54,22 @@ struct scb_platform_data;
 struct seeprom_descriptor;
 
 /****************************** Useful Macros *********************************/
+#ifndef MAX
+#define MAX(a,b) (((a) > (b)) ? (a) : (b))
+#endif
+
+#ifndef MIN
+#define MIN(a,b) (((a) < (b)) ? (a) : (b))
+#endif
+
 #ifndef TRUE
 #define TRUE 1
 #endif
 #ifndef FALSE
 #define FALSE 0
 #endif
+
+#define NUM_ELEMENTS(array) (sizeof(array) / sizeof(*array))
 
 #define ALL_CHANNELS '\0'
 #define ALL_TARGETS_MASK 0xFFFF
@@ -223,7 +233,6 @@ typedef enum {
 	AHC_TARGETMODE	= 0x20000,	/* Has tested target mode support */
 	AHC_MULTIROLE	= 0x40000,	/* Space for two roles at a time */
 	AHC_REMOVABLE	= 0x80000,	/* Hot-Swap supported */
-	AHC_HVD		= 0x100000,	/* HVD rather than SE */
 	AHC_AIC7770_FE	= AHC_FENONE,
 	/*
 	 * The real 7850 does not support Ultra modes, but there are
@@ -234,7 +243,7 @@ typedef enum {
 	 */
 	AHC_AIC7850_FE	= AHC_SPIOCAP|AHC_AUTOPAUSE|AHC_TARGETMODE|AHC_ULTRA,
 	AHC_AIC7860_FE	= AHC_AIC7850_FE,
-	AHC_AIC7870_FE	= AHC_TARGETMODE|AHC_AUTOPAUSE,
+	AHC_AIC7870_FE	= AHC_TARGETMODE,
 	AHC_AIC7880_FE	= AHC_AIC7870_FE|AHC_ULTRA,
 	/*
 	 * Although we have space for both the initiator and
@@ -337,6 +346,7 @@ typedef enum {
 					  * controller.
 					  */
 	AHC_NEWEEPROM_FMT     = 0x4000,
+	AHC_RESOURCE_SHORTAGE = 0x8000,
 	AHC_TQINFIFO_BLOCKED  = 0x10000,  /* Blocked waiting for ATIOs */
 	AHC_INT50_SPEEDFLEX   = 0x20000,  /*
 					   * Internal 50pin connector
@@ -440,7 +450,7 @@ struct hardware_scb {
  *	o A residual has occurred if SG_FULL_RESID is set in sgptr,
  *	  or residual_sgptr does not have SG_LIST_NULL set.
  *
- *	o We are transferring the last segment if residual_datacnt has
+ *	o We are transfering the last segment if residual_datacnt has
  *	  the SG_LAST_SEG flag set.
  *
  * Host:
@@ -494,7 +504,7 @@ struct hardware_scb {
  */
 
 /*
- * Definition of a scatter/gather element as transferred to the controller.
+ * Definition of a scatter/gather element as transfered to the controller.
  * The aic7xxx chips only support a 24bit length.  We use the top byte of
  * the length to store additional address bits and a flag to indicate
  * that a given segment terminates the transfer.  This gives us an
@@ -568,6 +578,9 @@ struct scb {
 	ahc_io_ctx_t		  io_ctx;
 	struct ahc_softc	 *ahc_softc;
 	scb_flag		  flags;
+#ifndef __linux__
+	bus_dmamap_t		  dmamap;
+#endif
 	struct scb_platform_data *platform_data;
 	struct sg_map_node	 *sg_map;
 	struct ahc_dma_seg 	 *sg_list;
@@ -615,7 +628,7 @@ struct scb_data {
 /************************ Target Mode Definitions *****************************/
 
 /*
- * Connection descriptor for select-in requests in target mode.
+ * Connection desciptor for select-in requests in target mode.
  */
 struct target_cmd {
 	uint8_t scsiid;		/* Our ID and the initiator's ID */
@@ -733,7 +746,7 @@ struct ahc_syncrate {
 #define		ST_SXFR	   0x010	/* Rate Single Transition Only */
 #define		DT_SXFR	   0x040	/* Rate Double Transition Only */
 	uint8_t period; /* Period to send to SCSI target */
-	const char *rate;
+	char *rate;
 };
 
 /* Safe and valid period for async negotiations. */
@@ -896,11 +909,16 @@ union ahc_bus_softc {
 
 typedef void (*ahc_bus_intr_t)(struct ahc_softc *);
 typedef int (*ahc_bus_chip_init_t)(struct ahc_softc *);
+typedef int (*ahc_bus_suspend_t)(struct ahc_softc *);
+typedef int (*ahc_bus_resume_t)(struct ahc_softc *);
 typedef void ahc_callback_t (void *);
 
 struct ahc_softc {
 	bus_space_tag_t           tag;
 	bus_space_handle_t        bsh;
+#ifndef __linux__
+	bus_dma_tag_t		  buffer_dmat;   /* dmat for buffer I/O */
+#endif
 	struct scb_data		 *scb_data;
 
 	struct scb		 *next_queued_scb;
@@ -908,7 +926,7 @@ struct ahc_softc {
 	/*
 	 * SCBs that have been sent to the controller
 	 */
-	BSD_LIST_HEAD(, scb)	  pending_scbs;
+	LIST_HEAD(, scb)	  pending_scbs;
 
 	/*
 	 * Counting lock for deferring the release of additional
@@ -941,7 +959,6 @@ struct ahc_softc {
 	 * Platform specific device information.
 	 */
 	ahc_dev_softc_t		  dev_softc;
-	struct device		  *dev;
 
 	/*
 	 * Bus specific device information.
@@ -953,6 +970,16 @@ struct ahc_softc {
 	 * after a chip reset.
 	 */
 	ahc_bus_chip_init_t	  bus_chip_init;
+
+	/*
+	 * Bus specific suspend routine.
+	 */
+	ahc_bus_suspend_t	  bus_suspend;
+
+	/*
+	 * Bus specific resume routine.
+	 */
+	ahc_bus_resume_t	  bus_resume;
 
 	/*
 	 * Target mode related state kept on a per enabled lun basis.
@@ -996,6 +1023,9 @@ struct ahc_softc {
 	/* Critical Section Data */
 	struct cs		 *critical_sections;
 	u_int			  num_critical_sections;
+
+	/* Links for chaining softcs */
+	TAILQ_ENTRY(ahc_softc)	  links;
 
 	/* Channel Names ('A', 'B', etc.) */
 	char			  channel;
@@ -1081,6 +1111,9 @@ struct ahc_softc {
 	uint16_t		  user_tagenable;/* Tagged Queuing allowed */
 };
 
+TAILQ_HEAD(ahc_softc_tailq, ahc_softc);
+extern struct ahc_softc_tailq ahc_tailq;
+
 /************************ Active Device Information ***************************/
 typedef enum {
 	ROLE_UNKNOWN,
@@ -1107,9 +1140,11 @@ typedef int (ahc_device_setup_t)(struct ahc_softc *);
 struct ahc_pci_identity {
 	uint64_t		 full_id;
 	uint64_t		 id_mask;
-	const char		*name;
+	char			*name;
 	ahc_device_setup_t	*setup;
 };
+extern struct ahc_pci_identity ahc_pci_ident_table[];
+extern const u_int ahc_num_pci_devs;
 
 /***************************** VL/EISA Declarations ***************************/
 struct aic7770_identity {
@@ -1126,13 +1161,16 @@ extern const int ahc_num_aic7770_devs;
 
 /*************************** Function Declarations ****************************/
 /******************************************************************************/
+u_int			ahc_index_busy_tcl(struct ahc_softc *ahc, u_int tcl);
+void			ahc_unbusy_tcl(struct ahc_softc *ahc, u_int tcl);
+void			ahc_busy_tcl(struct ahc_softc *ahc,
+				     u_int tcl, u_int busyid);
 
 /***************************** PCI Front End *********************************/
-const struct ahc_pci_identity	*ahc_find_pci_device(ahc_dev_softc_t);
+struct ahc_pci_identity	*ahc_find_pci_device(ahc_dev_softc_t);
 int			 ahc_pci_config(struct ahc_softc *,
-					const struct ahc_pci_identity *);
+					struct ahc_pci_identity *);
 int			 ahc_pci_test_register_access(struct ahc_softc *);
-void __maybe_unused	 ahc_pci_resume(struct ahc_softc *ahc);
 
 /*************************** EISA/VL Front End ********************************/
 struct aic7770_identity *aic7770_find_device(uint32_t);
@@ -1142,6 +1180,9 @@ int			 aic7770_config(struct ahc_softc *ahc,
 
 /************************** SCB and SCB queue management **********************/
 int		ahc_probe_scbs(struct ahc_softc *);
+void		ahc_run_untagged_queues(struct ahc_softc *ahc);
+void		ahc_run_untagged_queue(struct ahc_softc *ahc,
+				       struct scb_tailq *queue);
 void		ahc_qinfifo_requeue_tail(struct ahc_softc *ahc,
 					 struct scb *scb);
 int		ahc_match_scb(struct ahc_softc *ahc, struct scb *scb,
@@ -1156,12 +1197,28 @@ int			 ahc_chip_init(struct ahc_softc *ahc);
 int			 ahc_init(struct ahc_softc *ahc);
 void			 ahc_intr_enable(struct ahc_softc *ahc, int enable);
 void			 ahc_pause_and_flushwork(struct ahc_softc *ahc);
-int __maybe_unused	 ahc_suspend(struct ahc_softc *ahc);
-int __maybe_unused	 ahc_resume(struct ahc_softc *ahc);
+int			 ahc_suspend(struct ahc_softc *ahc); 
+int			 ahc_resume(struct ahc_softc *ahc);
+void			 ahc_softc_insert(struct ahc_softc *);
+struct ahc_softc	*ahc_find_softc(struct ahc_softc *ahc);
 void			 ahc_set_unit(struct ahc_softc *, int);
 void			 ahc_set_name(struct ahc_softc *, char *);
+void			 ahc_alloc_scbs(struct ahc_softc *ahc);
 void			 ahc_free(struct ahc_softc *ahc);
 int			 ahc_reset(struct ahc_softc *ahc, int reinit);
+void			 ahc_shutdown(void *arg);
+
+/*************************** Interrupt Services *******************************/
+void			ahc_clear_intstat(struct ahc_softc *ahc);
+void			ahc_run_qoutfifo(struct ahc_softc *ahc);
+#ifdef AHC_TARGET_MODE
+void			ahc_run_tqinfifo(struct ahc_softc *ahc, int paused);
+#endif
+void			ahc_handle_brkadrint(struct ahc_softc *ahc);
+void			ahc_handle_seqint(struct ahc_softc *ahc, u_int intstat);
+void			ahc_handle_scsiint(struct ahc_softc *ahc,
+					   u_int intstat);
+void			ahc_clear_critical_section(struct ahc_softc *ahc);
 
 /***************************** Error Recovery *********************************/
 typedef enum {
@@ -1182,19 +1239,36 @@ int			ahc_search_disc_list(struct ahc_softc *ahc, int target,
 					     char channel, int lun, u_int tag,
 					     int stop_on_first, int remove,
 					     int save_state);
+void			ahc_freeze_devq(struct ahc_softc *ahc, struct scb *scb);
 int			ahc_reset_channel(struct ahc_softc *ahc, char channel,
 					  int initiate_reset);
-
+int			ahc_abort_scbs(struct ahc_softc *ahc, int target,
+				       char channel, int lun, u_int tag,
+				       role_t role, uint32_t status);
+void			ahc_restart(struct ahc_softc *ahc);
+void			ahc_calc_residual(struct ahc_softc *ahc,
+					  struct scb *scb);
 /*************************** Utility Functions ********************************/
+struct ahc_phase_table_entry*
+			ahc_lookup_phase_entry(int phase);
 void			ahc_compile_devinfo(struct ahc_devinfo *devinfo,
 					    u_int our_id, u_int target,
 					    u_int lun, char channel,
 					    role_t role);
 /************************** Transfer Negotiation ******************************/
-const struct ahc_syncrate*	ahc_find_syncrate(struct ahc_softc *ahc, u_int *period,
+struct ahc_syncrate*	ahc_find_syncrate(struct ahc_softc *ahc, u_int *period,
 					  u_int *ppr_options, u_int maxsync);
 u_int			ahc_find_period(struct ahc_softc *ahc,
 					u_int scsirate, u_int maxsync);
+void			ahc_validate_offset(struct ahc_softc *ahc,
+					    struct ahc_initiator_tinfo *tinfo,
+					    struct ahc_syncrate *syncrate,
+					    u_int *offset, int wide,
+					    role_t role);
+void			ahc_validate_width(struct ahc_softc *ahc,
+					   struct ahc_initiator_tinfo *tinfo,
+					   u_int *bus_width,
+					   role_t role);
 /*
  * Negotiation types.  These are used to qualify if we should renegotiate
  * even if our goal and current transport parameters are identical.
@@ -1214,7 +1288,7 @@ void			ahc_set_width(struct ahc_softc *ahc,
 				      u_int width, u_int type, int paused);
 void			ahc_set_syncrate(struct ahc_softc *ahc,
 					 struct ahc_devinfo *devinfo,
-					 const struct ahc_syncrate *syncrate,
+					 struct ahc_syncrate *syncrate,
 					 u_int period, u_int offset,
 					 u_int ppr_options,
 					 u_int type, int paused);
@@ -1223,6 +1297,10 @@ typedef enum {
 	AHC_QUEUE_BASIC,
 	AHC_QUEUE_TAGGED
 } ahc_queue_alg;
+
+void			ahc_set_tags(struct ahc_softc *ahc,
+				     struct ahc_devinfo *devinfo,
+				     ahc_queue_alg alg);
 
 /**************************** Target Mode *************************************/
 #ifdef AHC_TARGET_MODE
@@ -1256,10 +1334,11 @@ extern uint32_t ahc_debug;
 #define AHC_SHOW_MASKED_ERRORS	0x1000
 #define AHC_DEBUG_SEQUENCER	0x2000
 #endif
+void			ahc_print_scb(struct scb *scb);
 void			ahc_print_devinfo(struct ahc_softc *ahc,
 					  struct ahc_devinfo *dev);
 void			ahc_dump_card_state(struct ahc_softc *ahc);
-int			ahc_print_register(const ahc_reg_parse_entry_t *table,
+int			ahc_print_register(ahc_reg_parse_entry_t *table,
 					   u_int num_entries,
 					   const char *name,
 					   u_int address,

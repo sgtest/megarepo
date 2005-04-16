@@ -1,5 +1,5 @@
 /*
- * linux/fs/nls/nls_koi8-ru.c
+ * linux/fs/nls_koi8-ru.c
  *
  * Charset koi8-ru translation based on charset koi8-u.
  * The Unicode to charset table has only exact mappings.
@@ -55,6 +55,7 @@ static struct nls_table table = {
 	.charset	= "koi8-ru",
 	.uni2char	= uni2char,
 	.char2uni	= char2uni,
+	.owner		= THIS_MODULE,
 };
 
 static int __init init_nls_koi8_ru(void)

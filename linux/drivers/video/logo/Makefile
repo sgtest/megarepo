@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: GPL-2.0
 # Makefile for the Linux logos
 
 obj-$(CONFIG_LOGO)			+= logo.o
@@ -14,24 +13,42 @@ obj-$(CONFIG_LOGO_SUPERH_MONO)		+= logo_superh_mono.o
 obj-$(CONFIG_LOGO_SUPERH_VGA16)		+= logo_superh_vga16.o
 obj-$(CONFIG_LOGO_SUPERH_CLUT224)	+= logo_superh_clut224.o
 
-obj-$(CONFIG_SPU_BASE)			+= logo_spe_clut224.o
-
 # How to generate logo's
 
-hostprogs := pnmtologo
+# Use logo-cfiles to retreive list of .c files to be built
+logo-cfiles = $(notdir $(patsubst %.$(2), %.c, \
+              $(wildcard $(srctree)/$(src)/*$(1).$(2))))
+
+
+# Mono logos
+extra-y += $(call logo-cfiles,_mono,pbm)
+
+# VGA16 logos
+extra-y += $(call logo-cfiles,_vga16,ppm)
+
+# 224 Logos
+extra-y += $(call logo-cfiles,_clut224,ppm)
+
+# Gray 256
+extra-y += $(call logo-cfiles,_gray256,pgm)
 
 # Create commands like "pnmtologo -t mono -n logo_mac_mono -o ..."
-quiet_cmd_logo = LOGO    $@
-      cmd_logo = $(obj)/pnmtologo -t $(lastword $(subst _, ,$*)) -n $* -o $@ $<
+quiet_cmd_logo = LOGO	$@
+	cmd_logo = scripts/pnmtologo \
+			-t $(patsubst $*_%,%,$(notdir $(basename $<))) \
+			-n $(notdir $(basename $<)) -o $@ $<
 
-$(obj)/%.c: $(src)/%.pbm $(obj)/pnmtologo FORCE
+$(obj)/%_mono.c: $(src)/%_mono.pbm FORCE
 	$(call if_changed,logo)
 
-$(obj)/%.c: $(src)/%.ppm $(obj)/pnmtologo FORCE
+$(obj)/%_vga16.c: $(src)/%_vga16.ppm FORCE
 	$(call if_changed,logo)
 
-$(obj)/%.c: $(src)/%.pgm $(obj)/pnmtologo FORCE
+$(obj)/%_clut224.c: $(src)/%_clut224.ppm FORCE
 	$(call if_changed,logo)
 
-# generated C files
-targets += *_mono.c *_vga16.c *_clut224.c *_gray256.c
+$(obj)/%_gray256.c: $(src)/%_gray256.pgm FORCE
+	$(call if_changed,logo)
+
+# Files generated that shall be removed upon make clean
+clean-files := *.o *_mono.c *_vga16.c *_clut224.c *_gray256.c

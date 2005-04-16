@@ -1,7 +1,21 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Copyright (C) 2001,2002,2003 Broadcom Corporation
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
  */
+#include <linux/init.h>
 
 #include <asm/asm.h>
 #include <asm/regdef.h>
@@ -10,15 +24,17 @@
 #include <asm/cacheops.h>
 #include <asm/sibyte/board.h>
 
-#define C0_ERRCTL     $26	      /* CP0: Error info */
-#define C0_CERR_I     $27	      /* CP0: Icache error */
-#define C0_CERR_D     $27,1	      /* CP0: Dcache error */
+#define C0_ERRCTL     $26             /* CP0: Error info */
+#define C0_CERR_I     $27             /* CP0: Icache error */
+#define C0_CERR_D     $27,1           /* CP0: Dcache error */
 
 	/*
 	 * Based on SiByte sample software cache-err/cerr.S
 	 * CVS revision 1.8.  Only the 'unrecoverable' case
 	 * is changed.
 	 */
+
+        __INIT
 
 	.set	mips64
 	.set	noreorder
@@ -48,10 +64,6 @@ LEAF(except_vec2_sb1)
 	sd	k0,0x170($0)
 	sd	k1,0x178($0)
 
-#ifdef CONFIG_SB1_CEX_ALWAYS_FATAL
-	j	handle_vec2_sb1
-	 nop
-#else
 	/*
 	 * M_ERRCTL_RECOVERABLE is bit 31, which makes it easy to tell
 	 * if we can fast-path out of here for a h/w-recovered error.
@@ -63,7 +75,7 @@ LEAF(except_vec2_sb1)
 recovered_dcache:
 	/*
 	 * Unlock CacheErr-D (which in turn unlocks CacheErr-DPA).
-	 * Ought to log the occurrence of this recovered dcache error.
+	 * Ought to log the occurence of this recovered dcache error.
 	 */
 	b	recovered
 	 mtc0	$0,C0_CERR_D
@@ -72,7 +84,7 @@ attempt_recovery:
 	/*
 	 * k0 has C0_ERRCTL << 1, which puts 'DC' at bit 31.  Any
 	 * Dcache errors we can recover from will take more extensive
-	 * processing.	For now, they are considered "unrecoverable".
+	 * processing.  For now, they are considered "unrecoverable".
 	 * Note that 'DC' becoming set (outside of ERL mode) will
 	 * cause 'IC' to clear; so if there's an Icache error, we'll
 	 * only find out about it if we recover from this error and
@@ -122,9 +134,10 @@ unrecoverable:
 	/* Unrecoverable Icache or Dcache error; log it and/or fail */
 	j	handle_vec2_sb1
 	 nop
-#endif
 
 END(except_vec2_sb1)
+
+	__FINIT
 
 	LEAF(handle_vec2_sb1)
 	mfc0	k0,CP0_CONFIG

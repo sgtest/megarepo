@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * arch/alpha/lib/ev6-memchr.S
  *
@@ -28,7 +27,7 @@
  *	L	- lower subcluster; L0 - subcluster L0; L1 - subcluster L1
  * Try not to change the actual algorithm if possible for consistency.
  */
-#include <asm/export.h>
+
         .set noreorder
         .set noat
 
@@ -85,7 +84,7 @@ $last_quad:
         beq     $2, $not_found	# U : U L U L
 
 $found_it:
-#ifdef CONFIG_ALPHA_EV67
+#if defined(__alpha_fix__) && defined(__alpha_cix__)
 	/*
 	 * Since we are guaranteed to have set one of the bits, we don't
 	 * have to worry about coming back with a 0x40 out of cttz...
@@ -190,4 +189,3 @@ $not_found:
 	ret			# L0 :
 
         .end memchr
-	EXPORT_SYMBOL(memchr)

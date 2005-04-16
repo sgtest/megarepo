@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * arch/alpha/lib/ev67-strrchr.S
  * 21264 version by Rick Gorton <rick.gorton@alpha-processor.com>
@@ -19,7 +18,7 @@
  *	L	- lower subcluster; L0 - subcluster L0; L1 - subcluster L1
  */
 
-#include <asm/export.h>
+
 #include <asm/regdef.h>
 
 	.set noreorder
@@ -83,7 +82,7 @@ $loop:
 $eos:
 	negq	t1, t4		# E : isolate first null byte match
 	and	t1, t4, t4	# E :
-	subq	t4, 1, t5	# E : build a mask of the bytes up to...
+	subq	t4, 1, t5	# E : build a mask of the bytes upto...
 	or	t4, t5, t4	# E : ... and including the null
 
 	and	t3, t4, t3	# E : mask out char matches after null
@@ -108,4 +107,3 @@ $eos:
 	nop
 
 	.end strrchr
-	EXPORT_SYMBOL(strrchr)

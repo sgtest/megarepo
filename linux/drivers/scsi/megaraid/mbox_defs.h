@@ -1,11 +1,16 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  *
  *			Linux MegaRAID Unified device driver
  *
  * Copyright (c) 2003-2004  LSI Logic Corporation.
  *
+ *	   This program is free software; you can redistribute it and/or
+ *	   modify it under the terms of the GNU General Public License
+ *	   as published by the Free Software Foundation; either version
+ *	   2 of the License, or (at your option) any later version.
+ *
  * FILE		: mbox_defs.h
+ *
  */
 #ifndef _MRAID_MBOX_DEFS_H_
 #define _MRAID_MBOX_DEFS_H_
@@ -492,7 +497,7 @@ typedef struct {
  * @inserted_drive		: channel:Id of inserted drive
  * @battery_status		: bit 0: battery module missing
  *				bit 1: VBAD
- *				bit 2: temperature high
+ *				bit 2: temprature high
  *				bit 3: battery pack missing
  *				bit 4,5:
  *					00 - charge complete
@@ -655,7 +660,7 @@ typedef struct {
  * @lparam	: logical drives parameters
  * @span	: span
  *
- * 8-LD logical drive with up to 8 spans
+ * 8-LD logical drive with upto 8 spans
  */
 typedef struct {
 	logdrv_param_t	lparam;
@@ -668,7 +673,7 @@ typedef struct {
  * @lparam	: logical drives parameters
  * @span	: span
  *
- * 8-LD logical drive with up to 4 spans
+ * 8-LD logical drive with upto 4 spans
  */
 typedef struct {
 	logdrv_param_t	lparam;
@@ -681,7 +686,7 @@ typedef struct {
  * @type	: Type of the device
  * @cur_status	: current status of the device
  * @tag_depth	: Level of tagging
- * @sync_neg	: sync negotiation - ENABLE or DISABLE
+ * @sync_neg	: sync negotiation - ENABLE or DISBALE
  * @size	: configurable size in terms of 512 byte
  */
 typedef struct {
@@ -715,7 +720,7 @@ typedef struct {
  * @ldrv	: logical drives information
  * @pdrv	: physical drives information
  *
- * Disk array for 8LD logical drives with up to 8 spans
+ * Disk array for 8LD logical drives with upto 8 spans
  */
 typedef struct {
 	uint8_t			numldrv;
@@ -732,7 +737,7 @@ typedef struct {
  * @ldrv	: logical drives information
  * @pdrv	: physical drives information
  *
- * Disk array for 8LD logical drives with up to 4 spans
+ * Disk array for 8LD logical drives with upto 4 spans
  */
 typedef struct {
 	uint8_t			numldrv;
@@ -743,7 +748,7 @@ typedef struct {
 
 
 /**
- * struct private_bios_data - bios private data for boot devices
+ * private_bios_data - bios private data for boot devices
  * @geometry	: bits 0-3 - BIOS geometry, 0x0001 - 1GB, 0x0010 - 2GB,
  *		0x1000 - 8GB, Others values are invalid
  * @unused	: bits 4-7 are unused
@@ -781,3 +786,5 @@ typedef struct {
 } __attribute__ ((packed)) mbox_sgl32;
 
 #endif		// _MRAID_MBOX_DEFS_H_
+
+/* vim: set ts=8 sw=8 tw=78: */

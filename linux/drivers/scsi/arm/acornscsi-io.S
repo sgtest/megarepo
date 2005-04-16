@@ -1,16 +1,26 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  *  linux/drivers/acorn/scsi/acornscsi-io.S: Acorn SCSI card IO
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  */
 #include <linux/linkage.h>
 
 #include <asm/assembler.h>
-#include <mach/hardware.h>
+#include <asm/hardware.h>
 
-#if defined(__APCS_32__)
-#define LOADREGS(t,r,l...)	ldm##t	r, l
-#elif defined(__APCS_26__)
-#define LOADREGS(t,r,l...)	ldm##t	r, l##^
+#if (IO_BASE == (PCIO_BASE & 0xff000000))
+#define ADDR(off,reg)						\
+		tst	off, $0x80000000			;\
+		mov	reg, $IO_BASE				;\
+		orreq	reg, reg, $(PCIO_BASE & 0x00ff0000)
+#else
+#define ADDR(off,reg)						\
+		tst	off, $0x80000000			;\
+		movne	reg, $IO_BASE				;\
+		moveq	reg, $(PCIO_BASE & 0xff000000)		;\
+		orreq	reg, reg, $(PCIO_BASE & 0x00ff0000)
 #endif
 
 @ Purpose: transfer a block of data from the acorn scsi card to memory

@@ -1,9 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * HP zx1 AGPGART routines.
  *
  * (c) Copyright 2002, 2003 Hewlett-Packard Development Company, L.P.
  *	Bjorn Helgaas <bjorn.helgaas@hp.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  */
 
 #include <linux/acpi.h>
@@ -11,12 +14,14 @@
 #include <linux/pci.h>
 #include <linux/init.h>
 #include <linux/agp_backend.h>
-#include <linux/log2.h>
-#include <linux/slab.h>
 
 #include <asm/acpi-ext.h>
 
 #include "agp.h"
+
+#ifndef log2
+#define log2(x)		ffz(~(x))
+#endif
 
 #define HP_ZX1_IOC_OFFSET	0x1000  /* ACPI reports SBA, we want IOC */
 
@@ -80,8 +85,8 @@ static int __init hp_zx1_ioc_shared(void)
 	/*
 	 * IOC already configured by sba_iommu module; just use
 	 * its setup.  We assume:
-	 *	- IOVA space is 1Gb in size
-	 *	- first 512Mb is IOMMU, second 512Mb is GART
+	 * 	- IOVA space is 1Gb in size
+	 * 	- first 512Mb is IOMMU, second 512Mb is GART
 	 */
 	hp->io_tlb_ps = readq(hp->ioc_regs+HP_ZX1_TCNFG);
 	switch (hp->io_tlb_ps) {
@@ -110,7 +115,7 @@ static int __init hp_zx1_ioc_shared(void)
 
 	if (hp->gatt[0] != HP_ZX1_SBA_IOMMU_COOKIE) {
 		/* Normal case when no AGP device in system */
-		hp->gatt = NULL;
+	    	hp->gatt = NULL;
 		hp->gatt_entries = 0;
 		printk(KERN_ERR PFX "No reserved IO PDIR entry found; "
 		       "GART disabled\n");
@@ -216,7 +221,6 @@ hp_zx1_lba_init (u64 hpa)
 	if (cap != PCI_CAP_ID_AGP) {
 		printk(KERN_ERR PFX "Invalid capability ID 0x%02x at 0x%x\n",
 		       cap, hp->lba_cap_offset);
-		iounmap(hp->lba_regs);
 		return -ENODEV;
 	}
 
@@ -248,11 +252,11 @@ hp_zx1_configure (void)
 		readl(hp->ioc_regs+HP_ZX1_PDIR_BASE);
 		writel(hp->io_tlb_ps, hp->ioc_regs+HP_ZX1_TCNFG);
 		readl(hp->ioc_regs+HP_ZX1_TCNFG);
-		writel((unsigned int)(~(HP_ZX1_IOVA_SIZE-1)), hp->ioc_regs+HP_ZX1_IMASK);
+		writel(~(HP_ZX1_IOVA_SIZE-1), hp->ioc_regs+HP_ZX1_IMASK);
 		readl(hp->ioc_regs+HP_ZX1_IMASK);
 		writel(hp->iova_base|1, hp->ioc_regs+HP_ZX1_IBASE);
 		readl(hp->ioc_regs+HP_ZX1_IBASE);
-		writel(hp->iova_base|ilog2(HP_ZX1_IOVA_SIZE), hp->ioc_regs+HP_ZX1_PCOM);
+		writel(hp->iova_base|log2(HP_ZX1_IOVA_SIZE), hp->ioc_regs+HP_ZX1_PCOM);
 		readl(hp->ioc_regs+HP_ZX1_PCOM);
 	}
 
@@ -280,7 +284,7 @@ hp_zx1_tlbflush (struct agp_memory *mem)
 {
 	struct _hp_private *hp = &hp_private;
 
-	writeq(hp->gart_base | ilog2(hp->gart_size), hp->ioc_regs+HP_ZX1_PCOM);
+	writeq(hp->gart_base | log2(hp->gart_size), hp->ioc_regs+HP_ZX1_PCOM);
 	readq(hp->ioc_regs+HP_ZX1_PCOM);
 }
 
@@ -333,8 +337,7 @@ hp_zx1_insert_memory (struct agp_memory *mem, off_t pg_start, int type)
 	off_t j, io_pg_start;
 	int io_pg_count;
 
-	if (type != mem->type ||
-		agp_bridge->driver->agp_type_to_mask_type(agp_bridge, type)) {
+	if (type != 0 || mem->type != 0) {
 		return -EINVAL;
 	}
 
@@ -352,19 +355,21 @@ hp_zx1_insert_memory (struct agp_memory *mem, off_t pg_start, int type)
 		j++;
 	}
 
-	if (!mem->is_flushed) {
+	if (mem->is_flushed == FALSE) {
 		global_cache_flush();
-		mem->is_flushed = true;
+		mem->is_flushed = TRUE;
 	}
 
 	for (i = 0, j = io_pg_start; i < mem->page_count; i++) {
 		unsigned long paddr;
 
-		paddr = page_to_phys(mem->pages[i]);
+		paddr = mem->memory[i];
 		for (k = 0;
 		     k < hp->io_pages_per_kpage;
 		     k++, j++, paddr += hp->io_page_size) {
-			hp->gatt[j] = HP_ZX1_PDIR_VALID_BIT | paddr;
+			hp->gatt[j] =
+				agp_bridge->driver->mask_memory(agp_bridge,
+					paddr, type);
 		}
 	}
 
@@ -378,8 +383,7 @@ hp_zx1_remove_memory (struct agp_memory *mem, off_t pg_start, int type)
 	struct _hp_private *hp = &hp_private;
 	int i, io_pg_start, io_pg_count;
 
-	if (type != mem->type ||
-		agp_bridge->driver->agp_type_to_mask_type(agp_bridge, type)) {
+	if (type != 0 || mem->type != 0) {
 		return -EINVAL;
 	}
 
@@ -394,7 +398,8 @@ hp_zx1_remove_memory (struct agp_memory *mem, off_t pg_start, int type)
 }
 
 static unsigned long
-hp_zx1_mask_memory (struct agp_bridge_data *bridge, dma_addr_t addr, int type)
+hp_zx1_mask_memory (struct agp_bridge_data *bridge,
+	unsigned long addr, int type)
 {
 	return HP_ZX1_PDIR_VALID_BIT | addr;
 }
@@ -414,7 +419,7 @@ hp_zx1_enable (struct agp_bridge_data *bridge, u32 mode)
 	agp_device_command(command, (mode & AGP8X_MODE) != 0);
 }
 
-const struct agp_bridge_driver hp_zx1_driver = {
+struct agp_bridge_driver hp_zx1_driver = {
 	.owner			= THIS_MODULE,
 	.size_type		= FIXED_APER_SIZE,
 	.configure		= hp_zx1_configure,
@@ -432,11 +437,8 @@ const struct agp_bridge_driver hp_zx1_driver = {
 	.alloc_by_type		= agp_generic_alloc_by_type,
 	.free_by_type		= agp_generic_free_by_type,
 	.agp_alloc_page		= agp_generic_alloc_page,
-	.agp_alloc_pages	= agp_generic_alloc_pages,
 	.agp_destroy_page	= agp_generic_destroy_page,
-	.agp_destroy_pages	= agp_generic_destroy_pages,
-	.agp_type_to_mask_type  = agp_generic_type_to_mask_type,
-	.cant_use_aperture	= true,
+	.cant_use_aperture	= 1,
 };
 
 static int __init
@@ -476,6 +478,7 @@ zx1_gart_probe (acpi_handle obj, u32 depth, void *context, void **ret)
 {
 	acpi_handle handle, parent;
 	acpi_status status;
+	struct acpi_buffer buffer;
 	struct acpi_device_info *info;
 	u64 lba_hpa, sba_hpa, length;
 	int match;
@@ -487,11 +490,14 @@ zx1_gart_probe (acpi_handle obj, u32 depth, void *context, void **ret)
 	/* Look for an enclosing IOC scope and find its CSR space */
 	handle = obj;
 	do {
-		status = acpi_get_object_info(handle, &info);
-		if (ACPI_SUCCESS(status) && (info->valid & ACPI_VALID_HID)) {
+		buffer.length = ACPI_ALLOCATE_LOCAL_BUFFER;
+		status = acpi_get_object_info(handle, &buffer);
+		if (ACPI_SUCCESS(status)) {
 			/* TBD check _CID also */
-			match = (strcmp(info->hardware_id.string, "HWP0001") == 0);
-			kfree(info);
+			info = buffer.pointer;
+			info->hardware_id.value[sizeof(info->hardware_id)-1] = '\0';
+			match = (strcmp(info->hardware_id.value, "HWP0001") == 0);
+			ACPI_MEM_FREE(info);
 			if (match) {
 				status = hp_acpi_csr_space(handle, &sba_hpa, &length);
 				if (ACPI_SUCCESS(status))
@@ -508,15 +514,11 @@ zx1_gart_probe (acpi_handle obj, u32 depth, void *context, void **ret)
 		handle = parent;
 	} while (ACPI_SUCCESS(status));
 
-	if (ACPI_FAILURE(status))
-		return AE_OK;	/* found no enclosing IOC */
-
 	if (hp_zx1_setup(sba_hpa + HP_ZX1_IOC_OFFSET, lba_hpa))
 		return AE_OK;
 
-	printk(KERN_INFO PFX "Detected HP ZX1 %s AGP chipset "
-		"(ioc=%llx, lba=%llx)\n", (char *)context,
-		sba_hpa + HP_ZX1_IOC_OFFSET, lba_hpa);
+	printk(KERN_INFO PFX "Detected HP ZX1 %s AGP chipset (ioc=%lx, lba=%lx)\n",
+		(char *) context, sba_hpa + HP_ZX1_IOC_OFFSET, lba_hpa);
 
 	hp_zx1_gart_found = 1;
 	return AE_CTRL_TERMINATE; /* we only support one bridge; quit looking */

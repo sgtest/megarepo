@@ -1,8 +1,7 @@
-# SPDX-License-Identifier: GPL-2.0
 #
-# Makefile for USB monitor
+# Makefile for USB Core files and filesystem
 #
 
-usbmon-y := mon_main.o mon_stat.o mon_text.o mon_bin.o
+usbmon-objs	:= mon_main.o mon_stat.o mon_text.o
 
 obj-$(CONFIG_USB_MON)	+= usbmon.o

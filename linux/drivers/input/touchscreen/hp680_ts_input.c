@@ -1,12 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0-only
 #include <linux/input.h>
 #include <linux/module.h>
 #include <linux/init.h>
+
 #include <linux/interrupt.h>
 #include <asm/io.h>
 #include <asm/delay.h>
 #include <asm/adc.h>
-#include <mach/hp6xx.h>
+#include <asm/hp6xx/hp6xx.h>
 
 #define MODNAME "hp680_ts_input"
 
@@ -15,58 +15,61 @@
 #define HP680_TS_ABS_Y_MIN	80
 #define HP680_TS_ABS_Y_MAX	910
 
+#define	SCPCR	0xa4000116
 #define	PHDR	0xa400012e
 #define SCPDR	0xa4000136
 
-static void do_softint(struct work_struct *work);
+static void do_softint(void *data);
 
-static struct input_dev *hp680_ts_dev;
-static DECLARE_DELAYED_WORK(work, do_softint);
+static struct input_dev hp680_ts_dev;
+static DECLARE_WORK(work, do_softint, 0);
+static char *hp680_ts_name = "HP Jornada touchscreen";
+static char *hp680_ts_phys = "input0";
 
-static void do_softint(struct work_struct *work)
+static void do_softint(void *data)
 {
 	int absx = 0, absy = 0;
 	u8 scpdr;
 	int touched = 0;
 
-	if (__raw_readb(PHDR) & PHDR_TS_PEN_DOWN) {
-		scpdr = __raw_readb(SCPDR);
+	if (ctrl_inb(PHDR) & PHDR_TS_PEN_DOWN) {
+		scpdr = ctrl_inb(SCPDR);
 		scpdr |= SCPDR_TS_SCAN_ENABLE;
 		scpdr &= ~SCPDR_TS_SCAN_Y;
-		__raw_writeb(scpdr, SCPDR);
+		ctrl_outb(scpdr, SCPDR);
 		udelay(30);
 
 		absy = adc_single(ADC_CHANNEL_TS_Y);
 
-		scpdr = __raw_readb(SCPDR);
+		scpdr = ctrl_inb(SCPDR);
 		scpdr |= SCPDR_TS_SCAN_Y;
 		scpdr &= ~SCPDR_TS_SCAN_X;
-		__raw_writeb(scpdr, SCPDR);
+		ctrl_outb(scpdr, SCPDR);
 		udelay(30);
 
 		absx = adc_single(ADC_CHANNEL_TS_X);
 
-		scpdr = __raw_readb(SCPDR);
+		scpdr = ctrl_inb(SCPDR);
 		scpdr |= SCPDR_TS_SCAN_X;
 		scpdr &= ~SCPDR_TS_SCAN_ENABLE;
-		__raw_writeb(scpdr, SCPDR);
+		ctrl_outb(scpdr, SCPDR);
 		udelay(100);
-		touched = __raw_readb(PHDR) & PHDR_TS_PEN_DOWN;
+		touched = ctrl_inb(PHDR) & PHDR_TS_PEN_DOWN;
 	}
 
 	if (touched) {
-		input_report_key(hp680_ts_dev, BTN_TOUCH, 1);
-		input_report_abs(hp680_ts_dev, ABS_X, absx);
-		input_report_abs(hp680_ts_dev, ABS_Y, absy);
+		input_report_key(&hp680_ts_dev, BTN_TOUCH, 1);
+		input_report_abs(&hp680_ts_dev, ABS_X, absx);
+		input_report_abs(&hp680_ts_dev, ABS_Y, absy);
 	} else {
-		input_report_key(hp680_ts_dev, BTN_TOUCH, 0);
+		input_report_key(&hp680_ts_dev, BTN_TOUCH, 0);
 	}
 
-	input_sync(hp680_ts_dev);
+	input_sync(&hp680_ts_dev);
 	enable_irq(HP680_TS_IRQ);
 }
 
-static irqreturn_t hp680_ts_interrupt(int irq, void *dev)
+static irqreturn_t hp680_ts_interrupt(int irq, void *dev, struct pt_regs *regs)
 {
 	disable_irq_nosync(irq);
 	schedule_delayed_work(&work, HZ / 20);
@@ -76,48 +79,52 @@ static irqreturn_t hp680_ts_interrupt(int irq, void *dev)
 
 static int __init hp680_ts_init(void)
 {
-	int err;
+	u8 scpdr;
+	u16 scpcr;
 
-	hp680_ts_dev = input_allocate_device();
-	if (!hp680_ts_dev)
-		return -ENOMEM;
+	scpdr = ctrl_inb(SCPDR);
+	scpdr |= SCPDR_TS_SCAN_X | SCPDR_TS_SCAN_Y;
+	scpdr &= ~SCPDR_TS_SCAN_ENABLE;
+	ctrl_outb(scpdr, SCPDR);
 
-	hp680_ts_dev->evbit[0] = BIT_MASK(EV_ABS) | BIT_MASK(EV_KEY);
-	hp680_ts_dev->keybit[BIT_WORD(BTN_TOUCH)] = BIT_MASK(BTN_TOUCH);
+	scpcr = ctrl_inw(SCPCR);
+	scpcr &= ~SCPCR_TS_MASK;
+	scpcr |= SCPCR_TS_ENABLE;
+	ctrl_outw(scpcr, SCPCR);
 
-	input_set_abs_params(hp680_ts_dev, ABS_X,
-		HP680_TS_ABS_X_MIN, HP680_TS_ABS_X_MAX, 0, 0);
-	input_set_abs_params(hp680_ts_dev, ABS_Y,
-		HP680_TS_ABS_Y_MIN, HP680_TS_ABS_Y_MAX, 0, 0);
+	memset(&hp680_ts_dev, 0, sizeof(hp680_ts_dev));
+	init_input_dev(&hp680_ts_dev);
 
-	hp680_ts_dev->name = "HP Jornada touchscreen";
-	hp680_ts_dev->phys = "hp680_ts/input0";
+	hp680_ts_dev.evbit[0] = BIT(EV_ABS) | BIT(EV_KEY);
+	hp680_ts_dev.absbit[0] = BIT(ABS_X) | BIT(ABS_Y);
+	hp680_ts_dev.keybit[LONG(BTN_TOUCH)] = BIT(BTN_TOUCH);
 
-	if (request_irq(HP680_TS_IRQ, hp680_ts_interrupt,
-			0, MODNAME, NULL) < 0) {
-		printk(KERN_ERR "hp680_touchscreen.c: Can't allocate irq %d\n",
+	hp680_ts_dev.absmin[ABS_X] = HP680_TS_ABS_X_MIN;
+	hp680_ts_dev.absmin[ABS_Y] = HP680_TS_ABS_Y_MIN;
+	hp680_ts_dev.absmax[ABS_X] = HP680_TS_ABS_X_MAX;
+	hp680_ts_dev.absmax[ABS_Y] = HP680_TS_ABS_Y_MAX;
+
+	hp680_ts_dev.name = hp680_ts_name;
+	hp680_ts_dev.phys = hp680_ts_phys;
+	input_register_device(&hp680_ts_dev);
+
+	if (request_irq
+	    (HP680_TS_IRQ, hp680_ts_interrupt, SA_INTERRUPT, MODNAME, 0) < 0) {
+		printk(KERN_ERR "hp680_touchscreen.c : Can't allocate irq %d\n",
 		       HP680_TS_IRQ);
-		err = -EBUSY;
-		goto fail1;
+		input_unregister_device(&hp680_ts_dev);
+		return -EBUSY;
 	}
 
-	err = input_register_device(hp680_ts_dev);
-	if (err)
-		goto fail2;
-
 	return 0;
-
- fail2:	free_irq(HP680_TS_IRQ, NULL);
-	cancel_delayed_work_sync(&work);
- fail1:	input_free_device(hp680_ts_dev);
-	return err;
 }
 
 static void __exit hp680_ts_exit(void)
 {
-	free_irq(HP680_TS_IRQ, NULL);
-	cancel_delayed_work_sync(&work);
-	input_unregister_device(hp680_ts_dev);
+	free_irq(HP680_TS_IRQ, 0);
+	cancel_delayed_work(&work);
+	flush_scheduled_work();
+	input_unregister_device(&hp680_ts_dev);
 }
 
 module_init(hp680_ts_init);

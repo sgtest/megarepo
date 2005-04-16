@@ -25,7 +25,6 @@
 #define HFS_SECTOR_SIZE		512    /* size of an HFS sector */
 #define HFS_SECTOR_SIZE_BITS	9      /* log_2(HFS_SECTOR_SIZE) */
 #define HFS_NAMELEN		31     /* maximum length of an HFS filename */
-#define HFS_MAX_NAMELEN		128
 #define HFS_MAX_VALENCE		32767U
 
 /* Meanings of the drAtrb field of the MDB,
@@ -82,6 +81,8 @@
 #define HFS_FLG_INVISIBLE	0x4000
 
 /*======== HFS structures as they appear on the disk ========*/
+
+#define __packed __attribute__ ((packed))
 
 /* Pascal-style string of up to 31 characters */
 struct hfs_name {
@@ -166,9 +167,6 @@ typedef union hfs_btree_key {
 	struct hfs_cat_key cat;
 	struct hfs_ext_key ext;
 } hfs_btree_key;
-
-#define HFS_MAX_CAT_KEYLEN	(sizeof(struct hfs_cat_key) - sizeof(u8))
-#define HFS_MAX_EXT_KEYLEN	(sizeof(struct hfs_ext_key) - sizeof(u8))
 
 typedef union hfs_btree_key btree_key;
 

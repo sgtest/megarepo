@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *  linux/fs/isofs/dir.c
  *
@@ -8,18 +7,46 @@
  *
  *  Steve Beynon		       : Missing last directory entries fixed
  *  (stephen@askone.demon.co.uk)      : 21st June 1996
- *
+ * 
  *  isofs directory handling functions
  */
-#include <linux/gfp.h>
-#include "isofs.h"
+#include <linux/errno.h>
+#include <linux/fs.h>
+#include <linux/iso_fs.h>
+#include <linux/kernel.h>
+#include <linux/stat.h>
+#include <linux/string.h>
+#include <linux/mm.h>
+#include <linux/slab.h>
+#include <linux/time.h>
+#include <linux/config.h>
+#include <linux/smp_lock.h>
+#include <linux/buffer_head.h>
+
+#include <asm/uaccess.h>
+
+static int isofs_readdir(struct file *, void *, filldir_t);
+
+struct file_operations isofs_dir_operations =
+{
+	.read		= generic_read_dir,
+	.readdir	= isofs_readdir,
+};
+
+/*
+ * directories can handle most operations...
+ */
+struct inode_operations isofs_dir_inode_operations =
+{
+	.lookup		= isofs_lookup,
+};
 
 int isofs_name_translate(struct iso_directory_record *de, char *new, struct inode *inode)
 {
 	char * old = de->name;
 	int len = de->name_len[0];
 	int i;
-
+			
 	for (i = 0; i < len; i++) {
 		unsigned char c = old[i];
 		if (!c)
@@ -46,28 +73,23 @@ int isofs_name_translate(struct iso_directory_record *de, char *new, struct inod
 	return i;
 }
 
-/* Acorn extensions written by Matthew Wilcox <willy@infradead.org> 1998 */
-int get_acorn_filename(struct iso_directory_record *de,
-			    char *retname, struct inode *inode)
+/* Acorn extensions written by Matthew Wilcox <willy@bofh.ai> 1998 */
+int get_acorn_filename(struct iso_directory_record * de,
+			    char * retname, struct inode * inode)
 {
 	int std;
-	unsigned char *chr;
+	unsigned char * chr;
 	int retnamlen = isofs_name_translate(de, retname, inode);
-
-	if (retnamlen == 0)
-		return 0;
+	if (retnamlen == 0) return 0;
 	std = sizeof(struct iso_directory_record) + de->name_len[0];
-	if (std & 1)
-		std++;
-	if (de->length[0] - std != 32)
-		return retnamlen;
+	if (std & 1) std++;
+	if ((*((unsigned char *) de) - std) != 32) return retnamlen;
 	chr = ((unsigned char *) de) + std;
-	if (strncmp(chr, "ARCHIMEDES", 10))
-		return retnamlen;
-	if ((*retname == '_') && ((chr[19] & 1) == 1))
-		*retname = '!';
+	if (strncmp(chr, "ARCHIMEDES", 10)) return retnamlen;
+	if ((*retname == '_') && ((chr[19] & 1) == 1)) *retname = '!';
 	if (((de->flags[0] & 2) == 0) && (chr[13] == 0xff)
-		&& ((chr[12] & 0xf0) == 0xf0)) {
+		&& ((chr[12] & 0xf0) == 0xf0))
+	{
 		retname[retnamlen] = ',';
 		sprintf(retname+retnamlen+1, "%3.3x",
 			((chr[12] & 0xf) << 8) | chr[11]);
@@ -79,9 +101,9 @@ int get_acorn_filename(struct iso_directory_record *de,
 /*
  * This should _really_ be cleaned up some day..
  */
-static int do_isofs_readdir(struct inode *inode, struct file *file,
-		struct dir_context *ctx,
-		char *tmpname, struct iso_directory_record *tmpde)
+static int do_isofs_readdir(struct inode *inode, struct file *filp,
+		void *dirent, filldir_t filldir,
+		char * tmpname, struct iso_directory_record * tmpde)
 {
 	unsigned long bufsize = ISOFS_BUFFER_SIZE(inode);
 	unsigned char bufbits = ISOFS_BUFFER_BITS(inode);
@@ -95,10 +117,10 @@ static int do_isofs_readdir(struct inode *inode, struct file *file,
 	struct iso_directory_record *de;
 	struct isofs_sb_info *sbi = ISOFS_SB(inode->i_sb);
 
-	offset = ctx->pos & (bufsize - 1);
-	block = ctx->pos >> bufbits;
+	offset = filp->f_pos & (bufsize - 1);
+	block = filp->f_pos >> bufbits;
 
-	while (ctx->pos < inode->i_size) {
+	while (filp->f_pos < inode->i_size) {
 		int de_len;
 
 		if (!bh) {
@@ -109,19 +131,17 @@ static int do_isofs_readdir(struct inode *inode, struct file *file,
 
 		de = (struct iso_directory_record *) (bh->b_data + offset);
 
-		de_len = *(unsigned char *)de;
+		de_len = *(unsigned char *) de;
 
-		/*
-		 * If the length byte is zero, we should move on to the next
-		 * CDROM sector.  If we are at the end of the directory, we
-		 * kick out of the while loop.
-		 */
+		/* If the length byte is zero, we should move on to the next
+		   CDROM sector.  If we are at the end of the directory, we
+		   kick out of the while loop. */
 
 		if (de_len == 0) {
 			brelse(bh);
 			bh = NULL;
-			ctx->pos = (ctx->pos + ISOFS_BLOCK_SIZE) & ~(ISOFS_BLOCK_SIZE - 1);
-			block = ctx->pos >> bufbits;
+			filp->f_pos = (filp->f_pos + ISOFS_BLOCK_SIZE) & ~(ISOFS_BLOCK_SIZE - 1);
+			block = filp->f_pos >> bufbits;
 			offset = 0;
 			continue;
 		}
@@ -146,36 +166,28 @@ static int do_isofs_readdir(struct inode *inode, struct file *file,
 			}
 			de = tmpde;
 		}
-		/* Basic sanity check, whether name doesn't exceed dir entry */
-		if (de_len < de->name_len[0] +
-					sizeof(struct iso_directory_record)) {
-			printk(KERN_NOTICE "iso9660: Corrupted directory entry"
-			       " in block %lu of inode %lu\n", block,
-			       inode->i_ino);
-			brelse(bh);
-			return -EIO;
-		}
 
 		if (first_de) {
 			isofs_normalize_block_and_offset(de,
-							&block_saved,
-							&offset_saved);
+							 &block_saved,
+							 &offset_saved);
 			inode_number = isofs_get_ino(block_saved,
-							offset_saved, bufbits);
+						     offset_saved,
+						     bufbits);
 		}
 
 		if (de->flags[-sbi->s_high_sierra] & 0x80) {
 			first_de = 0;
-			ctx->pos += de_len;
+			filp->f_pos += de_len;
 			continue;
 		}
 		first_de = 1;
 
 		/* Handle the case of the '.' directory */
 		if (de->name_len[0] == 1 && de->name[0] == 0) {
-			if (!dir_emit_dot(file, ctx))
+			if (filldir(dirent, ".", 1, filp->f_pos, inode->i_ino, DT_DIR) < 0)
 				break;
-			ctx->pos += de_len;
+			filp->f_pos += de_len;
 			continue;
 		}
 
@@ -183,24 +195,21 @@ static int do_isofs_readdir(struct inode *inode, struct file *file,
 
 		/* Handle the case of the '..' directory */
 		if (de->name_len[0] == 1 && de->name[0] == 1) {
-			if (!dir_emit_dotdot(file, ctx))
+			inode_number = parent_ino(filp->f_dentry);
+			if (filldir(dirent, "..", 2, filp->f_pos, inode_number, DT_DIR) < 0)
 				break;
-			ctx->pos += de_len;
+			filp->f_pos += de_len;
 			continue;
 		}
 
 		/* Handle everything else.  Do name translation if there
 		   is no Rock Ridge NM field. */
-
-		/*
-		 * Do not report hidden files if so instructed, or associated
-		 * files unless instructed to do so
-		 */
-		if ((sbi->s_hide && (de->flags[-sbi->s_high_sierra] & 1)) ||
-		    (!sbi->s_showassoc &&
-				(de->flags[-sbi->s_high_sierra] & 4))) {
-			ctx->pos += de_len;
-			continue;
+		if (sbi->s_unhide == 'n') {
+			/* Do not report hidden or associated files */
+			if (de->flags[-sbi->s_high_sierra] & 5) {
+				filp->f_pos += de_len;
+				continue;
+			}
 		}
 
 		map = 1;
@@ -231,13 +240,14 @@ static int do_isofs_readdir(struct inode *inode, struct file *file,
 			}
 		}
 		if (len > 0) {
-			if (!dir_emit(ctx, p, len, inode_number, DT_UNKNOWN))
+			if (filldir(dirent, p, len, filp->f_pos, inode_number, DT_UNKNOWN) < 0)
 				break;
 		}
-		ctx->pos += de_len;
+		filp->f_pos += de_len;
+
+		continue;
 	}
-	if (bh)
-		brelse(bh);
+	if (bh) brelse(bh);
 	return 0;
 }
 
@@ -246,38 +256,25 @@ static int do_isofs_readdir(struct inode *inode, struct file *file,
  * handling split directory entries.. The real work is done by
  * "do_isofs_readdir()".
  */
-static int isofs_readdir(struct file *file, struct dir_context *ctx)
+static int isofs_readdir(struct file *filp,
+		void *dirent, filldir_t filldir)
 {
 	int result;
-	char *tmpname;
-	struct iso_directory_record *tmpde;
-	struct inode *inode = file_inode(file);
+	char * tmpname;
+	struct iso_directory_record * tmpde;
+	struct inode *inode = filp->f_dentry->d_inode;
+
 
 	tmpname = (char *)__get_free_page(GFP_KERNEL);
 	if (tmpname == NULL)
 		return -ENOMEM;
 
+	lock_kernel();
 	tmpde = (struct iso_directory_record *) (tmpname+1024);
 
-	result = do_isofs_readdir(inode, file, ctx, tmpname, tmpde);
+	result = do_isofs_readdir(inode, filp, dirent, filldir, tmpname, tmpde);
 
 	free_page((unsigned long) tmpname);
+	unlock_kernel();
 	return result;
 }
-
-const struct file_operations isofs_dir_operations =
-{
-	.llseek = generic_file_llseek,
-	.read = generic_read_dir,
-	.iterate_shared = isofs_readdir,
-};
-
-/*
- * directories can handle most operations...
- */
-const struct inode_operations isofs_dir_inode_operations =
-{
-	.lookup = isofs_lookup,
-};
-
-

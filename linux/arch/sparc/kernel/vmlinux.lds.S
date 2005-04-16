@@ -1,193 +1,103 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-/* ld script for sparc32/sparc64 kernel */
+/* ld script to make SparcLinux kernel */
 
 #include <asm-generic/vmlinux.lds.h>
 
-#include <asm/page.h>
-#include <asm/thread_info.h>
-
-#ifdef CONFIG_SPARC32
-#define INITIAL_ADDRESS  0x10000 + SIZEOF_HEADERS
-#define TEXTSTART	0xf0004000
-
-#define SMP_CACHE_BYTES_SHIFT 5
-
-#else
-#define SMP_CACHE_BYTES_SHIFT 6
-#define INITIAL_ADDRESS 0x4000
-#define TEXTSTART      0x0000000000404000
-
-#endif
-
-#define SMP_CACHE_BYTES (1 << SMP_CACHE_BYTES_SHIFT)
-
-#ifdef CONFIG_SPARC32
 OUTPUT_FORMAT("elf32-sparc", "elf32-sparc", "elf32-sparc")
 OUTPUT_ARCH(sparc)
 ENTRY(_start)
 jiffies = jiffies_64 + 4;
-#else
-/* sparc64 */
-OUTPUT_FORMAT("elf64-sparc", "elf64-sparc", "elf64-sparc")
-OUTPUT_ARCH(sparc:v9a)
-ENTRY(_start)
-jiffies = jiffies_64;
-#endif
-
-#ifdef CONFIG_SPARC64
-ASSERT((swapper_tsb == 0x0000000000408000), "Error: sparc64 early assembler too large")
-#endif
-
 SECTIONS
 {
-#ifdef CONFIG_SPARC64
-	swapper_pg_dir = 0x0000000000402000;
-#endif
-	. = INITIAL_ADDRESS;
-	.text TEXTSTART :
-	{
-		_text = .;
-		HEAD_TEXT
-		TEXT_TEXT
-		SCHED_TEXT
-		CPUIDLE_TEXT
-		LOCK_TEXT
-		KPROBES_TEXT
-		IRQENTRY_TEXT
-		SOFTIRQENTRY_TEXT
-		*(.gnu.warning)
-	} = 0
-	_etext = .;
+  . = 0x10000 + SIZEOF_HEADERS;
+  .text 0xf0004000 :
+  {
+    *(.text)
+    SCHED_TEXT
+    LOCK_TEXT
+    *(.gnu.warning)
+  } =0
+  _etext = .;
+  PROVIDE (etext = .);
+  RODATA
+  .data    :
+  {
+    *(.data)
+    CONSTRUCTORS
+  }
+  .data1   : { *(.data1) }
+  _edata  =  .;
+  PROVIDE (edata = .);
+  __start___fixup = .;
+  .fixup   : { *(.fixup) }
+  __stop___fixup = .;
+  __start___ex_table = .;
+  __ex_table : { *(__ex_table) }
+  __stop___ex_table = .;
 
-	RO_DATA(PAGE_SIZE)
+  . = ALIGN(4096);
+  __init_begin = .;
+  .init.text : { 
+	_sinittext = .;
+	*(.init.text)
+	_einittext = .;
+  }
+  __init_text_end = .;
+  .init.data : { *(.init.data) }
+  . = ALIGN(16);
+  __setup_start = .;
+  .init.setup : { *(.init.setup) }
+  __setup_end = .;
+  __initcall_start = .;
+  .initcall.init : {
+	*(.initcall1.init) 
+	*(.initcall2.init) 
+	*(.initcall3.init) 
+	*(.initcall4.init) 
+	*(.initcall5.init) 
+	*(.initcall6.init) 
+	*(.initcall7.init)
+  }
+  __initcall_end = .;
+  __con_initcall_start = .;
+  .con_initcall.init : { *(.con_initcall.init) }
+  __con_initcall_end = .;
+  SECURITY_INIT
+  . = ALIGN(4096);
+  __initramfs_start = .;
+  .init.ramfs : { *(.init.ramfs) }
+  __initramfs_end = .;
+  . = ALIGN(32);
+  __per_cpu_start = .;
+  .data.percpu  : { *(.data.percpu) }
+  __per_cpu_end = .;
+  . = ALIGN(4096);
+  __init_end = .;
+  . = ALIGN(32);
+  .data.cacheline_aligned : { *(.data.cacheline_aligned) }
 
-	/* Start of data section */
-	_sdata = .;
-
-	.data1 : {
-		*(.data1)
-	}
-	RW_DATA(SMP_CACHE_BYTES, 0, THREAD_SIZE)
-
-	/* End of data section */
-	_edata = .;
-
-	.fixup : {
-		__start___fixup = .;
-		*(.fixup)
-		__stop___fixup = .;
-	}
-	EXCEPTION_TABLE(16)
-
-	. = ALIGN(PAGE_SIZE);
-	__init_begin = ALIGN(PAGE_SIZE);
-	INIT_TEXT_SECTION(PAGE_SIZE)
-	__init_text_end = .;
-	INIT_DATA_SECTION(16)
-
-	. = ALIGN(4);
-	.tsb_ldquad_phys_patch : {
-		__tsb_ldquad_phys_patch = .;
-		*(.tsb_ldquad_phys_patch)
-		__tsb_ldquad_phys_patch_end = .;
-	}
-
-	.tsb_phys_patch : {
-		__tsb_phys_patch = .;
-		*(.tsb_phys_patch)
-		__tsb_phys_patch_end = .;
-	}
-
-	.cpuid_patch : {
-		__cpuid_patch = .;
-		*(.cpuid_patch)
-		__cpuid_patch_end = .;
-	}
-
-	.sun4v_1insn_patch : {
-		__sun4v_1insn_patch = .;
-		*(.sun4v_1insn_patch)
-		__sun4v_1insn_patch_end = .;
-	}
-	.sun4v_2insn_patch : {
-		__sun4v_2insn_patch = .;
-		*(.sun4v_2insn_patch)
-		__sun4v_2insn_patch_end = .;
-	}
-	.leon_1insn_patch : {
-		__leon_1insn_patch = .;
-		*(.leon_1insn_patch)
-		__leon_1insn_patch_end = .;
-	}
-	.swapper_tsb_phys_patch : {
-		__swapper_tsb_phys_patch = .;
-		*(.swapper_tsb_phys_patch)
-		__swapper_tsb_phys_patch_end = .;
-	}
-	.swapper_4m_tsb_phys_patch : {
-		__swapper_4m_tsb_phys_patch = .;
-		*(.swapper_4m_tsb_phys_patch)
-		__swapper_4m_tsb_phys_patch_end = .;
-	}
-	.popc_3insn_patch : {
-		__popc_3insn_patch = .;
-		*(.popc_3insn_patch)
-		__popc_3insn_patch_end = .;
-	}
-	.popc_6insn_patch : {
-		__popc_6insn_patch = .;
-		*(.popc_6insn_patch)
-		__popc_6insn_patch_end = .;
-	}
-	.pause_3insn_patch : {
-		__pause_3insn_patch = .;
-		*(.pause_3insn_patch)
-		__pause_3insn_patch_end = .;
-	}
-	.sun_m7_1insn_patch : {
-		__sun_m7_1insn_patch = .;
-		*(.sun_m7_1insn_patch)
-		__sun_m7_1insn_patch_end = .;
-	}
-	.sun_m7_2insn_patch : {
-		__sun_m7_2insn_patch = .;
-		*(.sun_m7_2insn_patch)
-		__sun_m7_2insn_patch_end = .;
-	}
-	.get_tick_patch : {
-		__get_tick_patch = .;
-		*(.get_tick_patch)
-		__get_tick_patch_end = .;
-	}
-	.pud_huge_patch : {
-		__pud_huge_patch = .;
-		*(.pud_huge_patch)
-		__pud_huge_patch_end = .;
-	}
-	.fast_win_ctrl_1insn_patch : {
-		__fast_win_ctrl_1insn_patch = .;
-		*(.fast_win_ctrl_1insn_patch)
-		__fast_win_ctrl_1insn_patch_end = .;
-	}
-	PERCPU_SECTION(SMP_CACHE_BYTES)
-
-	. = ALIGN(PAGE_SIZE);
-	.exit.text : {
-		EXIT_TEXT
-	}
-
-	.exit.data : {
-		EXIT_DATA
-	}
-
-	. = ALIGN(PAGE_SIZE);
-	__init_end = .;
-	BSS_SECTION(0, 0, 0)
-	_end = . ;
-
-	STABS_DEBUG
-	DWARF_DEBUG
-	ELF_DETAILS
-
-	DISCARDS
+  __bss_start = .;
+  .sbss      : { *(.sbss) *(.scommon) }
+  .bss       :
+  {
+   *(.dynbss)
+   *(.bss)
+   *(COMMON)
+  }
+  _end = . ;
+  PROVIDE (end = .);
+  /* Stabs debugging sections.  */
+  .stab 0 : { *(.stab) }
+  .stabstr 0 : { *(.stabstr) }
+  .stab.excl 0 : { *(.stab.excl) }
+  .stab.exclstr 0 : { *(.stab.exclstr) }
+  .stab.index 0 : { *(.stab.index) }
+  .stab.indexstr 0 : { *(.stab.indexstr) }
+  .comment 0 : { *(.comment) }
+  .debug          0 : { *(.debug) }
+  .debug_srcinfo  0 : { *(.debug_srcinfo) }
+  .debug_aranges  0 : { *(.debug_aranges) }
+  .debug_pubnames 0 : { *(.debug_pubnames) }
+  .debug_sfnames  0 : { *(.debug_sfnames) }
+  .line           0 : { *(.line) }
+  /DISCARD/ : { *(.exit.text) *(.exit.data) *(.exitcall.exit) }
 }

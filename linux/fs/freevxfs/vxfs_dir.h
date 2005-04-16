@@ -1,6 +1,31 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * Copyright (c) 2000-2001 Christoph Hellwig.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions, and the following disclaimer,
+ *    without modification.
+ * 2. The name of the author may not be used to endorse or promote products
+ *    derived from this software without specific prior written permission.
+ *
+ * Alternatively, this software may be distributed under the terms of the
+ * GNU General Public License ("GPL").
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
  */
 #ifndef _VXFS_DIR_H_
 #define _VXFS_DIR_H_
@@ -16,16 +41,16 @@
  * VxFS directory block header.
  *
  * This entry is the head of every filesystem block in a directory.
- * It is used for free space management and additionally includes
+ * It is used for free space managment and additionally includes
  * a hash for speeding up directory search (lookup).
  *
  * The hash may be empty and in fact we do not use it all in the
  * Linux driver for now.
  */
 struct vxfs_dirblk {
-	__fs16		d_free;		/* free space in dirblock */
-	__fs16		d_nhash;	/* no of hash chains */
-	__fs16		d_hash[1];	/* hash chain */
+	u_int16_t	d_free;		/* free space in dirblock */
+	u_int16_t	d_nhash;	/* no of hash chains */
+	u_int16_t	d_hash[1];	/* hash chain */
 };
 
 /*
@@ -38,10 +63,10 @@ struct vxfs_dirblk {
  * VxFS directory entry.
  */
 struct vxfs_direct {
-	__fs32		d_ino;			/* inode number */
-	__fs16		d_reclen;		/* record length */
-	__fs16		d_namelen;		/* d_name length */
-	__fs16		d_hashnext;		/* next hash entry */
+	vx_ino_t	d_ino;			/* inode number */
+	u_int16_t	d_reclen;		/* record length */
+	u_int16_t	d_namelen;		/* d_name length */
+	u_int16_t	d_hashnext;		/* next hash entry */
 	char		d_name[VXFS_NAMELEN];	/* name */
 };
 
@@ -55,14 +80,13 @@ struct vxfs_direct {
  *	a d_name with size len.
  */
 #define VXFS_DIRPAD		4
-#define VXFS_NAMEMIN		offsetof(struct vxfs_direct, d_name)
+#define VXFS_NAMEMIN		((int)((struct vxfs_direct *)0)->d_name)
 #define VXFS_DIRROUND(len)	((VXFS_DIRPAD + (len) - 1) & ~(VXFS_DIRPAD -1))
 #define VXFS_DIRLEN(len)	(VXFS_DIRROUND(VXFS_NAMEMIN + (len)))
 
 /*
  * VXFS_DIRBLKOV is the overhead of a specific dirblock.
  */
-#define VXFS_DIRBLKOV(sbi, dbp)	\
-	((sizeof(short) * fs16_to_cpu(sbi, dbp->d_nhash)) + 4)
+#define VXFS_DIRBLKOV(dbp)	((sizeof(short) * dbp->d_nhash) + 4)
 
 #endif /* _VXFS_DIR_H_ */

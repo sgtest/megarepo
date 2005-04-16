@@ -1,155 +1,121 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-#ifndef __ASM_GENERIC_UNALIGNED_H
-#define __ASM_GENERIC_UNALIGNED_H
+#ifndef _ASM_GENERIC_UNALIGNED_H_
+#define _ASM_GENERIC_UNALIGNED_H_
 
 /*
- * This is the most generic implementation of unaligned accesses
- * and should work almost anywhere.
+ * For the benefit of those who are trying to port Linux to another
+ * architecture, here are some C-language equivalents. 
+ *
+ * This is based almost entirely upon Richard Henderson's
+ * asm-alpha/unaligned.h implementation.  Some comments were
+ * taken from David Mosberger's asm-ia64/unaligned.h header.
  */
-#include <linux/unaligned/packed_struct.h>
-#include <asm/byteorder.h>
 
-#define __get_unaligned_t(type, ptr) ({						\
-	const struct { type x; } __packed *__pptr = (typeof(__pptr))(ptr);	\
-	__pptr->x;								\
-})
+#include <linux/types.h>
 
-#define __put_unaligned_t(type, val, ptr) do {					\
-	struct { type x; } __packed *__pptr = (typeof(__pptr))(ptr);		\
-	__pptr->x = (val);							\
-} while (0)
+/* 
+ * The main single-value unaligned transfer routines.
+ */
+#define get_unaligned(ptr) \
+	((__typeof__(*(ptr)))__get_unaligned((ptr), sizeof(*(ptr))))
+#define put_unaligned(x,ptr) \
+	__put_unaligned((unsigned long)(x), (ptr), sizeof(*(ptr)))
 
-#define get_unaligned(ptr)	__get_unaligned_t(typeof(*(ptr)), (ptr))
-#define put_unaligned(val, ptr) __put_unaligned_t(typeof(*(ptr)), (val), (ptr))
+/*
+ * This function doesn't actually exist.  The idea is that when
+ * someone uses the macros below with an unsupported size (datatype),
+ * the linker will alert us to the problem via an unresolved reference
+ * error.
+ */
+extern void bad_unaligned_access_length(void) __attribute__((noreturn));
 
-static inline u16 get_unaligned_le16(const void *p)
+struct __una_u64 { __u64 x __attribute__((packed)); };
+struct __una_u32 { __u32 x __attribute__((packed)); };
+struct __una_u16 { __u16 x __attribute__((packed)); };
+
+/*
+ * Elemental unaligned loads 
+ */
+
+static inline unsigned long __uldq(const __u64 *addr)
 {
-	return le16_to_cpu(__get_unaligned_t(__le16, p));
+	const struct __una_u64 *ptr = (const struct __una_u64 *) addr;
+	return ptr->x;
 }
 
-static inline u32 get_unaligned_le32(const void *p)
+static inline unsigned long __uldl(const __u32 *addr)
 {
-	return le32_to_cpu(__get_unaligned_t(__le32, p));
+	const struct __una_u32 *ptr = (const struct __una_u32 *) addr;
+	return ptr->x;
 }
 
-static inline u64 get_unaligned_le64(const void *p)
+static inline unsigned long __uldw(const __u16 *addr)
 {
-	return le64_to_cpu(__get_unaligned_t(__le64, p));
+	const struct __una_u16 *ptr = (const struct __una_u16 *) addr;
+	return ptr->x;
 }
 
-static inline void put_unaligned_le16(u16 val, void *p)
+/*
+ * Elemental unaligned stores 
+ */
+
+static inline void __ustq(__u64 val, __u64 *addr)
 {
-	__put_unaligned_t(__le16, cpu_to_le16(val), p);
+	struct __una_u64 *ptr = (struct __una_u64 *) addr;
+	ptr->x = val;
 }
 
-static inline void put_unaligned_le32(u32 val, void *p)
+static inline void __ustl(__u32 val, __u32 *addr)
 {
-	__put_unaligned_t(__le32, cpu_to_le32(val), p);
+	struct __una_u32 *ptr = (struct __una_u32 *) addr;
+	ptr->x = val;
 }
 
-static inline void put_unaligned_le64(u64 val, void *p)
+static inline void __ustw(__u16 val, __u16 *addr)
 {
-	__put_unaligned_t(__le64, cpu_to_le64(val), p);
+	struct __una_u16 *ptr = (struct __una_u16 *) addr;
+	ptr->x = val;
 }
 
-static inline u16 get_unaligned_be16(const void *p)
+static inline unsigned long __get_unaligned(const void *ptr, size_t size)
 {
-	return be16_to_cpu(__get_unaligned_t(__be16, p));
+	unsigned long val;
+	switch (size) {
+	case 1:
+		val = *(const __u8 *)ptr;
+		break;
+	case 2:
+		val = __uldw((const __u16 *)ptr);
+		break;
+	case 4:
+		val = __uldl((const __u32 *)ptr);
+		break;
+	case 8:
+		val = __uldq((const __u64 *)ptr);
+		break;
+	default:
+		bad_unaligned_access_length();
+	};
+	return val;
 }
 
-static inline u32 get_unaligned_be32(const void *p)
+static inline void __put_unaligned(unsigned long val, void *ptr, size_t size)
 {
-	return be32_to_cpu(__get_unaligned_t(__be32, p));
+	switch (size) {
+	case 1:
+		*(__u8 *)ptr = val;
+	        break;
+	case 2:
+		__ustw(val, (__u16 *)ptr);
+		break;
+	case 4:
+		__ustl(val, (__u32 *)ptr);
+		break;
+	case 8:
+		__ustq(val, (__u64 *)ptr);
+		break;
+	default:
+	    	bad_unaligned_access_length();
+	};
 }
 
-static inline u64 get_unaligned_be64(const void *p)
-{
-	return be64_to_cpu(__get_unaligned_t(__be64, p));
-}
-
-static inline void put_unaligned_be16(u16 val, void *p)
-{
-	__put_unaligned_t(__be16, cpu_to_be16(val), p);
-}
-
-static inline void put_unaligned_be32(u32 val, void *p)
-{
-	__put_unaligned_t(__be32, cpu_to_be32(val), p);
-}
-
-static inline void put_unaligned_be64(u64 val, void *p)
-{
-	__put_unaligned_t(__be64, cpu_to_be64(val), p);
-}
-
-static inline u32 __get_unaligned_be24(const u8 *p)
-{
-	return p[0] << 16 | p[1] << 8 | p[2];
-}
-
-static inline u32 get_unaligned_be24(const void *p)
-{
-	return __get_unaligned_be24(p);
-}
-
-static inline u32 __get_unaligned_le24(const u8 *p)
-{
-	return p[0] | p[1] << 8 | p[2] << 16;
-}
-
-static inline u32 get_unaligned_le24(const void *p)
-{
-	return __get_unaligned_le24(p);
-}
-
-static inline void __put_unaligned_be24(const u32 val, u8 *p)
-{
-	*p++ = val >> 16;
-	*p++ = val >> 8;
-	*p++ = val;
-}
-
-static inline void put_unaligned_be24(const u32 val, void *p)
-{
-	__put_unaligned_be24(val, p);
-}
-
-static inline void __put_unaligned_le24(const u32 val, u8 *p)
-{
-	*p++ = val;
-	*p++ = val >> 8;
-	*p++ = val >> 16;
-}
-
-static inline void put_unaligned_le24(const u32 val, void *p)
-{
-	__put_unaligned_le24(val, p);
-}
-
-static inline void __put_unaligned_be48(const u64 val, __u8 *p)
-{
-	*p++ = val >> 40;
-	*p++ = val >> 32;
-	*p++ = val >> 24;
-	*p++ = val >> 16;
-	*p++ = val >> 8;
-	*p++ = val;
-}
-
-static inline void put_unaligned_be48(const u64 val, void *p)
-{
-	__put_unaligned_be48(val, p);
-}
-
-static inline u64 __get_unaligned_be48(const u8 *p)
-{
-	return (u64)p[0] << 40 | (u64)p[1] << 32 | (u64)p[2] << 24 |
-		p[3] << 16 | p[4] << 8 | p[5];
-}
-
-static inline u64 get_unaligned_be48(const void *p)
-{
-	return __get_unaligned_be48(p);
-}
-
-#endif /* __ASM_GENERIC_UNALIGNED_H */
+#endif /* _ASM_GENERIC_UNALIGNED_H */

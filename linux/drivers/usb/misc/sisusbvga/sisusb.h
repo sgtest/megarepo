@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause) */
 /*
  * sisusb - usb kernel driver for Net2280/SiS315 based USB2VGA dongles
  *
@@ -9,58 +8,59 @@
  *
  * Otherwise, the following license terms apply:
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1) Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2) Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3) The name of the author may not be used to endorse or promote products
- *    derived from this software without specific prior written permission.
+ * * Redistribution and use in source and binary forms, with or without
+ * * modification, are permitted provided that the following conditions
+ * * are met:
+ * * 1) Redistributions of source code must retain the above copyright
+ * *    notice, this list of conditions and the following disclaimer.
+ * * 2) Redistributions in binary form must reproduce the above copyright
+ * *    notice, this list of conditions and the following disclaimer in the
+ * *    documentation and/or other materials provided with the distribution.
+ * * 3) The name of the author may not be used to endorse or promote products
+ * *    derived from this software without specific prior written permission.
+ * *
+ * * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESSED OR
+ * * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ * * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+ * * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+ * * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ * * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESSED OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
- * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
- * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
- * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- * Author:	Thomas Winischhofer <thomas@winischhofer.net>
+ * Author: 	Thomas Winischhofer <thomas@winischhofer.net>
  *
  */
 
 #ifndef _SISUSB_H_
 #define _SISUSB_H_
 
-#include <linux/mutex.h>
+#ifdef CONFIG_COMPAT
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,10)
+#include <linux/ioctl32.h>
+#define SISUSB_OLD_CONFIG_COMPAT
+#else
+#define SISUSB_NEW_CONFIG_COMPAT
+#endif
+#endif
 
 /* Version Information */
 
 #define SISUSB_VERSION		0
-#define SISUSB_REVISION		0
-#define SISUSB_PATCHLEVEL	8
-
-/* Include console and mode switching code? */
-
-#include <linux/console.h>
-#include <linux/vt_kern.h>
-#include "sisusb_struct.h"
+#define SISUSB_REVISION 	0
+#define SISUSB_PATCHLEVEL	7
 
 /* USB related */
 
-#define SISUSB_MINOR		133	/* official */
+#define SISUSB_MINOR	133		/* FIXME */
 
 /* Size of the sisusb input/output buffers */
 #define SISUSB_IBUF_SIZE  0x01000
 #define SISUSB_OBUF_SIZE  0x10000	/* fixed */
 
-#define NUMOBUFS 8		/* max number of output buffers/output URBs */
+#define NUMOBUFS 8			/* max number of output buffers/output URBs */
 
 /* About endianness:
  *
@@ -79,7 +79,7 @@
  */
 
 #ifdef __BIG_ENDIAN
-#define SISUSB_CORRECT_ENDIANNESS_PACKET(p)		\
+#define SISUSB_CORRECT_ENDIANNESS_PACKET(p) 		\
 	do {						\
 		p->header  = cpu_to_le16(p->header);	\
 		p->address = cpu_to_le32(p->address);	\
@@ -91,7 +91,7 @@
 
 struct sisusb_usb_data;
 
-struct sisusb_urb_context {	/* urb->context for outbound bulk URBs */
+struct sisusb_urb_context {		/* urb->context for outbound bulk URBs */
 	struct sisusb_usb_data *sisusb;
 	int urbindex;
 	int *actual_length;
@@ -102,50 +102,35 @@ struct sisusb_usb_data {
 	struct usb_interface *interface;
 	struct kref kref;
 	wait_queue_head_t wait_q;	/* for syncind and timeouts */
-	struct mutex lock;	/* general race avoidance */
-	unsigned int ifnum;	/* interface number of the USB device */
-	int minor;		/* minor (for logging clarity) */
-	int isopen;		/* !=0 if open */
-	int present;		/* !=0 if device is present on the bus */
-	int ready;		/* !=0 if device is ready for userland */
-	int numobufs;		/* number of obufs = number of out urbs */
+	struct semaphore lock;		/* general race avoidance */
+	unsigned int ifnum;		/* interface number of the USB device */
+	int minor;			/* minor (for logging clarity) */
+	int isopen;			/* !=0 if open */
+	int present;			/* !=0 if device is present on the bus */
+	int ready;			/* !=0 if device is ready for userland */
+#ifdef SISUSB_OLD_CONFIG_COMPAT
+	int ioctl32registered;
+#endif
+	int numobufs;			/* number of obufs = number of out urbs */
 	char *obuf[NUMOBUFS], *ibuf;	/* transfer buffers */
 	int obufsize, ibufsize;
+	dma_addr_t transfer_dma_out[NUMOBUFS];
+	dma_addr_t transfer_dma_in;
 	struct urb *sisurbout[NUMOBUFS];
 	struct urb *sisurbin;
 	unsigned char urbstatus[NUMOBUFS];
 	unsigned char completein;
 	struct sisusb_urb_context urbout_context[NUMOBUFS];
 	unsigned long flagb0;
-	unsigned long vrambase;	/* framebuffer base */
-	unsigned int vramsize;	/* framebuffer size (bytes) */
+	unsigned long vrambase;		/* framebuffer base */
+	unsigned int vramsize;		/* framebuffer size (bytes) */
 	unsigned long mmiobase;
 	unsigned int mmiosize;
 	unsigned long ioportbase;
-	unsigned char devinit;	/* device initialized? */
-	unsigned char gfxinit;	/* graphics core initialized? */
+	unsigned char devinit;		/* device initialized? */
+	unsigned char gfxinit;		/* graphics core initialized? */
 	unsigned short chipid, chipvendor;
 	unsigned short chiprevision;
-#ifdef CONFIG_USB_SISUSBVGA_CON
-	struct SiS_Private *SiS_Pr;
-	unsigned long scrbuf;
-	unsigned int scrbuf_size;
-	int haveconsole, con_first, con_last;
-	int havethisconsole[MAX_NR_CONSOLES];
-	int textmodedestroyed;
-	unsigned int sisusb_num_columns;	/* real number, not vt's idea */
-	int cur_start_addr, con_rolled_over;
-	int sisusb_cursor_loc, bad_cursor_pos;
-	int sisusb_cursor_size_from;
-	int sisusb_cursor_size_to;
-	int current_font_height, current_font_512;
-	int font_backup_size, font_backup_height, font_backup_512;
-	char *font_backup;
-	int font_slot;
-	struct vc_data *sisusb_display_fg;
-	int is_gfx;
-	int con_blanked;
-#endif
 };
 
 #define to_sisusb_dev(d) container_of(d, struct sisusb_usb_data, kref)
@@ -178,7 +163,7 @@ struct sisusb_packet {
 	unsigned short header;
 	u32 address;
 	u32 data;
-} __attribute__ ((__packed__));
+} __attribute__((__packed__));
 
 #define CLEARPACKET(packet) memset(packet, 0, 10)
 
@@ -246,54 +231,48 @@ struct sisusb_packet {
 
 /* Structure argument for SISUSB_GET_INFO ioctl  */
 struct sisusb_info {
-	__u32 sisusb_id;	/* for identifying sisusb */
-#define SISUSB_ID  0x53495355	/* Identify myself with 'SISU' */
-	__u8 sisusb_version;
-	__u8 sisusb_revision;
-	__u8 sisusb_patchlevel;
-	__u8 sisusb_gfxinit;	/* graphics core initialized? */
+	__u32	sisusb_id;		/* for identifying sisusb */
+#define SISUSB_ID  0x53495355		/* Identify myself with 'SISU' */
+	__u8	sisusb_version;
+	__u8	sisusb_revision;
+	__u8	sisusb_patchlevel;
+	__u8	sisusb_gfxinit;		/* graphics core initialized? */
 
-	__u32 sisusb_vrambase;
-	__u32 sisusb_mmiobase;
-	__u32 sisusb_iobase;
-	__u32 sisusb_pcibase;
+	__u32	sisusb_vrambase;
+	__u32	sisusb_mmiobase;
+	__u32	sisusb_iobase;
+	__u32	sisusb_pcibase;
 
-	__u32 sisusb_vramsize;	/* framebuffer size in bytes */
+	__u32	sisusb_vramsize;	/* framebuffer size in bytes */
 
-	__u32 sisusb_minor;
+	__u32	sisusb_minor;
 
-	__u32 sisusb_fbdevactive;	/* != 0 if framebuffer device active */
+	__u32   sisusb_fbdevactive;	/* != 0 if framebuffer device active */
 
-	__u32 sisusb_conactive;	/* != 0 if console driver active */
-
-	__u8 sisusb_reserved[28];	/* for future use */
+	__u8	sisusb_reserved[32];	/* for future use */
 };
 
 struct sisusb_command {
-	__u8 operation;		/* see below */
-	__u8 data0;		/* operation dependent */
-	__u8 data1;		/* operation dependent */
-	__u8 data2;		/* operation dependent */
-	__u32 data3;		/* operation dependent */
-	__u32 data4;		/* for future use */
+	__u8   operation;	/* see below */
+	__u8   data0;		/* operation dependent */
+	__u8   data1;		/* operation dependent */
+	__u8   data2;		/* operation dependent */
+	__u32  data3;		/* operation dependent */
+	__u32  data4;		/* for future use */
 };
 
-#define SUCMD_GET	0x01	/* for all: data0 = index, data3 = port */
-#define SUCMD_SET	0x02	/* data1 = value */
-#define SUCMD_SETOR	0x03	/* data1 = or */
-#define SUCMD_SETAND	0x04	/* data1 = and */
-#define SUCMD_SETANDOR	0x05	/* data1 = and, data2 = or */
-#define SUCMD_SETMASK	0x06	/* data1 = data, data2 = mask */
+#define SUCMD_GET      0x01	/* for all: data0 = index, data3 = port */
+#define SUCMD_SET      0x02	/* data1 = value */
+#define SUCMD_SETOR    0x03	/* data1 = or */
+#define SUCMD_SETAND   0x04	/* data1 = and */
+#define SUCMD_SETANDOR 0x05	/* data1 = and, data2 = or */
+#define SUCMD_SETMASK  0x06	/* data1 = data, data2 = mask */
 
-#define SUCMD_CLRSCR	0x07	/* data0:1:2 = length, data3 = address */
-
-#define SUCMD_HANDLETEXTMODE 0x08	/* Reset/destroy text mode */
-
-#define SUCMD_SETMODE	0x09	/* Set a display mode (data3 = SiS mode) */
-#define SUCMD_SETVESAMODE 0x0a	/* Set a display mode (data3 = VESA mode) */
+#define SUCMD_CLRSCR   0x07	/* data0:1:2 = length, data3 = address */
 
 #define SISUSB_COMMAND		_IOWR(0xF3,0x3D,struct sisusb_command)
-#define SISUSB_GET_CONFIG_SIZE	_IOR(0xF3,0x3E,__u32)
-#define SISUSB_GET_CONFIG	_IOR(0xF3,0x3F,struct sisusb_info)
+#define SISUSB_GET_CONFIG_SIZE 	_IOR(0xF3,0x3E,__u32)
+#define SISUSB_GET_CONFIG  	_IOR(0xF3,0x3F,struct sisusb_info)
 
 #endif /* SISUSB_H */
+

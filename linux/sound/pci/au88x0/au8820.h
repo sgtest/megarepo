@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
     Aureal Vortex Soundcard driver.
 
@@ -12,7 +11,7 @@
 
 #define CHIP_AU8820
 
-#define CARD_NAME "Aureal Vortex"
+#define CARD_NAME "Aureal Vortex 3D Sound Processor"
 #define CARD_NAME_SHORT "au8820"
 
 /* Number of ADB and WT channels */
@@ -163,6 +162,11 @@
 #define		EN_SPORT	0x00030000
 #define		EN_SPDIF	0x000c0000
 #define VORTEX_CODEC_CHN 0x11880
+#define VORTEX_CODEC_WRITE 0x00800000
+#define VORTEX_CODEC_ADDSHIFT 16
+#define VORTEX_CODEC_ADDMASK 0x7f0000	/* 0x000f0000 */
+#define VORTEX_CODEC_DATSHIFT 0
+#define VORTEX_CODEC_DATMASK 0xffff
 #define VORTEX_CODEC_IO 0x11988
 
 #define VORTEX_SPDIF_FLAGS		0x1005c	/* FIXME */

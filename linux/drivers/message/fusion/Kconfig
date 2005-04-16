@@ -1,81 +1,36 @@
-# SPDX-License-Identifier: GPL-2.0-only
 
-menuconfig FUSION
-	bool "Fusion MPT device support"
-	depends on PCI
-	help
-	Say Y here to get to see options for Fusion Message
-	Passing Technology (MPT) drivers.
-	This option alone does not add any kernel code.
+menu "Fusion MPT device support"
 
-	If you say N, all options in this submenu will be skipped and disabled.
-
-if FUSION
-
-config FUSION_SPI
-	tristate "Fusion MPT ScsiHost drivers for SPI"
+config FUSION
+	tristate "Fusion MPT (base + ScsiHost) drivers"
 	depends on PCI && SCSI
-	select SCSI_SPI_ATTRS
-	help
-	  SCSI HOST support for a parallel SCSI host adapters.
+	---help---
+	  LSI Logic Fusion(TM) Message Passing Technology (MPT) device support
+	  provides high performance SCSI host initiator, and LAN [1] interface
+	  services to a host system.  The Fusion architecture is capable of
+	  duplexing these protocols on high-speed Fibre Channel
+	  (up to 2 GHz x 2 ports = 4 GHz) and parallel SCSI (up to Ultra-320)
+	  physical medium.
 
-	  List of supported controllers:
-
-	  LSI53C1020
-	  LSI53C1020A
-	  LSI53C1030
-	  LSI53C1035
-	  ATTO UL4D
-
-config FUSION_FC
-	tristate "Fusion MPT ScsiHost drivers for FC"
-	depends on PCI && SCSI
-	depends on SCSI_FC_ATTRS
-	help
-	  SCSI HOST support for a Fiber Channel host adapters.
-
-	  List of supported controllers:
-
-	  LSIFC909
-	  LSIFC919
-	  LSIFC919X
-	  LSIFC929
-	  LSIFC929X
-	  LSIFC929XL
-	  LSIFC949X
-	  LSIFC949E
-	  Brocade FC 410/420
-
-config FUSION_SAS
-	tristate "Fusion MPT ScsiHost drivers for SAS"
-	depends on PCI && SCSI
-	select SCSI_SAS_ATTRS
-	help
-	  SCSI HOST support for a SAS host adapters.
-
-	  List of supported controllers:
-
-	  LSISAS1064
-	  LSISAS1068
-	  LSISAS1064E
-	  LSISAS1068E
-	  LSISAS1078
+	  [1] LAN is not supported on parallel SCSI medium.
 
 config FUSION_MAX_SGE
-	int "Maximum number of scatter gather entries (16 - 128)"
-	default "128"
-	range 16 128
+	int "Maximum number of scatter gather entries"
+	depends on FUSION
+	default "40"
 	help
 	  This option allows you to specify the maximum number of scatter-
-	  gather entries per I/O. The driver default is 128, which matches
-	  SCSI_MAX_PHYS_SEGMENTS. However, it may decreased down to 16.
-	  Decreasing this parameter will reduce memory requirements
-	  on a per controller instance.
+	  gather entries per I/O. The driver defaults to 40, a reasonable number
+	  for most systems. However, the user may increase this up to 128.
+	  Increasing this parameter will require significantly more memory 
+	  on a per controller instance. Increasing the parameter is not
+	  necessary (or recommended) unless the user will be running 
+	  large I/O's via the raw interface.
 
 config FUSION_CTL
 	tristate "Fusion MPT misc device (ioctl) driver"
-	depends on FUSION_SPI || FUSION_FC || FUSION_SAS
-	help
+	depends on FUSION
+	---help---
 	  The Fusion MPT misc device driver provides specialized control
 	  of MPT adapters via system ioctl calls.  Use of ioctl calls to
 	  the MPT driver requires that you create and use a misc device
@@ -93,8 +48,8 @@ config FUSION_CTL
 
 config FUSION_LAN
 	tristate "Fusion MPT LAN driver"
-	depends on FUSION_FC && NET_FC
-	help
+	depends on FUSION && NET_FC
+	---help---
 	  This module supports LAN IP traffic over Fibre Channel port(s)
 	  on Fusion MPT compatible hardware (LSIFC9xx chips).
 	  The physical interface used is defined in RFC 2625.
@@ -108,17 +63,4 @@ config FUSION_LAN
 
 	  If unsure whether you really want or need this, say N.
 
-config FUSION_LOGGING
-	bool "Fusion MPT logging facility"
-	help
-	  This turns on a logging facility that can be used to debug a number
-	  of Fusion MPT related problems.
-
-	  The debug level can be programmed on the fly via SysFS (hex values)
-
-	  echo [level] > /sys/class/scsi_host/host#/debug_level
-
-	  There are various debug levels that can be found in the source:
-	  file:drivers/message/fusion/mptdebug.h
-
-endif # FUSION
+endmenu

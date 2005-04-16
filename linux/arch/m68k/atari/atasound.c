@@ -22,10 +22,11 @@
 #include <linux/fcntl.h>
 #include <linux/errno.h>
 #include <linux/mm.h>
-#include <linux/module.h>
 
 #include <asm/atarihw.h>
+#include <asm/system.h>
 #include <asm/irq.h>
+#include <asm/pgtable.h>
 #include <asm/atariints.h>
 
 
@@ -42,7 +43,6 @@ void atari_microwire_cmd (int cmd)
 	while( tt_microwire.mask != 0x7ff)
 		;
 }
-EXPORT_SYMBOL(atari_microwire_cmd);
 
 
 /* PSG base frequency */

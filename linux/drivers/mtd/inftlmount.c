@@ -1,25 +1,47 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
-/*
+/* 
  * inftlmount.c -- INFTL mount code with extensive checks.
  *
  * Author: Greg Ungerer (gerg@snapgear.com)
- * Copyright © 2002-2003, Greg Ungerer (gerg@snapgear.com)
+ * (C) Copyright 2002-2003, Greg Ungerer (gerg@snapgear.com)
  *
  * Based heavily on the nftlmount.c code which is:
- * Author: Fabrice Bellard (fabrice.bellard@netgem.com)
- * Copyright © 2000 Netgem S.A.
+ * Author: Fabrice Bellard (fabrice.bellard@netgem.com) 
+ * Copyright (C) 2000 Netgem S.A.
+ *
+ * $Id: inftlmount.c,v 1.16 2004/11/22 13:50:53 kalev Exp $
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <asm/errno.h>
 #include <asm/io.h>
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
+#include <linux/miscdevice.h>
+#include <linux/pci.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
+#include <linux/sched.h>
+#include <linux/init.h>
 #include <linux/mtd/mtd.h>
 #include <linux/mtd/nftl.h>
 #include <linux/mtd/inftl.h>
+#include <linux/mtd/compatmac.h>
+
+char inftlmountrev[]="$Revision: 1.16 $";
 
 /*
  * find_boot_record: Find the INFTL Media Header and its Spare copy which
@@ -35,11 +57,10 @@ static int find_boot_record(struct INFTLrecord *inftl)
 	unsigned int i, block;
 	u8 buf[SECTORSIZE];
 	struct INFTLMediaHeader *mh = &inftl->MediaHdr;
-	struct mtd_info *mtd = inftl->mbd.mtd;
 	struct INFTLPartition *ip;
 	size_t retlen;
 
-	pr_debug("INFTL: find_boot_record(inftl=%p)\n", inftl);
+	DEBUG(MTD_DEBUG_LEVEL3, "INFTL: find_boot_record(inftl=%p)\n", inftl);
 
         /*
 	 * Assume logical EraseSize == physical erasesize for starting the
@@ -47,7 +68,7 @@ static int find_boot_record(struct INFTLrecord *inftl)
 	 * otherwise.
 	 */
 	inftl->EraseSize = inftl->mbd.mtd->erasesize;
-        inftl->nb_blocks = (u32)inftl->mbd.mtd->size / inftl->EraseSize;
+        inftl->nb_blocks = inftl->mbd.mtd->size / inftl->EraseSize;
 
 	inftl->MediaUnit = BLOCK_NIL;
 
@@ -59,8 +80,8 @@ static int find_boot_record(struct INFTLrecord *inftl)
 		 * Check for BNAND header first. Then whinge if it's found
 		 * but later checks fail.
 		 */
-		ret = mtd_read(mtd, block * inftl->EraseSize, SECTORSIZE,
-			       &retlen, buf);
+		ret = MTD_READ(inftl->mbd.mtd, block * inftl->EraseSize,
+		    SECTORSIZE, &retlen, buf);
 		/* We ignore ret in case the ECC of the MediaHeader is invalid
 		   (which is apparently acceptable) */
 		if (retlen != SECTORSIZE) {
@@ -85,10 +106,8 @@ static int find_boot_record(struct INFTLrecord *inftl)
 		}
 
 		/* To be safer with BIOS, also use erase mark as discriminant */
-		ret = inftl_read_oob(mtd,
-				     block * inftl->EraseSize + SECTORSIZE + 8,
-				     8, &retlen,(char *)&h1);
-		if (ret < 0) {
+		if ((ret = MTD_READOOB(inftl->mbd.mtd, block * inftl->EraseSize +
+		    SECTORSIZE + 8, 8, &retlen, (char *)&h1) < 0)) {
 			printk(KERN_WARNING "INFTL: ANAND header found at "
 				"0x%x in mtd%d, but OOB data read failed "
 				"(err %d)\n", block * inftl->EraseSize,
@@ -104,8 +123,8 @@ static int find_boot_record(struct INFTLrecord *inftl)
 		memcpy(mh, buf, sizeof(struct INFTLMediaHeader));
 
 		/* Read the spare media header at offset 4096 */
-		mtd_read(mtd, block * inftl->EraseSize + 4096, SECTORSIZE,
-			 &retlen, buf);
+		MTD_READ(inftl->mbd.mtd, block * inftl->EraseSize + 4096,
+		    SECTORSIZE, &retlen, buf);
 		if (retlen != SECTORSIZE) {
 			printk(KERN_WARNING "INFTL: Unable to read spare "
 			       "Media Header\n");
@@ -125,20 +144,24 @@ static int find_boot_record(struct INFTLrecord *inftl)
 		mh->FormatFlags = le32_to_cpu(mh->FormatFlags);
 		mh->PercentUsed = le32_to_cpu(mh->PercentUsed);
 
-		pr_debug("INFTL: Media Header ->\n"
-			 "    bootRecordID          = %s\n"
-			 "    NoOfBootImageBlocks   = %d\n"
-			 "    NoOfBinaryPartitions  = %d\n"
-			 "    NoOfBDTLPartitions    = %d\n"
-			 "    BlockMultiplierBits   = %d\n"
-			 "    FormatFlgs            = %d\n"
-			 "    OsakVersion           = 0x%x\n"
-			 "    PercentUsed           = %d\n",
-			 mh->bootRecordID, mh->NoOfBootImageBlocks,
-			 mh->NoOfBinaryPartitions,
-			 mh->NoOfBDTLPartitions,
-			 mh->BlockMultiplierBits, mh->FormatFlags,
-			 mh->OsakVersion, mh->PercentUsed);
+#ifdef CONFIG_MTD_DEBUG_VERBOSE
+		if (CONFIG_MTD_DEBUG_VERBOSE >= 2) {
+			printk("INFTL: Media Header ->\n"
+				"    bootRecordID          = %s\n"
+				"    NoOfBootImageBlocks   = %d\n"
+				"    NoOfBinaryPartitions  = %d\n"
+				"    NoOfBDTLPartitions    = %d\n"
+				"    BlockMultiplerBits    = %d\n"
+				"    FormatFlgs            = %d\n"
+				"    OsakVersion           = 0x%x\n"
+				"    PercentUsed           = %d\n",
+				mh->bootRecordID, mh->NoOfBootImageBlocks,
+				mh->NoOfBinaryPartitions,
+				mh->NoOfBDTLPartitions,
+				mh->BlockMultiplierBits, mh->FormatFlags,
+				mh->OsakVersion, mh->PercentUsed);
+		}
+#endif
 
 		if (mh->NoOfBDTLPartitions == 0) {
 			printk(KERN_WARNING "INFTL: Media Header sanity check "
@@ -168,7 +191,7 @@ static int find_boot_record(struct INFTLrecord *inftl)
 				mh->BlockMultiplierBits);
 			inftl->EraseSize = inftl->mbd.mtd->erasesize <<
 				mh->BlockMultiplierBits;
-			inftl->nb_blocks = (u32)inftl->mbd.mtd->size / inftl->EraseSize;
+			inftl->nb_blocks = inftl->mbd.mtd->size / inftl->EraseSize;
 			block >>= mh->BlockMultiplierBits;
 		}
 
@@ -182,18 +205,24 @@ static int find_boot_record(struct INFTLrecord *inftl)
 			ip->spareUnits = le32_to_cpu(ip->spareUnits);
 			ip->Reserved0 = le32_to_cpu(ip->Reserved0);
 
-			pr_debug("    PARTITION[%d] ->\n"
-				 "        virtualUnits    = %d\n"
-				 "        firstUnit       = %d\n"
-				 "        lastUnit        = %d\n"
-				 "        flags           = 0x%x\n"
-				 "        spareUnits      = %d\n",
-				 i, ip->virtualUnits, ip->firstUnit,
-				 ip->lastUnit, ip->flags,
-				 ip->spareUnits);
+#ifdef CONFIG_MTD_DEBUG_VERBOSE
+			if (CONFIG_MTD_DEBUG_VERBOSE >= 2) {
+				printk("    PARTITION[%d] ->\n"
+					"        virtualUnits    = %d\n"
+					"        firstUnit       = %d\n"
+					"        lastUnit        = %d\n"
+					"        flags           = 0x%x\n"
+					"        spareUnits      = %d\n",
+					i, ip->virtualUnits, ip->firstUnit,
+					ip->lastUnit, ip->flags,
+					ip->spareUnits);
+			}
+#endif
 
 			if (ip->Reserved0 != ip->firstUnit) {
 				struct erase_info *instr = &inftl->instr;
+
+				instr->mtd = inftl->mbd.mtd;
 
 				/*
 				 * 	Most likely this is using the
@@ -204,7 +233,7 @@ static int find_boot_record(struct INFTLrecord *inftl)
 				 */
 				instr->addr = ip->Reserved0 * inftl->EraseSize;
 				instr->len = inftl->EraseSize;
-				mtd_erase(mtd, instr);
+				MTD_ERASE(inftl->mbd.mtd, instr);
 			}
 			if ((ip->lastUnit - ip->firstUnit + 1) < ip->virtualUnits) {
 				printk(KERN_WARNING "INFTL: Media Header "
@@ -244,7 +273,7 @@ static int find_boot_record(struct INFTLrecord *inftl)
 				inftl->nb_boot_blocks);
 			return -1;
 		}
-
+		
 		inftl->mbd.size  = inftl->numvunits *
 			(inftl->EraseSize / SECTORSIZE);
 
@@ -257,18 +286,23 @@ static int find_boot_record(struct INFTLrecord *inftl)
 		inftl->nb_blocks = ip->lastUnit + 1;
 
 		/* Memory alloc */
-		inftl->PUtable = kmalloc_array(inftl->nb_blocks, sizeof(u16),
-					       GFP_KERNEL);
-		if (!inftl->PUtable)
-			return -ENOMEM;
-
-		inftl->VUtable = kmalloc_array(inftl->nb_blocks, sizeof(u16),
-					       GFP_KERNEL);
-		if (!inftl->VUtable) {
-			kfree(inftl->PUtable);
+		inftl->PUtable = kmalloc(inftl->nb_blocks * sizeof(u16), GFP_KERNEL);
+		if (!inftl->PUtable) {
+			printk(KERN_WARNING "INFTL: allocation of PUtable "
+				"failed (%zd bytes)\n",
+				inftl->nb_blocks * sizeof(u16));
 			return -ENOMEM;
 		}
 
+		inftl->VUtable = kmalloc(inftl->nb_blocks * sizeof(u16), GFP_KERNEL);
+		if (!inftl->VUtable) {
+			kfree(inftl->PUtable);
+			printk(KERN_WARNING "INFTL: allocation of VUtable "
+				"failed (%zd bytes)\n",
+				inftl->nb_blocks * sizeof(u16));
+			return -ENOMEM;
+		}
+		
 		/* Mark the blocks before INFTL MediaHeader as reserved */
 		for (i = 0; i < inftl->nb_boot_blocks; i++)
 			inftl->PUtable[i] = BLOCK_RESERVED;
@@ -285,8 +319,7 @@ static int find_boot_record(struct INFTLrecord *inftl)
 			/* If any of the physical eraseblocks are bad, don't
 			   use the unit. */
 			for (physblock = 0; physblock < inftl->EraseSize; physblock += inftl->mbd.mtd->erasesize) {
-				if (mtd_block_isbad(inftl->mbd.mtd,
-						    i * inftl->EraseSize + physblock))
+				if (inftl->mbd.mtd->block_isbad(inftl->mbd.mtd, i * inftl->EraseSize + physblock))
 					inftl->PUtable[i] = BLOCK_RESERVED;
 			}
 		}
@@ -316,37 +349,28 @@ static int memcmpb(void *a, int c, int n)
 static int check_free_sectors(struct INFTLrecord *inftl, unsigned int address,
 	int len, int check_oob)
 {
-	struct mtd_info *mtd = inftl->mbd.mtd;
+	u8 buf[SECTORSIZE + inftl->mbd.mtd->oobsize];
 	size_t retlen;
-	int i, ret;
-	u8 *buf;
+	int i;
 
-	buf = kmalloc(SECTORSIZE + mtd->oobsize, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
+	DEBUG(MTD_DEBUG_LEVEL3, "INFTL: check_free_sectors(inftl=%p,"
+		"address=0x%x,len=%d,check_oob=%d)\n", inftl,
+		address, len, check_oob);
 
-	ret = -1;
 	for (i = 0; i < len; i += SECTORSIZE) {
-		if (mtd_read(mtd, address, SECTORSIZE, &retlen, buf))
-			goto out;
+		if (MTD_READECC(inftl->mbd.mtd, address, SECTORSIZE, &retlen, buf, &buf[SECTORSIZE], &inftl->oobinfo) < 0)
+			return -1;
 		if (memcmpb(buf, 0xff, SECTORSIZE) != 0)
-			goto out;
+			return -1;
 
 		if (check_oob) {
-			if(inftl_read_oob(mtd, address, mtd->oobsize,
-					  &retlen, &buf[SECTORSIZE]) < 0)
-				goto out;
-			if (memcmpb(buf + SECTORSIZE, 0xff, mtd->oobsize) != 0)
-				goto out;
+			if (memcmpb(buf + SECTORSIZE, 0xff, inftl->mbd.mtd->oobsize) != 0)
+				return -1;
 		}
 		address += SECTORSIZE;
 	}
 
-	ret = 0;
-
-out:
-	kfree(buf);
-	return ret;
+	return 0;
 }
 
 /*
@@ -356,17 +380,17 @@ out:
  *
  * Return: 0 when succeed, -1 on error.
  *
- * ToDo: 1. Is it necessary to check_free_sector after erasing ??
+ * ToDo: 1. Is it neceressary to check_free_sector after erasing ?? 
  */
 int INFTL_formatblock(struct INFTLrecord *inftl, int block)
 {
 	size_t retlen;
 	struct inftl_unittail uci;
 	struct erase_info *instr = &inftl->instr;
-	struct mtd_info *mtd = inftl->mbd.mtd;
 	int physblock;
 
-	pr_debug("INFTL: INFTL_formatblock(inftl=%p,block=%d)\n", inftl, block);
+	DEBUG(MTD_DEBUG_LEVEL3, "INFTL: INFTL_formatblock(inftl=%p,"
+		"block=%d)\n", inftl, block);
 
 	memset(instr, 0, sizeof(struct erase_info));
 
@@ -374,27 +398,26 @@ int INFTL_formatblock(struct INFTLrecord *inftl, int block)
 	   _first_? */
 
 	/* Use async erase interface, test return code */
+	instr->mtd = inftl->mbd.mtd;
 	instr->addr = block * inftl->EraseSize;
 	instr->len = inftl->mbd.mtd->erasesize;
 	/* Erase one physical eraseblock at a time, even though the NAND api
 	   allows us to group them.  This way we if we have a failure, we can
 	   mark only the failed block in the bbt. */
-	for (physblock = 0; physblock < inftl->EraseSize;
-	     physblock += instr->len, instr->addr += instr->len) {
-		int ret;
+	for (physblock = 0; physblock < inftl->EraseSize; physblock += instr->len, instr->addr += instr->len) {
+		MTD_ERASE(inftl->mbd.mtd, instr);
 
-		ret = mtd_erase(inftl->mbd.mtd, instr);
-		if (ret) {
+		if (instr->state == MTD_ERASE_FAILED) {
 			printk(KERN_WARNING "INFTL: error while formatting block %d\n",
 				block);
 			goto fail;
 		}
 
 		/*
-		 * Check the "freeness" of Erase Unit before updating metadata.
-		 * FixMe: is this check really necessary? Since we have check
-		 * the return code after the erase operation.
-		 */
+	 	* Check the "freeness" of Erase Unit before updating metadata.
+	 	* FixMe: is this check really necessary? Since we have check the
+	 	*        return code after the erase operation.
+	 	*/
 		if (check_free_sectors(inftl, instr->addr, instr->len, 1) != 0)
 			goto fail;
 	}
@@ -406,13 +429,14 @@ int INFTL_formatblock(struct INFTLrecord *inftl, int block)
 	uci.Reserved[2] = 0;
 	uci.Reserved[3] = 0;
 	instr->addr = block * inftl->EraseSize + SECTORSIZE * 2;
-	if (inftl_write_oob(mtd, instr->addr + 8, 8, &retlen, (char *)&uci) < 0)
+	if (MTD_WRITEOOB(inftl->mbd.mtd, instr->addr +
+	    8, 8, &retlen, (char *)&uci) < 0)
 		goto fail;
 	return 0;
 fail:
 	/* could not format, update the bad block table (caller is responsible
 	   for setting the PUtable to BLOCK_RESERVED on failure) */
-	mtd_block_markbad(inftl->mbd.mtd, instr->addr);
+	inftl->mbd.mtd->block_markbad(inftl->mbd.mtd, instr->addr);
 	return -1;
 }
 
@@ -456,30 +480,30 @@ void INFTL_dumptables(struct INFTLrecord *s)
 {
 	int i;
 
-	pr_debug("-------------------------------------------"
+	printk("-------------------------------------------"
 		"----------------------------------\n");
 
-	pr_debug("VUtable[%d] ->", s->nb_blocks);
+	printk("VUtable[%d] ->", s->nb_blocks);
 	for (i = 0; i < s->nb_blocks; i++) {
 		if ((i % 8) == 0)
-			pr_debug("\n%04x: ", i);
-		pr_debug("%04x ", s->VUtable[i]);
+			printk("\n%04x: ", i);
+		printk("%04x ", s->VUtable[i]);
 	}
 
-	pr_debug("\n-------------------------------------------"
+	printk("\n-------------------------------------------"
 		"----------------------------------\n");
 
-	pr_debug("PUtable[%d-%d=%d] ->", s->firstEUN, s->lastEUN, s->nb_blocks);
+	printk("PUtable[%d-%d=%d] ->", s->firstEUN, s->lastEUN, s->nb_blocks);
 	for (i = 0; i <= s->lastEUN; i++) {
 		if ((i % 8) == 0)
-			pr_debug("\n%04x: ", i);
-		pr_debug("%04x ", s->PUtable[i]);
+			printk("\n%04x: ", i);
+		printk("%04x ", s->PUtable[i]);
 	}
 
-	pr_debug("\n-------------------------------------------"
+	printk("\n-------------------------------------------"
 		"----------------------------------\n");
 
-	pr_debug("INFTL ->\n"
+	printk("INFTL ->\n"
 		"  EraseSize       = %d\n"
 		"  h/s/c           = %d/%d/%d\n"
 		"  numvunits       = %d\n"
@@ -493,7 +517,7 @@ void INFTL_dumptables(struct INFTLrecord *s)
 		s->numvunits, s->firstEUN, s->lastEUN, s->numfreeEUNs,
 		s->LastFreeEUN, s->nb_blocks, s->nb_boot_blocks);
 
-	pr_debug("\n-------------------------------------------"
+	printk("\n-------------------------------------------"
 		"----------------------------------\n");
 }
 
@@ -501,31 +525,30 @@ void INFTL_dumpVUchains(struct INFTLrecord *s)
 {
 	int logical, block, i;
 
-	pr_debug("-------------------------------------------"
+	printk("-------------------------------------------"
 		"----------------------------------\n");
 
-	pr_debug("INFTL Virtual Unit Chains:\n");
+	printk("INFTL Virtual Unit Chains:\n");
 	for (logical = 0; logical < s->nb_blocks; logical++) {
 		block = s->VUtable[logical];
-		if (block >= s->nb_blocks)
+		if (block > s->nb_blocks)
 			continue;
-		pr_debug("  LOGICAL %d --> %d ", logical, block);
+		printk("  LOGICAL %d --> %d ", logical, block);
 		for (i = 0; i < s->nb_blocks; i++) {
 			if (s->PUtable[block] == BLOCK_NIL)
 				break;
 			block = s->PUtable[block];
-			pr_debug("%d ", block);
+			printk("%d ", block);
 		}
-		pr_debug("\n");
+		printk("\n");
 	}
 
-	pr_debug("-------------------------------------------"
+	printk("-------------------------------------------"
 		"----------------------------------\n");
 }
 
 int INFTL_mount(struct INFTLrecord *s)
 {
-	struct mtd_info *mtd = s->mbd.mtd;
 	unsigned int block, first_block, prev_block, last_block;
 	unsigned int first_logical_block, logical_block, erase_mark;
 	int chain_length, do_format_chain;
@@ -535,12 +558,12 @@ int INFTL_mount(struct INFTLrecord *s)
 	int i;
 	u8 *ANACtable, ANAC;
 
-	pr_debug("INFTL: INFTL_mount(inftl=%p)\n", s);
+	DEBUG(MTD_DEBUG_LEVEL3, "INFTL: INFTL_mount(inftl=%p)\n", s);
 
 	/* Search for INFTL MediaHeader and Spare INFTL Media Header */
 	if (find_boot_record(s) < 0) {
 		printk(KERN_WARNING "INFTL: could not find valid boot record?\n");
-		return -ENXIO;
+		return -1;
 	}
 
 	/* Init the logical to physical table */
@@ -550,9 +573,8 @@ int INFTL_mount(struct INFTLrecord *s)
 	logical_block = block = BLOCK_NIL;
 
 	/* Temporary buffer to store ANAC numbers. */
-	ANACtable = kcalloc(s->nb_blocks, sizeof(u8), GFP_KERNEL);
-	if (!ANACtable)
-		return -ENOMEM;
+	ANACtable = kmalloc(s->nb_blocks * sizeof(u8), GFP_KERNEL);
+	memset(ANACtable, 0, s->nb_blocks);
 
 	/*
 	 * First pass is to explore each physical unit, and construct the
@@ -561,7 +583,7 @@ int INFTL_mount(struct INFTLrecord *s)
 	 * NOTEXPLORED state. Then at the end we will try to format it and
 	 * mark it as free.
 	 */
-	pr_debug("INFTL: pass 1, explore each unit\n");
+	DEBUG(MTD_DEBUG_LEVEL3, "INFTL: pass 1, explore each unit\n");
 	for (first_block = s->firstEUN; first_block <= s->lastEUN; first_block++) {
 		if (s->PUtable[first_block] != BLOCK_NOTEXPLORED)
 			continue;
@@ -573,17 +595,16 @@ int INFTL_mount(struct INFTLrecord *s)
 
 		for (chain_length = 0; ; chain_length++) {
 
-			if ((chain_length == 0) &&
+			if ((chain_length == 0) && 
 			    (s->PUtable[block] != BLOCK_NOTEXPLORED)) {
 				/* Nothing to do here, onto next block */
 				break;
 			}
 
-			if (inftl_read_oob(mtd, block * s->EraseSize + 8,
-					   8, &retlen, (char *)&h0) < 0 ||
-			    inftl_read_oob(mtd, block * s->EraseSize +
-					   2 * SECTORSIZE + 8, 8, &retlen,
-					   (char *)&h1) < 0) {
+			if (MTD_READOOB(s->mbd.mtd, block * s->EraseSize + 8,
+			    8, &retlen, (char *)&h0) < 0 ||
+			    MTD_READOOB(s->mbd.mtd, block * s->EraseSize +
+			    2 * SECTORSIZE + 8, 8, &retlen, (char *)&h1) < 0) {
 				/* Should never happen? */
 				do_format_chain++;
 				break;
@@ -693,14 +714,17 @@ int INFTL_mount(struct INFTLrecord *s)
 		logical_block = BLOCK_NIL;
 	}
 
-	INFTL_dumptables(s);
+#ifdef CONFIG_MTD_DEBUG_VERBOSE
+	if (CONFIG_MTD_DEBUG_VERBOSE >= 2)
+		INFTL_dumptables(s);
+#endif
 
 	/*
 	 * Second pass, check for infinite loops in chains. These are
 	 * possible because we don't update the previous pointers when
 	 * we fold chains. No big deal, just fix them up in PUtable.
 	 */
-	pr_debug("INFTL: pass 2, validate virtual chains\n");
+	DEBUG(MTD_DEBUG_LEVEL3, "INFTL: pass 2, validate virtual chains\n");
 	for (logical_block = 0; logical_block < s->numvunits; logical_block++) {
 		block = s->VUtable[logical_block];
 		last_block = BLOCK_NIL;
@@ -718,7 +742,7 @@ int INFTL_mount(struct INFTLrecord *s)
 					"in virtual chain %d\n",
 					s->PUtable[block], logical_block);
 				s->PUtable[block] = BLOCK_NIL;
-
+					
 			}
 			if (ANACtable[block] != ANAC) {
 				/*
@@ -745,8 +769,12 @@ int INFTL_mount(struct INFTLrecord *s)
 		}
 	}
 
-	INFTL_dumptables(s);
-	INFTL_dumpVUchains(s);
+#ifdef CONFIG_MTD_DEBUG_VERBOSE
+	if (CONFIG_MTD_DEBUG_VERBOSE >= 2)
+		INFTL_dumptables(s);
+	if (CONFIG_MTD_DEBUG_VERBOSE >= 2)
+		INFTL_dumpVUchains(s);
+#endif
 
 	/*
 	 * Third pass, format unreferenced blocks and init free block count.
@@ -754,7 +782,7 @@ int INFTL_mount(struct INFTLrecord *s)
 	s->numfreeEUNs = 0;
 	s->LastFreeEUN = BLOCK_NIL;
 
-	pr_debug("INFTL: pass 3, format unused blocks\n");
+	DEBUG(MTD_DEBUG_LEVEL3, "INFTL: pass 3, format unused blocks\n");
 	for (block = s->firstEUN; block <= s->lastEUN; block++) {
 		if (s->PUtable[block] == BLOCK_NOTEXPLORED) {
 			printk("INFTL: unreferenced block %d, formatting it\n",

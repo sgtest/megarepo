@@ -28,9 +28,9 @@
  * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
+ *
+ * $Id$
  */
-
-#include <asm/page.h>		/* PAGE_SHIFT */
 
 #include "mthca_dev.h"
 #include "mthca_memfree.h"
@@ -58,7 +58,7 @@ int mthca_init_uar_table(struct mthca_dev *dev)
 	ret = mthca_alloc_init(&dev->uar_table.alloc,
 			       dev->limits.num_uars,
 			       dev->limits.num_uars - 1,
-			       dev->limits.reserved_uars + 1);
+			       dev->limits.reserved_uars);
 	if (ret)
 		return ret;
 

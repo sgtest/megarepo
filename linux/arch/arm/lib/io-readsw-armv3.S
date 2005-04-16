@@ -1,22 +1,26 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  *  linux/arch/arm/lib/io-readsw-armv3.S
  *
  *  Copyright (C) 1995-2000 Russell King
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  */
 #include <linux/linkage.h>
 #include <asm/assembler.h>
+#include <asm/hardware.h>
 
-.Linsw_bad_alignment:
-		adr	r0, .Linsw_bad_align_msg
+.insw_bad_alignment:
+		adr	r0, .insw_bad_align_msg
 		mov	r2, lr
 		b	panic
-.Linsw_bad_align_msg:
+.insw_bad_align_msg:
 		.asciz	"insw: bad buffer alignment (0x%p, lr=0x%08lX)\n"
 		.align
 
-.Linsw_align:	tst	r1, #1
-		bne	.Linsw_bad_alignment
+.insw_align:	tst	r1, #1
+		bne	.insw_bad_alignment
 
 		ldr	r3, [r0]
 		strb	r3, [r1], #1
@@ -24,22 +28,22 @@
 		strb	r3, [r1], #1
 
 		subs	r2, r2, #1
-		reteq	lr
+		RETINSTR(moveq, pc, lr)
 
 ENTRY(__raw_readsw)
 		teq	r2, #0		@ do we have to check for the zero len?
-		reteq	lr
+		moveq	pc, lr
 		tst	r1, #3
-		bne	.Linsw_align
+		bne	.insw_align
 
-.Linsw_aligned:	mov	ip, #0xff
+.insw_aligned:	mov	ip, #0xff
 		orr	ip, ip, ip, lsl #8
 		stmfd	sp!, {r4, r5, r6, lr}
 
 		subs	r2, r2, #8
-		bmi	.Lno_insw_8
+		bmi	.no_insw_8
 
-.Linsw_8_lp:	ldr	r3, [r0]
+.insw_8_lp:	ldr	r3, [r0]
 		and	r3, r3, ip
 		ldr	r4, [r0]
 		orr	r3, r3, r4, lsl #16
@@ -62,13 +66,13 @@ ENTRY(__raw_readsw)
 		stmia	r1!, {r3 - r6}
 
 		subs	r2, r2, #8
-		bpl	.Linsw_8_lp
+		bpl	.insw_8_lp
 
 		tst	r2, #7
-		ldmfdeq	sp!, {r4, r5, r6, pc}
+		LOADREGS(eqfd, sp!, {r4, r5, r6, pc})
 
-.Lno_insw_8:	tst	r2, #4
-		beq	.Lno_insw_4
+.no_insw_8:	tst	r2, #4
+		beq	.no_insw_4
 
 		ldr	r3, [r0]
 		and	r3, r3, ip
@@ -82,8 +86,8 @@ ENTRY(__raw_readsw)
 
 		stmia	r1!, {r3, r4}
 
-.Lno_insw_4:	tst	r2, #2
-		beq	.Lno_insw_2
+.no_insw_4:	tst	r2, #2
+		beq	.no_insw_2
 
 		ldr	r3, [r0]
 		and	r3, r3, ip
@@ -92,12 +96,12 @@ ENTRY(__raw_readsw)
 
 		str	r3, [r1], #4
 
-.Lno_insw_2:	tst	r2, #1
+.no_insw_2:	tst	r2, #1
 		ldrne	r3, [r0]
-		strbne	r3, [r1], #1
+		strneb	r3, [r1], #1
 		movne	r3, r3, lsr #8
-		strbne	r3, [r1]
+		strneb	r3, [r1]
 
-		ldmfd	sp!, {r4, r5, r6, pc}
+		LOADREGS(fd, sp!, {r4, r5, r6, pc})
 
 

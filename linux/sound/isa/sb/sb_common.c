@@ -1,25 +1,39 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- *  Copyright (c) by Jaroslav Kysela <perex@perex.cz>
+ *  Copyright (c) by Jaroslav Kysela <perex@suse.cz>
  *                   Uros Bizjak <uros@kss-loka.si>
  *
  *  Lowlevel routines for control of Sound Blaster cards
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ *
  */
 
+#include <sound/driver.h>
 #include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/slab.h>
 #include <linux/ioport.h>
-#include <linux/module.h>
-#include <linux/io.h>
 #include <sound/core.h>
 #include <sound/sb.h>
 #include <sound/initval.h>
 
+#include <asm/io.h>
 #include <asm/dma.h>
 
-MODULE_AUTHOR("Jaroslav Kysela <perex@perex.cz>");
+MODULE_AUTHOR("Jaroslav Kysela <perex@suse.cz>");
 MODULE_DESCRIPTION("ALSA lowlevel driver for Sound Blaster cards");
 MODULE_LICENSE("GPL");
 
@@ -27,22 +41,22 @@ MODULE_LICENSE("GPL");
 
 #undef IO_DEBUG
 
-int snd_sbdsp_command(struct snd_sb *chip, unsigned char val)
+int snd_sbdsp_command(sb_t *chip, unsigned char val)
 {
 	int i;
 #ifdef IO_DEBUG
-	snd_printk(KERN_DEBUG "command 0x%x\n", val);
+	snd_printk("command 0x%x\n", val);
 #endif
 	for (i = BUSY_LOOPS; i; i--)
 		if ((inb(SBP(chip, STATUS)) & 0x80) == 0) {
 			outb(val, SBP(chip, COMMAND));
 			return 1;
 		}
-	snd_printd("%s [0x%lx]: timeout (0x%x)\n", __func__, chip->port, val);
+	snd_printd("%s [0x%lx]: timeout (0x%x)\n", __FUNCTION__, chip->port, val);
 	return 0;
 }
 
-int snd_sbdsp_get_byte(struct snd_sb *chip)
+int snd_sbdsp_get_byte(sb_t *chip)
 {
 	int val;
 	int i;
@@ -50,16 +64,16 @@ int snd_sbdsp_get_byte(struct snd_sb *chip)
 		if (inb(SBP(chip, DATA_AVAIL)) & 0x80) {
 			val = inb(SBP(chip, READ));
 #ifdef IO_DEBUG
-			snd_printk(KERN_DEBUG "get_byte 0x%x\n", val);
+			snd_printk("get_byte 0x%x\n", val);
 #endif
 			return val;
 		}
 	}
-	snd_printd("%s [0x%lx]: timeout\n", __func__, chip->port);
+	snd_printd("%s [0x%lx]: timeout\n", __FUNCTION__, chip->port);
 	return -ENODEV;
 }
 
-int snd_sbdsp_reset(struct snd_sb *chip)
+int snd_sbdsp_reset(sb_t *chip)
 {
 	int i;
 
@@ -74,13 +88,13 @@ int snd_sbdsp_reset(struct snd_sb *chip)
 			else
 				break;
 		}
-	snd_printdd("%s [0x%lx] failed...\n", __func__, chip->port);
+	snd_printdd("%s [0x%lx] failed...\n", __FUNCTION__, chip->port);
 	return -ENODEV;
 }
 
-static int snd_sbdsp_version(struct snd_sb * chip)
+static int snd_sbdsp_version(sb_t * chip)
 {
-	unsigned int result;
+	unsigned int result = -ENODEV;
 
 	snd_sbdsp_command(chip, SB_DSP_GET_VERSION);
 	result = (short) snd_sbdsp_get_byte(chip) << 8;
@@ -88,7 +102,7 @@ static int snd_sbdsp_version(struct snd_sb * chip)
 	return result;
 }
 
-static int snd_sbdsp_probe(struct snd_sb * chip)
+static int snd_sbdsp_probe(sb_t * chip)
 {
 	int version;
 	int major, minor;
@@ -114,7 +128,7 @@ static int snd_sbdsp_probe(struct snd_sb * chip)
 	minor = version & 0xff;
 	snd_printdd("SB [0x%lx]: DSP chip found, version = %i.%i\n",
 		    chip->port, major, minor);
-
+	
 	switch (chip->hardware) {
 	case SB_HW_AUTO:
 		switch (major) {
@@ -140,7 +154,7 @@ static int snd_sbdsp_probe(struct snd_sb * chip)
 			str = "16";
 			break;
 		default:
-			snd_printk(KERN_INFO "SB [0x%lx]: unknown DSP chip version %i.%i\n",
+			snd_printk("SB [0x%lx]: unknown DSP chip version %i.%i\n",
 				   chip->port, major, minor);
 			return -ENODEV;
 		}
@@ -154,12 +168,6 @@ static int snd_sbdsp_probe(struct snd_sb * chip)
 	case SB_HW_DT019X:
 		str = "(DT019X/ALS007)";
 		break;
-	case SB_HW_CS5530:
-		str = "16 (CS5530)";
-		break;
-	case SB_HW_JAZZ16:
-		str = "Pro (Jazz16)";
-		break;
 	default:
 		return -ENODEV;
 	}
@@ -168,23 +176,53 @@ static int snd_sbdsp_probe(struct snd_sb * chip)
 	return 0;
 }
 
-int snd_sbdsp_create(struct snd_card *card,
+static int snd_sbdsp_free(sb_t *chip)
+{
+	if (chip->res_port) {
+		release_resource(chip->res_port);
+		kfree_nocheck(chip->res_port);
+	}
+	if (chip->irq >= 0)
+		free_irq(chip->irq, (void *) chip);
+#ifdef CONFIG_ISA
+	if (chip->dma8 >= 0) {
+		disable_dma(chip->dma8);
+		free_dma(chip->dma8);
+	}
+	if (chip->dma16 >= 0 && chip->dma16 != chip->dma8) {
+		disable_dma(chip->dma16);
+		free_dma(chip->dma16);
+	}
+#endif
+	kfree(chip);
+	return 0;
+}
+
+static int snd_sbdsp_dev_free(snd_device_t *device)
+{
+	sb_t *chip = device->device_data;
+	return snd_sbdsp_free(chip);
+}
+
+int snd_sbdsp_create(snd_card_t *card,
 		     unsigned long port,
 		     int irq,
-		     irq_handler_t irq_handler,
+		     irqreturn_t (*irq_handler)(int, void *, struct pt_regs *),
 		     int dma8,
 		     int dma16,
 		     unsigned short hardware,
-		     struct snd_sb **r_chip)
+		     sb_t **r_chip)
 {
-	struct snd_sb *chip;
+	sb_t *chip;
 	int err;
+	static snd_device_ops_t ops = {
+		.dev_free =	snd_sbdsp_dev_free,
+	};
 
-	if (snd_BUG_ON(!r_chip))
-		return -EINVAL;
+	snd_assert(r_chip != NULL, return -EINVAL);
 	*r_chip = NULL;
-	chip = devm_kzalloc(card->dev, sizeof(*chip), GFP_KERNEL);
-	if (!chip)
+	chip = kcalloc(1, sizeof(*chip), GFP_KERNEL);
+	if (chip == NULL)
 		return -ENOMEM;
 	spin_lock_init(&chip->reg_lock);
 	spin_lock_init(&chip->open_lock);
@@ -195,31 +233,28 @@ int snd_sbdsp_create(struct snd_card *card,
 	chip->dma16 = -1;
 	chip->port = port;
 	
-	if (devm_request_irq(card->dev, irq, irq_handler,
-			     (hardware == SB_HW_ALS4000 ||
-			      hardware == SB_HW_CS5530) ?
-			     IRQF_SHARED : 0,
-			     "SoundBlaster", (void *) chip)) {
+	if (request_irq(irq, irq_handler, hardware == SB_HW_ALS4000 ?
+			SA_INTERRUPT | SA_SHIRQ : SA_INTERRUPT,
+			"SoundBlaster", (void *) chip)) {
 		snd_printk(KERN_ERR "sb: can't grab irq %d\n", irq);
+		snd_sbdsp_free(chip);
 		return -EBUSY;
 	}
 	chip->irq = irq;
-	card->sync_irq = chip->irq;
 
 	if (hardware == SB_HW_ALS4000)
 		goto __skip_allocation;
 	
-	chip->res_port = devm_request_region(card->dev, port, 16,
-					     "SoundBlaster");
-	if (!chip->res_port) {
+	if ((chip->res_port = request_region(port, 16, "SoundBlaster")) == NULL) {
 		snd_printk(KERN_ERR "sb: can't grab port 0x%lx\n", port);
+		snd_sbdsp_free(chip);
 		return -EBUSY;
 	}
 
 #ifdef CONFIG_ISA
-	if (dma8 >= 0 && snd_devm_request_dma(card->dev, dma8,
-					      "SoundBlaster - 8bit")) {
+	if (dma8 >= 0 && request_dma(dma8, "SoundBlaster - 8bit")) {
 		snd_printk(KERN_ERR "sb: can't grab DMA8 %d\n", dma8);
+		snd_sbdsp_free(chip);
 		return -EBUSY;
 	}
 	chip->dma8 = dma8;
@@ -227,9 +262,9 @@ int snd_sbdsp_create(struct snd_card *card,
 		if (hardware != SB_HW_ALS100 && (dma16 < 5 || dma16 > 7)) {
 			/* no duplex */
 			dma16 = -1;
-		} else if (snd_devm_request_dma(card->dev, dma16,
-						"SoundBlaster - 16bit")) {
+		} else if (request_dma(dma16, "SoundBlaster - 16bit")) {
 			snd_printk(KERN_ERR "sb: can't grab DMA16 %d\n", dma16);
+			snd_sbdsp_free(chip);
 			return -EBUSY;
 		}
 	}
@@ -239,9 +274,14 @@ int snd_sbdsp_create(struct snd_card *card,
       __skip_allocation:
 	chip->card = card;
 	chip->hardware = hardware;
-	err = snd_sbdsp_probe(chip);
-	if (err < 0)
+	if ((err = snd_sbdsp_probe(chip)) < 0) {
+		snd_sbdsp_free(chip);
 		return err;
+	}
+	if ((err = snd_device_new(card, SNDRV_DEV_LOWLEVEL, chip, &ops)) < 0) {
+		snd_sbdsp_free(chip);
+		return err;
+	}
 	*r_chip = chip;
 	return 0;
 }
@@ -255,7 +295,19 @@ EXPORT_SYMBOL(snd_sbmixer_write);
 EXPORT_SYMBOL(snd_sbmixer_read);
 EXPORT_SYMBOL(snd_sbmixer_new);
 EXPORT_SYMBOL(snd_sbmixer_add_ctl);
-#ifdef CONFIG_PM
-EXPORT_SYMBOL(snd_sbmixer_suspend);
-EXPORT_SYMBOL(snd_sbmixer_resume);
-#endif
+
+/*
+ *  INIT part
+ */
+
+static int __init alsa_sb_common_init(void)
+{
+	return 0;
+}
+
+static void __exit alsa_sb_common_exit(void)
+{
+}
+
+module_init(alsa_sb_common_init)
+module_exit(alsa_sb_common_exit)

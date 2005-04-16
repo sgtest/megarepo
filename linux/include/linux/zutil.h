@@ -15,6 +15,7 @@
 
 #include <linux/zlib.h>
 #include <linux/string.h>
+#include <linux/errno.h>
 #include <linux/kernel.h>
 
 typedef unsigned char  uch;
@@ -22,6 +23,18 @@ typedef unsigned short ush;
 typedef unsigned long  ulg;
 
         /* common constants */
+
+#ifndef DEF_WBITS
+#  define DEF_WBITS MAX_WBITS
+#endif
+/* default windowBits for decompression. MAX_WBITS is for compression only */
+
+#if MAX_MEM_LEVEL >= 8
+#  define DEF_MEM_LEVEL 8
+#else
+#  define DEF_MEM_LEVEL  MAX_MEM_LEVEL
+#endif
+/* default memLevel */
 
 #define STORED_BLOCK 0
 #define STATIC_TREES 1
@@ -68,10 +81,10 @@ typedef uLong (*check_func) (uLong check, const Byte *buf,
    An Adler-32 checksum is almost as reliable as a CRC32 but can be computed
    much faster. Usage example:
 
-     uLong adler = zlib_adler32(0L, NULL, 0);
+     uLong adler = adler32(0L, NULL, 0);
 
      while (read_buffer(buffer, length) != EOF) {
-       adler = zlib_adler32(adler, buffer, length);
+       adler = adler32(adler, buffer, length);
      }
      if (adler != original_adler) error();
 */

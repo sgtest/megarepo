@@ -1,10 +1,23 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Driver for Digigram miXart soundcards
  *
  * low level interface with interrupt handling and mail box implementation
  *
  * Copyright (c) 2003 by Digigram <alsa@digigram.com>
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  */
 
 #ifndef __SOUND_MIXART_CORE_H
@@ -49,25 +62,26 @@ enum mixart_message_id {
 	MSG_CLOCK_SET_PROPERTIES             = 0x200002,
 };
 
-#define MSG_DEFAULT_SIZE            512
 
+typedef struct mixart_msg mixart_msg_t;
 struct mixart_msg
 {
 	u32          message_id;
-	struct mixart_uid uid;
+	mixart_uid_t uid;
 	void*        data;
 	size_t       size;
 };
 
 /* structs used to communicate with miXart */
 
+typedef struct mixart_enum_connector_resp mixart_enum_connector_resp_t;
 struct mixart_enum_connector_resp
 {
 	u32  error_code;
 	u32  first_uid_offset;
 	u32  uid_count;
 	u32  current_uid_index;
-	struct mixart_uid uid[MIXART_MAX_PHYS_CONNECTORS];
+	mixart_uid_t uid[MIXART_MAX_PHYS_CONNECTORS];
 } __attribute__((packed));
 
 
@@ -76,6 +90,7 @@ struct mixart_enum_connector_resp
 #define MIXART_FLOAT_M_20_0_TO_HEX      0xc1a00000  /* -20.0f */
 #define MIXART_FLOAT____0_0_TO_HEX      0x00000000  /* 0.0f */
 
+typedef struct mixart_audio_info_req mixart_audio_info_req_t;
 struct mixart_audio_info_req
 {
 	u32 line_max_level;    /* float */
@@ -83,6 +98,7 @@ struct mixart_audio_info_req
 	u32 cd_max_level;      /* float */
 } __attribute__((packed));
 
+typedef struct mixart_analog_hw_info mixart_analog_hw_info_t;
 struct mixart_analog_hw_info
 {
 	u32 is_present;
@@ -95,6 +111,7 @@ struct mixart_analog_hw_info
 	u32 zero_var;          /* float */
 } __attribute__((packed));
 
+typedef struct mixart_digital_hw_info mixart_digital_hw_info_t;
 struct mixart_digital_hw_info
 {
 	u32   hw_connection_type;
@@ -103,33 +120,37 @@ struct mixart_digital_hw_info
 	u32   reserved;
 } __attribute__((packed));
 
+typedef struct mixart_analog_info mixart_analog_info_t;
 struct mixart_analog_info
 {
 	u32                     type_mask;
-	struct mixart_analog_hw_info micro_info;
-	struct mixart_analog_hw_info line_info;
-	struct mixart_analog_hw_info cd_info;
+	mixart_analog_hw_info_t micro_info;
+	mixart_analog_hw_info_t line_info;
+	mixart_analog_hw_info_t cd_info;
 	u32                     analog_level_present;
 } __attribute__((packed));
 
+typedef struct mixart_digital_info mixart_digital_info_t;
 struct mixart_digital_info
 {
 	u32 type_mask;
-	struct mixart_digital_hw_info aes_info;
-	struct mixart_digital_hw_info adat_info;
+	mixart_digital_hw_info_t aes_info;
+	mixart_digital_hw_info_t adat_info;
 } __attribute__((packed));
 
+typedef struct mixart_audio_info mixart_audio_info_t;
 struct mixart_audio_info
 {
 	u32                   clock_type_mask;
-	struct mixart_analog_info  analog_info;
-	struct mixart_digital_info digital_info;
+	mixart_analog_info_t  analog_info;
+	mixart_digital_info_t digital_info;
 } __attribute__((packed));
 
+typedef struct mixart_audio_info_resp mixart_audio_info_resp_t;
 struct mixart_audio_info_resp
 {
 	u32                 txx_status;
-	struct mixart_audio_info info;
+	mixart_audio_info_t info;
 } __attribute__((packed));
 
 
@@ -137,6 +158,7 @@ struct mixart_audio_info_resp
 #define MIXART_FLOAT_P__4_0_TO_HEX      0x40800000  /* +4.0f */
 #define MIXART_FLOAT_P__8_0_TO_HEX      0x41000000  /* +8.0f */
 
+typedef struct mixart_stream_info mixart_stream_info_t;
 struct mixart_stream_info
 {
 	u32 size_max_byte_frame;
@@ -147,6 +169,7 @@ struct mixart_stream_info
 /*  MSG_STREAM_ADD_INPUT_GROUP */
 /*  MSG_STREAM_ADD_OUTPUT_GROUP */
 
+typedef struct mixart_streaming_group_req mixart_streaming_group_req_t;
 struct mixart_streaming_group_req
 {
 	u32 stream_count;
@@ -154,30 +177,33 @@ struct mixart_streaming_group_req
 	u32 user_grp_number;
 	u32 first_phys_audio;
 	u32 latency;
-	struct mixart_stream_info stream_info[32];
-	struct mixart_uid connector;
+	mixart_stream_info_t stream_info[32];
+	mixart_uid_t connector;
 	u32 flow_entry[32];
 } __attribute__((packed));
 
+typedef struct mixart_stream_desc mixart_stream_desc_t;
 struct mixart_stream_desc
 {
-	struct mixart_uid stream_uid;
+	mixart_uid_t stream_uid;
 	u32          stream_desc;
 } __attribute__((packed));
 
+typedef struct mixart_streaming_group mixart_streaming_group_t;
 struct mixart_streaming_group
 {
 	u32                  status;
-	struct mixart_uid    group;
+	mixart_uid_t         group;
 	u32                  pipe_desc;
 	u32                  stream_count;
-	struct mixart_stream_desc stream[32];
+	mixart_stream_desc_t stream[32];
 } __attribute__((packed));
 
 /* MSG_STREAM_DELETE_GROUP */
 
 /* request : mixart_uid_t group */
 
+typedef struct mixart_delete_group_resp mixart_delete_group_resp_t;
 struct mixart_delete_group_resp
 {
 	u32  status;
@@ -191,49 +217,55 @@ struct mixart_delete_group_resp
 	MSG_STREAM_STOP_OUTPUT_STAGE_PACKET  = 0x130000 + 11,
  */
 
+typedef struct mixart_fx_couple_uid mixart_fx_couple_uid_t;
 struct mixart_fx_couple_uid
 {
-	struct mixart_uid uid_fx_code;
-	struct mixart_uid uid_fx_data;
+	mixart_uid_t uid_fx_code;
+	mixart_uid_t uid_fx_data;
 } __attribute__((packed));
 
+typedef struct mixart_txx_stream_desc mixart_txx_stream_desc_t;
 struct mixart_txx_stream_desc
 {
-	struct mixart_uid       uid_pipe;
+	mixart_uid_t            uid_pipe;
 	u32                     stream_idx;
 	u32                     fx_number;
-	struct mixart_fx_couple_uid  uid_fx[4];
+	mixart_fx_couple_uid_t  uid_fx[4];
 } __attribute__((packed));
 
+typedef struct mixart_flow_info mixart_flow_info_t;
 struct mixart_flow_info
 {
-	struct mixart_txx_stream_desc  stream_desc;
+	mixart_txx_stream_desc_t  stream_desc;
 	u32                       flow_entry;
 	u32                       flow_phy_addr;
 } __attribute__((packed));
 
+typedef struct mixart_stream_state_req mixart_stream_state_req_t;
 struct mixart_stream_state_req
 {
 	u32                 delayed;
 	u64                 scheduler;
 	u32                 reserved4np[3];
 	u32                 stream_count;  /* set to 1 for instance */
-	struct mixart_flow_info  stream_info;   /* could be an array[stream_count] */
+	mixart_flow_info_t  stream_info;   /* could be an array[stream_count] */
 } __attribute__((packed));
 
 /* 	MSG_STREAM_START_STREAM_GRP_PACKET   = 0x130000 + 6
 	MSG_STREAM_STOP_STREAM_GRP_PACKET    = 0x130000 + 9
  */
 
+typedef struct mixart_group_state_req mixart_group_state_req_t;
 struct mixart_group_state_req
 {
 	u32           delayed;
 	u64           scheduler;
 	u32           reserved4np[2];
 	u32           pipe_count;    /* set to 1 for instance */
-	struct mixart_uid  pipe_uid[1];   /* could be an array[pipe_count] */
+	mixart_uid_t  pipe_uid[1];   /* could be an array[pipe_count] */
 } __attribute__((packed));
 
+typedef struct mixart_group_state_resp mixart_group_state_resp_t;
 struct mixart_group_state_resp
 {
 	u32           txx_status;
@@ -244,6 +276,7 @@ struct mixart_group_state_resp
 
 /* Structures used by the MSG_SERVICES_TIMER_NOTIFY command */
 
+typedef struct mixart_sample_pos mixart_sample_pos_t;
 struct mixart_sample_pos
 {
 	u32   buffer_id;
@@ -252,17 +285,11 @@ struct mixart_sample_pos
 	u32   sample_pos_low_part;
 } __attribute__((packed));
 
-/*
- * This structure is limited by the size of MSG_DEFAULT_SIZE. Instead of
- * having MIXART_MAX_STREAM_PER_CARD * MIXART_MAX_CARDS many streams,
- * this is capped to have a total size below MSG_DEFAULT_SIZE.
- */
-#define MIXART_MAX_TIMER_NOTIFY_STREAMS				\
-	((MSG_DEFAULT_SIZE - sizeof(u32)) / sizeof(struct mixart_sample_pos))
+typedef struct mixart_timer_notify mixart_timer_notify_t;
 struct mixart_timer_notify
 {
 	u32                  stream_count;
-	struct mixart_sample_pos  streams[MIXART_MAX_TIMER_NOTIFY_STREAMS];
+	mixart_sample_pos_t  streams[MIXART_MAX_STREAM_PER_CARD * MIXART_MAX_CARDS];
 } __attribute__((packed));
 
 
@@ -271,10 +298,11 @@ struct mixart_timer_notify
 
 /* request is a uid with desc = MSG_CONSOLE_MANAGER | cardindex */
 
+typedef struct mixart_return_uid mixart_return_uid_t;
 struct mixart_return_uid
 {
 	u32 error_code;
-	struct mixart_uid uid;
+	mixart_uid_t uid;
 } __attribute__((packed));
 
 /*	MSG_CLOCK_CHECK_PROPERTIES           = 0x200001,
@@ -299,6 +327,7 @@ enum mixart_clock_mode {
 };
 
 
+typedef struct mixart_clock_properties mixart_clock_properties_t;
 struct mixart_clock_properties
 {
 	u32 error_code;
@@ -307,16 +336,17 @@ struct mixart_clock_properties
 	u32 reference_frequency;
 	u32 clock_generic_type;
 	u32 clock_mode;
-	struct mixart_uid uid_clock_source;
-	struct mixart_uid uid_event_source;
+	mixart_uid_t uid_clock_source;
+	mixart_uid_t uid_event_source;
 	u32 event_mode;
 	u32 synchro_signal_presence;
 	u32 format;
 	u32 board_mask;
 	u32 nb_callers; /* set to 1 (see below) */
-	struct mixart_uid uid_caller[1];
+	mixart_uid_t uid_caller[1];
 } __attribute__((packed));
 
+typedef struct mixart_clock_properties_resp mixart_clock_properties_resp_t;
 struct mixart_clock_properties_resp
 {
 	u32 status;
@@ -358,6 +388,7 @@ enum mixart_sample_type {
 	ST_INTEGER_32LE
 };
 
+typedef struct mixart_stream_param_desc mixart_stream_param_desc_t;
 struct mixart_stream_param_desc
 {
 	u32 coding_type;  /* use enum mixart_coding_type */
@@ -401,7 +432,7 @@ struct mixart_stream_param_desc
 	u32 reserved4np[3];
 	u32 pipe_count;                           /* set to 1 (array size !) */
 	u32 stream_count;                         /* set to 1 (array size !) */
-	struct mixart_txx_stream_desc stream_desc[1];  /* only one stream per command, but this could be an array */
+	mixart_txx_stream_desc_t stream_desc[1];  /* only one stream per command, but this could be an array */
 
 } __attribute__((packed));
 
@@ -410,6 +441,7 @@ struct mixart_stream_param_desc
  */
 
 
+typedef struct mixart_get_out_audio_level mixart_get_out_audio_level_t;
 struct mixart_get_out_audio_level
 {
 	u32 txx_status;
@@ -433,6 +465,7 @@ struct mixart_get_out_audio_level
 #define MIXART_AUDIO_LEVEL_MUTE_M1_MASK	0x10
 #define MIXART_AUDIO_LEVEL_MUTE_M2_MASK	0x20
 
+typedef struct mixart_set_out_audio_level mixart_set_out_audio_level_t;
 struct mixart_set_out_audio_level
 {
 	u32 delayed;
@@ -454,13 +487,14 @@ struct mixart_set_out_audio_level
 
 #define MIXART_MAX_PHYS_IO  (MIXART_MAX_CARDS * 2 * 2) /* 4 * (analog+digital) * (playback+capture) */
 
+typedef struct mixart_uid_enumeration mixart_uid_enumeration_t;
 struct mixart_uid_enumeration
 {
 	u32 error_code;
 	u32 first_uid_offset;
 	u32 nb_uid;
 	u32 current_uid_index;
-	struct mixart_uid uid[MIXART_MAX_PHYS_IO];
+	mixart_uid_t uid[MIXART_MAX_PHYS_IO];
 } __attribute__((packed));
 
 
@@ -468,38 +502,42 @@ struct mixart_uid_enumeration
 	MSG_PHYSICALIO_GET_LEVEL             = 0x0F000C,
 */
 
+typedef struct mixart_io_channel_level mixart_io_channel_level_t;
 struct mixart_io_channel_level
 {
 	u32 analog_level;   /* float */
 	u32 unused[2];
 } __attribute__((packed));
 
+typedef struct mixart_io_level mixart_io_level_t;
 struct mixart_io_level
 {
 	s32 channel; /* 0=left, 1=right, -1=both, -2=both same */
-	struct mixart_io_channel_level level[2];
+	mixart_io_channel_level_t level[2];
 } __attribute__((packed));
 
 
 /*	MSG_STREAM_SET_IN_AUDIO_LEVEL        = 0x130015,
  */
 
+typedef struct mixart_in_audio_level_info mixart_in_audio_level_info_t;
 struct mixart_in_audio_level_info
 {
-	struct mixart_uid connector;
+	mixart_uid_t connector;
 	u32 valid_mask1;
 	u32 valid_mask2;
 	u32 digital_level;
 	u32 analog_level;
 } __attribute__((packed));
 
+typedef struct mixart_set_in_audio_level_req mixart_set_in_audio_level_req_t;
 struct mixart_set_in_audio_level_req
 {
 	u32 delayed;
 	u64 scheduler;
 	u32 audio_count;  /* set to <= 2 */
 	u32 reserved4np;
-	struct mixart_in_audio_level_info level[2];
+	mixart_in_audio_level_info_t level[2];
 } __attribute__((packed));
 
 /* response is a 32 bit status */
@@ -518,6 +556,7 @@ struct mixart_set_in_audio_level_req
 #define MIXART_OUT_STREAM_SET_LEVEL_MUTE_1		0x40
 #define MIXART_OUT_STREAM_SET_LEVEL_MUTE_2		0x80
 
+typedef struct mixart_out_stream_level_info mixart_out_stream_level_info_t;
 struct mixart_out_stream_level_info
 {
 	u32 valid_mask1;
@@ -532,35 +571,37 @@ struct mixart_out_stream_level_info
 	u32 mute2;
 } __attribute__((packed));
 
+typedef struct mixart_set_out_stream_level mixart_set_out_stream_level_t;
 struct mixart_set_out_stream_level
 {
-	struct mixart_txx_stream_desc desc;
-	struct mixart_out_stream_level_info out_level;
+	mixart_txx_stream_desc_t desc;
+	mixart_out_stream_level_info_t out_level;
 } __attribute__((packed));
 
+typedef struct mixart_set_out_stream_level_req mixart_set_out_stream_level_req_t;
 struct mixart_set_out_stream_level_req
 {
 	u32 delayed;
 	u64 scheduler;
 	u32 reserved4np[2];
 	u32 nb_of_stream;  /* set to 1 */
-	struct mixart_set_out_stream_level stream_level; /* could be an array */
+	mixart_set_out_stream_level_t stream_level; /* could be an array */
 } __attribute__((packed));
 
 /* response to this request is a u32 status value */
 
 
 /* exported */
-void snd_mixart_init_mailbox(struct mixart_mgr *mgr);
-void snd_mixart_exit_mailbox(struct mixart_mgr *mgr);
+void snd_mixart_init_mailbox(mixart_mgr_t *mgr);
+void snd_mixart_exit_mailbox(mixart_mgr_t *mgr);
 
-int  snd_mixart_send_msg(struct mixart_mgr *mgr, struct mixart_msg *request, int max_resp_size, void *resp_data);
-int  snd_mixart_send_msg_wait_notif(struct mixart_mgr *mgr, struct mixart_msg *request, u32 notif_event);
-int  snd_mixart_send_msg_nonblock(struct mixart_mgr *mgr, struct mixart_msg *request);
+int  snd_mixart_send_msg(mixart_mgr_t *mgr, mixart_msg_t *request, int max_resp_size, void *resp_data);
+int  snd_mixart_send_msg_wait_notif(mixart_mgr_t *mgr, mixart_msg_t *request, u32 notif_event);
+int  snd_mixart_send_msg_nonblock(mixart_mgr_t *mgr, mixart_msg_t *request);
 
-irqreturn_t snd_mixart_interrupt(int irq, void *dev_id);
-irqreturn_t snd_mixart_threaded_irq(int irq, void *dev_id);
+irqreturn_t snd_mixart_interrupt(int irq, void *dev_id, struct pt_regs *regs);
+void snd_mixart_msg_tasklet( unsigned long arg);
 
-void snd_mixart_reset_board(struct mixart_mgr *mgr);
+void snd_mixart_reset_board(mixart_mgr_t *mgr);
 
 #endif /* __SOUND_MIXART_CORE_H */

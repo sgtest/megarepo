@@ -51,7 +51,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <sysexits.h>
+#ifdef __linux__
 #include "../queue.h"
+#else
+#include <sys/queue.h>
+#endif
 
 #include "aicasm.h"
 #include "aicasm_symbol.h"
@@ -62,7 +66,6 @@ static char string_buf[MAX_STR_CONST];
 static char *string_buf_ptr;
 static int  parren_count;
 static char buf[255];
-int  mmlineno;
 %}
 
 WORD		[A-Za-z_][-A-Za-z_0-9]*
@@ -73,7 +76,7 @@ MCARG		[^(), \t]+
 
 %%
 \n			{
-				++mmlineno;
+				++yylineno;
 			}
 \r			;
 <ARGLIST>{SPACE}	;

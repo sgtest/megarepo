@@ -1,20 +1,22 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  *
  * Copyright Jonathan Naylor G4KLX (g4klx@g4klx.demon.co.uk)
  * Copyright Alan Cox GW4PTS (alan@lxorguk.ukuu.org.uk)
  * Copyright Darryl Miles G7LED (dlm@g7led.demon.co.uk)
  */
+#include <linux/config.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
-#include <linux/capability.h>
 #include <linux/errno.h>
 #include <linux/types.h>
 #include <linux/socket.h>
 #include <linux/in.h>
-#include <linux/slab.h>
 #include <linux/kernel.h>
-#include <linux/sched/signal.h>
+#include <linux/sched.h>
 #include <linux/timer.h>
 #include <linux/string.h>
 #include <linux/sockios.h>
@@ -25,9 +27,9 @@
 #include <linux/netdevice.h>
 #include <linux/if_arp.h>
 #include <linux/skbuff.h>
-#include <net/net_namespace.h>
 #include <net/sock.h>
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
+#include <asm/system.h>
 #include <linux/fcntl.h>
 #include <linux/termios.h>	/* For TIOCINQ/OUTQ */
 #include <linux/mm.h>
@@ -37,7 +39,7 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <net/ip.h>
-#include <net/tcp_states.h>
+#include <net/tcp.h>
 #include <net/arp.h>
 #include <linux/init.h>
 
@@ -54,36 +56,13 @@ int sysctl_netrom_transport_requested_window_size = NR_DEFAULT_WINDOW;
 int sysctl_netrom_transport_no_activity_timeout   = NR_DEFAULT_IDLE;
 int sysctl_netrom_routing_control                 = NR_DEFAULT_ROUTING;
 int sysctl_netrom_link_fails_count                = NR_DEFAULT_FAILS;
-int sysctl_netrom_reset_circuit                   = NR_DEFAULT_RESET;
 
 static unsigned short circuit = 0x101;
 
 static HLIST_HEAD(nr_list);
 static DEFINE_SPINLOCK(nr_list_lock);
 
-static const struct proto_ops nr_proto_ops;
-
-/*
- * NETROM network devices are virtual network devices encapsulating NETROM
- * frames into AX.25 which will be sent through an AX.25 device, so form a
- * special "super class" of normal net devices; split their locks off into a
- * separate class since they always nest.
- */
-static struct lock_class_key nr_netdev_xmit_lock_key;
-static struct lock_class_key nr_netdev_addr_lock_key;
-
-static void nr_set_lockdep_one(struct net_device *dev,
-			       struct netdev_queue *txq,
-			       void *_unused)
-{
-	lockdep_set_class(&txq->_xmit_lock, &nr_netdev_xmit_lock_key);
-}
-
-static void nr_set_lockdep_key(struct net_device *dev)
-{
-	lockdep_set_class(&dev->addr_list_lock, &nr_netdev_addr_lock_key);
-	netdev_for_each_tx_queue(dev, nr_set_lockdep_one, NULL);
-}
+static struct proto_ops nr_proto_ops;
 
 /*
  *	Socket removal during an interrupt is now safe.
@@ -101,9 +80,10 @@ static void nr_remove_socket(struct sock *sk)
 static void nr_kill_by_device(struct net_device *dev)
 {
 	struct sock *s;
+	struct hlist_node *node;
 
 	spin_lock_bh(&nr_list_lock);
-	sk_for_each(s, &nr_list)
+	sk_for_each(s, node, &nr_list)
 		if (nr_sk(s)->device == dev)
 			nr_disconnect(s, ENETUNREACH);
 	spin_unlock_bh(&nr_list_lock);
@@ -114,17 +94,14 @@ static void nr_kill_by_device(struct net_device *dev)
  */
 static int nr_device_event(struct notifier_block *this, unsigned long event, void *ptr)
 {
-	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
-
-	if (!net_eq(dev_net(dev), &init_net))
-		return NOTIFY_DONE;
+	struct net_device *dev = (struct net_device *)ptr;
 
 	if (event != NETDEV_DOWN)
 		return NOTIFY_DONE;
 
 	nr_kill_by_device(dev);
 	nr_rt_device_down(dev);
-
+	
 	return NOTIFY_DONE;
 }
 
@@ -145,12 +122,13 @@ static void nr_insert_socket(struct sock *sk)
 static struct sock *nr_find_listener(ax25_address *addr)
 {
 	struct sock *s;
+	struct hlist_node *node;
 
 	spin_lock_bh(&nr_list_lock);
-	sk_for_each(s, &nr_list)
+	sk_for_each(s, node, &nr_list)
 		if (!ax25cmp(&nr_sk(s)->source_addr, addr) &&
 		    s->sk_state == TCP_LISTEN) {
-			sock_hold(s);
+		    	bh_lock_sock(s);
 			goto found;
 		}
 	s = NULL;
@@ -165,13 +143,14 @@ found:
 static struct sock *nr_find_socket(unsigned char index, unsigned char id)
 {
 	struct sock *s;
+	struct hlist_node *node;
 
 	spin_lock_bh(&nr_list_lock);
-	sk_for_each(s, &nr_list) {
+	sk_for_each(s, node, &nr_list) {
 		struct nr_sock *nr = nr_sk(s);
-
+		
 		if (nr->my_index == index && nr->my_id == id) {
-			sock_hold(s);
+			bh_lock_sock(s);
 			goto found;
 		}
 	}
@@ -188,14 +167,15 @@ static struct sock *nr_find_peer(unsigned char index, unsigned char id,
 	ax25_address *dest)
 {
 	struct sock *s;
+	struct hlist_node *node;
 
 	spin_lock_bh(&nr_list_lock);
-	sk_for_each(s, &nr_list) {
+	sk_for_each(s, node, &nr_list) {
 		struct nr_sock *nr = nr_sk(s);
-
+		
 		if (nr->your_index == index && nr->your_id == id &&
 		    !ax25cmp(&nr->dest_addr, dest)) {
-			sock_hold(s);
+		    	bh_lock_sock(s);
 			goto found;
 		}
 	}
@@ -221,7 +201,7 @@ static unsigned short nr_find_next_circuit(void)
 		if (i != 0 && j != 0) {
 			if ((sk=nr_find_socket(i, j)) == NULL)
 				break;
-			sock_put(sk);
+			bh_unlock_sock(sk);
 		}
 
 		id++;
@@ -238,9 +218,9 @@ void nr_destroy_socket(struct sock *);
 /*
  *	Handler for deferred kills.
  */
-static void nr_destroy_timer(struct timer_list *t)
+static void nr_destroy_timer(unsigned long data)
 {
-	struct sock *sk = from_timer(sk, t, sk_timer);
+	struct sock *sk=(struct sock *)data;
 	bh_lock_sock(sk);
 	sock_hold(sk);
 	nr_destroy_socket(sk);
@@ -279,7 +259,8 @@ void nr_destroy_socket(struct sock *sk)
 		kfree_skb(skb);
 	}
 
-	if (sk_has_allocations(sk)) {
+	if (atomic_read(&sk->sk_wmem_alloc) ||
+	    atomic_read(&sk->sk_rmem_alloc)) {
 		/* Defer: outstanding buffers */
 		sk->sk_timer.function = nr_destroy_timer;
 		sk->sk_timer.expires  = jiffies + 2 * HZ;
@@ -294,30 +275,30 @@ void nr_destroy_socket(struct sock *sk)
  */
 
 static int nr_setsockopt(struct socket *sock, int level, int optname,
-		sockptr_t optval, unsigned int optlen)
+	char __user *optval, int optlen)
 {
 	struct sock *sk = sock->sk;
 	struct nr_sock *nr = nr_sk(sk);
-	unsigned int opt;
+	int opt;
 
 	if (level != SOL_NETROM)
 		return -ENOPROTOOPT;
 
-	if (optlen < sizeof(unsigned int))
+	if (optlen < sizeof(int))
 		return -EINVAL;
 
-	if (copy_from_sockptr(&opt, optval, sizeof(opt)))
+	if (get_user(opt, (int __user *)optval))
 		return -EFAULT;
 
 	switch (optname) {
 	case NETROM_T1:
-		if (opt < 1 || opt > UINT_MAX / HZ)
+		if (opt < 1)
 			return -EINVAL;
 		nr->t1 = opt * HZ;
 		return 0;
 
 	case NETROM_T2:
-		if (opt < 1 || opt > UINT_MAX / HZ)
+		if (opt < 1)
 			return -EINVAL;
 		nr->t2 = opt * HZ;
 		return 0;
@@ -329,13 +310,13 @@ static int nr_setsockopt(struct socket *sock, int level, int optname,
 		return 0;
 
 	case NETROM_T4:
-		if (opt < 1 || opt > UINT_MAX / HZ)
+		if (opt < 1)
 			return -EINVAL;
 		nr->t4 = opt * HZ;
 		return 0;
 
 	case NETROM_IDLE:
-		if (opt > UINT_MAX / (60 * HZ))
+		if (opt < 0)
 			return -EINVAL;
 		nr->idle = opt * 60 * HZ;
 		return 0;
@@ -351,17 +332,17 @@ static int nr_getsockopt(struct socket *sock, int level, int optname,
 	struct sock *sk = sock->sk;
 	struct nr_sock *nr = nr_sk(sk);
 	int val = 0;
-	int len;
+	int len; 
 
 	if (level != SOL_NETROM)
 		return -ENOPROTOOPT;
-
+	
 	if (get_user(len, optlen))
 		return -EFAULT;
 
 	if (len < 0)
 		return -EINVAL;
-
+		
 	switch (optname) {
 	case NETROM_T1:
 		val = nr->t1 / HZ;
@@ -418,20 +399,15 @@ static struct proto nr_proto = {
 	.obj_size = sizeof(struct nr_sock),
 };
 
-static int nr_create(struct net *net, struct socket *sock, int protocol,
-		     int kern)
+static int nr_create(struct socket *sock, int protocol)
 {
 	struct sock *sk;
 	struct nr_sock *nr;
 
-	if (!net_eq(net, &init_net))
-		return -EAFNOSUPPORT;
-
 	if (sock->type != SOCK_SEQPACKET || protocol != 0)
 		return -ESOCKTNOSUPPORT;
 
-	sk = sk_alloc(net, PF_NETROM, GFP_ATOMIC, &nr_proto, kern);
-	if (sk  == NULL)
+	if ((sk = sk_alloc(PF_NETROM, GFP_ATOMIC, &nr_proto, 1)) == NULL)
 		return -ENOMEM;
 
 	nr = nr_sk(sk);
@@ -447,16 +423,11 @@ static int nr_create(struct net *net, struct socket *sock, int protocol,
 
 	nr_init_timers(sk);
 
-	nr->t1     =
-		msecs_to_jiffies(sysctl_netrom_transport_timeout);
-	nr->t2     =
-		msecs_to_jiffies(sysctl_netrom_transport_acknowledge_delay);
-	nr->n2     =
-		msecs_to_jiffies(sysctl_netrom_transport_maximum_tries);
-	nr->t4     =
-		msecs_to_jiffies(sysctl_netrom_transport_busy_delay);
-	nr->idle   =
-		msecs_to_jiffies(sysctl_netrom_transport_no_activity_timeout);
+	nr->t1     = sysctl_netrom_transport_timeout;
+	nr->t2     = sysctl_netrom_transport_acknowledge_delay;
+	nr->n2     = sysctl_netrom_transport_maximum_tries;
+	nr->t4     = sysctl_netrom_transport_busy_delay;
+	nr->idle   = sysctl_netrom_transport_no_activity_timeout;
 	nr->window = sysctl_netrom_transport_requested_window_size;
 
 	nr->bpqext = 1;
@@ -473,8 +444,7 @@ static struct sock *nr_make_new(struct sock *osk)
 	if (osk->sk_type != SOCK_SEQPACKET)
 		return NULL;
 
-	sk = sk_alloc(sock_net(osk), PF_NETROM, GFP_ATOMIC, osk->sk_prot, 0);
-	if (sk == NULL)
+	if ((sk = sk_alloc(PF_NETROM, GFP_ATOMIC, osk->sk_prot, 1)) == NULL)
 		return NULL;
 
 	nr = nr_sk(sk);
@@ -482,12 +452,19 @@ static struct sock *nr_make_new(struct sock *osk)
 	sock_init_data(NULL, sk);
 
 	sk->sk_type     = osk->sk_type;
+	sk->sk_socket   = osk->sk_socket;
 	sk->sk_priority = osk->sk_priority;
 	sk->sk_protocol = osk->sk_protocol;
 	sk->sk_rcvbuf   = osk->sk_rcvbuf;
 	sk->sk_sndbuf   = osk->sk_sndbuf;
 	sk->sk_state    = TCP_ESTABLISHED;
-	sock_copy_flags(sk, osk);
+	sk->sk_sleep    = osk->sk_sleep;
+
+	if (sock_flag(osk, SOCK_ZAPPED))
+		sock_set_flag(sk, SOCK_ZAPPED);
+
+	if (sock_flag(osk, SOCK_DBG))
+		sock_set_flag(sk, SOCK_DBG);
 
 	skb_queue_head_init(&nr->ack_queue);
 	skb_queue_head_init(&nr->reseq_queue);
@@ -518,7 +495,6 @@ static int nr_release(struct socket *sock)
 	if (sk == NULL) return 0;
 
 	sock_hold(sk);
-	sock_orphan(sk);
 	lock_sock(sk);
 	nr = nr_sk(sk);
 
@@ -542,14 +518,17 @@ static int nr_release(struct socket *sock)
 		sk->sk_state    = TCP_CLOSE;
 		sk->sk_shutdown |= SEND_SHUTDOWN;
 		sk->sk_state_change(sk);
+		sock_orphan(sk);
 		sock_set_flag(sk, SOCK_DESTROY);
+		sk->sk_socket   = NULL;
 		break;
 
 	default:
+		sk->sk_socket = NULL;
 		break;
 	}
 
-	sock->sk   = NULL;
+	sock->sk   = NULL;	
 	release_sock(sk);
 	sock_put(sk);
 
@@ -562,8 +541,7 @@ static int nr_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	struct nr_sock *nr = nr_sk(sk);
 	struct full_sockaddr_ax25 *addr = (struct full_sockaddr_ax25 *)uaddr;
 	struct net_device *dev;
-	ax25_uid_assoc *user;
-	ax25_address *source;
+	ax25_address *user, *source;
 
 	lock_sock(sk);
 	if (!sock_flag(sk, SOCK_ZAPPED)) {
@@ -583,6 +561,7 @@ static int nr_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 		return -EINVAL;
 	}
 	if ((dev = nr_dev_get(&addr->fsa_ax25.sax25_call)) == NULL) {
+		SOCK_DEBUG(sk, "NET/ROM: bind failed: invalid node callsign\n");
 		release_sock(sk);
 		return -EADDRNOTAVAIL;
 	}
@@ -594,26 +573,23 @@ static int nr_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 		if (!capable(CAP_NET_BIND_SERVICE)) {
 			dev_put(dev);
 			release_sock(sk);
-			return -EPERM;
+			return -EACCES;
 		}
 		nr->user_addr   = addr->fsa_digipeater[0];
 		nr->source_addr = addr->fsa_ax25.sax25_call;
 	} else {
 		source = &addr->fsa_ax25.sax25_call;
 
-		user = ax25_findbyuid(current_euid());
-		if (user) {
-			nr->user_addr   = user->call;
-			ax25_uid_put(user);
-		} else {
+		if ((user = ax25_findbyuid(current->euid)) == NULL) {
 			if (ax25_uid_policy && !capable(CAP_NET_BIND_SERVICE)) {
 				release_sock(sk);
 				dev_put(dev);
 				return -EPERM;
 			}
-			nr->user_addr   = *source;
+			user = source;
 		}
 
+		nr->user_addr   = *user;
 		nr->source_addr = *source;
 	}
 
@@ -623,7 +599,7 @@ static int nr_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	sock_reset_flag(sk, SOCK_ZAPPED);
 	dev_put(dev);
 	release_sock(sk);
-
+	SOCK_DEBUG(sk, "NET/ROM: socket is bound\n");
 	return 0;
 }
 
@@ -633,61 +609,57 @@ static int nr_connect(struct socket *sock, struct sockaddr *uaddr,
 	struct sock *sk = sock->sk;
 	struct nr_sock *nr = nr_sk(sk);
 	struct sockaddr_ax25 *addr = (struct sockaddr_ax25 *)uaddr;
-	const ax25_address *source = NULL;
-	ax25_uid_assoc *user;
+	ax25_address *user, *source = NULL;
 	struct net_device *dev;
-	int err = 0;
 
 	lock_sock(sk);
 	if (sk->sk_state == TCP_ESTABLISHED && sock->state == SS_CONNECTING) {
 		sock->state = SS_CONNECTED;
-		goto out_release;	/* Connect completed during a ERESTARTSYS event */
+		release_sock(sk);
+		return 0;	/* Connect completed during a ERESTARTSYS event */
 	}
 
 	if (sk->sk_state == TCP_CLOSE && sock->state == SS_CONNECTING) {
 		sock->state = SS_UNCONNECTED;
-		err = -ECONNREFUSED;
-		goto out_release;
+		release_sock(sk);
+		return -ECONNREFUSED;
 	}
 
 	if (sk->sk_state == TCP_ESTABLISHED) {
-		err = -EISCONN;	/* No reconnect on a seqpacket socket */
-		goto out_release;
+		release_sock(sk);
+		return -EISCONN;	/* No reconnect on a seqpacket socket */
 	}
 
-	sk->sk_state   = TCP_CLOSE;
+	sk->sk_state   = TCP_CLOSE;	
 	sock->state = SS_UNCONNECTED;
 
 	if (addr_len != sizeof(struct sockaddr_ax25) && addr_len != sizeof(struct full_sockaddr_ax25)) {
-		err = -EINVAL;
-		goto out_release;
+		release_sock(sk);
+		return -EINVAL;
 	}
 	if (addr->sax25_family != AF_NETROM) {
-		err = -EINVAL;
-		goto out_release;
+		release_sock(sk);
+		return -EINVAL;
 	}
 	if (sock_flag(sk, SOCK_ZAPPED)) {	/* Must bind first - autobinding in this may or may not work */
 		sock_reset_flag(sk, SOCK_ZAPPED);
 
 		if ((dev = nr_dev_first()) == NULL) {
-			err = -ENETUNREACH;
-			goto out_release;
+			release_sock(sk);
+			return -ENETUNREACH;
 		}
-		source = (const ax25_address *)dev->dev_addr;
+		source = (ax25_address *)dev->dev_addr;
 
-		user = ax25_findbyuid(current_euid());
-		if (user) {
-			nr->user_addr   = user->call;
-			ax25_uid_put(user);
-		} else {
+		if ((user = ax25_findbyuid(current->euid)) == NULL) {
 			if (ax25_uid_policy && !capable(CAP_NET_ADMIN)) {
 				dev_put(dev);
-				err = -EPERM;
-				goto out_release;
+				release_sock(sk);
+				return -EPERM;
 			}
-			nr->user_addr   = *source;
+			user = source;
 		}
 
+		nr->user_addr   = *user;
 		nr->source_addr = *source;
 		nr->device      = dev;
 
@@ -718,56 +690,55 @@ static int nr_connect(struct socket *sock, struct sockaddr *uaddr,
 
 	/* Now the loop */
 	if (sk->sk_state != TCP_ESTABLISHED && (flags & O_NONBLOCK)) {
-		err = -EINPROGRESS;
-		goto out_release;
+		release_sock(sk);
+		return -EINPROGRESS;
 	}
-
+		
 	/*
 	 * A Connect Ack with Choke or timeout or failed routing will go to
 	 * closed.
 	 */
 	if (sk->sk_state == TCP_SYN_SENT) {
-		DEFINE_WAIT(wait);
+		struct task_struct *tsk = current;
+		DECLARE_WAITQUEUE(wait, tsk);
 
+		add_wait_queue(sk->sk_sleep, &wait);
 		for (;;) {
-			prepare_to_wait(sk_sleep(sk), &wait,
-					TASK_INTERRUPTIBLE);
+			set_current_state(TASK_INTERRUPTIBLE);
 			if (sk->sk_state != TCP_SYN_SENT)
 				break;
-			if (!signal_pending(current)) {
-				release_sock(sk);
+			release_sock(sk);
+			if (!signal_pending(tsk)) {
 				schedule();
 				lock_sock(sk);
 				continue;
 			}
-			err = -ERESTARTSYS;
-			break;
+			current->state = TASK_RUNNING;
+			remove_wait_queue(sk->sk_sleep, &wait);
+			return -ERESTARTSYS;
 		}
-		finish_wait(sk_sleep(sk), &wait);
-		if (err)
-			goto out_release;
+		current->state = TASK_RUNNING;
+		remove_wait_queue(sk->sk_sleep, &wait);
 	}
 
 	if (sk->sk_state != TCP_ESTABLISHED) {
 		sock->state = SS_UNCONNECTED;
-		err = sock_error(sk);	/* Always set at this point */
-		goto out_release;
+		release_sock(sk);
+		return sock_error(sk);	/* Always set at this point */
 	}
 
 	sock->state = SS_CONNECTED;
-
-out_release:
 	release_sock(sk);
 
-	return err;
+	return 0;
 }
 
-static int nr_accept(struct socket *sock, struct socket *newsock, int flags,
-		     bool kern)
+static int nr_accept(struct socket *sock, struct socket *newsock, int flags)
 {
+	struct task_struct *tsk = current;
+	DECLARE_WAITQUEUE(wait, tsk);
 	struct sk_buff *skb;
 	struct sock *newsk;
-	DEFINE_WAIT(wait);
 	struct sock *sk;
 	int err = 0;
 
@@ -777,63 +748,63 @@ static int nr_accept(struct socket *sock, struct socket *newsock, int flags,
 	lock_sock(sk);
 	if (sk->sk_type != SOCK_SEQPACKET) {
 		err = -EOPNOTSUPP;
-		goto out_release;
+		goto out;
 	}
 
 	if (sk->sk_state != TCP_LISTEN) {
 		err = -EINVAL;
-		goto out_release;
+		goto out;
 	}
 
 	/*
 	 *	The write queue this time is holding sockets ready to use
 	 *	hooked into the SABM we saved
 	 */
+	add_wait_queue(sk->sk_sleep, &wait);
 	for (;;) {
-		prepare_to_wait(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
 		skb = skb_dequeue(&sk->sk_receive_queue);
 		if (skb)
 			break;
 
+		current->state = TASK_INTERRUPTIBLE;
+		release_sock(sk);
 		if (flags & O_NONBLOCK) {
-			err = -EWOULDBLOCK;
-			break;
+			current->state = TASK_RUNNING;
+			remove_wait_queue(sk->sk_sleep, &wait);
+			return -EWOULDBLOCK;
 		}
-		if (!signal_pending(current)) {
-			release_sock(sk);
+		if (!signal_pending(tsk)) {
 			schedule();
 			lock_sock(sk);
 			continue;
 		}
-		err = -ERESTARTSYS;
-		break;
+		current->state = TASK_RUNNING;
+		remove_wait_queue(sk->sk_sleep, &wait);
+		return -ERESTARTSYS;
 	}
-	finish_wait(sk_sleep(sk), &wait);
-	if (err)
-		goto out_release;
+	current->state = TASK_RUNNING;
+	remove_wait_queue(sk->sk_sleep, &wait);
 
 	newsk = skb->sk;
-	sock_graft(newsk, newsock);
+	newsk->sk_socket = newsock;
+	newsk->sk_sleep = &newsock->wait;
 
 	/* Now attach up the new socket */
 	kfree_skb(skb);
-	sk_acceptq_removed(sk);
+	sk->sk_ack_backlog--;
+	newsock->sk = newsk;
 
-out_release:
+out:
 	release_sock(sk);
-
 	return err;
 }
 
 static int nr_getname(struct socket *sock, struct sockaddr *uaddr,
-	int peer)
+	int *uaddr_len, int peer)
 {
 	struct full_sockaddr_ax25 *sax = (struct full_sockaddr_ax25 *)uaddr;
 	struct sock *sk = sock->sk;
 	struct nr_sock *nr = nr_sk(sk);
-	int uaddr_len;
-
-	memset(&sax->fsa_ax25, 0, sizeof(struct sockaddr_ax25));
 
 	lock_sock(sk);
 	if (peer != 0) {
@@ -844,24 +815,23 @@ static int nr_getname(struct socket *sock, struct sockaddr *uaddr,
 		sax->fsa_ax25.sax25_family = AF_NETROM;
 		sax->fsa_ax25.sax25_ndigis = 1;
 		sax->fsa_ax25.sax25_call   = nr->user_addr;
-		memset(sax->fsa_digipeater, 0, sizeof(sax->fsa_digipeater));
 		sax->fsa_digipeater[0]     = nr->dest_addr;
-		uaddr_len = sizeof(struct full_sockaddr_ax25);
+		*uaddr_len = sizeof(struct full_sockaddr_ax25);
 	} else {
 		sax->fsa_ax25.sax25_family = AF_NETROM;
 		sax->fsa_ax25.sax25_ndigis = 0;
 		sax->fsa_ax25.sax25_call   = nr->source_addr;
-		uaddr_len = sizeof(struct sockaddr_ax25);
+		*uaddr_len = sizeof(struct sockaddr_ax25);
 	}
 	release_sock(sk);
 
-	return uaddr_len;
+	return 0;
 }
 
 int nr_rx_frame(struct sk_buff *skb, struct net_device *dev)
 {
 	struct sock *sk;
-	struct sock *make;
+	struct sock *make;	
 	struct nr_sock *nr_make;
 	ax25_address *src, *dest, *user;
 	unsigned short circuit_index, circuit_id;
@@ -869,7 +839,7 @@ int nr_rx_frame(struct sk_buff *skb, struct net_device *dev)
 	unsigned short frametype, flags, window, timeout;
 	int ret;
 
-	skb_orphan(skb);
+	skb->sk = NULL;		/* Initially we don't know who it's for */
 
 	/*
 	 *	skb->data points to the netrom frame start
@@ -885,16 +855,17 @@ int nr_rx_frame(struct sk_buff *skb, struct net_device *dev)
 	frametype          = skb->data[19] & 0x0F;
 	flags              = skb->data[19] & 0xF0;
 
+#ifdef CONFIG_INET
 	/*
 	 * Check for an incoming IP over NET/ROM frame.
 	 */
-	if (frametype == NR_PROTOEXT &&
-	    circuit_index == NR_PROTO_IP && circuit_id == NR_PROTO_IP) {
+	if (frametype == NR_PROTOEXT && circuit_index == NR_PROTO_IP && circuit_id == NR_PROTO_IP) {
 		skb_pull(skb, NR_NETWORK_LEN + NR_TRANSPORT_LEN);
-		skb_reset_transport_header(skb);
+		skb->h.raw = skb->data;
 
 		return nr_rx_ip(skb, dev);
 	}
+#endif
 
 	/*
 	 * Find an existing socket connection, based on circuit ID, if it's
@@ -917,8 +888,7 @@ int nr_rx_frame(struct sk_buff *skb, struct net_device *dev)
 	}
 
 	if (sk != NULL) {
-		bh_lock_sock(sk);
-		skb_reset_transport_header(skb);
+		skb->h.raw = skb->data;
 
 		if (frametype == NR_CONNACK && skb->len == 22)
 			nr_sk(sk)->bpqext = 1;
@@ -927,7 +897,6 @@ int nr_rx_frame(struct sk_buff *skb, struct net_device *dev)
 
 		ret = nr_process_rx_frame(sk, skb);
 		bh_unlock_sock(sk);
-		sock_put(sk);
 		return ret;
 	}
 
@@ -937,17 +906,17 @@ int nr_rx_frame(struct sk_buff *skb, struct net_device *dev)
 	if (frametype != NR_CONNREQ) {
 		/*
 		 * Here it would be nice to be able to send a reset but
-		 * NET/ROM doesn't have one.  We've tried to extend the protocol
-		 * by sending NR_CONNACK | NR_CHOKE_FLAGS replies but that
-		 * apparently kills BPQ boxes... :-(
-		 * So now we try to follow the established behaviour of
-		 * G8PZT's Xrouter which is sending packets with command type 7
-		 * as an extension of the protocol.
+		 * NET/ROM doesn't have one. The following hack would
+		 * have been a way to extend the protocol but apparently
+		 * it kills BPQ boxes... :-(
 		 */
-		if (sysctl_netrom_reset_circuit &&
-		    (frametype != NR_RESET || flags != 0))
-			nr_transmit_reset(skb, 1);
-
+#if 0
+		/*
+		 * Never reply to a CONNACK/CHOKE.
+		 */
+		if (frametype != NR_CONNACK || flags != NR_CHOKE_FLAG)
+			nr_transmit_refusal(skb, 1);
+#endif
 		return 0;
 	}
 
@@ -959,17 +928,13 @@ int nr_rx_frame(struct sk_buff *skb, struct net_device *dev)
 	    (make = nr_make_new(sk)) == NULL) {
 		nr_transmit_refusal(skb, 0);
 		if (sk)
-			sock_put(sk);
+			bh_unlock_sock(sk);
 		return 0;
 	}
 
-	bh_lock_sock(sk);
-
 	window = skb->data[20];
 
-	sock_hold(make);
 	skb->sk             = make;
-	skb->destructor     = sock_efree;
 	make->sk_state	    = TCP_ESTABLISHED;
 
 	/* Fill in his circuit details */
@@ -1012,28 +977,28 @@ int nr_rx_frame(struct sk_buff *skb, struct net_device *dev)
 	nr_make->vr        = 0;
 	nr_make->vl        = 0;
 	nr_make->state     = NR_STATE_3;
-	sk_acceptq_added(sk);
-	skb_queue_head(&sk->sk_receive_queue, skb);
-
-	if (!sock_flag(sk, SOCK_DEAD))
-		sk->sk_data_ready(sk);
-
-	bh_unlock_sock(sk);
-	sock_put(sk);
+	sk->sk_ack_backlog++;
 
 	nr_insert_socket(make);
+
+	skb_queue_head(&sk->sk_receive_queue, skb);
 
 	nr_start_heartbeat(make);
 	nr_start_idletimer(make);
 
+	if (!sock_flag(sk, SOCK_DEAD))
+		sk->sk_data_ready(sk, skb->len);
+
+	bh_unlock_sock(sk);
 	return 1;
 }
 
-static int nr_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
+static int nr_sendmsg(struct kiocb *iocb, struct socket *sock,
+		      struct msghdr *msg, size_t len)
 {
 	struct sock *sk = sock->sk;
 	struct nr_sock *nr = nr_sk(sk);
-	DECLARE_SOCKADDR(struct sockaddr_ax25 *, usax, msg->msg_name);
+	struct sockaddr_ax25 *usax = (struct sockaddr_ax25 *)msg->msg_name;
 	int err;
 	struct sockaddr_ax25 sax;
 	struct sk_buff *skb;
@@ -1083,26 +1048,23 @@ static int nr_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
 		sax.sax25_call   = nr->dest_addr;
 	}
 
-	/* Build a packet - the conventional user limit is 236 bytes. We can
-	   do ludicrously large NetROM frames but must not overflow */
-	if (len > 65536) {
-		err = -EMSGSIZE;
-		goto out;
-	}
+	SOCK_DEBUG(sk, "NET/ROM: sendto: Addresses built.\n");
 
+	/* Build a packet */
+	SOCK_DEBUG(sk, "NET/ROM: sendto: building packet.\n");
 	size = len + NR_NETWORK_LEN + NR_TRANSPORT_LEN;
 
 	if ((skb = sock_alloc_send_skb(sk, size, msg->msg_flags & MSG_DONTWAIT, &err)) == NULL)
 		goto out;
 
 	skb_reserve(skb, size - len);
-	skb_reset_transport_header(skb);
 
 	/*
 	 *	Push down the NET/ROM header
 	 */
 
 	asmptr = skb_push(skb, NR_TRANSPORT_LEN);
+	SOCK_DEBUG(sk, "Building NET/ROM Header.\n");
 
 	/* Build a NET/ROM Transport header */
 
@@ -1111,18 +1073,25 @@ static int nr_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
 	*asmptr++ = 0;		/* To be filled in later */
 	*asmptr++ = 0;		/*      Ditto            */
 	*asmptr++ = NR_INFO;
+	SOCK_DEBUG(sk, "Built header.\n");
 
 	/*
 	 *	Put the data on the end
 	 */
-	skb_put(skb, len);
+
+	skb->h.raw = skb_put(skb, len);
+
+	asmptr = skb->h.raw;
+	SOCK_DEBUG(sk, "NET/ROM: Appending user data\n");
 
 	/* User data follows immediately after the NET/ROM transport header */
-	if (memcpy_from_msg(skb_transport_header(skb), msg, len)) {
+	if (memcpy_fromiovec(asmptr, msg->msg_iov, len)) {
 		kfree_skb(skb);
 		err = -EFAULT;
 		goto out;
 	}
+
+	SOCK_DEBUG(sk, "NET/ROM: Transmitting buffer\n");
 
 	if (sk->sk_state != TCP_ESTABLISHED) {
 		kfree_skb(skb);
@@ -1138,11 +1107,11 @@ out:
 	return err;
 }
 
-static int nr_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
-		      int flags)
+static int nr_recvmsg(struct kiocb *iocb, struct socket *sock,
+		      struct msghdr *msg, size_t size, int flags)
 {
 	struct sock *sk = sock->sk;
-	DECLARE_SOCKADDR(struct sockaddr_ax25 *, sax, msg->msg_name);
+	struct sockaddr_ax25 *sax = (struct sockaddr_ax25 *)msg->msg_name;
 	size_t copied;
 	struct sk_buff *skb;
 	int er;
@@ -1159,13 +1128,12 @@ static int nr_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
 	}
 
 	/* Now we can treat all alike */
-	skb = skb_recv_datagram(sk, flags, &er);
-	if (!skb) {
+	if ((skb = skb_recv_datagram(sk, flags & ~MSG_DONTWAIT, flags & MSG_DONTWAIT, &er)) == NULL) {
 		release_sock(sk);
 		return er;
 	}
 
-	skb_reset_transport_header(skb);
+	skb->h.raw = skb->data;
 	copied     = skb->len;
 
 	if (copied > size) {
@@ -1173,20 +1141,14 @@ static int nr_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
 		msg->msg_flags |= MSG_TRUNC;
 	}
 
-	er = skb_copy_datagram_msg(skb, 0, msg, copied);
-	if (er < 0) {
-		skb_free_datagram(sk, skb);
-		release_sock(sk);
-		return er;
-	}
+	skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
 
 	if (sax != NULL) {
-		memset(sax, 0, sizeof(*sax));
 		sax->sax25_family = AF_NETROM;
-		skb_copy_from_linear_data_offset(skb, 7, sax->sax25_call.ax25_call,
-			      AX25_ADDR_LEN);
-		msg->msg_namelen = sizeof(*sax);
+		memcpy(sax->sax25_call.ax25_call, skb->data + 7, AX25_ADDR_LEN);
 	}
+
+	msg->msg_namelen = sizeof(*sax);
 
 	skb_free_datagram(sk, skb);
 
@@ -1199,13 +1161,13 @@ static int nr_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 {
 	struct sock *sk = sock->sk;
 	void __user *argp = (void __user *)arg;
+	int ret;
 
+	lock_sock(sk);
 	switch (cmd) {
 	case TIOCOUTQ: {
 		long amount;
-
-		lock_sock(sk);
-		amount = sk->sk_sndbuf - sk_wmem_alloc_get(sk);
+		amount = sk->sk_sndbuf - atomic_read(&sk->sk_wmem_alloc);
 		if (amount < 0)
 			amount = 0;
 		release_sock(sk);
@@ -1215,14 +1177,19 @@ static int nr_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 	case TIOCINQ: {
 		struct sk_buff *skb;
 		long amount = 0L;
-
-		lock_sock(sk);
 		/* These two are safe on a single CPU system as only user tasks fiddle here */
 		if ((skb = skb_peek(&sk->sk_receive_queue)) != NULL)
 			amount = skb->len;
 		release_sock(sk);
 		return put_user(amount, (int __user *)argp);
 	}
+
+	case SIOCGSTAMP:
+		ret = -EINVAL;
+		if (sk != NULL)
+			ret = sock_get_timestamp(sk, argp);
+		release_sock(sk);
+		return ret;
 
 	case SIOCGIFADDR:
 	case SIOCSIFADDR:
@@ -1234,18 +1201,21 @@ static int nr_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 	case SIOCSIFNETMASK:
 	case SIOCGIFMETRIC:
 	case SIOCSIFMETRIC:
+		release_sock(sk);
 		return -EINVAL;
 
 	case SIOCADDRT:
 	case SIOCDELRT:
 	case SIOCNRDECOBS:
-		if (!capable(CAP_NET_ADMIN))
-			return -EPERM;
+		release_sock(sk);
+		if (!capable(CAP_NET_ADMIN)) return -EPERM;
 		return nr_rt_ioctl(cmd, argp);
 
 	default:
-		return -ENOIOCTLCMD;
+		release_sock(sk);
+		return dev_ioctl(cmd, argp);
 	}
+	release_sock(sk);
 
 	return 0;
 }
@@ -1253,30 +1223,42 @@ static int nr_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 #ifdef CONFIG_PROC_FS
 
 static void *nr_info_start(struct seq_file *seq, loff_t *pos)
-	__acquires(&nr_list_lock)
 {
+	struct sock *s;
+	struct hlist_node *node;
+	int i = 1;
+
 	spin_lock_bh(&nr_list_lock);
-	return seq_hlist_start_head(&nr_list, *pos);
+	if (*pos == 0)
+		return SEQ_START_TOKEN;
+
+	sk_for_each(s, node, &nr_list) {
+		if (i == *pos)
+			return s;
+		++i;
+	}
+	return NULL;
 }
 
 static void *nr_info_next(struct seq_file *seq, void *v, loff_t *pos)
 {
-	return seq_hlist_next(v, &nr_list, pos);
-}
+	++*pos;
 
+	return (v == SEQ_START_TOKEN) ? sk_head(&nr_list) 
+		: sk_next((struct sock *)v);
+}
+	
 static void nr_info_stop(struct seq_file *seq, void *v)
-	__releases(&nr_list_lock)
 {
 	spin_unlock_bh(&nr_list_lock);
 }
 
 static int nr_info_show(struct seq_file *seq, void *v)
 {
-	struct sock *s = sk_entry(v);
+	struct sock *s = v;
 	struct net_device *dev;
 	struct nr_sock *nr;
 	const char *devname;
-	char buf[11];
 
 	if (v == SEQ_START_TOKEN)
 		seq_puts(seq,
@@ -1292,11 +1274,11 @@ static int nr_info_show(struct seq_file *seq, void *v)
 		else
 			devname = dev->name;
 
-		seq_printf(seq, "%-9s ", ax2asc(buf, &nr->user_addr));
-		seq_printf(seq, "%-9s ", ax2asc(buf, &nr->dest_addr));
-		seq_printf(seq,
+		seq_printf(seq, "%-9s ", ax2asc(&nr->user_addr));
+		seq_printf(seq, "%-9s ", ax2asc(&nr->dest_addr));
+		seq_printf(seq, 
 "%-9s %-3s  %02X/%02X %02X/%02X %2d %3d %3d %3d %3lu/%03lu %2lu/%02lu %3lu/%03lu %3lu/%03lu %2d/%02d %3d %5d %5d %ld\n",
-			ax2asc(buf, &nr->source_addr),
+			ax2asc(&nr->source_addr),
 			devname,
 			nr->my_index,
 			nr->my_id,
@@ -1317,8 +1299,8 @@ static int nr_info_show(struct seq_file *seq, void *v)
 			nr->n2count,
 			nr->n2,
 			nr->window,
-			sk_wmem_alloc_get(s),
-			sk_rmem_alloc_get(s),
+			atomic_read(&s->sk_wmem_alloc),
+			atomic_read(&s->sk_rmem_alloc),
 			s->sk_socket ? SOCK_INODE(s->sk_socket)->i_ino : 0L);
 
 		bh_unlock_sock(s);
@@ -1326,21 +1308,34 @@ static int nr_info_show(struct seq_file *seq, void *v)
 	return 0;
 }
 
-static const struct seq_operations nr_info_seqops = {
+static struct seq_operations nr_info_seqops = {
 	.start = nr_info_start,
 	.next = nr_info_next,
 	.stop = nr_info_stop,
 	.show = nr_info_show,
 };
+ 
+static int nr_info_open(struct inode *inode, struct file *file)
+{
+	return seq_open(file, &nr_info_seqops);
+}
+ 
+static struct file_operations nr_info_fops = {
+	.owner = THIS_MODULE,
+	.open = nr_info_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = seq_release,
+};
 #endif	/* CONFIG_PROC_FS */
 
-static const struct net_proto_family nr_family_ops = {
+static struct net_proto_family nr_family_ops = {
 	.family		=	PF_NETROM,
 	.create		=	nr_create,
 	.owner		=	THIS_MODULE,
 };
 
-static const struct proto_ops nr_proto_ops = {
+static struct proto_ops nr_proto_ops = {
 	.family		=	PF_NETROM,
 	.owner		=	THIS_MODULE,
 	.release	=	nr_release,
@@ -1351,7 +1346,6 @@ static const struct proto_ops nr_proto_ops = {
 	.getname	=	nr_getname,
 	.poll		=	datagram_poll,
 	.ioctl		=	nr_ioctl,
-	.gettstamp	=	sock_gettstamp,
 	.listen		=	nr_listen,
 	.shutdown	=	sock_no_shutdown,
 	.setsockopt	=	nr_setsockopt,
@@ -1368,117 +1362,81 @@ static struct notifier_block nr_dev_notifier = {
 
 static struct net_device **dev_nr;
 
-static struct ax25_protocol nr_pid = {
-	.pid	= AX25_P_NETROM,
-	.func	= nr_route_frame
-};
-
-static struct ax25_linkfail nr_linkfail_notifier = {
-	.func	= nr_link_failed,
-};
+static char banner[] __initdata = KERN_INFO "G4KLX NET/ROM for Linux. Version 0.7 for AX25.037 Linux 2.4\n";
 
 static int __init nr_proto_init(void)
 {
 	int i;
 	int rc = proto_register(&nr_proto, 0);
 
-	if (rc)
-		return rc;
+	if (rc != 0)
+		goto out;
 
 	if (nr_ndevs > 0x7fffffff/sizeof(struct net_device *)) {
-		pr_err("NET/ROM: %s - nr_ndevs parameter too large\n",
-		       __func__);
-		rc = -EINVAL;
-		goto unregister_proto;
+		printk(KERN_ERR "NET/ROM: nr_proto_init - nr_ndevs parameter to large\n");
+		return -1;
 	}
 
-	dev_nr = kcalloc(nr_ndevs, sizeof(struct net_device *), GFP_KERNEL);
-	if (!dev_nr) {
-		pr_err("NET/ROM: %s - unable to allocate device array\n",
-		       __func__);
-		rc = -ENOMEM;
-		goto unregister_proto;
+	dev_nr = kmalloc(nr_ndevs * sizeof(struct net_device *), GFP_KERNEL);
+	if (dev_nr == NULL) {
+		printk(KERN_ERR "NET/ROM: nr_proto_init - unable to allocate device array\n");
+		return -1;
 	}
+
+	memset(dev_nr, 0x00, nr_ndevs * sizeof(struct net_device *));
 
 	for (i = 0; i < nr_ndevs; i++) {
 		char name[IFNAMSIZ];
 		struct net_device *dev;
 
 		sprintf(name, "nr%d", i);
-		dev = alloc_netdev(0, name, NET_NAME_UNKNOWN, nr_setup);
+		dev = alloc_netdev(sizeof(struct net_device_stats), name,
+					  nr_setup);
 		if (!dev) {
-			rc = -ENOMEM;
+			printk(KERN_ERR "NET/ROM: nr_proto_init - unable to allocate device structure\n");
 			goto fail;
 		}
-
+		
 		dev->base_addr = i;
-		rc = register_netdev(dev);
-		if (rc) {
+		if (register_netdev(dev)) {
+			printk(KERN_ERR "NET/ROM: nr_proto_init - unable to register network device\n");
 			free_netdev(dev);
 			goto fail;
 		}
-		nr_set_lockdep_key(dev);
 		dev_nr[i] = dev;
 	}
 
-	rc = sock_register(&nr_family_ops);
-	if (rc)
+	if (sock_register(&nr_family_ops)) {
+		printk(KERN_ERR "NET/ROM: nr_proto_init - unable to register socket family\n");
 		goto fail;
+	}
+		
+	register_netdevice_notifier(&nr_dev_notifier);
+	printk(banner);
 
-	rc = register_netdevice_notifier(&nr_dev_notifier);
-	if (rc)
-		goto out_sock;
-
-	ax25_register_pid(&nr_pid);
-	ax25_linkfail_register(&nr_linkfail_notifier);
+	ax25_protocol_register(AX25_P_NETROM, nr_route_frame);
+	ax25_linkfail_register(nr_link_failed);
 
 #ifdef CONFIG_SYSCTL
-	rc = nr_register_sysctl();
-	if (rc)
-		goto out_sysctl;
+	nr_register_sysctl();
 #endif
 
 	nr_loopback_init();
 
-	rc = -ENOMEM;
-	if (!proc_create_seq("nr", 0444, init_net.proc_net, &nr_info_seqops))
-		goto proc_remove1;
-	if (!proc_create_seq("nr_neigh", 0444, init_net.proc_net,
-			     &nr_neigh_seqops))
-		goto proc_remove2;
-	if (!proc_create_seq("nr_nodes", 0444, init_net.proc_net,
-			     &nr_node_seqops))
-		goto proc_remove3;
-
-	return 0;
-
-proc_remove3:
-	remove_proc_entry("nr_neigh", init_net.proc_net);
-proc_remove2:
-	remove_proc_entry("nr", init_net.proc_net);
-proc_remove1:
-
-	nr_loopback_clear();
-	nr_rt_free();
-
-#ifdef CONFIG_SYSCTL
-	nr_unregister_sysctl();
-out_sysctl:
-#endif
-	ax25_linkfail_release(&nr_linkfail_notifier);
-	ax25_protocol_release(AX25_P_NETROM);
-	unregister_netdevice_notifier(&nr_dev_notifier);
-out_sock:
-	sock_unregister(PF_NETROM);
+	proc_net_fops_create("nr", S_IRUGO, &nr_info_fops);
+	proc_net_fops_create("nr_neigh", S_IRUGO, &nr_neigh_fops);
+	proc_net_fops_create("nr_nodes", S_IRUGO, &nr_nodes_fops);
+out:
+	return rc;
 fail:
 	while (--i >= 0) {
 		unregister_netdev(dev_nr[i]);
 		free_netdev(dev_nr[i]);
 	}
 	kfree(dev_nr);
-unregister_proto:
 	proto_unregister(&nr_proto);
-	return rc;
+	rc = -1;
+	goto out;
 }
 
 module_init(nr_proto_init);
@@ -1495,9 +1453,9 @@ static void __exit nr_exit(void)
 {
 	int i;
 
-	remove_proc_entry("nr", init_net.proc_net);
-	remove_proc_entry("nr_neigh", init_net.proc_net);
-	remove_proc_entry("nr_nodes", init_net.proc_net);
+	proc_net_remove("nr");
+	proc_net_remove("nr_neigh");
+	proc_net_remove("nr_nodes");
 	nr_loopback_clear();
 
 	nr_rt_free();
@@ -1506,7 +1464,7 @@ static void __exit nr_exit(void)
 	nr_unregister_sysctl();
 #endif
 
-	ax25_linkfail_release(&nr_linkfail_notifier);
+	ax25_linkfail_release(nr_link_failed);
 	ax25_protocol_release(AX25_P_NETROM);
 
 	unregister_netdevice_notifier(&nr_dev_notifier);

@@ -1,9 +1,23 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
+    ali15x3.c - Part of lm_sensors, Linux kernel modules for hardware
+              monitoring
     Copyright (c) 1999  Frodo Looijaard <frodol@dds.nl> and
     Philip Edelbrock <phil@netroedge.com> and
     Mark D. Studebaker <mdsxyz123@yahoo.com>
 
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 */
 
 /*
@@ -46,15 +60,17 @@
 
 /* Note: we assume there can only be one ALI15X3, with one SMBus interface */
 
+#include <linux/config.h>
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/kernel.h>
 #include <linux/stddef.h>
+#include <linux/sched.h>
 #include <linux/ioport.h>
 #include <linux/delay.h>
 #include <linux/i2c.h>
-#include <linux/acpi.h>
-#include <linux/io.h>
+#include <linux/init.h>
+#include <asm/io.h>
 
 /* ALI15X3 SMBus address offsets */
 #define SMBHSTSTS	(0 + ali15x3_smba)
@@ -110,13 +126,12 @@
 
 /* If force_addr is set to anything different from 0, we forcibly enable
    the device at the given address. */
-static u16 force_addr;
-module_param_hw(force_addr, ushort, ioport, 0);
+static u16 force_addr = 0;
+module_param(force_addr, ushort, 0);
 MODULE_PARM_DESC(force_addr,
 		 "Initialize the base address of the i2c controller");
 
-static struct pci_driver ali15x3_driver;
-static unsigned short ali15x3_smba;
+static unsigned short ali15x3_smba = 0;
 
 static int ali15x3_setup(struct pci_dev *ALI15X3_dev)
 {
@@ -152,12 +167,7 @@ static int ali15x3_setup(struct pci_dev *ALI15X3_dev)
 	if(force_addr)
 		ali15x3_smba = force_addr & ~(ALI15X3_SMB_IOSIZE - 1);
 
-	if (acpi_check_region(ali15x3_smba, ALI15X3_SMB_IOSIZE,
-			      ali15x3_driver.name))
-		return -EBUSY;
-
-	if (!request_region(ali15x3_smba, ALI15X3_SMB_IOSIZE,
-			    ali15x3_driver.name)) {
+	if (!request_region(ali15x3_smba, ALI15X3_SMB_IOSIZE, "ali15x3-smb")) {
 		dev_err(&ALI15X3_dev->dev,
 			"ALI15X3_smb region 0x%x already in use!\n",
 			ali15x3_smba);
@@ -272,7 +282,7 @@ static int ali15x3_transaction(struct i2c_adapter *adap)
 			dev_err(&adap->dev, "SMBus reset failed! (0x%02x) - "
 				"controller or device on bus is probably hung\n",
 				temp);
-			return -EBUSY;
+			return -1;
 		}
 	} else {
 		/* check and clear done bit */
@@ -293,24 +303,24 @@ static int ali15x3_transaction(struct i2c_adapter *adap)
 		 && (timeout++ < MAX_TIMEOUT));
 
 	/* If the SMBus is still busy, we give up */
-	if (timeout > MAX_TIMEOUT) {
-		result = -ETIMEDOUT;
+	if (timeout >= MAX_TIMEOUT) {
+		result = -1;
 		dev_err(&adap->dev, "SMBus Timeout!\n");
 	}
 
 	if (temp & ALI15X3_STS_TERM) {
-		result = -EIO;
+		result = -1;
 		dev_dbg(&adap->dev, "Error: Failed bus transaction\n");
 	}
 
 	/*
 	  Unfortunately the ALI SMB controller maps "no response" and "bus
-	  collision" into a single bit. No response is the usual case so don't
+	  collision" into a single bit. No reponse is the usual case so don't
 	  do a printk.
 	  This means that bus collisions go unreported.
 	*/
 	if (temp & ALI15X3_STS_COLL) {
-		result = -ENXIO;
+		result = -1;
 		dev_dbg(&adap->dev,
 			"Error: no response or bus collision ADD=%02x\n",
 			inb_p(SMBHSTADD));
@@ -318,7 +328,7 @@ static int ali15x3_transaction(struct i2c_adapter *adap)
 
 	/* haven't ever seen this */
 	if (temp & ALI15X3_STS_DEV) {
-		result = -EIO;
+		result = -1;
 		dev_err(&adap->dev, "Error: device error\n");
 	}
 	dev_dbg(&adap->dev, "Transaction (post): STS=%02x, CNT=%02x, CMD=%02x, "
@@ -328,7 +338,7 @@ static int ali15x3_transaction(struct i2c_adapter *adap)
 	return result;
 }
 
-/* Return negative errno on error. */
+/* Return -1 on error. */
 static s32 ali15x3_access(struct i2c_adapter * adap, u16 addr,
 		   unsigned short flags, char read_write, u8 command,
 		   int size, union i2c_smbus_data * data)
@@ -352,6 +362,9 @@ static s32 ali15x3_access(struct i2c_adapter * adap, u16 addr,
 	}
 
 	switch (size) {
+	case I2C_SMBUS_PROC_CALL:
+		dev_err(&adap->dev, "I2C_SMBUS_PROC_CALL not supported!\n");
+		return -1;
 	case I2C_SMBUS_QUICK:
 		outb_p(((addr & 0x7f) << 1) | (read_write & 0x01),
 		       SMBHSTADD);
@@ -404,16 +417,12 @@ static s32 ali15x3_access(struct i2c_adapter * adap, u16 addr,
 		}
 		size = ALI15X3_BLOCK_DATA;
 		break;
-	default:
-		dev_warn(&adap->dev, "Unsupported transaction %d\n", size);
-		return -EOPNOTSUPP;
 	}
 
 	outb_p(size, SMBHSTCNT);	/* output command */
 
-	temp = ali15x3_transaction(adap);
-	if (temp)
-		return temp;
+	if (ali15x3_transaction(adap))	/* Error in transaction */
+		return -1;
 
 	if ((read_write == I2C_SMBUS_WRITE) || (size == ALI15X3_QUICK))
 		return 0;
@@ -453,25 +462,28 @@ static u32 ali15x3_func(struct i2c_adapter *adapter)
 	    I2C_FUNC_SMBUS_BLOCK_DATA;
 }
 
-static const struct i2c_algorithm smbus_algorithm = {
+static struct i2c_algorithm smbus_algorithm = {
+	.name		= "Non-I2C SMBus adapter",
+	.id		= I2C_ALGO_SMBUS,
 	.smbus_xfer	= ali15x3_access,
 	.functionality	= ali15x3_func,
 };
 
 static struct i2c_adapter ali15x3_adapter = {
 	.owner		= THIS_MODULE,
-	.class          = I2C_CLASS_HWMON | I2C_CLASS_SPD,
+	.class          = I2C_CLASS_HWMON,
 	.algo		= &smbus_algorithm,
+	.name		= "unset",
 };
 
-static const struct pci_device_id ali15x3_ids[] = {
+static struct pci_device_id ali15x3_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_AL, PCI_DEVICE_ID_AL_M7101) },
 	{ 0, }
 };
 
 MODULE_DEVICE_TABLE (pci, ali15x3_ids);
 
-static int ali15x3_probe(struct pci_dev *dev, const struct pci_device_id *id)
+static int __devinit ali15x3_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
 	if (ali15x3_setup(dev)) {
 		dev_err(&dev->dev,
@@ -479,15 +491,15 @@ static int ali15x3_probe(struct pci_dev *dev, const struct pci_device_id *id)
 		return -ENODEV;
 	}
 
-	/* set up the sysfs linkage to our parent device */
+	/* set up the driverfs linkage to our parent device */
 	ali15x3_adapter.dev.parent = &dev->dev;
 
-	snprintf(ali15x3_adapter.name, sizeof(ali15x3_adapter.name),
+	snprintf(ali15x3_adapter.name, I2C_NAME_SIZE,
 		"SMBus ALI15X3 adapter at %04x", ali15x3_smba);
 	return i2c_add_adapter(&ali15x3_adapter);
 }
 
-static void ali15x3_remove(struct pci_dev *dev)
+static void __devexit ali15x3_remove(struct pci_dev *dev)
 {
 	i2c_del_adapter(&ali15x3_adapter);
 	release_region(ali15x3_smba, ALI15X3_SMB_IOSIZE);
@@ -497,13 +509,24 @@ static struct pci_driver ali15x3_driver = {
 	.name		= "ali15x3_smbus",
 	.id_table	= ali15x3_ids,
 	.probe		= ali15x3_probe,
-	.remove		= ali15x3_remove,
+	.remove		= __devexit_p(ali15x3_remove),
 };
 
-module_pci_driver(ali15x3_driver);
+static int __init i2c_ali15x3_init(void)
+{
+	return pci_register_driver(&ali15x3_driver);
+}
 
-MODULE_AUTHOR("Frodo Looijaard <frodol@dds.nl>");
-MODULE_AUTHOR("Philip Edelbrock <phil@netroedge.com>");
-MODULE_AUTHOR("Mark D. Studebaker <mdsxyz123@yahoo.com>");
+static void __exit i2c_ali15x3_exit(void)
+{
+	pci_unregister_driver(&ali15x3_driver);
+}
+
+MODULE_AUTHOR ("Frodo Looijaard <frodol@dds.nl>, "
+		"Philip Edelbrock <phil@netroedge.com>, "
+		"and Mark D. Studebaker <mdsxyz123@yahoo.com>");
 MODULE_DESCRIPTION("ALI15X3 SMBus driver");
 MODULE_LICENSE("GPL");
+
+module_init(i2c_ali15x3_init);
+module_exit(i2c_ali15x3_exit);

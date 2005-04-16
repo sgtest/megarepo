@@ -32,8 +32,7 @@
  */
 #include <linux/kernel.h>
 #include <linux/bitops.h>
-
-#include <asm/div64.h>
+#include <asm/ptrace.h>
 #include <asm/vfp.h>
 
 #include "vfpinstr.h"
@@ -197,14 +196,12 @@ u32 vfp_single_normaliseround(int sd, struct vfp_single *vs, u32 fpscr, u32 exce
 	vfp_single_dump("pack: final", vs);
 	{
 		s32 d = vfp_single_pack(vs);
-#ifdef DEBUG
 		pr_debug("VFP: %s: d(s%d)=%08x exceptions=%08x\n", func,
 			 sd, d, exceptions);
-#endif
-		vfp_put_float(d, sd);
+		vfp_put_float(sd, d);
 	}
 
-	return exceptions;
+	return exceptions & ~VFP_NAN_FLAG;
 }
 
 /*
@@ -258,19 +255,19 @@ vfp_propagate_nan(struct vfp_single *vsd, struct vfp_single *vsn,
  */
 static u32 vfp_single_fabs(int sd, int unused, s32 m, u32 fpscr)
 {
-	vfp_put_float(vfp_single_packed_abs(m), sd);
+	vfp_put_float(sd, vfp_single_packed_abs(m));
 	return 0;
 }
 
 static u32 vfp_single_fcpy(int sd, int unused, s32 m, u32 fpscr)
 {
-	vfp_put_float(m, sd);
+	vfp_put_float(sd, m);
 	return 0;
 }
 
 static u32 vfp_single_fneg(int sd, int unused, s32 m, u32 fpscr)
 {
-	vfp_put_float(vfp_single_packed_negate(m), sd);
+	vfp_put_float(sd, vfp_single_packed_negate(m));
 	return 0;
 }
 
@@ -290,7 +287,7 @@ u32 vfp_estimate_sqrt_significand(u32 exponent, u32 significand)
 	u32 z, a;
 
 	if ((significand & 0xc0000000) != 0x40000000) {
-		pr_warn("VFP: estimate_sqrt: invalid significand\n");
+		printk(KERN_WARNING "VFP: estimate_sqrt: invalid significand\n");
 	}
 
 	a = significand << 1;
@@ -306,11 +303,7 @@ u32 vfp_estimate_sqrt_significand(u32 exponent, u32 significand)
 		if (z <= a)
 			return (s32)a >> 1;
 	}
-	{
-		u64 v = (u64)a << 31;
-		do_div(v, z);
-		return v + (z >> 1);
-	}
+	return (u32)(((u64)a << 31) / z) + (z >> 1);
 }
 
 static u32 vfp_single_fsqrt(int sd, int unused, s32 m, u32 fpscr)
@@ -334,7 +327,7 @@ static u32 vfp_single_fsqrt(int sd, int unused, s32 m, u32 fpscr)
 			vsp = &vfp_single_default_qnan;
 			ret = FPSCR_IOC;
 		}
-		vfp_put_float(vfp_single_pack(vsp), sd);
+		vfp_put_float(sd, vfp_single_pack(vsp));
 		return ret;
 	}
 
@@ -507,7 +500,7 @@ static u32 vfp_single_fcvtd(int dd, int unused, s32 m, u32 fpscr)
 	 */
 	if (tm & (VFP_INFINITY|VFP_NAN)) {
 		vdd.exponent = 2047;
-		if (tm == VFP_QNAN)
+		if (tm & VFP_NAN)
 			vdd.significand |= VFP_DOUBLE_SIGNIFICAND_QNAN;
 		goto pack_nan;
 	} else if (tm & VFP_ZERO)
@@ -515,10 +508,14 @@ static u32 vfp_single_fcvtd(int dd, int unused, s32 m, u32 fpscr)
 	else
 		vdd.exponent = vsm.exponent + (1023 - 127);
 
+	/*
+	 * Technically, if bit 0 of dd is set, this is an invalid
+	 * instruction.  However, we ignore this for efficiency.
+	 */
 	return vfp_double_normaliseround(dd, &vdd, fpscr, exceptions, "fcvtd");
 
  pack_nan:
-	vfp_put_double(vfp_double_pack(&vdd), dd);
+	vfp_put_double(dd, vfp_double_pack(&vdd));
 	return exceptions;
 }
 
@@ -614,7 +611,7 @@ static u32 vfp_single_ftoui(int sd, int unused, s32 m, u32 fpscr)
 
 	pr_debug("VFP: ftoui: d(s%d)=%08x exceptions=%08x\n", sd, d, exceptions);
 
-	vfp_put_float(d, sd);
+	vfp_put_float(sd, d);
 
 	return exceptions;
 }
@@ -629,7 +626,6 @@ static u32 vfp_single_ftosi(int sd, int unused, s32 m, u32 fpscr)
 	struct vfp_single vsm;
 	u32 d, exceptions = 0;
 	int rmode = fpscr & FPSCR_RMODE_MASK;
-	int tm;
 
 	vfp_single_unpack(&vsm, m);
 	vfp_single_dump("VSM", &vsm);
@@ -637,14 +633,10 @@ static u32 vfp_single_ftosi(int sd, int unused, s32 m, u32 fpscr)
 	/*
 	 * Do we have a denormalised number?
 	 */
-	tm = vfp_single_type(&vsm);
 	if (vfp_single_type(&vsm) & VFP_DENORMAL)
 		exceptions |= FPSCR_IDC;
 
-	if (tm & VFP_NAN) {
-		d = 0;
-		exceptions |= FPSCR_IOC;
-	} else if (vsm.exponent >= 127 + 32) {
+	if (vsm.exponent >= 127 + 32) {
 		/*
 		 * m >= 2^31-2^7: invalid
 		 */
@@ -693,7 +685,7 @@ static u32 vfp_single_ftosi(int sd, int unused, s32 m, u32 fpscr)
 
 	pr_debug("VFP: ftosi: d(s%d)=%08x exceptions=%08x\n", sd, d, exceptions);
 
-	vfp_put_float((s32)d, sd);
+	vfp_put_float(sd, (s32)d);
 
 	return exceptions;
 }
@@ -703,22 +695,22 @@ static u32 vfp_single_ftosiz(int sd, int unused, s32 m, u32 fpscr)
 	return vfp_single_ftosi(sd, unused, m, FPSCR_ROUND_TOZERO);
 }
 
-static struct op fops_ext[32] = {
-	[FEXT_TO_IDX(FEXT_FCPY)]	= { vfp_single_fcpy,   0 },
-	[FEXT_TO_IDX(FEXT_FABS)]	= { vfp_single_fabs,   0 },
-	[FEXT_TO_IDX(FEXT_FNEG)]	= { vfp_single_fneg,   0 },
-	[FEXT_TO_IDX(FEXT_FSQRT)]	= { vfp_single_fsqrt,  0 },
-	[FEXT_TO_IDX(FEXT_FCMP)]	= { vfp_single_fcmp,   OP_SCALAR },
-	[FEXT_TO_IDX(FEXT_FCMPE)]	= { vfp_single_fcmpe,  OP_SCALAR },
-	[FEXT_TO_IDX(FEXT_FCMPZ)]	= { vfp_single_fcmpz,  OP_SCALAR },
-	[FEXT_TO_IDX(FEXT_FCMPEZ)]	= { vfp_single_fcmpez, OP_SCALAR },
-	[FEXT_TO_IDX(FEXT_FCVT)]	= { vfp_single_fcvtd,  OP_SCALAR|OP_DD },
-	[FEXT_TO_IDX(FEXT_FUITO)]	= { vfp_single_fuito,  OP_SCALAR },
-	[FEXT_TO_IDX(FEXT_FSITO)]	= { vfp_single_fsito,  OP_SCALAR },
-	[FEXT_TO_IDX(FEXT_FTOUI)]	= { vfp_single_ftoui,  OP_SCALAR },
-	[FEXT_TO_IDX(FEXT_FTOUIZ)]	= { vfp_single_ftouiz, OP_SCALAR },
-	[FEXT_TO_IDX(FEXT_FTOSI)]	= { vfp_single_ftosi,  OP_SCALAR },
-	[FEXT_TO_IDX(FEXT_FTOSIZ)]	= { vfp_single_ftosiz, OP_SCALAR },
+static u32 (* const fop_extfns[32])(int sd, int unused, s32 m, u32 fpscr) = {
+	[FEXT_TO_IDX(FEXT_FCPY)]	= vfp_single_fcpy,
+	[FEXT_TO_IDX(FEXT_FABS)]	= vfp_single_fabs,
+	[FEXT_TO_IDX(FEXT_FNEG)]	= vfp_single_fneg,
+	[FEXT_TO_IDX(FEXT_FSQRT)]	= vfp_single_fsqrt,
+	[FEXT_TO_IDX(FEXT_FCMP)]	= vfp_single_fcmp,
+	[FEXT_TO_IDX(FEXT_FCMPE)]	= vfp_single_fcmpe,
+	[FEXT_TO_IDX(FEXT_FCMPZ)]	= vfp_single_fcmpz,
+	[FEXT_TO_IDX(FEXT_FCMPEZ)]	= vfp_single_fcmpez,
+	[FEXT_TO_IDX(FEXT_FCVT)]	= vfp_single_fcvtd,
+	[FEXT_TO_IDX(FEXT_FUITO)]	= vfp_single_fuito,
+	[FEXT_TO_IDX(FEXT_FSITO)]	= vfp_single_fsito,
+	[FEXT_TO_IDX(FEXT_FTOUI)]	= vfp_single_ftoui,
+	[FEXT_TO_IDX(FEXT_FTOUIZ)]	= vfp_single_ftouiz,
+	[FEXT_TO_IDX(FEXT_FTOSI)]	= vfp_single_ftosi,
+	[FEXT_TO_IDX(FEXT_FTOSIZ)]	= vfp_single_ftosiz,
 };
 
 
@@ -915,8 +907,6 @@ vfp_single_multiply_accumulate(int sd, int sn, s32 m, u32 fpscr, u32 negate, cha
 	v = vfp_get_float(sd);
 	pr_debug("VFP: s%u = %08x\n", sd, v);
 	vfp_single_unpack(&vsn, v);
-	if (vsn.exponent == 0 && vsn.significand)
-		vfp_single_normalise_denormal(&vsn);
 	if (negate & NEG_SUBTRACT)
 		vsn.sign = vfp_sign_negate(vsn.sign);
 
@@ -1117,11 +1107,7 @@ static u32 vfp_single_fdiv(int sd, int sn, s32 m, u32 fpscr)
 		vsn.significand >>= 1;
 		vsd.exponent++;
 	}
-	{
-		u64 significand = (u64)vsn.significand << 32;
-		do_div(significand, vsm.significand);
-		vsd.significand = significand;
-	}
+	vsd.significand = ((u64)vsn.significand << 32) / vsm.significand;
 	if ((vsd.significand & 0x3f) == 0)
 		vsd.significand |= ((u64)vsm.significand * vsd.significand != (u64)vsn.significand << 32);
 
@@ -1130,7 +1116,7 @@ static u32 vfp_single_fdiv(int sd, int sn, s32 m, u32 fpscr)
  vsn_nan:
 	exceptions = vfp_propagate_nan(&vsd, &vsn, &vsm, fpscr);
  pack:
-	vfp_put_float(vfp_single_pack(&vsd), sd);
+	vfp_put_float(sd, vfp_single_pack(&vsd));
 	return exceptions;
 
  vsm_nan:
@@ -1150,20 +1136,20 @@ static u32 vfp_single_fdiv(int sd, int sn, s32 m, u32 fpscr)
 	goto pack;
 
  invalid:
-	vfp_put_float(vfp_single_pack(&vfp_single_default_qnan), sd);
+	vfp_put_float(sd, vfp_single_pack(&vfp_single_default_qnan));
 	return FPSCR_IOC;
 }
 
-static struct op fops[16] = {
-	[FOP_TO_IDX(FOP_FMAC)]	= { vfp_single_fmac,  0 },
-	[FOP_TO_IDX(FOP_FNMAC)]	= { vfp_single_fnmac, 0 },
-	[FOP_TO_IDX(FOP_FMSC)]	= { vfp_single_fmsc,  0 },
-	[FOP_TO_IDX(FOP_FNMSC)]	= { vfp_single_fnmsc, 0 },
-	[FOP_TO_IDX(FOP_FMUL)]	= { vfp_single_fmul,  0 },
-	[FOP_TO_IDX(FOP_FNMUL)]	= { vfp_single_fnmul, 0 },
-	[FOP_TO_IDX(FOP_FADD)]	= { vfp_single_fadd,  0 },
-	[FOP_TO_IDX(FOP_FSUB)]	= { vfp_single_fsub,  0 },
-	[FOP_TO_IDX(FOP_FDIV)]	= { vfp_single_fdiv,  0 },
+static u32 (* const fop_fns[16])(int sd, int sn, s32 m, u32 fpscr) = {
+	[FOP_TO_IDX(FOP_FMAC)]	= vfp_single_fmac,
+	[FOP_TO_IDX(FOP_FNMAC)]	= vfp_single_fnmac,
+	[FOP_TO_IDX(FOP_FMSC)]	= vfp_single_fmsc,
+	[FOP_TO_IDX(FOP_FNMSC)]	= vfp_single_fnmsc,
+	[FOP_TO_IDX(FOP_FMUL)]	= vfp_single_fmul,
+	[FOP_TO_IDX(FOP_FNMUL)]	= vfp_single_fnmul,
+	[FOP_TO_IDX(FOP_FADD)]	= vfp_single_fadd,
+	[FOP_TO_IDX(FOP_FSUB)]	= vfp_single_fsub,
+	[FOP_TO_IDX(FOP_FDIV)]	= vfp_single_fdiv,
 };
 
 #define FREG_BANK(x)	((x) & 0x18)
@@ -1173,68 +1159,60 @@ u32 vfp_single_cpdo(u32 inst, u32 fpscr)
 {
 	u32 op = inst & FOP_MASK;
 	u32 exceptions = 0;
-	unsigned int dest;
+	unsigned int sd = vfp_get_sd(inst);
 	unsigned int sn = vfp_get_sn(inst);
 	unsigned int sm = vfp_get_sm(inst);
 	unsigned int vecitr, veclen, vecstride;
-	struct op *fop;
+	u32 (*fop)(int, int, s32, u32);
 
+	veclen = fpscr & FPSCR_LENGTH_MASK;
 	vecstride = 1 + ((fpscr & FPSCR_STRIDE_MASK) == FPSCR_STRIDE_MASK);
-
-	fop = (op == FOP_EXT) ? &fops_ext[FEXT_TO_IDX(inst)] : &fops[FOP_TO_IDX(op)];
-
-	/*
-	 * fcvtsd takes a dN register number as destination, not sN.
-	 * Technically, if bit 0 of dd is set, this is an invalid
-	 * instruction.  However, we ignore this for efficiency.
-	 * It also only operates on scalars.
-	 */
-	if (fop->flags & OP_DD)
-		dest = vfp_get_dd(inst);
-	else
-		dest = vfp_get_sd(inst);
 
 	/*
 	 * If destination bank is zero, vector length is always '1'.
 	 * ARM DDI0100F C5.1.3, C5.3.2.
 	 */
-	if ((fop->flags & OP_SCALAR) || FREG_BANK(dest) == 0)
+	if (FREG_BANK(sd) == 0)
 		veclen = 0;
-	else
-		veclen = fpscr & FPSCR_LENGTH_MASK;
 
 	pr_debug("VFP: vecstride=%u veclen=%u\n", vecstride,
 		 (veclen >> FPSCR_LENGTH_BIT) + 1);
 
-	if (!fop->fn)
+	fop = (op == FOP_EXT) ? fop_extfns[sn] : fop_fns[FOP_TO_IDX(op)];
+	if (!fop)
 		goto invalid;
 
 	for (vecitr = 0; vecitr <= veclen; vecitr += 1 << FPSCR_LENGTH_BIT) {
 		s32 m = vfp_get_float(sm);
 		u32 except;
-		char type;
 
-		type = fop->flags & OP_DD ? 'd' : 's';
 		if (op == FOP_EXT)
-			pr_debug("VFP: itr%d (%c%u) = op[%u] (s%u=%08x)\n",
-				 vecitr >> FPSCR_LENGTH_BIT, type, dest, sn,
-				 sm, m);
+			pr_debug("VFP: itr%d (s%u) = op[%u] (s%u=%08x)\n",
+				 vecitr >> FPSCR_LENGTH_BIT, sd, sn, sm, m);
 		else
-			pr_debug("VFP: itr%d (%c%u) = (s%u) op[%u] (s%u=%08x)\n",
-				 vecitr >> FPSCR_LENGTH_BIT, type, dest, sn,
+			pr_debug("VFP: itr%d (s%u) = (s%u) op[%u] (s%u=%08x)\n",
+				 vecitr >> FPSCR_LENGTH_BIT, sd, sn,
 				 FOP_TO_IDX(op), sm, m);
 
-		except = fop->fn(dest, sn, m, fpscr);
+		except = fop(sd, sn, m, fpscr);
 		pr_debug("VFP: itr%d: exceptions=%08x\n",
 			 vecitr >> FPSCR_LENGTH_BIT, except);
 
 		exceptions |= except;
 
 		/*
+		 * This ensures that comparisons only operate on scalars;
+		 * comparisons always return with one FPSCR status bit set.
+		 */
+		if (except & (FPSCR_N|FPSCR_Z|FPSCR_C|FPSCR_V))
+			break;
+
+		/*
 		 * CHECK: It appears to be undefined whether we stop when
 		 * we encounter an exception.  We continue.
 		 */
-		dest = FREG_BANK(dest) + ((FREG_IDX(dest) + vecstride) & 7);
+
+		sd = FREG_BANK(sd) + ((FREG_IDX(sd) + vecstride) & 7);
 		sn = FREG_BANK(sn) + ((FREG_IDX(sn) + vecstride) & 7);
 		if (FREG_BANK(sm) != 0)
 			sm = FREG_BANK(sm) + ((FREG_IDX(sm) + vecstride) & 7);

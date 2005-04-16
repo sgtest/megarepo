@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Wrapper functions for accessing the file_struct fd array.
  */
@@ -6,107 +5,80 @@
 #ifndef __LINUX_FILE_H
 #define __LINUX_FILE_H
 
-#include <linux/compiler.h>
-#include <linux/types.h>
+#include <asm/atomic.h>
 #include <linux/posix_types.h>
-#include <linux/errno.h>
+#include <linux/compiler.h>
+#include <linux/spinlock.h>
 
-struct file;
+/*
+ * The default fd array needs to be at least BITS_PER_LONG,
+ * as this is the granularity returned by copy_fdset().
+ */
+#define NR_OPEN_DEFAULT BITS_PER_LONG
 
-extern void fput(struct file *);
+/*
+ * Open file table structure
+ */
+struct files_struct {
+        atomic_t count;
+        spinlock_t file_lock;     /* Protects all the below members.  Nests inside tsk->alloc_lock */
+        int max_fds;
+        int max_fdset;
+        int next_fd;
+        struct file ** fd;      /* current fd array */
+        fd_set *close_on_exec;
+        fd_set *open_fds;
+        fd_set close_on_exec_init;
+        fd_set open_fds_init;
+        struct file * fd_array[NR_OPEN_DEFAULT];
+};
 
-struct file_operations;
-struct task_struct;
-struct vfsmount;
-struct dentry;
-struct inode;
-struct path;
-extern struct file *alloc_file_pseudo(struct inode *, struct vfsmount *,
-	const char *, int flags, const struct file_operations *);
-extern struct file *alloc_file_clone(struct file *, int flags,
-	const struct file_operations *);
+extern void FASTCALL(__fput(struct file *));
+extern void FASTCALL(fput(struct file *));
 
 static inline void fput_light(struct file *file, int fput_needed)
 {
-	if (fput_needed)
+	if (unlikely(fput_needed))
 		fput(file);
 }
 
-struct fd {
-	struct file *file;
-	unsigned int flags;
-};
-#define FDPUT_FPUT       1
-#define FDPUT_POS_UNLOCK 2
+extern struct file * FASTCALL(fget(unsigned int fd));
+extern struct file * FASTCALL(fget_light(unsigned int fd, int *fput_needed));
+extern void FASTCALL(set_close_on_exec(unsigned int fd, int flag));
+extern void put_filp(struct file *);
+extern int get_unused_fd(void);
+extern void FASTCALL(put_unused_fd(unsigned int fd));
+struct kmem_cache_s;
+extern void filp_ctor(void * objp, struct kmem_cache_s *cachep, unsigned long cflags);
+extern void filp_dtor(void * objp, struct kmem_cache_s *cachep, unsigned long dflags);
 
-static inline void fdput(struct fd fd)
+extern struct file ** alloc_fd_array(int);
+extern void free_fd_array(struct file **, int);
+
+extern fd_set *alloc_fdset(int);
+extern void free_fdset(fd_set *, int);
+
+extern int expand_files(struct files_struct *, int nr);
+
+static inline struct file * fcheck_files(struct files_struct *files, unsigned int fd)
 {
-	if (fd.flags & FDPUT_FPUT)
-		fput(fd.file);
+	struct file * file = NULL;
+
+	if (fd < files->max_fds)
+		file = files->fd[fd];
+	return file;
 }
 
-extern struct file *fget(unsigned int fd);
-extern struct file *fget_raw(unsigned int fd);
-extern struct file *fget_task(struct task_struct *task, unsigned int fd);
-extern unsigned long __fdget(unsigned int fd);
-extern unsigned long __fdget_raw(unsigned int fd);
-extern unsigned long __fdget_pos(unsigned int fd);
-extern void __f_unlock_pos(struct file *);
+/*
+ * Check whether the specified fd has an open file.
+ */
+#define fcheck(fd)	fcheck_files(current->files, fd)
 
-static inline struct fd __to_fd(unsigned long v)
-{
-	return (struct fd){(struct file *)(v & ~3),v & 3};
-}
+extern void FASTCALL(fd_install(unsigned int fd, struct file * file));
 
-static inline struct fd fdget(unsigned int fd)
-{
-	return __to_fd(__fdget(fd));
-}
+struct task_struct;
 
-static inline struct fd fdget_raw(unsigned int fd)
-{
-	return __to_fd(__fdget_raw(fd));
-}
-
-static inline struct fd fdget_pos(int fd)
-{
-	return __to_fd(__fdget_pos(fd));
-}
-
-static inline void fdput_pos(struct fd f)
-{
-	if (f.flags & FDPUT_POS_UNLOCK)
-		__f_unlock_pos(f.file);
-	fdput(f);
-}
-
-extern int f_dupfd(unsigned int from, struct file *file, unsigned flags);
-extern int replace_fd(unsigned fd, struct file *file, unsigned flags);
-extern void set_close_on_exec(unsigned int fd, int flag);
-extern bool get_close_on_exec(unsigned int fd);
-extern int __get_unused_fd_flags(unsigned flags, unsigned long nofile);
-extern int get_unused_fd_flags(unsigned flags);
-extern void put_unused_fd(unsigned int fd);
-
-extern void fd_install(unsigned int fd, struct file *file);
-
-extern int __receive_fd(struct file *file, int __user *ufd,
-			unsigned int o_flags);
-
-extern int receive_fd(struct file *file, unsigned int o_flags);
-
-static inline int receive_fd_user(struct file *file, int __user *ufd,
-				  unsigned int o_flags)
-{
-	if (ufd == NULL)
-		return -EFAULT;
-	return __receive_fd(file, ufd, o_flags);
-}
-int receive_fd_replace(int new_fd, struct file *file, unsigned int o_flags);
-
-extern void flush_delayed_fput(void);
-extern void __fput_sync(struct file *);
-
-extern unsigned int sysctl_nr_open_min, sysctl_nr_open_max;
+struct files_struct *get_files_struct(struct task_struct *);
+void FASTCALL(put_files_struct(struct files_struct *fs));
 
 #endif /* __LINUX_FILE_H */

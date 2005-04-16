@@ -1,4 +1,5 @@
-/*
+/* $Id: fault.c,v 1.5 2000/01/26 16:20:29 jsm Exp $
+ *
  * This file is subject to the terms and conditions of the GNU General Public
  * License.  See the file "COPYING" in the main directory of this archive
  * for more details.
@@ -13,16 +14,19 @@
 #include <linux/mm.h>
 #include <linux/ptrace.h>
 #include <linux/sched.h>
-#include <linux/sched/debug.h>
 #include <linux/interrupt.h>
-#include <linux/extable.h>
-#include <linux/uaccess.h>
-#include <linux/hugetlb.h>
-#include <linux/perf_event.h>
+#include <linux/module.h>
 
+#include <asm/uaccess.h>
 #include <asm/traps.h>
 
-#define DEBUG_NATLB 0
+#define PRINT_USER_FAULTS /* (turn this on if you want user faults to be */
+			 /*  dumped to the console via printk)          */
+
+
+/* Defines for parisc_acctyp()	*/
+#define READ		0
+#define WRITE		1
 
 /* Various important other fields */
 #define bit22set(x)		(x & 0x00000200)
@@ -33,12 +37,12 @@
 #define BITSSET		0x1c0	/* for identifying LDCW */
 
 
-int show_unhandled_signals = 1;
+DEFINE_PER_CPU(struct exception_data, exception_data);
 
 /*
  * parisc_acctyp(unsigned int inst) --
  *    Given a PA-RISC memory access instruction, determine if the
- *    instruction would perform a memory read or memory write
+ *    the instruction would perform a memory read or memory write
  *    operation.
  *
  *    This function assumes that the given instruction is a memory access
@@ -50,7 +54,7 @@ int show_unhandled_signals = 1;
  *   VM_WRITE if write operation
  *   VM_EXEC  if execute operation
  */
-unsigned long
+static unsigned long
 parisc_acctyp(unsigned long code, unsigned int inst)
 {
 	if (code == 6 || code == 16)
@@ -69,7 +73,6 @@ parisc_acctyp(unsigned long code, unsigned int inst)
 	case 0x30000000: /* coproc2 */
 		if (bit22set(inst))
 			return VM_WRITE;
-		fallthrough;
 
 	case 0x0: /* indexed/memory management */
 		if (bit22set(inst)) {
@@ -140,153 +143,19 @@ parisc_acctyp(unsigned long code, unsigned int inst)
 			}
 #endif
 
-int fixup_exception(struct pt_regs *regs)
-{
-	const struct exception_table_entry *fix;
-
-	fix = search_exception_tables(regs->iaoq[0]);
-	if (fix) {
-		/*
-		 * Fix up get_user() and put_user().
-		 * ASM_EXCEPTIONTABLE_ENTRY_EFAULT() sets the least-significant
-		 * bit in the relative address of the fixup routine to indicate
-		 * that gr[ASM_EXCEPTIONTABLE_REG] should be loaded with
-		 * -EFAULT to report a userspace access error.
-		 */
-		if (fix->fixup & 1) {
-			regs->gr[ASM_EXCEPTIONTABLE_REG] = -EFAULT;
-
-			/* zero target register for get_user() */
-			if (parisc_acctyp(0, regs->iir) == VM_READ) {
-				int treg = regs->iir & 0x1f;
-				BUG_ON(treg == 0);
-				regs->gr[treg] = 0;
-			}
-		}
-
-		regs->iaoq[0] = (unsigned long)&fix->fixup + fix->fixup;
-		regs->iaoq[0] &= ~3;
-		/*
-		 * NOTE: In some cases the faulting instruction
-		 * may be in the delay slot of a branch. We
-		 * don't want to take the branch, so we don't
-		 * increment iaoq[1], instead we set it to be
-		 * iaoq[0]+4, and clear the B bit in the PSW
-		 */
-		regs->iaoq[1] = regs->iaoq[0] + 4;
-		regs->gr[0] &= ~PSW_B; /* IPSW in gr[0] */
-
-		return 1;
-	}
-
-	return 0;
-}
-
-/*
- * parisc hardware trap list
- *
- * Documented in section 3 "Addressing and Access Control" of the
- * "PA-RISC 1.1 Architecture and Instruction Set Reference Manual"
- * https://parisc.wiki.kernel.org/index.php/File:Pa11_acd.pdf
- *
- * For implementation see handle_interruption() in traps.c
- */
-static const char * const trap_description[] = {
-	[1] "High-priority machine check (HPMC)",
-	[2] "Power failure interrupt",
-	[3] "Recovery counter trap",
-	[5] "Low-priority machine check",
-	[6] "Instruction TLB miss fault",
-	[7] "Instruction access rights / protection trap",
-	[8] "Illegal instruction trap",
-	[9] "Break instruction trap",
-	[10] "Privileged operation trap",
-	[11] "Privileged register trap",
-	[12] "Overflow trap",
-	[13] "Conditional trap",
-	[14] "FP Assist Exception trap",
-	[15] "Data TLB miss fault",
-	[16] "Non-access ITLB miss fault",
-	[17] "Non-access DTLB miss fault",
-	[18] "Data memory protection/unaligned access trap",
-	[19] "Data memory break trap",
-	[20] "TLB dirty bit trap",
-	[21] "Page reference trap",
-	[22] "Assist emulation trap",
-	[25] "Taken branch trap",
-	[26] "Data memory access rights trap",
-	[27] "Data memory protection ID trap",
-	[28] "Unaligned data reference trap",
-};
-
-const char *trap_name(unsigned long code)
-{
-	const char *t = NULL;
-
-	if (code < ARRAY_SIZE(trap_description))
-		t = trap_description[code];
-
-	return t ? t : "Unknown trap";
-}
-
-/*
- * Print out info about fatal segfaults, if the show_unhandled_signals
- * sysctl is set:
- */
-static inline void
-show_signal_msg(struct pt_regs *regs, unsigned long code,
-		unsigned long address, struct task_struct *tsk,
-		struct vm_area_struct *vma)
-{
-	if (!unhandled_signal(tsk, SIGSEGV))
-		return;
-
-	if (!printk_ratelimit())
-		return;
-
-	pr_warn("\n");
-	pr_warn("do_page_fault() command='%s' type=%lu address=0x%08lx",
-	    tsk->comm, code, address);
-	print_vma_addr(KERN_CONT " in ", regs->iaoq[0]);
-
-	pr_cont("\ntrap #%lu: %s%c", code, trap_name(code),
-		vma ? ',':'\n');
-
-	if (vma)
-		pr_cont(" vm_start = 0x%08lx, vm_end = 0x%08lx\n",
-			vma->vm_start, vma->vm_end);
-
-	show_regs(regs);
-}
-
 void do_page_fault(struct pt_regs *regs, unsigned long code,
 			      unsigned long address)
 {
 	struct vm_area_struct *vma, *prev_vma;
-	struct task_struct *tsk;
-	struct mm_struct *mm;
+	struct task_struct *tsk = current;
+	struct mm_struct *mm = tsk->mm;
+	const struct exception_table_entry *fix;
 	unsigned long acc_type;
-	vm_fault_t fault = 0;
-	unsigned int flags;
-	char *msg;
 
-	tsk = current;
-	mm = tsk->mm;
-	if (!mm) {
-		msg = "Page fault: no context";
+	if (in_interrupt() || !mm)
 		goto no_context;
-	}
 
-	flags = FAULT_FLAG_DEFAULT;
-	if (user_mode(regs))
-		flags |= FAULT_FLAG_USER;
-
-	acc_type = parisc_acctyp(code, regs->iir);
-	if (acc_type & VM_WRITE)
-		flags |= FAULT_FLAG_WRITE;
-	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, address);
-retry:
-	mmap_read_lock(mm);
+	down_read(&mm->mmap_sem);
 	vma = find_vma_prev(mm, address, &prev_vma);
 	if (!vma || address < vma->vm_start)
 		goto check_expansion;
@@ -297,6 +166,8 @@ retry:
 
 good_area:
 
+	acc_type = parisc_acctyp(code,regs->iir);
+
 	if ((vma->vm_flags & acc_type) != acc_type)
 		goto bad_area;
 
@@ -306,40 +177,24 @@ good_area:
 	 * fault.
 	 */
 
-	fault = handle_mm_fault(vma, address, flags, regs);
-
-	if (fault_signal_pending(fault, regs))
-		return;
-
-	/* The fault is fully completed (including releasing mmap lock) */
-	if (fault & VM_FAULT_COMPLETED)
-		return;
-
-	if (unlikely(fault & VM_FAULT_ERROR)) {
+	switch (handle_mm_fault(mm, vma, address, (acc_type & VM_WRITE) != 0)) {
+	      case 1:
+		++current->min_flt;
+		break;
+	      case 2:
+		++current->maj_flt;
+		break;
+	      case 0:
 		/*
-		 * We hit a shared mapping outside of the file, or some
-		 * other thing happened to us that made us unable to
-		 * handle the page fault gracefully.
+		 * We ran out of memory, or some other thing happened
+		 * to us that made us unable to handle the page fault
+		 * gracefully.
 		 */
-		if (fault & VM_FAULT_OOM)
-			goto out_of_memory;
-		else if (fault & VM_FAULT_SIGSEGV)
-			goto bad_area;
-		else if (fault & (VM_FAULT_SIGBUS|VM_FAULT_HWPOISON|
-				  VM_FAULT_HWPOISON_LARGE))
-			goto bad_area;
-		BUG();
+		goto bad_area;
+	      default:
+		goto out_of_memory;
 	}
-	if (fault & VM_FAULT_RETRY) {
-		/*
-		 * No need to mmap_read_unlock(mm) as we would
-		 * have already released it in __lock_page_or_retry
-		 * in mm/filemap.c.
-		 */
-		flags |= FAULT_FLAG_TRIED;
-		goto retry;
-	}
-	mmap_read_unlock(mm);
+	up_read(&mm->mmap_sem);
 	return;
 
 check_expansion:
@@ -351,172 +206,66 @@ check_expansion:
  * Something tried to access memory that isn't in our memory map..
  */
 bad_area:
-	mmap_read_unlock(mm);
+	up_read(&mm->mmap_sem);
 
 	if (user_mode(regs)) {
-		int signo, si_code;
+		struct siginfo si;
 
-		switch (code) {
-		case 15:	/* Data TLB miss fault/Data page fault */
-			/* send SIGSEGV when outside of vma */
-			if (!vma ||
-			    address < vma->vm_start || address >= vma->vm_end) {
-				signo = SIGSEGV;
-				si_code = SEGV_MAPERR;
-				break;
-			}
-
-			/* send SIGSEGV for wrong permissions */
-			if ((vma->vm_flags & acc_type) != acc_type) {
-				signo = SIGSEGV;
-				si_code = SEGV_ACCERR;
-				break;
-			}
-
-			/* probably address is outside of mapped file */
-			fallthrough;
-		case 17:	/* NA data TLB miss / page fault */
-		case 18:	/* Unaligned access - PCXS only */
-			signo = SIGBUS;
-			si_code = (code == 18) ? BUS_ADRALN : BUS_ADRERR;
-			break;
-		case 16:	/* Non-access instruction TLB miss fault */
-		case 26:	/* PCXL: Data memory access rights trap */
-		default:
-			signo = SIGSEGV;
-			si_code = (code == 26) ? SEGV_ACCERR : SEGV_MAPERR;
-			break;
+#ifdef PRINT_USER_FAULTS
+		printk(KERN_DEBUG "\n");
+		printk(KERN_DEBUG "do_page_fault() pid=%d command='%s' type=%lu address=0x%08lx\n",
+		    tsk->pid, tsk->comm, code, address);
+		if (vma) {
+			printk(KERN_DEBUG "vm_start = 0x%08lx, vm_end = 0x%08lx\n",
+					vma->vm_start, vma->vm_end);
 		}
-#ifdef CONFIG_MEMORY_FAILURE
-		if (fault & (VM_FAULT_HWPOISON|VM_FAULT_HWPOISON_LARGE)) {
-			unsigned int lsb = 0;
-			printk(KERN_ERR
-	"MCE: Killing %s:%d due to hardware memory corruption fault at %08lx\n",
-			tsk->comm, tsk->pid, address);
-			/*
-			 * Either small page or large page may be poisoned.
-			 * In other words, VM_FAULT_HWPOISON_LARGE and
-			 * VM_FAULT_HWPOISON are mutually exclusive.
-			 */
-			if (fault & VM_FAULT_HWPOISON_LARGE)
-				lsb = hstate_index_to_shift(VM_FAULT_GET_HINDEX(fault));
-			else if (fault & VM_FAULT_HWPOISON)
-				lsb = PAGE_SHIFT;
-
-			force_sig_mceerr(BUS_MCEERR_AR, (void __user *) address,
-					 lsb);
-			return;
-		}
+		show_regs(regs);
 #endif
-		show_signal_msg(regs, code, address, tsk, vma);
-
-		force_sig_fault(signo, si_code, (void __user *) address);
+		/* FIXME: actually we need to get the signo and code correct */
+		si.si_signo = SIGSEGV;
+		si.si_errno = 0;
+		si.si_code = SEGV_MAPERR;
+		si.si_addr = (void __user *) address;
+		force_sig_info(SIGSEGV, &si, current);
 		return;
 	}
-	msg = "Page fault: bad address";
 
 no_context:
 
-	if (!user_mode(regs) && fixup_exception(regs)) {
-		return;
-	}
-
-	parisc_terminate(msg, regs, code, address);
-
-out_of_memory:
-	mmap_read_unlock(mm);
 	if (!user_mode(regs)) {
-		msg = "Page fault: out of memory";
-		goto no_context;
-	}
-	pagefault_out_of_memory();
-}
+		fix = search_exception_tables(regs->iaoq[0]);
 
-/* Handle non-access data TLB miss faults.
- *
- * For probe instructions, accesses to userspace are considered allowed
- * if they lie in a valid VMA and the access type matches. We are not
- * allowed to handle MM faults here so there may be situations where an
- * actual access would fail even though a probe was successful.
- */
-int
-handle_nadtlb_fault(struct pt_regs *regs)
-{
-	unsigned long insn = regs->iir;
-	int breg, treg, xreg, val = 0;
-	struct vm_area_struct *vma, *prev_vma;
-	struct task_struct *tsk;
-	struct mm_struct *mm;
-	unsigned long address;
-	unsigned long acc_type;
+		if (fix) {
+			struct exception_data *d;
 
-	switch (insn & 0x380) {
-	case 0x280:
-		/* FDC instruction */
-		fallthrough;
-	case 0x380:
-		/* PDC and FIC instructions */
-		if (DEBUG_NATLB && printk_ratelimit()) {
-			pr_warn("WARNING: nullifying cache flush/purge instruction\n");
-			show_regs(regs);
+			d = &__get_cpu_var(exception_data);
+			d->fault_ip = regs->iaoq[0];
+			d->fault_space = regs->isr;
+			d->fault_addr = regs->ior;
+
+			regs->iaoq[0] = ((fix->fixup) & ~3);
+
+			/*
+			 * NOTE: In some cases the faulting instruction
+			 * may be in the delay slot of a branch. We
+			 * don't want to take the branch, so we don't
+			 * increment iaoq[1], instead we set it to be
+			 * iaoq[0]+4, and clear the B bit in the PSW
+			 */
+
+			regs->iaoq[1] = regs->iaoq[0] + 4;
+			regs->gr[0] &= ~PSW_B; /* IPSW in gr[0] */
+
+			return;
 		}
-		if (insn & 0x20) {
-			/* Base modification */
-			breg = (insn >> 21) & 0x1f;
-			xreg = (insn >> 16) & 0x1f;
-			if (breg && xreg)
-				regs->gr[breg] += regs->gr[xreg];
-		}
-		regs->gr[0] |= PSW_N;
-		return 1;
-
-	case 0x180:
-		/* PROBE instruction */
-		treg = insn & 0x1f;
-		if (regs->isr) {
-			tsk = current;
-			mm = tsk->mm;
-			if (mm) {
-				/* Search for VMA */
-				address = regs->ior;
-				mmap_read_lock(mm);
-				vma = find_vma_prev(mm, address, &prev_vma);
-				mmap_read_unlock(mm);
-
-				/*
-				 * Check if access to the VMA is okay.
-				 * We don't allow for stack expansion.
-				 */
-				acc_type = (insn & 0x40) ? VM_WRITE : VM_READ;
-				if (vma
-				    && address >= vma->vm_start
-				    && (vma->vm_flags & acc_type) == acc_type)
-					val = 1;
-			}
-		}
-		if (treg)
-			regs->gr[treg] = val;
-		regs->gr[0] |= PSW_N;
-		return 1;
-
-	case 0x300:
-		/* LPA instruction */
-		if (insn & 0x20) {
-			/* Base modification */
-			breg = (insn >> 21) & 0x1f;
-			xreg = (insn >> 16) & 0x1f;
-			if (breg && xreg)
-				regs->gr[breg] += regs->gr[xreg];
-		}
-		treg = insn & 0x1f;
-		if (treg)
-			regs->gr[treg] = 0;
-		regs->gr[0] |= PSW_N;
-		return 1;
-
-	default:
-		break;
 	}
 
-	return 0;
+	parisc_terminate("Bad Address (null pointer deref?)", regs, code, address);
+
+  out_of_memory:
+	up_read(&mm->mmap_sem);
+	printk(KERN_CRIT "VM: killing process %s\n", current->comm);
+	if (user_mode(regs))
+		do_exit(SIGKILL);
+	goto no_context;
 }

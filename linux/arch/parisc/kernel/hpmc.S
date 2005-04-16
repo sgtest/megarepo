@@ -1,10 +1,23 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /* 
  * HPMC (High Priority Machine Check) handler.
  *
  * Copyright (C) 1999 Philipp Rumpf <prumpf@tux.org>
  * Copyright (C) 1999 Hewlett-Packard (Frank Rowand)
  * Copyright (C) 2000 Hewlett-Packard (John Marvin)
+ *
+ *    This program is free software; you can redistribute it and/or modify
+ *    it under the terms of the GNU General Public License as published by
+ *    the Free Software Foundation; either version 2, or (at your option)
+ *    any later version.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU General Public License for more details.
+ *
+ *    You should have received a copy of the GNU General Public License
+ *    along with this program; if not, write to the Free Software
+ *    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
 
@@ -28,13 +41,10 @@
  */
 
 	.level		1.1
+	.data
 
 #include <asm/assembly.h>
 #include <asm/pdc.h>
-#include <asm/psw.h>
-
-#include <linux/linkage.h>
-#include <linux/init.h>
 
 	/*
 	 * stack for os_hpmc, the HPMC handler.
@@ -43,35 +53,33 @@
 	 * IODC requires 7K byte stack.  That leaves 1K byte for os_hpmc.
 	 */
 
-	.import toc_stack,data
-#define hpmc_stack	toc_stack	/* re-use the TOC stack */
+	.align 4096
+hpmc_stack:
+	.block 16384
 
 #define HPMC_IODC_BUF_SIZE 0x8000
 
-	__PAGE_ALIGNED_BSS
 	.align 4096
 hpmc_iodc_buf:
 	.block HPMC_IODC_BUF_SIZE
 
-	.section .bss
 	.align 8
 hpmc_raddr:
 	.block 128
 
 #define HPMC_PIM_DATA_SIZE 896 /* Enough to hold all architected 2.0 state */
 
-	.section .bss
+	.export hpmc_pim_data, data
 	.align 8
-ENTRY(hpmc_pim_data)
+hpmc_pim_data:
 	.block HPMC_PIM_DATA_SIZE
-END(hpmc_pim_data)
 
 	.text
 
+	.export os_hpmc, code
 	.import intr_save, code
-	.align 16
-ENTRY(os_hpmc)
-.os_hpmc:
+
+os_hpmc:
 
 	/*
 	 * registers modified:
@@ -122,7 +130,7 @@ ENTRY(os_hpmc)
 	 * So turn on the Q bit and turn off the M bit.
 	 */
 
-	ldi     PSW_SM_Q,%r4                   /* PSW Q on, PSW M off */
+	ldo     8(%r0),%r4                       /* PSW Q on, PSW M off */
 	mtctl   %r4,ipsw
 	mtctl   %r0,pcsq
 	mtctl   %r0,pcsq
@@ -244,7 +252,7 @@ os_hpmc_5:
 
 	tovirt_r1 %r30      /* make sp virtual */
 
-	rsm     PSW_SM_Q,%r0           /* Clear Q bit */
+	rsm 8,%r0           /* Clear Q bit */
 	ldi     1,%r8       /* Set trap code to "1" for HPMC */
 	load32	PA(intr_save),%r1
 	be      0(%sr7,%r1)
@@ -286,4 +294,11 @@ os_hpmc_6:
 
 	b .
 	nop
-	.align 16	/* make function length multiple of 16 bytes */
+
+	/* this label used to compute os_hpmc checksum */
+
+	.export os_hpmc_end, code
+
+os_hpmc_end:
+
+	nop

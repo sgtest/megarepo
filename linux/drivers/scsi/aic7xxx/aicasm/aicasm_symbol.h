@@ -1,5 +1,5 @@
 /*
- * Aic7xxx SCSI host adapter firmware assembler symbol table definitions
+ * Aic7xxx SCSI host adapter firmware asssembler symbol table definitions
  *
  * Copyright (c) 1997 Justin T. Gibbs.
  * Copyright (c) 2002 Adaptec Inc.
@@ -42,7 +42,11 @@
  * $FreeBSD$
  */
 
+#ifdef __linux__
 #include "../queue.h"
+#else
+#include <sys/queue.h>
+#endif
 
 typedef enum {
 	UNINITIALIZED,
@@ -108,7 +112,7 @@ struct macro_arg {
 	regex_t	arg_regex;
 	char   *replacement_text;
 };
-STAILQ_HEAD(macro_arg_list, macro_arg);
+STAILQ_HEAD(macro_arg_list, macro_arg) args;
 
 struct macro_info {
 	struct macro_arg_list args;
@@ -124,7 +128,6 @@ typedef struct expression_info {
 typedef struct symbol {
 	char	*name;
 	symtype	type;
-	int	count;
 	union	{
 		struct reg_info	  *rinfo;
 		struct field_info *finfo;
@@ -133,8 +136,7 @@ typedef struct symbol {
 		struct label_info *linfo;
 		struct cond_info  *condinfo;
 		struct macro_info *macroinfo;
-	} info;
-	int	dont_generate_debug_code;
+	}info;
 } symbol_t;
 
 typedef struct symbol_ref {

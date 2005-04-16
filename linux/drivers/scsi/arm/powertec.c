@@ -1,33 +1,34 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  *  linux/drivers/acorn/scsi/powertec.c
  *
  *  Copyright (C) 1997-2005 Russell King
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  */
 #include <linux/module.h>
 #include <linux/blkdev.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/ioport.h>
+#include <linux/sched.h>
 #include <linux/proc_fs.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/init.h>
 #include <linux/dma-mapping.h>
-#include <linux/pgtable.h>
 
 #include <asm/dma.h>
 #include <asm/ecard.h>
 #include <asm/io.h>
+#include <asm/irq.h>
+#include <asm/pgtable.h>
 
-#include <scsi/scsi.h>
-#include <scsi/scsi_cmnd.h>
-#include <scsi/scsi_device.h>
-#include <scsi/scsi_eh.h>
+#include "../scsi.h"
 #include <scsi/scsi_host.h>
-#include <scsi/scsi_tcq.h>
 #include "fas216.h"
-#include "arm_scsi.h"
+#include "scsi.h"
 
 #include <scsi/scsicam.h>
 
@@ -112,8 +113,10 @@ powertecscsi_terminator_ctl(struct Scsi_Host *host, int on_off)
  * Purpose  : handle interrupts from Powertec SCSI card
  * Params   : irq    - interrupt number
  *	      dev_id - user-defined (Scsi_Host structure)
+ *	      regs   - processor registers at interrupt
  */
-static irqreturn_t powertecscsi_intr(int irq, void *dev_id)
+static irqreturn_t
+powertecscsi_intr(int irq, void *dev_id, struct pt_regs *regs)
 {
 	struct powertec_info *info = dev_id;
 
@@ -129,7 +132,7 @@ static irqreturn_t powertecscsi_intr(int irq, void *dev_id)
  * Returns  : type of transfer to be performed
  */
 static fasdmatype_t
-powertecscsi_dma_setup(struct Scsi_Host *host, struct scsi_pointer *SCp,
+powertecscsi_dma_setup(struct Scsi_Host *host, Scsi_Pointer *SCp,
 		       fasdmadir_t direction, fasdmatype_t min_type)
 {
 	struct powertec_info *info = (struct powertec_info *)host->hostdata;
@@ -142,18 +145,17 @@ powertecscsi_dma_setup(struct Scsi_Host *host, struct scsi_pointer *SCp,
 
 		bufs = copy_SCp_to_sg(&info->sg[0], SCp, NR_SG);
 
-		if (direction == DMA_OUT) {
-			map_dir = DMA_TO_DEVICE;
+		if (direction == DMA_OUT)
+			map_dir = DMA_TO_DEVICE,
 			dma_dir = DMA_MODE_WRITE;
-		} else {
-			map_dir = DMA_FROM_DEVICE;
+		else
+			map_dir = DMA_FROM_DEVICE,
 			dma_dir = DMA_MODE_READ;
-		}
 
-		dma_map_sg(dev, info->sg, bufs, map_dir);
+		dma_map_sg(dev, info->sg, bufs + 1, map_dir);
 
 		disable_dma(dmach);
-		set_dma_sg(dmach, info->sg, bufs);
+		set_dma_sg(dmach, info->sg, bufs + 1);
 		set_dma_mode(dmach, dma_dir);
 		enable_dma(dmach);
 		return fasdma_real_all;
@@ -172,7 +174,7 @@ powertecscsi_dma_setup(struct Scsi_Host *host, struct scsi_pointer *SCp,
  *	      SCpnt - command
  */
 static void
-powertecscsi_dma_stop(struct Scsi_Host *host, struct scsi_pointer *SCp)
+powertecscsi_dma_stop(struct Scsi_Host *host, Scsi_Pointer *SCp)
 {
 	struct powertec_info *info = (struct powertec_info *)host->hostdata;
 	if (info->info.scsi.dma != NO_DMA)
@@ -234,28 +236,40 @@ powertecscsi_set_proc_info(struct Scsi_Host *host, char *buffer, int length)
  * Params   : buffer  - a buffer to write information to
  *	      start   - a pointer into this buffer set by this routine to the start
  *		        of the required information.
- *	      offset  - offset into information that we have read up to.
+ *	      offset  - offset into information that we have read upto.
  *	      length  - length of buffer
  *	      inout   - 0 for reading, 1 for writing.
  * Returns  : length of data written to buffer.
  */
-static int powertecscsi_show_info(struct seq_file *m, struct Scsi_Host *host)
+int powertecscsi_proc_info(struct Scsi_Host *host, char *buffer, char **start, off_t offset,
+			    int length, int inout)
 {
 	struct powertec_info *info;
+	char *p = buffer;
+	int pos;
+
+	if (inout == 1)
+		return powertecscsi_set_proc_info(host, buffer, length);
 
 	info = (struct powertec_info *)host->hostdata;
 
-	seq_printf(m, "PowerTec SCSI driver v%s\n", VERSION);
-	fas216_print_host(&info->info, m);
-	seq_printf(m, "Term    : o%s\n",
+	p += sprintf(p, "PowerTec SCSI driver v%s\n", VERSION);
+	p += fas216_print_host(&info->info, p);
+	p += sprintf(p, "Term    : o%s\n",
 			info->term_ctl ? "n" : "ff");
 
-	fas216_print_stats(&info->info, m);
-	fas216_print_devices(&info->info, m);
-	return 0;
+	p += fas216_print_stats(&info->info, p);
+	p += fas216_print_devices(&info->info, p);
+
+	*start = buffer + offset;
+	pos = p - buffer - offset;
+	if (pos > length)
+		pos = length;
+
+	return pos;
 }
 
-static ssize_t powertecscsi_show_term(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t powertecscsi_show_term(struct device *dev, char *buf)
 {
 	struct expansion_card *ec = ECARD_DEV(dev);
 	struct Scsi_Host *host = ecard_get_drvdata(ec);
@@ -265,7 +279,7 @@ static ssize_t powertecscsi_show_term(struct device *dev, struct device_attribut
 }
 
 static ssize_t
-powertecscsi_store_term(struct device *dev, struct device_attribute *attr, const char *buf, size_t len)
+powertecscsi_store_term(struct device *dev, const char *buf, size_t len)
 {
 	struct expansion_card *ec = ECARD_DEV(dev);
 	struct Scsi_Host *host = ecard_get_drvdata(ec);
@@ -279,10 +293,9 @@ powertecscsi_store_term(struct device *dev, struct device_attribute *attr, const
 static DEVICE_ATTR(bus_term, S_IRUGO | S_IWUSR,
 		   powertecscsi_show_term, powertecscsi_store_term);
 
-static struct scsi_host_template powertecscsi_template = {
+static Scsi_Host_Template powertecscsi_template = {
 	.module				= THIS_MODULE,
-	.show_info			= powertecscsi_show_info,
-	.write_info			= powertecscsi_set_proc_info,
+	.proc_info			= powertecscsi_proc_info,
 	.name				= "PowerTec SCSI",
 	.info				= powertecscsi_info,
 	.queuecommand			= fas216_queue_command,
@@ -290,20 +303,21 @@ static struct scsi_host_template powertecscsi_template = {
 	.eh_bus_reset_handler		= fas216_eh_bus_reset,
 	.eh_device_reset_handler	= fas216_eh_device_reset,
 	.eh_abort_handler		= fas216_eh_abort,
-	.cmd_size			= sizeof(struct fas216_cmd_priv),
+
 	.can_queue			= 8,
 	.this_id			= 7,
-	.sg_tablesize			= SG_MAX_SEGMENTS,
-	.dma_boundary			= IOMD_DMA_BOUNDARY,
+	.sg_tablesize			= SG_ALL,
 	.cmd_per_lun			= 2,
+	.use_clustering			= ENABLE_CLUSTERING,
 	.proc_name			= "powertec",
 };
 
-static int powertecscsi_probe(struct expansion_card *ec,
-			      const struct ecard_id *id)
+static int __devinit
+powertecscsi_probe(struct expansion_card *ec, const struct ecard_id *id)
 {
 	struct Scsi_Host *host;
 	struct powertec_info *info;
+	unsigned long resbase, reslen;
 	void __iomem *base;
 	int ret;
 
@@ -311,7 +325,9 @@ static int powertecscsi_probe(struct expansion_card *ec,
 	if (ret)
 		goto out;
 
-	base = ecardm_iomap(ec, ECARD_RES_IOCFAST, 0, 0);
+	resbase = ecard_resource_start(ec, ECARD_RES_IOCFAST);
+	reslen = ecard_resource_len(ec, ECARD_RES_IOCFAST);
+	base = ioremap(resbase, reslen);
 	if (!base) {
 		ret = -ENOMEM;
 		goto out_region;
@@ -321,7 +337,7 @@ static int powertecscsi_probe(struct expansion_card *ec,
 			       sizeof (struct powertec_info));
 	if (!host) {
 		ret = -ENOMEM;
-		goto out_region;
+		goto out_unmap;
 	}
 
 	ecard_set_drvdata(ec, host);
@@ -330,7 +346,6 @@ static int powertecscsi_probe(struct expansion_card *ec,
 	info->base = base;
 	powertecscsi_terminator_ctl(host, term[ec->slot_no]);
 
-	info->ec = ec;
 	info->info.scsi.io_base		= base + POWERTEC_FAS216_OFFSET;
 	info->info.scsi.io_shift	= POWERTEC_FAS216_SHIFT;
 	info->info.scsi.irq		= ec->irq;
@@ -349,8 +364,8 @@ static int powertecscsi_probe(struct expansion_card *ec,
 
 	ec->irqaddr	= base + POWERTEC_INTR_STATUS;
 	ec->irqmask	= POWERTEC_INTR_BIT;
-
-	ecard_setirq(ec, &powertecscsi_ops, info);
+	ec->irq_data	= info;
+	ec->ops		= &powertecscsi_ops;
 
 	device_create_file(&ec->dev, &dev_attr_bus_term);
 
@@ -359,7 +374,7 @@ static int powertecscsi_probe(struct expansion_card *ec,
 		goto out_free;
 
 	ret = request_irq(ec->irq, powertecscsi_intr,
-			  0, "powertec", info);
+			  SA_INTERRUPT, "powertec", info);
 	if (ret) {
 		printk("scsi%d: IRQ%d not free: %d\n",
 		       host->host_no, ec->irq, ret);
@@ -383,7 +398,7 @@ static int powertecscsi_probe(struct expansion_card *ec,
 
 	if (info->info.scsi.dma != NO_DMA)
 		free_dma(info->info.scsi.dma);
-	free_irq(ec->irq, info);
+	free_irq(ec->irq, host);
 
  out_release:
 	fas216_release(host);
@@ -392,6 +407,9 @@ static int powertecscsi_probe(struct expansion_card *ec,
 	device_remove_file(&ec->dev, &dev_attr_bus_term);
 	scsi_host_put(host);
 
+ out_unmap:
+	iounmap(base);
+
  out_region:
 	ecard_release_resources(ec);
 
@@ -399,7 +417,7 @@ static int powertecscsi_probe(struct expansion_card *ec,
 	return ret;
 }
 
-static void powertecscsi_remove(struct expansion_card *ec)
+static void __devexit powertecscsi_remove(struct expansion_card *ec)
 {
 	struct Scsi_Host *host = ecard_get_drvdata(ec);
 	struct powertec_info *info = (struct powertec_info *)host->hostdata;
@@ -413,6 +431,8 @@ static void powertecscsi_remove(struct expansion_card *ec)
 		free_dma(info->info.scsi.dma);
 	free_irq(ec->irq, info);
 
+	iounmap(info->base);
+
 	fas216_release(host);
 	scsi_host_put(host);
 	ecard_release_resources(ec);
@@ -425,7 +445,7 @@ static const struct ecard_id powertecscsi_cids[] = {
 
 static struct ecard_driver powertecscsi_driver = {
 	.probe		= powertecscsi_probe,
-	.remove		= powertecscsi_remove,
+	.remove		= __devexit_p(powertecscsi_remove),
 	.id_table	= powertecscsi_cids,
 	.drv = {
 		.name		= "powertecscsi",
@@ -447,6 +467,6 @@ module_exit(powertecscsi_exit);
 
 MODULE_AUTHOR("Russell King");
 MODULE_DESCRIPTION("Powertec SCSI driver");
-module_param_array(term, int, NULL, 0);
+MODULE_PARM(term, "1-8i");
 MODULE_PARM_DESC(term, "SCSI bus termination");
 MODULE_LICENSE("GPL");

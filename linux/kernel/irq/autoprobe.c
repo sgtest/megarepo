@@ -1,5 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
+ * linux/kernel/irq/autoprobe.c
+ *
  * Copyright (C) 1992, 1998-2004 Linus Torvalds, Ingo Molnar
  *
  * This file contains the interrupt probing code and driver APIs.
@@ -8,17 +9,13 @@
 #include <linux/irq.h>
 #include <linux/module.h>
 #include <linux/interrupt.h>
-#include <linux/delay.h>
-#include <linux/async.h>
-
-#include "internals.h"
 
 /*
  * Autodetection depends on the fact that any interrupt that
  * comes in on to an unassigned handler will get stuck with
- * "IRQS_WAITING" cleared and the interrupt disabled.
+ * "IRQ_WAITING" cleared and the interrupt disabled.
  */
-static DEFINE_MUTEX(probing_active);
+static DECLARE_MUTEX(probe_sem);
 
 /**
  *	probe_irq_on	- begin an interrupt autodetect
@@ -29,77 +26,77 @@ static DEFINE_MUTEX(probing_active);
  */
 unsigned long probe_irq_on(void)
 {
-	struct irq_desc *desc;
-	unsigned long mask = 0;
-	int i;
+	unsigned long val, delay;
+	irq_desc_t *desc;
+	unsigned int i;
 
-	/*
-	 * quiesce the kernel, or at least the asynchronous portion
-	 */
-	async_synchronize_full();
-	mutex_lock(&probing_active);
+	down(&probe_sem);
 	/*
 	 * something may have generated an irq long ago and we want to
 	 * flush such a longstanding irq before considering it as spurious.
 	 */
-	for_each_irq_desc_reverse(i, desc) {
-		raw_spin_lock_irq(&desc->lock);
-		if (!desc->action && irq_settings_can_probe(desc)) {
-			/*
-			 * Some chips need to know about probing in
-			 * progress:
-			 */
-			if (desc->irq_data.chip->irq_set_type)
-				desc->irq_data.chip->irq_set_type(&desc->irq_data,
-							 IRQ_TYPE_PROBE);
-			irq_activate_and_startup(desc, IRQ_NORESEND);
-		}
-		raw_spin_unlock_irq(&desc->lock);
+	for (i = NR_IRQS-1; i > 0; i--) {
+		desc = irq_desc + i;
+
+		spin_lock_irq(&desc->lock);
+		if (!irq_desc[i].action)
+			irq_desc[i].handler->startup(i);
+		spin_unlock_irq(&desc->lock);
 	}
 
 	/* Wait for longstanding interrupts to trigger. */
-	msleep(20);
+	for (delay = jiffies + HZ/50; time_after(delay, jiffies); )
+		/* about 20ms delay */ barrier();
 
 	/*
 	 * enable any unassigned irqs
 	 * (we must startup again here because if a longstanding irq
 	 * happened in the previous stage, it may have masked itself)
 	 */
-	for_each_irq_desc_reverse(i, desc) {
-		raw_spin_lock_irq(&desc->lock);
-		if (!desc->action && irq_settings_can_probe(desc)) {
-			desc->istate |= IRQS_AUTODETECT | IRQS_WAITING;
-			if (irq_activate_and_startup(desc, IRQ_NORESEND))
-				desc->istate |= IRQS_PENDING;
+	for (i = NR_IRQS-1; i > 0; i--) {
+		desc = irq_desc + i;
+
+		spin_lock_irq(&desc->lock);
+		if (!desc->action) {
+			desc->status |= IRQ_AUTODETECT | IRQ_WAITING;
+			if (desc->handler->startup(i))
+				desc->status |= IRQ_PENDING;
 		}
-		raw_spin_unlock_irq(&desc->lock);
+		spin_unlock_irq(&desc->lock);
 	}
 
 	/*
 	 * Wait for spurious interrupts to trigger
 	 */
-	msleep(100);
+	for (delay = jiffies + HZ/10; time_after(delay, jiffies); )
+		/* about 100ms delay */ barrier();
 
 	/*
 	 * Now filter out any obviously spurious interrupts
 	 */
-	for_each_irq_desc(i, desc) {
-		raw_spin_lock_irq(&desc->lock);
+	val = 0;
+	for (i = 0; i < NR_IRQS; i++) {
+		irq_desc_t *desc = irq_desc + i;
+		unsigned int status;
 
-		if (desc->istate & IRQS_AUTODETECT) {
+		spin_lock_irq(&desc->lock);
+		status = desc->status;
+
+		if (status & IRQ_AUTODETECT) {
 			/* It triggered already - consider it spurious. */
-			if (!(desc->istate & IRQS_WAITING)) {
-				desc->istate &= ~IRQS_AUTODETECT;
-				irq_shutdown_and_deactivate(desc);
+			if (!(status & IRQ_WAITING)) {
+				desc->status = status & ~IRQ_AUTODETECT;
+				desc->handler->shutdown(i);
 			} else
 				if (i < 32)
-					mask |= 1 << i;
+					val |= 1 << i;
 		}
-		raw_spin_unlock_irq(&desc->lock);
+		spin_unlock_irq(&desc->lock);
 	}
 
-	return mask;
+	return val;
 }
+
 EXPORT_SYMBOL(probe_irq_on);
 
 /**
@@ -116,22 +113,27 @@ EXPORT_SYMBOL(probe_irq_on);
  */
 unsigned int probe_irq_mask(unsigned long val)
 {
-	unsigned int mask = 0;
-	struct irq_desc *desc;
+	unsigned int mask;
 	int i;
 
-	for_each_irq_desc(i, desc) {
-		raw_spin_lock_irq(&desc->lock);
-		if (desc->istate & IRQS_AUTODETECT) {
-			if (i < 16 && !(desc->istate & IRQS_WAITING))
+	mask = 0;
+	for (i = 0; i < NR_IRQS; i++) {
+		irq_desc_t *desc = irq_desc + i;
+		unsigned int status;
+
+		spin_lock_irq(&desc->lock);
+		status = desc->status;
+
+		if (status & IRQ_AUTODETECT) {
+			if (i < 16 && !(status & IRQ_WAITING))
 				mask |= 1 << i;
 
-			desc->istate &= ~IRQS_AUTODETECT;
-			irq_shutdown_and_deactivate(desc);
+			desc->status = status & ~IRQ_AUTODETECT;
+			desc->handler->shutdown(i);
 		}
-		raw_spin_unlock_irq(&desc->lock);
+		spin_unlock_irq(&desc->lock);
 	}
-	mutex_unlock(&probing_active);
+	up(&probe_sem);
 
 	return mask & val;
 }
@@ -156,29 +158,32 @@ EXPORT_SYMBOL(probe_irq_mask);
  */
 int probe_irq_off(unsigned long val)
 {
-	int i, irq_found = 0, nr_of_irqs = 0;
-	struct irq_desc *desc;
+	int i, irq_found = 0, nr_irqs = 0;
 
-	for_each_irq_desc(i, desc) {
-		raw_spin_lock_irq(&desc->lock);
+	for (i = 0; i < NR_IRQS; i++) {
+		irq_desc_t *desc = irq_desc + i;
+		unsigned int status;
 
-		if (desc->istate & IRQS_AUTODETECT) {
-			if (!(desc->istate & IRQS_WAITING)) {
-				if (!nr_of_irqs)
+		spin_lock_irq(&desc->lock);
+		status = desc->status;
+
+		if (status & IRQ_AUTODETECT) {
+			if (!(status & IRQ_WAITING)) {
+				if (!nr_irqs)
 					irq_found = i;
-				nr_of_irqs++;
+				nr_irqs++;
 			}
-			desc->istate &= ~IRQS_AUTODETECT;
-			irq_shutdown_and_deactivate(desc);
+			desc->status = status & ~IRQ_AUTODETECT;
+			desc->handler->shutdown(i);
 		}
-		raw_spin_unlock_irq(&desc->lock);
+		spin_unlock_irq(&desc->lock);
 	}
-	mutex_unlock(&probing_active);
+	up(&probe_sem);
 
-	if (nr_of_irqs > 1)
+	if (nr_irqs > 1)
 		irq_found = -irq_found;
-
 	return irq_found;
 }
+
 EXPORT_SYMBOL(probe_irq_off);
 

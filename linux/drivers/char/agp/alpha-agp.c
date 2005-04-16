@@ -11,26 +11,28 @@
 
 #include "agp.h"
 
-static vm_fault_t alpha_core_agp_vm_fault(struct vm_fault *vmf)
+static struct page *alpha_core_agp_vm_nopage(struct vm_area_struct *vma,
+					     unsigned long address,
+					     int *type)
 {
 	alpha_agp_info *agp = agp_bridge->dev_private_data;
 	dma_addr_t dma_addr;
 	unsigned long pa;
 	struct page *page;
 
-	dma_addr = vmf->address - vmf->vma->vm_start + agp->aperture.bus_base;
+	dma_addr = address - vma->vm_start + agp->aperture.bus_base;
 	pa = agp->ops->translate(agp, dma_addr);
 
-	if (pa == (unsigned long)-EINVAL)
-		return VM_FAULT_SIGBUS;	/* no translation */
-
+	if (pa == (unsigned long)-EINVAL) return NULL;	/* no translation */
+	
 	/*
 	 * Get the page, inc the use count, and return it
 	 */
 	page = virt_to_page(__va(pa));
 	get_page(page);
-	vmf->page = page;
-	return 0;
+	if (type)
+		*type = VM_FAULT_MINOR;
+	return page;
 }
 
 static struct aper_size_info_fixed alpha_core_agp_sizes[] =
@@ -38,10 +40,16 @@ static struct aper_size_info_fixed alpha_core_agp_sizes[] =
 	{ 0, 0, 0 }, /* filled in by alpha_core_agp_setup */
 };
 
-static const struct vm_operations_struct alpha_core_agp_vm_ops = {
-	.fault = alpha_core_agp_vm_fault,
+struct vm_operations_struct alpha_core_agp_vm_ops = {
+	.nopage = alpha_core_agp_vm_nopage,
 };
 
+
+static int alpha_core_agp_nop(void)
+{
+	/* just return success */
+	return 0;
+}
 
 static int alpha_core_agp_fetch_size(void)
 {
@@ -78,23 +86,19 @@ static void alpha_core_agp_enable(struct agp_bridge_data *bridge, u32 mode)
 	agp->mode.bits.enable = 1;
 	agp->ops->configure(agp);
 
-	agp_device_command(agp->mode.lw, false);
+	agp_device_command(agp->mode.lw, 0);
 }
 
-static int alpha_core_agp_insert_memory(struct agp_memory *mem, off_t pg_start,
+static int alpha_core_agp_insert_memory(struct agp_memory *mem, off_t pg_start, 
 					int type)
 {
 	alpha_agp_info *agp = agp_bridge->dev_private_data;
 	int num_entries, status;
 	void *temp;
 
-	if (type >= AGP_USER_TYPES || mem->type >= AGP_USER_TYPES)
-		return -EINVAL;
-
 	temp = agp_bridge->current_size;
 	num_entries = A_SIZE_FIX(temp)->num_entries;
-	if ((pg_start + mem->page_count) > num_entries)
-		return -EINVAL;
+	if ((pg_start + mem->page_count) > num_entries) return -EINVAL;
 
 	status = agp->ops->bind(agp, pg_start, mem);
 	mb();
@@ -103,7 +107,7 @@ static int alpha_core_agp_insert_memory(struct agp_memory *mem, off_t pg_start,
 	return status;
 }
 
-static int alpha_core_agp_remove_memory(struct agp_memory *mem, off_t pg_start,
+static int alpha_core_agp_remove_memory(struct agp_memory *mem, off_t pg_start, 
 					int type)
 {
 	alpha_agp_info *agp = agp_bridge->dev_private_data;
@@ -114,19 +118,14 @@ static int alpha_core_agp_remove_memory(struct agp_memory *mem, off_t pg_start,
 	return status;
 }
 
-static int alpha_core_agp_create_free_gatt_table(struct agp_bridge_data *a)
-{
-	return 0;
-}
-
 struct agp_bridge_driver alpha_core_agp_driver = {
 	.owner			= THIS_MODULE,
 	.aperture_sizes		= alpha_core_agp_sizes,
 	.num_aperture_sizes	= 1,
 	.size_type		= FIXED_APER_SIZE,
-	.cant_use_aperture	= true,
+	.cant_use_aperture	= 1,
 	.masks			= NULL,
-
+	
 	.fetch_size		= alpha_core_agp_fetch_size,
 	.configure		= alpha_core_agp_configure,
 	.agp_enable		= alpha_core_agp_enable,
@@ -134,17 +133,14 @@ struct agp_bridge_driver alpha_core_agp_driver = {
 	.tlb_flush		= alpha_core_agp_tlbflush,
 	.mask_memory		= agp_generic_mask_memory,
 	.cache_flush		= global_cache_flush,
-	.create_gatt_table	= alpha_core_agp_create_free_gatt_table,
-	.free_gatt_table	= alpha_core_agp_create_free_gatt_table,
+	.create_gatt_table	= alpha_core_agp_nop,
+	.free_gatt_table	= alpha_core_agp_nop,
 	.insert_memory		= alpha_core_agp_insert_memory,
 	.remove_memory		= alpha_core_agp_remove_memory,
 	.alloc_by_type		= agp_generic_alloc_by_type,
 	.free_by_type		= agp_generic_free_by_type,
 	.agp_alloc_page		= agp_generic_alloc_page,
-	.agp_alloc_pages	= agp_generic_alloc_pages,
 	.agp_destroy_page	= agp_generic_destroy_page,
-	.agp_destroy_pages	= agp_generic_destroy_pages,
-	.agp_type_to_mask_type  = agp_generic_type_to_mask_type,
 };
 
 struct agp_bridge_data *alpha_bridge;
@@ -172,7 +168,7 @@ alpha_core_agp_setup(void)
 	/*
 	 * Build a fake pci_dev struct
 	 */
-	pdev = pci_alloc_dev(NULL);
+	pdev = kmalloc(sizeof(struct pci_dev), GFP_KERNEL);
 	if (!pdev)
 		return -ENOMEM;
 	pdev->vendor = 0xffff;

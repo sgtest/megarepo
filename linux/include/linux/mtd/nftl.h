@@ -1,6 +1,7 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * Copyright © 1999-2010 David Woodhouse <dwmw2@infradead.org>
+ * $Id: nftl.h,v 1.16 2004/06/30 14:49:00 dbrown Exp $
+ *
+ * (C) 1999-2003 David Woodhouse <dwmw2@infradead.org>
  */
 
 #ifndef __MTD_NFTL_H__
@@ -36,15 +37,11 @@ struct NFTLrecord {
         unsigned int nb_blocks;		/* number of physical blocks */
         unsigned int nb_boot_blocks;	/* number of blocks used by the bios */
         struct erase_info instr;
+	struct nand_oobinfo oobinfo;
 };
 
 int NFTL_mount(struct NFTLrecord *s);
 int NFTL_formatblock(struct NFTLrecord *s, int block);
-
-int nftl_read_oob(struct mtd_info *mtd, loff_t offs, size_t len,
-		  size_t *retlen, uint8_t *buf);
-int nftl_write_oob(struct mtd_info *mtd, loff_t offs, size_t len,
-		   size_t *retlen, uint8_t *buf);
 
 #ifndef NFTL_MAJOR
 #define NFTL_MAJOR 93

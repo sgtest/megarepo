@@ -1,9 +1,13 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  *
  *			Linux MegaRAID device driver
  *
  * Copyright (c) 2003-2004  LSI Logic Corporation.
+ *
+ *	   This program is free software; you can redistribute it and/or
+ *	   modify it under the terms of the GNU General Public License
+ *	   as published by the Free Software Foundation; either version
+ *	   2 of the License, or (at your option) any later version.
  *
  * FILE		: megaraid_mm.h
  */
@@ -13,20 +17,21 @@
 
 #include <linux/spinlock.h>
 #include <linux/fs.h>
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
+#include <linux/version.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/pci.h>
 #include <linux/list.h>
-#include <linux/miscdevice.h>
+#include <linux/ioctl32.h>
 
 #include "mbox_defs.h"
 #include "megaraid_ioctl.h"
 
 
-#define LSI_COMMON_MOD_VERSION	"2.20.2.7"
+#define LSI_COMMON_MOD_VERSION	"2.20.2.5"
 #define LSI_COMMON_MOD_EXT_VERSION	\
-		"(Release Date: Sun Jul 16 00:01:03 EST 2006)"
+		"(Release Date: Fri Jan 21 00:01:03 EST 2005)"
 
 
 #define LSI_DBGLVL			dbglevel

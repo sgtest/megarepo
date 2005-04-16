@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * LSAPIC Interrupt Controller
  *
@@ -16,30 +15,23 @@
 #include <linux/irq.h>
 
 static unsigned int
-lsapic_noop_startup (struct irq_data *data)
+lsapic_noop_startup (unsigned int irq)
 {
 	return 0;
 }
 
 static void
-lsapic_noop (struct irq_data *data)
+lsapic_noop (unsigned int irq)
 {
-	/* nothing to do... */
+	/* nuthing to do... */
 }
 
-static int lsapic_retrigger(struct irq_data *data)
-{
-	ia64_resend_irq(data->irq);
-
-	return 1;
-}
-
-struct irq_chip irq_type_ia64_lsapic = {
-	.name =			"LSAPIC",
-	.irq_startup =		lsapic_noop_startup,
-	.irq_shutdown =		lsapic_noop,
-	.irq_enable =		lsapic_noop,
-	.irq_disable =		lsapic_noop,
-	.irq_ack =		lsapic_noop,
-	.irq_retrigger =	lsapic_retrigger,
+struct hw_interrupt_type irq_type_ia64_lsapic = {
+	.typename =	"LSAPIC",
+	.startup =	lsapic_noop_startup,
+	.shutdown =	lsapic_noop,
+	.enable =	lsapic_noop,
+	.disable =	lsapic_noop,
+	.ack =		lsapic_noop,
+	.end =		lsapic_noop
 };

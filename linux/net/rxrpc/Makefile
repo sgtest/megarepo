@@ -1,37 +1,25 @@
-# SPDX-License-Identifier: GPL-2.0
 #
-# Makefile for Linux kernel RxRPC
+# Makefile for Linux kernel Rx RPC
 #
 
-obj-$(CONFIG_AF_RXRPC) += rxrpc.o
+#CFLAGS += -finstrument-functions
 
-rxrpc-y := \
-	af_rxrpc.o \
-	call_accept.o \
-	call_event.o \
-	call_object.o \
-	conn_client.o \
-	conn_event.o \
-	conn_object.o \
-	conn_service.o \
-	input.o \
-	insecure.o \
-	key.o \
-	local_event.o \
-	local_object.o \
-	misc.o \
-	net_ns.o \
-	output.o \
-	peer_event.o \
-	peer_object.o \
-	recvmsg.o \
-	rtt.o \
-	security.o \
-	sendmsg.o \
-	server_key.o \
-	skbuff.o \
-	utils.o
+rxrpc-objs := \
+	call.o \
+	connection.o \
+	krxiod.o \
+	krxsecd.o \
+	krxtimod.o \
+	main.o \
+	peer.o \
+	rxrpc_syms.o \
+	transport.o
 
-rxrpc-$(CONFIG_PROC_FS) += proc.o
-rxrpc-$(CONFIG_RXKAD) += rxkad.o
-rxrpc-$(CONFIG_SYSCTL) += sysctl.o
+ifeq ($(CONFIG_PROC_FS),y)
+rxrpc-objs += proc.o
+endif
+ifeq ($(CONFIG_SYSCTL),y)
+rxrpc-objs += sysctl.o
+endif
+
+obj-$(CONFIG_RXRPC) := rxrpc.o

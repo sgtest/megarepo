@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
     NetWinder Floating Point Emulator
     (c) Rebel.COM, 1998,1999
@@ -6,14 +5,35 @@
 
     Direct questions, comments to Scott Bambrough <scottb@netwinder.org>
 
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 */
 
+#include <linux/config.h>
 #include "fpa11.h"
 #include "fpopcode.h"
 #include "fpa11.inl"
 #include "fpmodule.h"
 #include "fpmodule.inl"
-#include "softfloat.h"
+
+#ifdef CONFIG_FPE_NWFPE_XP
+extern flag floatx80_is_nan(floatx80);
+#endif
+extern flag float64_is_nan(float64);
+extern flag float32_is_nan(float32);
+
+void SetRoundingMode(const unsigned int opcode);
 
 unsigned int PerformFLT(const unsigned int opcode);
 unsigned int PerformFIX(const unsigned int opcode);
@@ -57,17 +77,14 @@ unsigned int EmulateCPRT(const unsigned int opcode)
 unsigned int PerformFLT(const unsigned int opcode)
 {
 	FPA11 *fpa11 = GET_FPA11();
-	struct roundingData roundData;
-
-	roundData.mode = SetRoundingMode(opcode);
-	roundData.precision = SetRoundingPrecision(opcode);
-	roundData.exception = 0;
+	SetRoundingMode(opcode);
+	SetRoundingPrecision(opcode);
 
 	switch (opcode & MASK_ROUNDING_PRECISION) {
 	case ROUND_SINGLE:
 		{
 			fpa11->fType[getFn(opcode)] = typeSingle;
-			fpa11->fpreg[getFn(opcode)].fSingle = int32_to_float32(&roundData, readRegister(getRd(opcode)));
+			fpa11->fpreg[getFn(opcode)].fSingle = int32_to_float32(readRegister(getRd(opcode)));
 		}
 		break;
 
@@ -91,9 +108,6 @@ unsigned int PerformFLT(const unsigned int opcode)
 		return 0;
 	}
 
-	if (roundData.exception)
-		float_raise(roundData.exception);
-
 	return 1;
 }
 
@@ -101,29 +115,26 @@ unsigned int PerformFIX(const unsigned int opcode)
 {
 	FPA11 *fpa11 = GET_FPA11();
 	unsigned int Fn = getFm(opcode);
-	struct roundingData roundData;
 
-	roundData.mode = SetRoundingMode(opcode);
-	roundData.precision = SetRoundingPrecision(opcode);
-	roundData.exception = 0;
+	SetRoundingMode(opcode);
 
 	switch (fpa11->fType[Fn]) {
 	case typeSingle:
 		{
-			writeRegister(getRd(opcode), float32_to_int32(&roundData, fpa11->fpreg[Fn].fSingle));
+			writeRegister(getRd(opcode), float32_to_int32(fpa11->fpreg[Fn].fSingle));
 		}
 		break;
 
 	case typeDouble:
 		{
-			writeRegister(getRd(opcode), float64_to_int32(&roundData, fpa11->fpreg[Fn].fDouble));
+			writeRegister(getRd(opcode), float64_to_int32(fpa11->fpreg[Fn].fDouble));
 		}
 		break;
 
 #ifdef CONFIG_FPE_NWFPE_XP
 	case typeExtended:
 		{
-			writeRegister(getRd(opcode), floatx80_to_int32(&roundData, fpa11->fpreg[Fn].fExtended));
+			writeRegister(getRd(opcode), floatx80_to_int32(fpa11->fpreg[Fn].fExtended));
 		}
 		break;
 #endif
@@ -131,9 +142,6 @@ unsigned int PerformFIX(const unsigned int opcode)
 	default:
 		return 0;
 	}
-
-	if (roundData.exception)
-		float_raise(roundData.exception);
 
 	return 1;
 }

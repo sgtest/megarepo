@@ -1,112 +1,143 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * xfrm6_output.c - Common IPsec encapsulation code for IPv6.
  * Copyright (C) 2002 USAGI/WIDE Project
  * Copyright (c) 2004 Herbert Xu <herbert@gondor.apana.org.au>
+ * 
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version
+ * 2 of the License, or (at your option) any later version.
  */
 
-#include <linux/if_ether.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
 #include <linux/skbuff.h>
+#include <linux/spinlock.h>
 #include <linux/icmpv6.h>
-#include <linux/netfilter_ipv6.h>
-#include <net/dst.h>
+#include <net/dsfield.h>
+#include <net/inet_ecn.h>
 #include <net/ipv6.h>
-#include <net/ip6_route.h>
 #include <net/xfrm.h>
 
-void xfrm6_local_rxpmtu(struct sk_buff *skb, u32 mtu)
+/* Add encapsulation header.
+ *
+ * In transport mode, the IP header and mutable extension headers will be moved
+ * forward to make space for the encapsulation header.
+ *
+ * In tunnel mode, the top IP header will be constructed per RFC 2401.
+ * The following fields in it shall be filled in by x->type->output:
+ *	payload_len
+ *
+ * On exit, skb->h will be set to the start of the encapsulation header to be
+ * filled in by x->type->output and skb->nh will be set to the nextheader field
+ * of the extension header directly preceding the encapsulation header, or in
+ * its absence, that of the top IP header.  The value of skb->data will always
+ * point to the top IP header.
+ */
+static void xfrm6_encap(struct sk_buff *skb)
 {
-	struct flowi6 fl6;
-	struct sock *sk = skb->sk;
-
-	fl6.flowi6_oif = sk->sk_bound_dev_if;
-	fl6.daddr = ipv6_hdr(skb)->daddr;
-
-	ipv6_local_rxpmtu(sk, &fl6, mtu);
-}
-
-void xfrm6_local_error(struct sk_buff *skb, u32 mtu)
-{
-	struct flowi6 fl6;
-	const struct ipv6hdr *hdr;
-	struct sock *sk = skb->sk;
-
-	hdr = skb->encapsulation ? inner_ipv6_hdr(skb) : ipv6_hdr(skb);
-	fl6.fl6_dport = inet_sk(sk)->inet_dport;
-	fl6.daddr = hdr->daddr;
-
-	ipv6_local_error(sk, EMSGSIZE, &fl6, mtu);
-}
-
-static int __xfrm6_output_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
-{
-	return xfrm_output(sk, skb);
-}
-
-static int xfrm6_noneed_fragment(struct sk_buff *skb)
-{
-	struct frag_hdr *fh;
-	u8 prevhdr = ipv6_hdr(skb)->nexthdr;
-
-	if (prevhdr != NEXTHDR_FRAGMENT)
-		return 0;
-	fh = (struct frag_hdr *)(skb->data + sizeof(struct ipv6hdr));
-	if (fh->nexthdr == NEXTHDR_ESP || fh->nexthdr == NEXTHDR_AUTH)
-		return 1;
-	return 0;
-}
-
-static int __xfrm6_output(struct net *net, struct sock *sk, struct sk_buff *skb)
-{
-	struct dst_entry *dst = skb_dst(skb);
+	struct dst_entry *dst = skb->dst;
 	struct xfrm_state *x = dst->xfrm;
-	unsigned int mtu;
-	bool toobig;
+	struct ipv6hdr *iph, *top_iph;
+	int dsfield;
 
-#ifdef CONFIG_NETFILTER
-	if (!x) {
-		IP6CB(skb)->flags |= IP6SKB_REROUTED;
-		return dst_output(net, sk, skb);
-	}
-#endif
+	skb_push(skb, x->props.header_len);
+	iph = skb->nh.ipv6h;
 
-	if (x->props.mode != XFRM_MODE_TUNNEL)
-		goto skip_frag;
+	if (!x->props.mode) {
+		u8 *prevhdr;
+		int hdr_len;
 
-	if (skb->protocol == htons(ETH_P_IPV6))
-		mtu = ip6_skb_dst_mtu(skb);
-	else
-		mtu = dst_mtu(skb_dst(skb));
-
-	toobig = skb->len > mtu && !skb_is_gso(skb);
-
-	if (toobig && xfrm6_local_dontfrag(skb->sk)) {
-		xfrm6_local_rxpmtu(skb, mtu);
-		kfree_skb(skb);
-		return -EMSGSIZE;
-	} else if (toobig && xfrm6_noneed_fragment(skb)) {
-		skb->ignore_df = 1;
-		goto skip_frag;
-	} else if (!skb->ignore_df && toobig && skb->sk) {
-		xfrm_local_error(skb, mtu);
-		kfree_skb(skb);
-		return -EMSGSIZE;
+		hdr_len = ip6_find_1stfragopt(skb, &prevhdr);
+		skb->nh.raw = prevhdr - x->props.header_len;
+		skb->h.raw = skb->data + hdr_len;
+		memmove(skb->data, iph, hdr_len);
+		return;
 	}
 
-	if (toobig || dst_allfrag(skb_dst(skb)))
-		return ip6_fragment(net, sk, skb,
-				    __xfrm6_output_finish);
+	skb->nh.raw = skb->data;
+	top_iph = skb->nh.ipv6h;
+	skb->nh.raw = &top_iph->nexthdr;
+	skb->h.ipv6h = top_iph + 1;
 
-skip_frag:
-	return xfrm_output(sk, skb);
+	top_iph->version = 6;
+	top_iph->priority = iph->priority;
+	top_iph->flow_lbl[0] = iph->flow_lbl[0];
+	top_iph->flow_lbl[1] = iph->flow_lbl[1];
+	top_iph->flow_lbl[2] = iph->flow_lbl[2];
+	dsfield = ipv6_get_dsfield(top_iph);
+	dsfield = INET_ECN_encapsulate(dsfield, dsfield);
+	if (x->props.flags & XFRM_STATE_NOECN)
+		dsfield &= ~INET_ECN_MASK;
+	ipv6_change_dsfield(top_iph, 0, dsfield);
+	top_iph->nexthdr = IPPROTO_IPV6; 
+	top_iph->hop_limit = dst_metric(dst->child, RTAX_HOPLIMIT);
+	ipv6_addr_copy(&top_iph->saddr, (struct in6_addr *)&x->props.saddr);
+	ipv6_addr_copy(&top_iph->daddr, (struct in6_addr *)&x->id.daddr);
 }
 
-int xfrm6_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+static int xfrm6_tunnel_check_size(struct sk_buff *skb)
 {
-	return NF_HOOK_COND(NFPROTO_IPV6, NF_INET_POST_ROUTING,
-			    net, sk, skb,  skb->dev, skb_dst(skb)->dev,
-			    __xfrm6_output,
-			    !(IP6CB(skb)->flags & IP6SKB_REROUTED));
+	int mtu, ret = 0;
+	struct dst_entry *dst = skb->dst;
+
+	mtu = dst_mtu(dst);
+	if (mtu < IPV6_MIN_MTU)
+		mtu = IPV6_MIN_MTU;
+
+	if (skb->len > mtu) {
+		icmpv6_send(skb, ICMPV6_PKT_TOOBIG, 0, mtu, skb->dev);
+		ret = -EMSGSIZE;
+	}
+
+	return ret;
+}
+
+int xfrm6_output(struct sk_buff *skb)
+{
+	struct dst_entry *dst = skb->dst;
+	struct xfrm_state *x = dst->xfrm;
+	int err;
+	
+	if (skb->ip_summed == CHECKSUM_HW) {
+		err = skb_checksum_help(skb, 0);
+		if (err)
+			goto error_nolock;
+	}
+
+	if (x->props.mode) {
+		err = xfrm6_tunnel_check_size(skb);
+		if (err)
+			goto error_nolock;
+	}
+
+	spin_lock_bh(&x->lock);
+	err = xfrm_state_check(x, skb);
+	if (err)
+		goto error;
+
+	xfrm6_encap(skb);
+
+	err = x->type->output(x, skb);
+	if (err)
+		goto error;
+
+	x->curlft.bytes += skb->len;
+	x->curlft.packets++;
+
+	spin_unlock_bh(&x->lock);
+
+	skb->nh.raw = skb->data;
+	
+	if (!(skb->dst = dst_pop(dst))) {
+		err = -EHOSTUNREACH;
+		goto error_nolock;
+	}
+	err = NET_XMIT_BYPASS;
+
+out_exit:
+	return err;
+error:
+	spin_unlock_bh(&x->lock);
+error_nolock:
+	kfree_skb(skb);
+	goto out_exit;
 }

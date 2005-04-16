@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * arch/alpha/lib/strrchr.S
  * Contributed by Richard Henderson (rth@tamu.edu)
@@ -6,7 +5,7 @@
  * Return the address of the last occurrence of a given character
  * within a null-terminated string, or null if it is not found.
  */
-#include <asm/export.h>
+
 #include <asm/regdef.h>
 
 	.set noreorder
@@ -55,7 +54,7 @@ $loop:
 $eos:
 	negq	t1, t4		# e0    : isolate first null byte match
 	and	t1, t4, t4	# e1    :
-	subq	t4, 1, t5	# e0    : build a mask of the bytes up to...
+	subq	t4, 1, t5	# e0    : build a mask of the bytes upto...
 	or	t4, t5, t4	# e1    : ... and including the null
 
 	and	t3, t4, t3	# e0    : mask out char matches after null
@@ -86,4 +85,3 @@ $retnull:
 	ret			# .. e1 :
 
 	.end strrchr
-	EXPORT_SYMBOL(strrchr)

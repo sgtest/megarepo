@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _AHA152X_H
 #define _AHA152X_H
 
@@ -299,7 +298,7 @@ typedef union {
 enum {
   debug_procinfo  = 0x0001,
   debug_queue     = 0x0002,
-  debug_locking   = 0x0004,
+  debug_locks     = 0x0004,
   debug_intr      = 0x0008,
   debug_selection = 0x0010,
   debug_msgo      = 0x0020,
@@ -333,6 +332,6 @@ struct aha152x_setup {
 
 struct Scsi_Host *aha152x_probe_one(struct aha152x_setup *);
 void aha152x_release(struct Scsi_Host *);
-int aha152x_host_reset_host(struct Scsi_Host *);
+int aha152x_host_reset(Scsi_Cmnd *);
 
 #endif /* _AHA152X_H */

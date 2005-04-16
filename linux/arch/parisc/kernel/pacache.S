@@ -1,9 +1,22 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  *  PARISC TLB and cache flushing support
  *  Copyright (C) 2000-2001 Hewlett-Packard (John Marvin)
  *  Copyright (C) 2001 Matthew Wilcox (willy at parisc-linux.org)
  *  Copyright (C) 2002 Richard Hirst (rhirst with parisc-linux.org)
+ *
+ *    This program is free software; you can redistribute it and/or modify
+ *    it under the terms of the GNU General Public License as published by
+ *    the Free Software Foundation; either version 2, or (at your option)
+ *    any later version.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU General Public License for more details.
+ *
+ *    You should have received a copy of the GNU General Public License
+ *    along with this program; if not, write to the Free Software
+ *    Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
 /*
@@ -13,25 +26,35 @@
  *       can be used.
  */
 
-#ifdef CONFIG_64BIT
+#ifdef __LP64__
+#define ADDIB	addib,*
+#define CMPB	cmpb,*
+#define ANDCM	andcm,*
+
 	.level	2.0w
 #else
+#define ADDIB	addib,
+#define CMPB	cmpb,
+#define ANDCM	andcm
+
 	.level	2.0
 #endif
 
-#include <asm/psw.h>
 #include <asm/assembly.h>
+#include <asm/psw.h>
+#include <asm/pgtable.h>
 #include <asm/cache.h>
-#include <asm/ldcw.h>
-#include <asm/alternative.h>
-#include <linux/linkage.h>
-#include <linux/init.h>
-#include <linux/pgtable.h>
 
-	.section .text.hot
-	.align	16
+	.text
+	.align	128
 
-ENTRY_CFI(flush_tlb_all_local)
+	.export flush_tlb_all_local,code
+
+flush_tlb_all_local:
+	.proc
+	.callinfo NO_CALLS
+	.entry
+
 	/*
 	 * The pitlbe and pdtlbe instructions should only be used to
 	 * flush the entire tlb. Also, there needs to be no intervening
@@ -39,31 +62,41 @@ ENTRY_CFI(flush_tlb_all_local)
 	 * to happen in real mode with all interruptions disabled.
 	 */
 
-	/* pcxt_ssm_bug	- relied upon translation! PA 2.0 Arch. F-4 and F-5 */
-	rsm		PSW_SM_I, %r19		/* save I-bit state */
-	load32		PA(1f), %r1
-	nop
-	nop
-	nop
-	nop
-	nop
+	/*
+	 * Once again, we do the rfi dance ... some day we need examine
+	 * all of our uses of this type of code and see what can be
+	 * consolidated.
+	 */
 
-	rsm		PSW_SM_Q, %r0		/* prep to load iia queue */
+	rsm		PSW_SM_I, %r19		/* relied upon translation! PA 2.0 Arch. F-5 */
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	
+	rsm		PSW_SM_Q, %r0		/* Turn off Q bit to load iia queue */
+	ldil		L%REAL_MODE_PSW, %r1
+	ldo		R%REAL_MODE_PSW(%r1), %r1
+	mtctl		%r1, %cr22
 	mtctl		%r0, %cr17		/* Clear IIASQ tail */
 	mtctl		%r0, %cr17		/* Clear IIASQ head */
+	ldil		L%PA(1f), %r1
+	ldo		R%PA(1f)(%r1), %r1
 	mtctl		%r1, %cr18		/* IIAOQ head */
 	ldo		4(%r1), %r1
 	mtctl		%r1, %cr18		/* IIAOQ tail */
-	load32		REAL_MODE_PSW, %r1
-	mtctl           %r1, %ipsw
 	rfi
 	nop
 
-1:      load32		PA(cache_info), %r1
+1:      ldil		L%PA(cache_info), %r1
+	ldo		R%PA(cache_info)(%r1), %r1
 
 	/* Flush Instruction Tlb */
 
-88:	LDREG		ITLB_SID_BASE(%r1), %r20
+	LDREG		ITLB_SID_BASE(%r1), %r20
 	LDREG		ITLB_SID_STRIDE(%r1), %r21
 	LDREG		ITLB_SID_COUNT(%r1), %r22
 	LDREG		ITLB_OFF_BASE(%r1), %arg0
@@ -71,7 +104,7 @@ ENTRY_CFI(flush_tlb_all_local)
 	LDREG		ITLB_OFF_COUNT(%r1), %arg2
 	LDREG		ITLB_LOOP(%r1), %arg3
 
-	addib,COND(=)		-1, %arg3, fitoneloop	/* Preadjust and test */
+	ADDIB=		-1, %arg3, fitoneloop	/* Preadjust and test */
 	movb,<,n	%arg3, %r31, fitdone	/* If loop < 0, skip */
 	copy		%arg0, %r28		/* Init base addr */
 
@@ -81,14 +114,14 @@ fitmanyloop:					/* Loop if LOOP >= 2 */
 	copy		%arg2, %r29		/* Init middle loop count */
 
 fitmanymiddle:					/* Loop if LOOP >= 2 */
-	addib,COND(>)		-1, %r31, fitmanymiddle	/* Adjusted inner loop decr */
-	pitlbe		%r0(%sr1, %r28)
+	ADDIB>		-1, %r31, fitmanymiddle	/* Adjusted inner loop decr */
+	pitlbe		0(%sr1, %r28)
 	pitlbe,m	%arg1(%sr1, %r28)	/* Last pitlbe and addr adjust */
-	addib,COND(>)		-1, %r29, fitmanymiddle	/* Middle loop decr */
+	ADDIB>		-1, %r29, fitmanymiddle	/* Middle loop decr */
 	copy		%arg3, %r31		/* Re-init inner loop count */
 
 	movb,tr		%arg0, %r28, fitmanyloop /* Re-init base addr */
-	addib,COND(<=),n	-1, %r22, fitdone	/* Outer loop count decr */
+	ADDIB<=,n	-1, %r22, fitdone	/* Outer loop count decr */
 
 fitoneloop:					/* Loop if LOOP = 1 */
 	mtsp		%r20, %sr1
@@ -96,14 +129,13 @@ fitoneloop:					/* Loop if LOOP = 1 */
 	copy		%arg2, %r29		/* init middle loop count */
 
 fitonemiddle:					/* Loop if LOOP = 1 */
-	addib,COND(>)		-1, %r29, fitonemiddle	/* Middle loop count decr */
+	ADDIB>		-1, %r29, fitonemiddle	/* Middle loop count decr */
 	pitlbe,m	%arg1(%sr1, %r28)	/* pitlbe for one loop */
 
-	addib,COND(>)		-1, %r22, fitoneloop	/* Outer loop count decr */
+	ADDIB>		-1, %r22, fitoneloop	/* Outer loop count decr */
 	add		%r21, %r20, %r20		/* increment space */
 
 fitdone:
-	ALTERNATIVE(88b, fitdone, ALT_COND_NO_SPLIT_TLB, INSN_NOP)
 
 	/* Flush Data Tlb */
 
@@ -115,7 +147,7 @@ fitdone:
 	LDREG		DTLB_OFF_COUNT(%r1), %arg2
 	LDREG		DTLB_LOOP(%r1), %arg3
 
-	addib,COND(=)		-1, %arg3, fdtoneloop	/* Preadjust and test */
+	ADDIB=		-1, %arg3, fdtoneloop	/* Preadjust and test */
 	movb,<,n	%arg3, %r31, fdtdone	/* If loop < 0, skip */
 	copy		%arg0, %r28		/* Init base addr */
 
@@ -125,14 +157,14 @@ fdtmanyloop:					/* Loop if LOOP >= 2 */
 	copy		%arg2, %r29		/* Init middle loop count */
 
 fdtmanymiddle:					/* Loop if LOOP >= 2 */
-	addib,COND(>)		-1, %r31, fdtmanymiddle	/* Adjusted inner loop decr */
-	pdtlbe		%r0(%sr1, %r28)
+	ADDIB>		-1, %r31, fdtmanymiddle	/* Adjusted inner loop decr */
+	pdtlbe		0(%sr1, %r28)
 	pdtlbe,m	%arg1(%sr1, %r28)	/* Last pdtlbe and addr adjust */
-	addib,COND(>)		-1, %r29, fdtmanymiddle	/* Middle loop decr */
+	ADDIB>		-1, %r29, fdtmanymiddle	/* Middle loop decr */
 	copy		%arg3, %r31		/* Re-init inner loop count */
 
 	movb,tr		%arg0, %r28, fdtmanyloop /* Re-init base addr */
-	addib,COND(<=),n	-1, %r22,fdtdone	/* Outer loop count decr */
+	ADDIB<=,n	-1, %r22,fdtdone	/* Outer loop count decr */
 
 fdtoneloop:					/* Loop if LOOP = 1 */
 	mtsp		%r20, %sr1
@@ -140,55 +172,48 @@ fdtoneloop:					/* Loop if LOOP = 1 */
 	copy		%arg2, %r29		/* init middle loop count */
 
 fdtonemiddle:					/* Loop if LOOP = 1 */
-	addib,COND(>)		-1, %r29, fdtonemiddle	/* Middle loop count decr */
+	ADDIB>		-1, %r29, fdtonemiddle	/* Middle loop count decr */
 	pdtlbe,m	%arg1(%sr1, %r28)	/* pdtlbe for one loop */
 
-	addib,COND(>)		-1, %r22, fdtoneloop	/* Outer loop count decr */
+	ADDIB>		-1, %r22, fdtoneloop	/* Outer loop count decr */
 	add		%r21, %r20, %r20	/* increment space */
 
-
 fdtdone:
-	/*
-	 * Switch back to virtual mode
-	 */
-	/* pcxt_ssm_bug */
-	rsm		PSW_SM_I, %r0
-	load32		2f, %r1
-	nop
-	nop
-	nop
-	nop
-	nop
 
-	rsm		PSW_SM_Q, %r0		/* prep to load iia queue */
+	/* Switch back to virtual mode */
+
+	rsm		PSW_SM_Q, %r0		/* clear Q bit to load iia queue */
+	ldil		L%KERNEL_PSW, %r1
+	ldo		R%KERNEL_PSW(%r1), %r1
+	or		%r1, %r19, %r1		/* Set I bit if set on entry */
+	mtctl		%r1, %cr22
 	mtctl		%r0, %cr17		/* Clear IIASQ tail */
 	mtctl		%r0, %cr17		/* Clear IIASQ head */
+	ldil		L%(2f), %r1
+	ldo		R%(2f)(%r1), %r1
 	mtctl		%r1, %cr18		/* IIAOQ head */
 	ldo		4(%r1), %r1
 	mtctl		%r1, %cr18		/* IIAOQ tail */
-	load32		KERNEL_PSW, %r1
-	or		%r1, %r19, %r1	/* I-bit to state on entry */
-	mtctl		%r1, %ipsw	/* restore I-bit (entire PSW) */
 	rfi
 	nop
 
 2:      bv		%r0(%r2)
 	nop
+	.exit
 
-	/*
-	 * When running in qemu, drop whole flush_tlb_all_local function and
-	 * replace by one pdtlbe instruction, for which QEMU will drop all
-	 * local TLB entries.
-	 */
-3:	pdtlbe		%r0(%sr1,%r0)
-	bv,n		%r0(%r2)
-	ALTERNATIVE_CODE(flush_tlb_all_local, 2, ALT_COND_RUN_ON_QEMU, 3b)
-ENDPROC_CFI(flush_tlb_all_local)
+	.procend
 
+	.export flush_instruction_cache_local,code
 	.import cache_info,data
 
-ENTRY_CFI(flush_instruction_cache_local)
-88:	load32		cache_info, %r1
+flush_instruction_cache_local:
+	.proc
+	.callinfo NO_CALLS
+	.entry
+
+	mtsp		%r0, %sr1
+	ldil		L%cache_info, %r1
+	ldo		R%cache_info(%r1), %r1
 
 	/* Flush Instruction Cache */
 
@@ -196,60 +221,41 @@ ENTRY_CFI(flush_instruction_cache_local)
 	LDREG		ICACHE_STRIDE(%r1), %arg1
 	LDREG		ICACHE_COUNT(%r1), %arg2
 	LDREG		ICACHE_LOOP(%r1), %arg3
-	rsm		PSW_SM_I, %r22		/* No mmgt ops during loop*/
-	mtsp		%r0, %sr1
-	addib,COND(=)		-1, %arg3, fioneloop	/* Preadjust and test */
+	rsm             PSW_SM_I, %r22		/* No mmgt ops during loop*/
+	ADDIB=		-1, %arg3, fioneloop	/* Preadjust and test */
 	movb,<,n	%arg3, %r31, fisync	/* If loop < 0, do sync */
 
 fimanyloop:					/* Loop if LOOP >= 2 */
-	addib,COND(>)		-1, %r31, fimanyloop	/* Adjusted inner loop decr */
-	fice            %r0(%sr1, %arg0)
+	ADDIB>		-1, %r31, fimanyloop	/* Adjusted inner loop decr */
+	fice            0(%sr1, %arg0)
 	fice,m		%arg1(%sr1, %arg0)	/* Last fice and addr adjust */
 	movb,tr		%arg3, %r31, fimanyloop	/* Re-init inner loop count */
-	addib,COND(<=),n	-1, %arg2, fisync	/* Outer loop decr */
+	ADDIB<=,n	-1, %arg2, fisync	/* Outer loop decr */
 
 fioneloop:					/* Loop if LOOP = 1 */
-	/* Some implementations may flush with a single fice instruction */
-	cmpib,COND(>>=),n	15, %arg2, fioneloop2
-
-fioneloop1:
-	fice,m		%arg1(%sr1, %arg0)
-	fice,m		%arg1(%sr1, %arg0)
-	fice,m		%arg1(%sr1, %arg0)
-	fice,m		%arg1(%sr1, %arg0)
-	fice,m		%arg1(%sr1, %arg0)
-	fice,m		%arg1(%sr1, %arg0)
-	fice,m		%arg1(%sr1, %arg0)
-	fice,m		%arg1(%sr1, %arg0)
-	fice,m		%arg1(%sr1, %arg0)
-	fice,m		%arg1(%sr1, %arg0)
-	fice,m		%arg1(%sr1, %arg0)
-	fice,m		%arg1(%sr1, %arg0)
-	fice,m		%arg1(%sr1, %arg0)
-	fice,m		%arg1(%sr1, %arg0)
-	fice,m		%arg1(%sr1, %arg0)
-	addib,COND(>)	-16, %arg2, fioneloop1
-	fice,m		%arg1(%sr1, %arg0)
-
-	/* Check if done */
-	cmpb,COND(=),n	%arg2, %r0, fisync	/* Predict branch taken */
-
-fioneloop2:
-	addib,COND(>)	-1, %arg2, fioneloop2	/* Outer loop count decr */
+	ADDIB>		-1, %arg2, fioneloop	/* Outer loop count decr */
 	fice,m		%arg1(%sr1, %arg0)	/* Fice for one loop */
 
 fisync:
 	sync
-	mtsm		%r22			/* restore I-bit */
-89:	ALTERNATIVE(88b, 89b, ALT_COND_NO_ICACHE, INSN_NOP)
+	mtsm		%r22
 	bv		%r0(%r2)
 	nop
-ENDPROC_CFI(flush_instruction_cache_local)
+	.exit
 
+	.procend
 
+	.export flush_data_cache_local, code
 	.import cache_info, data
-ENTRY_CFI(flush_data_cache_local)
-88:	load32		cache_info, %r1
+
+flush_data_cache_local:
+	.proc
+	.callinfo NO_CALLS
+	.entry
+
+	mtsp		%r0, %sr1
+	ldil		L%cache_info, %r1
+	ldo		R%cache_info(%r1), %r1
 
 	/* Flush Data Cache */
 
@@ -257,133 +263,53 @@ ENTRY_CFI(flush_data_cache_local)
 	LDREG		DCACHE_STRIDE(%r1), %arg1
 	LDREG		DCACHE_COUNT(%r1), %arg2
 	LDREG		DCACHE_LOOP(%r1), %arg3
-	rsm		PSW_SM_I, %r22		/* No mmgt ops during loop*/
-	mtsp		%r0, %sr1
-	addib,COND(=)		-1, %arg3, fdoneloop	/* Preadjust and test */
+	rsm		PSW_SM_I, %r22
+	ADDIB=		-1, %arg3, fdoneloop	/* Preadjust and test */
 	movb,<,n	%arg3, %r31, fdsync	/* If loop < 0, do sync */
 
 fdmanyloop:					/* Loop if LOOP >= 2 */
-	addib,COND(>)		-1, %r31, fdmanyloop	/* Adjusted inner loop decr */
-	fdce		%r0(%sr1, %arg0)
+	ADDIB>		-1, %r31, fdmanyloop	/* Adjusted inner loop decr */
+	fdce		0(%sr1, %arg0)
 	fdce,m		%arg1(%sr1, %arg0)	/* Last fdce and addr adjust */
 	movb,tr		%arg3, %r31, fdmanyloop	/* Re-init inner loop count */
-	addib,COND(<=),n	-1, %arg2, fdsync	/* Outer loop decr */
+	ADDIB<=,n	-1, %arg2, fdsync	/* Outer loop decr */
 
 fdoneloop:					/* Loop if LOOP = 1 */
-	/* Some implementations may flush with a single fdce instruction */
-	cmpib,COND(>>=),n	15, %arg2, fdoneloop2
-
-fdoneloop1:
-	fdce,m		%arg1(%sr1, %arg0)
-	fdce,m		%arg1(%sr1, %arg0)
-	fdce,m		%arg1(%sr1, %arg0)
-	fdce,m		%arg1(%sr1, %arg0)
-	fdce,m		%arg1(%sr1, %arg0)
-	fdce,m		%arg1(%sr1, %arg0)
-	fdce,m		%arg1(%sr1, %arg0)
-	fdce,m		%arg1(%sr1, %arg0)
-	fdce,m		%arg1(%sr1, %arg0)
-	fdce,m		%arg1(%sr1, %arg0)
-	fdce,m		%arg1(%sr1, %arg0)
-	fdce,m		%arg1(%sr1, %arg0)
-	fdce,m		%arg1(%sr1, %arg0)
-	fdce,m		%arg1(%sr1, %arg0)
-	fdce,m		%arg1(%sr1, %arg0)
-	addib,COND(>)	-16, %arg2, fdoneloop1
-	fdce,m		%arg1(%sr1, %arg0)
-
-	/* Check if done */
-	cmpb,COND(=),n	%arg2, %r0, fdsync	/* Predict branch taken */
-
-fdoneloop2:
-	addib,COND(>)	-1, %arg2, fdoneloop2	/* Outer loop count decr */
+	ADDIB>		-1, %arg2, fdoneloop	/* Outer loop count decr */
 	fdce,m		%arg1(%sr1, %arg0)	/* Fdce for one loop */
 
 fdsync:
+	syncdma
 	sync
-	mtsm		%r22			/* restore I-bit */
-89:	ALTERNATIVE(88b, 89b, ALT_COND_NO_DCACHE, INSN_NOP)
+	mtsm		%r22
 	bv		%r0(%r2)
 	nop
-ENDPROC_CFI(flush_data_cache_local)
+	.exit
 
-/* Clear page using kernel mapping.  */
+	.procend
 
-ENTRY_CFI(clear_page_asm)
-#ifdef CONFIG_64BIT
+	.export copy_user_page_asm,code
+	.align	16
 
-	/* Unroll the loop.  */
-	ldi		(PAGE_SIZE / 128), %r1
+copy_user_page_asm:
+	.proc
+	.callinfo NO_CALLS
+	.entry
 
-1:
-	std		%r0, 0(%r26)
-	std		%r0, 8(%r26)
-	std		%r0, 16(%r26)
-	std		%r0, 24(%r26)
-	std		%r0, 32(%r26)
-	std		%r0, 40(%r26)
-	std		%r0, 48(%r26)
-	std		%r0, 56(%r26)
-	std		%r0, 64(%r26)
-	std		%r0, 72(%r26)
-	std		%r0, 80(%r26)
-	std		%r0, 88(%r26)
-	std		%r0, 96(%r26)
-	std		%r0, 104(%r26)
-	std		%r0, 112(%r26)
-	std		%r0, 120(%r26)
-
-	/* Note reverse branch hint for addib is taken.  */
-	addib,COND(>),n	-1, %r1, 1b
-	ldo		128(%r26), %r26
-
-#else
-
-	/*
-	 * Note that until (if) we start saving the full 64-bit register
-	 * values on interrupt, we can't use std on a 32 bit kernel.
-	 */
-	ldi		(PAGE_SIZE / 64), %r1
-
-1:
-	stw		%r0, 0(%r26)
-	stw		%r0, 4(%r26)
-	stw		%r0, 8(%r26)
-	stw		%r0, 12(%r26)
-	stw		%r0, 16(%r26)
-	stw		%r0, 20(%r26)
-	stw		%r0, 24(%r26)
-	stw		%r0, 28(%r26)
-	stw		%r0, 32(%r26)
-	stw		%r0, 36(%r26)
-	stw		%r0, 40(%r26)
-	stw		%r0, 44(%r26)
-	stw		%r0, 48(%r26)
-	stw		%r0, 52(%r26)
-	stw		%r0, 56(%r26)
-	stw		%r0, 60(%r26)
-
-	addib,COND(>),n	-1, %r1, 1b
-	ldo		64(%r26), %r26
-#endif
-	bv		%r0(%r2)
-	nop
-ENDPROC_CFI(clear_page_asm)
-
-/* Copy page using kernel mapping.  */
-
-ENTRY_CFI(copy_page_asm)
-#ifdef CONFIG_64BIT
+#ifdef __LP64__
 	/* PA8x00 CPUs can consume 2 loads or 1 store per cycle.
 	 * Unroll the loop by hand and arrange insn appropriately.
-	 * Prefetch doesn't improve performance on rp3440.
-	 * GCC probably can do this just as well...
+	 * GCC probably can do this just as well.
 	 */
 
-	ldi		(PAGE_SIZE / 128), %r1
+	ldd		0(%r25), %r19
+	ldi		32, %r1                 /* PAGE_SIZE/128 == 32 */
+	ldw		64(%r25), %r0		/* prefetch 1 cacheline ahead */
+	ldw		128(%r25), %r0		/* prefetch 2 */
 
-1:	ldd		0(%r25), %r19
-	ldd		8(%r25), %r20
+1:	ldd		8(%r25), %r20
+	ldw		192(%r25), %r0		/* prefetch 3 */
+	ldw		256(%r25), %r0		/* prefetch 4 */
 
 	ldd		16(%r25), %r21
 	ldd		24(%r25), %r22
@@ -417,16 +343,16 @@ ENTRY_CFI(copy_page_asm)
 
 	ldd		112(%r25), %r21
 	ldd		120(%r25), %r22
-	ldo		128(%r25), %r25
 	std		%r19, 96(%r26)
 	std		%r20, 104(%r26)
 
+	ldo		128(%r25), %r25
 	std		%r21, 112(%r26)
 	std		%r22, 120(%r26)
-
-	/* Note reverse branch hint for addib is taken.  */
-	addib,COND(>),n	-1, %r1, 1b
 	ldo		128(%r26), %r26
+
+	ADDIB>		-1, %r1, 1b		/* bundle 10 */
+	ldd		0(%r25), %r19		/* start next loads */
 
 #else
 
@@ -437,10 +363,10 @@ ENTRY_CFI(copy_page_asm)
 	 * the full 64 bit register values on interrupt, we can't
 	 * use ldd/std on a 32 bit kernel.
 	 */
-	ldw		0(%r25), %r19
-	ldi		(PAGE_SIZE / 64), %r1
+	ldi		64, %r1		/* PAGE_SIZE/64 == 64 */
 
 1:
+	ldw		0(%r25), %r19
 	ldw		4(%r25), %r20
 	ldw		8(%r25), %r21
 	ldw		12(%r25), %r22
@@ -470,24 +396,23 @@ ENTRY_CFI(copy_page_asm)
 	ldw		60(%r25), %r22
 	stw		%r19, 48(%r26)
 	stw		%r20, 52(%r26)
-	ldo		64(%r25), %r25
 	stw		%r21, 56(%r26)
 	stw		%r22, 60(%r26)
 	ldo		64(%r26), %r26
-	addib,COND(>),n	-1, %r1, 1b
-	ldw		0(%r25), %r19
+	ADDIB>		-1, %r1, 1b
+	ldo		64(%r25), %r25
 #endif
 	bv		%r0(%r2)
 	nop
-ENDPROC_CFI(copy_page_asm)
+	.exit
+
+	.procend
 
 /*
  * NOTE: Code in clear_user_page has a hard coded dependency on the
  *       maximum alias boundary being 4 Mb. We've been assured by the
  *       parisc chip designers that there will not ever be a parisc
  *       chip with a larger alias boundary (Never say never :-) ).
- *
- *       Yah, what about the PA8800 and PA8900 processors?
  *
  *       Subtle: the dtlb miss handlers support the temp alias region by
  *       "knowing" that if a dtlb miss happens within the temp alias
@@ -500,115 +425,59 @@ ENDPROC_CFI(copy_page_asm)
  *       miss on the translation, the dtlb miss handler inserts the
  *       translation into the tlb using these values:
  *
- *          %r26 physical address of "to" translation
- *          %r23 physical address of "from" translation
+ *          %r26 physical page (shifted for tlb insert) of "to" translation
+ *          %r23 physical page (shifted for tlb insert) of "from" translation
  */
 
+#if 0
+
 	/*
-	 * copy_user_page_asm() performs a page copy using mappings
-	 * equivalent to the user page mappings.  It can be used to
-	 * implement copy_user_page() but unfortunately both the `from'
-	 * and `to' pages need to be flushed through mappings equivalent
-	 * to the user mappings after the copy because the kernel accesses
-	 * the `from' page through the kmap kernel mapping and the `to'
-	 * page needs to be flushed since code can be copied.  As a
-	 * result, this implementation is less efficient than the simpler
-	 * copy using the kernel mapping.  It only needs the `from' page
-	 * to flushed via the user mapping.  The kunmap routines handle
-	 * the flushes needed for the kernel mapping.
+	 * We can't do this since copy_user_page is used to bring in
+	 * file data that might have instructions. Since the data would
+	 * then need to be flushed out so the i-fetch can see it, it
+	 * makes more sense to just copy through the kernel translation
+	 * and flush it.
 	 *
 	 * I'm still keeping this around because it may be possible to
 	 * use it if more information is passed into copy_user_page().
 	 * Have to do some measurements to see if it is worthwhile to
 	 * lobby for such a change.
-	 *
 	 */
 
-ENTRY_CFI(copy_user_page_asm)
-	/* Convert virtual `to' and `from' addresses to physical addresses.
-	   Move `from' physical address to non shadowed register.  */
+	.export copy_user_page_asm,code
+
+copy_user_page_asm:
+	.proc
+	.callinfo NO_CALLS
+	.entry
+
 	ldil		L%(__PAGE_OFFSET), %r1
 	sub		%r26, %r1, %r26
-	sub		%r25, %r1, %r23
+	sub		%r25, %r1, %r23		/* move physical addr into non shadowed reg */
 
 	ldil		L%(TMPALIAS_MAP_START), %r28
-	dep_safe	%r24, 31,TMPALIAS_SIZE_BITS, %r28	/* Form aliased virtual address 'to' */
-	depi_safe	0, 31,PAGE_SHIFT, %r28			/* Clear any offset bits */
+#ifdef __LP64__
+	extrd,u		%r26,56,32, %r26		/* convert phys addr to tlb insert format */
+	extrd,u		%r23,56,32, %r23		/* convert phys addr to tlb insert format */
+	depd		%r24,63,22, %r28		/* Form aliased virtual address 'to' */
+	depdi		0, 63,12, %r28		/* Clear any offset bits */
 	copy		%r28, %r29
-	depi_safe	1, 31-TMPALIAS_SIZE_BITS,1, %r29	/* Form aliased virtual address 'from' */
+	depdi		1, 41,1, %r29		/* Form aliased virtual address 'from' */
+#else
+	extrw,u		%r26, 24,25, %r26	/* convert phys addr to tlb insert format */
+	extrw,u		%r23, 24,25, %r23	/* convert phys addr to tlb insert format */
+	depw		%r24, 31,22, %r28	/* Form aliased virtual address 'to' */
+	depwi		0, 31,12, %r28		/* Clear any offset bits */
+	copy		%r28, %r29
+	depwi		1, 9,1, %r29		/* Form aliased virtual address 'from' */
+#endif
 
 	/* Purge any old translations */
 
-#ifdef CONFIG_PA20
-	pdtlb,l		%r0(%r28)
-	pdtlb,l		%r0(%r29)
-#else
-0:	pdtlb		%r0(%r28)
-1:	pdtlb		%r0(%r29)
-	ALTERNATIVE(0b, 0b+4, ALT_COND_NO_SMP, INSN_PxTLB)
-	ALTERNATIVE(1b, 1b+4, ALT_COND_NO_SMP, INSN_PxTLB)
-#endif
+	pdtlb		0(%r28)
+	pdtlb		0(%r29)
 
-#ifdef CONFIG_64BIT
-	/* PA8x00 CPUs can consume 2 loads or 1 store per cycle.
-	 * Unroll the loop by hand and arrange insn appropriately.
-	 * GCC probably can do this just as well.
-	 */
-
-	ldd		0(%r29), %r19
-	ldi		(PAGE_SIZE / 128), %r1
-
-1:	ldd		8(%r29), %r20
-
-	ldd		16(%r29), %r21
-	ldd		24(%r29), %r22
-	std		%r19, 0(%r28)
-	std		%r20, 8(%r28)
-
-	ldd		32(%r29), %r19
-	ldd		40(%r29), %r20
-	std		%r21, 16(%r28)
-	std		%r22, 24(%r28)
-
-	ldd		48(%r29), %r21
-	ldd		56(%r29), %r22
-	std		%r19, 32(%r28)
-	std		%r20, 40(%r28)
-
-	ldd		64(%r29), %r19
-	ldd		72(%r29), %r20
-	std		%r21, 48(%r28)
-	std		%r22, 56(%r28)
-
-	ldd		80(%r29), %r21
-	ldd		88(%r29), %r22
-	std		%r19, 64(%r28)
-	std		%r20, 72(%r28)
-
-	ldd		 96(%r29), %r19
-	ldd		104(%r29), %r20
-	std		%r21, 80(%r28)
-	std		%r22, 88(%r28)
-
-	ldd		112(%r29), %r21
-	ldd		120(%r29), %r22
-	std		%r19, 96(%r28)
-	std		%r20, 104(%r28)
-
-	ldo		128(%r29), %r29
-	std		%r21, 112(%r28)
-	std		%r22, 120(%r28)
-	ldo		128(%r28), %r28
-
-	/* conditional branches nullify on forward taken branch, and on
-	 * non-taken backward branch. Note that .+4 is a backwards branch.
-	 * The ldd should only get executed if the branch is taken.
-	 */
-	addib,COND(>),n	-1, %r1, 1b		/* bundle 10 */
-	ldd		0(%r29), %r19		/* start next loads */
-
-#else
-	ldi		(PAGE_SIZE / 64), %r1
+	ldi		64, %r1
 
 	/*
 	 * This loop is optimized for PCXL/PCXL2 ldw/ldw and stw/stw
@@ -619,7 +488,9 @@ ENTRY_CFI(copy_user_page_asm)
 	 * use ldd/std on a 32 bit kernel.
 	 */
 
-1:	ldw		0(%r29), %r19
+
+1:
+	ldw		0(%r29), %r19
 	ldw		4(%r29), %r20
 	ldw		8(%r29), %r21
 	ldw		12(%r29), %r22
@@ -652,36 +523,48 @@ ENTRY_CFI(copy_user_page_asm)
 	stw		%r21, 56(%r28)
 	stw		%r22, 60(%r28)
 	ldo		64(%r28), %r28
-
-	addib,COND(>)		-1, %r1,1b
+	ADDIB>		-1, %r1,1b
 	ldo		64(%r29), %r29
-#endif
 
 	bv		%r0(%r2)
 	nop
-ENDPROC_CFI(copy_user_page_asm)
+	.exit
 
-ENTRY_CFI(clear_user_page_asm)
+	.procend
+#endif
+
+	.export __clear_user_page_asm,code
+
+__clear_user_page_asm:
+	.proc
+	.callinfo NO_CALLS
+	.entry
+
 	tophys_r1	%r26
 
 	ldil		L%(TMPALIAS_MAP_START), %r28
-	dep_safe	%r25, 31,TMPALIAS_SIZE_BITS, %r28	/* Form aliased virtual address 'to' */
-	depi_safe	0, 31,PAGE_SHIFT, %r28			/* Clear any offset bits */
+#ifdef __LP64__
+#if (TMPALIAS_MAP_START >= 0x80000000)
+	depdi		0, 31,32, %r28		/* clear any sign extension */
+#endif
+	extrd,u		%r26, 56,32, %r26	/* convert phys addr to tlb insert format */
+	depd		%r25, 63,22, %r28	/* Form aliased virtual address 'to' */
+	depdi		0, 63,12, %r28		/* Clear any offset bits */
+#else
+	extrw,u		%r26, 24,25, %r26	/* convert phys addr to tlb insert format */
+	depw		%r25, 31,22, %r28	/* Form aliased virtual address 'to' */
+	depwi		0, 31,12, %r28		/* Clear any offset bits */
+#endif
 
 	/* Purge any old translation */
 
-#ifdef CONFIG_PA20
-	pdtlb,l		%r0(%r28)
-#else
-0:	pdtlb		%r0(%r28)
-	ALTERNATIVE(0b, 0b+4, ALT_COND_NO_SMP, INSN_PxTLB)
-#endif
+	pdtlb		0(%r28)
 
-#ifdef CONFIG_64BIT
-	ldi		(PAGE_SIZE / 128), %r1
+#ifdef __LP64__
+	ldi		32, %r1			/* PAGE_SIZE/128 == 32 */
 
 	/* PREFETCH (Write) has not (yet) been proven to help here */
-	/* #define	PREFETCHW_OP	ldd		256(%0), %r0 */
+/* #define	PREFETCHW_OP	ldd		256(%0), %r0 */
 
 1:	std		%r0, 0(%r28)
 	std		%r0, 8(%r28)
@@ -699,13 +582,15 @@ ENTRY_CFI(clear_user_page_asm)
 	std		%r0, 104(%r28)
 	std		%r0, 112(%r28)
 	std		%r0, 120(%r28)
-	addib,COND(>)		-1, %r1, 1b
+	ADDIB>		-1, %r1, 1b
 	ldo		128(%r28), %r28
 
-#else	/* ! CONFIG_64BIT */
-	ldi		(PAGE_SIZE / 64), %r1
+#else	/* ! __LP64 */
 
-1:	stw		%r0, 0(%r28)
+	ldi		64, %r1			/* PAGE_SIZE/64 == 64 */
+
+1:
+	stw		%r0, 0(%r28)
 	stw		%r0, 4(%r28)
 	stw		%r0, 8(%r28)
 	stw		%r0, 12(%r28)
@@ -721,182 +606,34 @@ ENTRY_CFI(clear_user_page_asm)
 	stw		%r0, 52(%r28)
 	stw		%r0, 56(%r28)
 	stw		%r0, 60(%r28)
-	addib,COND(>)		-1, %r1, 1b
+	ADDIB>		-1, %r1, 1b
 	ldo		64(%r28), %r28
-#endif	/* CONFIG_64BIT */
+#endif	/* __LP64 */
 
 	bv		%r0(%r2)
 	nop
-ENDPROC_CFI(clear_user_page_asm)
+	.exit
 
-ENTRY_CFI(flush_dcache_page_asm)
-	ldil		L%(TMPALIAS_MAP_START), %r28
-	dep_safe	%r25, 31,TMPALIAS_SIZE_BITS, %r28	/* Form aliased virtual address 'to' */
-	depi_safe	0, 31,PAGE_SHIFT, %r28			/* Clear any offset bits */
+	.procend
 
-	/* Purge any old translation */
+	.export flush_kernel_dcache_page
 
-#ifdef CONFIG_PA20
-	pdtlb,l		%r0(%r28)
-#else
-0:	pdtlb		%r0(%r28)
-	ALTERNATIVE(0b, 0b+4, ALT_COND_NO_SMP, INSN_PxTLB)
-#endif
+flush_kernel_dcache_page:
+	.proc
+	.callinfo NO_CALLS
+	.entry
 
-88:	ldil		L%dcache_stride, %r1
-	ldw		R%dcache_stride(%r1), r31
-
-#ifdef CONFIG_64BIT
-	depdi,z		1, 63-PAGE_SHIFT,1, %r25
-#else
-	depwi,z		1, 31-PAGE_SHIFT,1, %r25
-#endif
-	add		%r28, %r25, %r25
-	sub		%r25, r31, %r25
-
-1:	fdc,m		r31(%r28)
-	fdc,m		r31(%r28)
-	fdc,m		r31(%r28)
-	fdc,m		r31(%r28)
-	fdc,m		r31(%r28)
-	fdc,m		r31(%r28)
-	fdc,m		r31(%r28)
-	fdc,m		r31(%r28)
-	fdc,m		r31(%r28)
-	fdc,m		r31(%r28)
-	fdc,m		r31(%r28)
-	fdc,m		r31(%r28)
-	fdc,m		r31(%r28)
-	fdc,m		r31(%r28)
-	fdc,m		r31(%r28)
-	cmpb,COND(>>)	%r25, %r28, 1b /* predict taken */
-	fdc,m		r31(%r28)
-
-89:	ALTERNATIVE(88b, 89b, ALT_COND_NO_DCACHE, INSN_NOP)
-	sync
-	bv		%r0(%r2)
-	nop
-ENDPROC_CFI(flush_dcache_page_asm)
-
-ENTRY_CFI(purge_dcache_page_asm)
-	ldil		L%(TMPALIAS_MAP_START), %r28
-	dep_safe	%r25, 31,TMPALIAS_SIZE_BITS, %r28	/* Form aliased virtual address 'to' */
-	depi_safe	0, 31,PAGE_SHIFT, %r28			/* Clear any offset bits */
-
-	/* Purge any old translation */
-
-#ifdef CONFIG_PA20
-	pdtlb,l		%r0(%r28)
-#else
-0:	pdtlb		%r0(%r28)
-	ALTERNATIVE(0b, 0b+4, ALT_COND_NO_SMP, INSN_PxTLB)
-#endif
-
-88:	ldil		L%dcache_stride, %r1
-	ldw		R%dcache_stride(%r1), r31
-
-#ifdef CONFIG_64BIT
-	depdi,z		1, 63-PAGE_SHIFT,1, %r25
-#else
-	depwi,z		1, 31-PAGE_SHIFT,1, %r25
-#endif
-	add		%r28, %r25, %r25
-	sub		%r25, r31, %r25
-
-1:      pdc,m		r31(%r28)
-	pdc,m		r31(%r28)
-	pdc,m		r31(%r28)
-	pdc,m		r31(%r28)
-	pdc,m		r31(%r28)
-	pdc,m		r31(%r28)
-	pdc,m		r31(%r28)
-	pdc,m		r31(%r28)
-	pdc,m		r31(%r28)
-	pdc,m		r31(%r28)
-	pdc,m		r31(%r28)
-	pdc,m		r31(%r28)
-	pdc,m		r31(%r28)
-	pdc,m		r31(%r28)
-	pdc,m		r31(%r28)
-	cmpb,COND(>>)	%r25, %r28, 1b /* predict taken */
-	pdc,m		r31(%r28)
-
-89:	ALTERNATIVE(88b, 89b, ALT_COND_NO_DCACHE, INSN_NOP)
-	sync
-	bv		%r0(%r2)
-	nop
-ENDPROC_CFI(purge_dcache_page_asm)
-
-ENTRY_CFI(flush_icache_page_asm)
-	ldil		L%(TMPALIAS_MAP_START), %r28
-	dep_safe	%r25, 31,TMPALIAS_SIZE_BITS, %r28	/* Form aliased virtual address 'to' */
-	depi_safe	0, 31,PAGE_SHIFT, %r28			/* Clear any offset bits */
-
-	/* Purge any old translation.  Note that the FIC instruction
-	 * may use either the instruction or data TLB.  Given that we
-	 * have a flat address space, it's not clear which TLB will be
-	 * used.  So, we purge both entries.  */
-
-#ifdef CONFIG_PA20
-	pdtlb,l		%r0(%r28)
-1:	pitlb,l         %r0(%sr4,%r28)
-	ALTERNATIVE(1b, 1b+4, ALT_COND_NO_SPLIT_TLB, INSN_NOP)
-#else
-0:	pdtlb		%r0(%r28)
-1:	pitlb           %r0(%sr4,%r28)
-	ALTERNATIVE(0b, 0b+4, ALT_COND_NO_SMP, INSN_PxTLB)
-	ALTERNATIVE(1b, 1b+4, ALT_COND_NO_SMP, INSN_PxTLB)
-	ALTERNATIVE(1b, 1b+4, ALT_COND_NO_SPLIT_TLB, INSN_NOP)
-#endif
-
-88:	ldil		L%icache_stride, %r1
-	ldw		R%icache_stride(%r1), %r31
-
-#ifdef CONFIG_64BIT
-	depdi,z		1, 63-PAGE_SHIFT,1, %r25
-#else
-	depwi,z		1, 31-PAGE_SHIFT,1, %r25
-#endif
-	add		%r28, %r25, %r25
-	sub		%r25, %r31, %r25
-
-	/* fic only has the type 26 form on PA1.1, requiring an
-	 * explicit space specification, so use %sr4 */
-1:      fic,m		%r31(%sr4,%r28)
-	fic,m		%r31(%sr4,%r28)
-	fic,m		%r31(%sr4,%r28)
-	fic,m		%r31(%sr4,%r28)
-	fic,m		%r31(%sr4,%r28)
-	fic,m		%r31(%sr4,%r28)
-	fic,m		%r31(%sr4,%r28)
-	fic,m		%r31(%sr4,%r28)
-	fic,m		%r31(%sr4,%r28)
-	fic,m		%r31(%sr4,%r28)
-	fic,m		%r31(%sr4,%r28)
-	fic,m		%r31(%sr4,%r28)
-	fic,m		%r31(%sr4,%r28)
-	fic,m		%r31(%sr4,%r28)
-	fic,m		%r31(%sr4,%r28)
-	cmpb,COND(>>)	%r25, %r28, 1b /* predict taken */
-	fic,m		%r31(%sr4,%r28)
-
-89:	ALTERNATIVE(88b, 89b, ALT_COND_NO_ICACHE, INSN_NOP)
-	sync
-	bv		%r0(%r2)
-	nop
-ENDPROC_CFI(flush_icache_page_asm)
-
-ENTRY_CFI(flush_kernel_dcache_page_asm)
-88:	ldil		L%dcache_stride, %r1
+	ldil		L%dcache_stride, %r1
 	ldw		R%dcache_stride(%r1), %r23
 
-#ifdef CONFIG_64BIT
+#ifdef __LP64__
 	depdi,z		1, 63-PAGE_SHIFT,1, %r25
 #else
 	depwi,z		1, 31-PAGE_SHIFT,1, %r25
 #endif
 	add		%r26, %r25, %r25
 	sub		%r25, %r23, %r25
+
 
 1:      fdc,m		%r23(%r26)
 	fdc,m		%r23(%r26)
@@ -913,20 +650,116 @@ ENTRY_CFI(flush_kernel_dcache_page_asm)
 	fdc,m		%r23(%r26)
 	fdc,m		%r23(%r26)
 	fdc,m		%r23(%r26)
-	cmpb,COND(>>)	%r25, %r26, 1b /* predict taken */
+	CMPB<<		%r26, %r25,1b
 	fdc,m		%r23(%r26)
 
-89:	ALTERNATIVE(88b, 89b, ALT_COND_NO_DCACHE, INSN_NOP)
 	sync
 	bv		%r0(%r2)
 	nop
-ENDPROC_CFI(flush_kernel_dcache_page_asm)
+	.exit
 
-ENTRY_CFI(purge_kernel_dcache_page_asm)
-88:	ldil		L%dcache_stride, %r1
+	.procend
+	
+	.export flush_user_dcache_page
+
+flush_user_dcache_page:
+	.proc
+	.callinfo NO_CALLS
+	.entry
+
+	ldil		L%dcache_stride, %r1
 	ldw		R%dcache_stride(%r1), %r23
 
-#ifdef CONFIG_64BIT
+#ifdef __LP64__
+	depdi,z		1,63-PAGE_SHIFT,1, %r25
+#else
+	depwi,z		1,31-PAGE_SHIFT,1, %r25
+#endif
+	add		%r26, %r25, %r25
+	sub		%r25, %r23, %r25
+
+
+1:      fdc,m		%r23(%sr3, %r26)
+	fdc,m		%r23(%sr3, %r26)
+	fdc,m		%r23(%sr3, %r26)
+	fdc,m		%r23(%sr3, %r26)
+	fdc,m		%r23(%sr3, %r26)
+	fdc,m		%r23(%sr3, %r26)
+	fdc,m		%r23(%sr3, %r26)
+	fdc,m		%r23(%sr3, %r26)
+	fdc,m		%r23(%sr3, %r26)
+	fdc,m		%r23(%sr3, %r26)
+	fdc,m		%r23(%sr3, %r26)
+	fdc,m		%r23(%sr3, %r26)
+	fdc,m		%r23(%sr3, %r26)
+	fdc,m		%r23(%sr3, %r26)
+	fdc,m		%r23(%sr3, %r26)
+	CMPB<<		%r26, %r25,1b
+	fdc,m		%r23(%sr3, %r26)
+
+	sync
+	bv		%r0(%r2)
+	nop
+	.exit
+
+	.procend
+
+	.export flush_user_icache_page
+
+flush_user_icache_page:
+	.proc
+	.callinfo NO_CALLS
+	.entry
+
+	ldil		L%dcache_stride, %r1
+	ldw		R%dcache_stride(%r1), %r23
+
+#ifdef __LP64__
+	depdi,z		1, 63-PAGE_SHIFT,1, %r25
+#else
+	depwi,z		1, 31-PAGE_SHIFT,1, %r25
+#endif
+	add		%r26, %r25, %r25
+	sub		%r25, %r23, %r25
+
+
+1:      fic,m		%r23(%sr3, %r26)
+	fic,m		%r23(%sr3, %r26)
+	fic,m		%r23(%sr3, %r26)
+	fic,m		%r23(%sr3, %r26)
+	fic,m		%r23(%sr3, %r26)
+	fic,m		%r23(%sr3, %r26)
+	fic,m		%r23(%sr3, %r26)
+	fic,m		%r23(%sr3, %r26)
+	fic,m		%r23(%sr3, %r26)
+	fic,m		%r23(%sr3, %r26)
+	fic,m		%r23(%sr3, %r26)
+	fic,m		%r23(%sr3, %r26)
+	fic,m		%r23(%sr3, %r26)
+	fic,m		%r23(%sr3, %r26)
+	fic,m		%r23(%sr3, %r26)
+	CMPB<<		%r26, %r25,1b
+	fic,m		%r23(%sr3, %r26)
+
+	sync
+	bv		%r0(%r2)
+	nop
+	.exit
+
+	.procend
+
+
+	.export purge_kernel_dcache_page
+
+purge_kernel_dcache_page:
+	.proc
+	.callinfo NO_CALLS
+	.entry
+
+	ldil		L%dcache_stride, %r1
+	ldw		R%dcache_stride(%r1), %r23
+
+#ifdef __LP64__
 	depdi,z		1, 63-PAGE_SHIFT,1, %r25
 #else
 	depwi,z		1, 31-PAGE_SHIFT,1, %r25
@@ -949,184 +782,160 @@ ENTRY_CFI(purge_kernel_dcache_page_asm)
 	pdc,m		%r23(%r26)
 	pdc,m		%r23(%r26)
 	pdc,m		%r23(%r26)
-	cmpb,COND(>>)	%r25, %r26, 1b /* predict taken */
+	CMPB<<		%r26, %r25, 1b
 	pdc,m		%r23(%r26)
 
-89:	ALTERNATIVE(88b, 89b, ALT_COND_NO_DCACHE, INSN_NOP)
 	sync
 	bv		%r0(%r2)
 	nop
-ENDPROC_CFI(purge_kernel_dcache_page_asm)
+	.exit
 
-ENTRY_CFI(flush_user_dcache_range_asm)
-88:	ldil		L%dcache_stride, %r1
+	.procend
+
+#if 0
+	/* Currently not used, but it still is a possible alternate
+	 * solution.
+	 */
+
+	.export flush_alias_page
+
+flush_alias_page:
+	.proc
+	.callinfo NO_CALLS
+	.entry
+
+	tophys_r1		%r26
+
+	ldil		L%(TMPALIAS_MAP_START), %r28
+#ifdef __LP64__
+	extrd,u		%r26, 56,32, %r26	/* convert phys addr to tlb insert format */
+	depd		%r25, 63,22, %r28	/* Form aliased virtual address 'to' */
+	depdi		0, 63,12, %r28		/* Clear any offset bits */
+#else
+	extrw,u		%r26, 24,25, %r26	/* convert phys addr to tlb insert format */
+	depw		%r25, 31,22, %r28	/* Form aliased virtual address 'to' */
+	depwi		0, 31,12, %r28		/* Clear any offset bits */
+#endif
+
+	/* Purge any old translation */
+
+	pdtlb		0(%r28)
+
+	ldil		L%dcache_stride, %r1
+	ldw		R%dcache_stride(%r1), %r23
+
+#ifdef __LP64__
+	depdi,z		1, 63-PAGE_SHIFT,1, %r29
+#else
+	depwi,z		1, 31-PAGE_SHIFT,1, %r29
+#endif
+	add		%r28, %r29, %r29
+	sub		%r29, %r23, %r29
+
+1:      fdc,m		%r23(%r28)
+	fdc,m		%r23(%r28)
+	fdc,m		%r23(%r28)
+	fdc,m		%r23(%r28)
+	fdc,m		%r23(%r28)
+	fdc,m		%r23(%r28)
+	fdc,m		%r23(%r28)
+	fdc,m		%r23(%r28)
+	fdc,m		%r23(%r28)
+	fdc,m		%r23(%r28)
+	fdc,m		%r23(%r28)
+	fdc,m		%r23(%r28)
+	fdc,m		%r23(%r28)
+	fdc,m		%r23(%r28)
+	fdc,m		%r23(%r28)
+	CMPB<<		%r28, %r29, 1b
+	fdc,m		%r23(%r28)
+
+	sync
+	bv		%r0(%r2)
+	nop
+	.exit
+
+	.procend
+#endif
+
+	.export flush_user_dcache_range_asm
+
+flush_user_dcache_range_asm:
+	.proc
+	.callinfo NO_CALLS
+	.entry
+
+	ldil		L%dcache_stride, %r1
 	ldw		R%dcache_stride(%r1), %r23
 	ldo		-1(%r23), %r21
 	ANDCM		%r26, %r21, %r26
 
-#ifdef CONFIG_64BIT
-	depd,z		%r23, 59, 60, %r21
-#else
-	depw,z		%r23, 27, 28, %r21
-#endif
-	add		%r26, %r21, %r22
-	cmpb,COND(>>),n	%r22, %r25, 2f /* predict not taken */
-1:	add		%r22, %r21, %r22
-	fdc,m		%r23(%sr3, %r26)
-	fdc,m		%r23(%sr3, %r26)
-	fdc,m		%r23(%sr3, %r26)
-	fdc,m		%r23(%sr3, %r26)
-	fdc,m		%r23(%sr3, %r26)
-	fdc,m		%r23(%sr3, %r26)
-	fdc,m		%r23(%sr3, %r26)
-	fdc,m		%r23(%sr3, %r26)
-	fdc,m		%r23(%sr3, %r26)
-	fdc,m		%r23(%sr3, %r26)
-	fdc,m		%r23(%sr3, %r26)
-	fdc,m		%r23(%sr3, %r26)
-	fdc,m		%r23(%sr3, %r26)
-	fdc,m		%r23(%sr3, %r26)
-	fdc,m		%r23(%sr3, %r26)
-	cmpb,COND(<<=)	%r22, %r25, 1b /* predict taken */
+1:      CMPB<<,n	%r26, %r25, 1b
 	fdc,m		%r23(%sr3, %r26)
 
-2:	cmpb,COND(>>),n	%r25, %r26, 2b
-	fdc,m		%r23(%sr3, %r26)
-
-89:	ALTERNATIVE(88b, 89b, ALT_COND_NO_DCACHE, INSN_NOP)
 	sync
 	bv		%r0(%r2)
 	nop
-ENDPROC_CFI(flush_user_dcache_range_asm)
+	.exit
 
-ENTRY_CFI(flush_kernel_dcache_range_asm)
-88:	ldil		L%dcache_stride, %r1
+	.procend
+
+	.export flush_kernel_dcache_range_asm
+
+flush_kernel_dcache_range_asm:
+	.proc
+	.callinfo NO_CALLS
+	.entry
+
+	ldil		L%dcache_stride, %r1
 	ldw		R%dcache_stride(%r1), %r23
 	ldo		-1(%r23), %r21
 	ANDCM		%r26, %r21, %r26
 
-#ifdef CONFIG_64BIT
-	depd,z		%r23, 59, 60, %r21
-#else
-	depw,z		%r23, 27, 28, %r21
-#endif
-	add		%r26, %r21, %r22
-	cmpb,COND(>>),n	%r22, %r25, 2f /* predict not taken */
-1:	add		%r22, %r21, %r22
-	fdc,m		%r23(%r26)
-	fdc,m		%r23(%r26)
-	fdc,m		%r23(%r26)
-	fdc,m		%r23(%r26)
-	fdc,m		%r23(%r26)
-	fdc,m		%r23(%r26)
-	fdc,m		%r23(%r26)
-	fdc,m		%r23(%r26)
-	fdc,m		%r23(%r26)
-	fdc,m		%r23(%r26)
-	fdc,m		%r23(%r26)
-	fdc,m		%r23(%r26)
-	fdc,m		%r23(%r26)
-	fdc,m		%r23(%r26)
-	fdc,m		%r23(%r26)
-	cmpb,COND(<<=)	%r22, %r25, 1b /* predict taken */
-	fdc,m		%r23(%r26)
-
-2:	cmpb,COND(>>),n	%r25, %r26, 2b /* predict taken */
+1:      CMPB<<,n	%r26, %r25,1b
 	fdc,m		%r23(%r26)
 
 	sync
-89:	ALTERNATIVE(88b, 89b, ALT_COND_NO_DCACHE, INSN_NOP)
+	syncdma
 	bv		%r0(%r2)
 	nop
-ENDPROC_CFI(flush_kernel_dcache_range_asm)
+	.exit
 
-ENTRY_CFI(purge_kernel_dcache_range_asm)
-88:	ldil		L%dcache_stride, %r1
-	ldw		R%dcache_stride(%r1), %r23
-	ldo		-1(%r23), %r21
-	ANDCM		%r26, %r21, %r26
+	.procend
 
-#ifdef CONFIG_64BIT
-	depd,z		%r23, 59, 60, %r21
-#else
-	depw,z		%r23, 27, 28, %r21
-#endif
-	add		%r26, %r21, %r22
-	cmpb,COND(>>),n	%r22, %r25, 2f /* predict not taken */
-1:	add		%r22, %r21, %r22
-	pdc,m		%r23(%r26)
-	pdc,m		%r23(%r26)
-	pdc,m		%r23(%r26)
-	pdc,m		%r23(%r26)
-	pdc,m		%r23(%r26)
-	pdc,m		%r23(%r26)
-	pdc,m		%r23(%r26)
-	pdc,m		%r23(%r26)
-	pdc,m		%r23(%r26)
-	pdc,m		%r23(%r26)
-	pdc,m		%r23(%r26)
-	pdc,m		%r23(%r26)
-	pdc,m		%r23(%r26)
-	pdc,m		%r23(%r26)
-	pdc,m		%r23(%r26)
-	cmpb,COND(<<=)	%r22, %r25, 1b /* predict taken */
-	pdc,m		%r23(%r26)
+	.export flush_user_icache_range_asm
 
-2:	cmpb,COND(>>),n	%r25, %r26, 2b /* predict taken */
-	pdc,m		%r23(%r26)
+flush_user_icache_range_asm:
+	.proc
+	.callinfo NO_CALLS
+	.entry
 
-	sync
-89:	ALTERNATIVE(88b, 89b, ALT_COND_NO_DCACHE, INSN_NOP)
-	bv		%r0(%r2)
-	nop
-ENDPROC_CFI(purge_kernel_dcache_range_asm)
-
-ENTRY_CFI(flush_user_icache_range_asm)
-88:	ldil		L%icache_stride, %r1
+	ldil		L%icache_stride, %r1
 	ldw		R%icache_stride(%r1), %r23
 	ldo		-1(%r23), %r21
 	ANDCM		%r26, %r21, %r26
 
-#ifdef CONFIG_64BIT
-	depd,z		%r23, 59, 60, %r21
-#else
-	depw,z		%r23, 27, 28, %r21
-#endif
-	add		%r26, %r21, %r22
-	cmpb,COND(>>),n	%r22, %r25, 2f /* predict not taken */
-1:	add		%r22, %r21, %r22
-	fic,m		%r23(%sr3, %r26)
-	fic,m		%r23(%sr3, %r26)
-	fic,m		%r23(%sr3, %r26)
-	fic,m		%r23(%sr3, %r26)
-	fic,m		%r23(%sr3, %r26)
-	fic,m		%r23(%sr3, %r26)
-	fic,m		%r23(%sr3, %r26)
-	fic,m		%r23(%sr3, %r26)
-	fic,m		%r23(%sr3, %r26)
-	fic,m		%r23(%sr3, %r26)
-	fic,m		%r23(%sr3, %r26)
-	fic,m		%r23(%sr3, %r26)
-	fic,m		%r23(%sr3, %r26)
-	fic,m		%r23(%sr3, %r26)
-	fic,m		%r23(%sr3, %r26)
-	cmpb,COND(<<=)	%r22, %r25, 1b /* predict taken */
+1:      CMPB<<,n	%r26, %r25,1b
 	fic,m		%r23(%sr3, %r26)
 
-2:	cmpb,COND(>>),n	%r25, %r26, 2b
-	fic,m		%r23(%sr3, %r26)
-
-89:	ALTERNATIVE(88b, 89b, ALT_COND_NO_ICACHE, INSN_NOP)
 	sync
 	bv		%r0(%r2)
 	nop
-ENDPROC_CFI(flush_user_icache_range_asm)
+	.exit
 
-ENTRY_CFI(flush_kernel_icache_page)
-88:	ldil		L%icache_stride, %r1
+	.procend
+
+	.export flush_kernel_icache_page
+
+flush_kernel_icache_page:
+	.proc
+	.callinfo NO_CALLS
+	.entry
+
+	ldil		L%icache_stride, %r1
 	ldw		R%icache_stride(%r1), %r23
 
-#ifdef CONFIG_64BIT
+#ifdef __LP64__
 	depdi,z		1, 63-PAGE_SHIFT,1, %r25
 #else
 	depwi,z		1, 31-PAGE_SHIFT,1, %r25
@@ -1135,98 +944,84 @@ ENTRY_CFI(flush_kernel_icache_page)
 	sub		%r25, %r23, %r25
 
 
-1:      fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	cmpb,COND(>>)	%r25, %r26, 1b /* predict taken */
-	fic,m		%r23(%sr4, %r26)
+1:      fic,m		%r23(%r26)
+	fic,m		%r23(%r26)
+	fic,m		%r23(%r26)
+	fic,m		%r23(%r26)
+	fic,m		%r23(%r26)
+	fic,m		%r23(%r26)
+	fic,m		%r23(%r26)
+	fic,m		%r23(%r26)
+	fic,m		%r23(%r26)
+	fic,m		%r23(%r26)
+	fic,m		%r23(%r26)
+	fic,m		%r23(%r26)
+	fic,m		%r23(%r26)
+	fic,m		%r23(%r26)
+	fic,m		%r23(%r26)
+	CMPB<<		%r26, %r25, 1b
+	fic,m		%r23(%r26)
 
-89:	ALTERNATIVE(88b, 89b, ALT_COND_NO_ICACHE, INSN_NOP)
 	sync
 	bv		%r0(%r2)
 	nop
-ENDPROC_CFI(flush_kernel_icache_page)
+	.exit
 
-ENTRY_CFI(flush_kernel_icache_range_asm)
-88:	ldil		L%icache_stride, %r1
+	.procend
+
+	.export flush_kernel_icache_range_asm
+
+flush_kernel_icache_range_asm:
+	.proc
+	.callinfo NO_CALLS
+	.entry
+
+	ldil		L%icache_stride, %r1
 	ldw		R%icache_stride(%r1), %r23
 	ldo		-1(%r23), %r21
 	ANDCM		%r26, %r21, %r26
 
-#ifdef CONFIG_64BIT
-	depd,z		%r23, 59, 60, %r21
-#else
-	depw,z		%r23, 27, 28, %r21
-#endif
-	add		%r26, %r21, %r22
-	cmpb,COND(>>),n	%r22, %r25, 2f /* predict not taken */
-1:	add		%r22, %r21, %r22
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	fic,m		%r23(%sr4, %r26)
-	cmpb,COND(<<=)	%r22, %r25, 1b /* predict taken */
-	fic,m		%r23(%sr4, %r26)
+1:      CMPB<<,n	%r26, %r25, 1b
+	fic,m		%r23(%r26)
 
-2:	cmpb,COND(>>),n	%r25, %r26, 2b /* predict taken */
-	fic,m		%r23(%sr4, %r26)
-
-89:	ALTERNATIVE(88b, 89b, ALT_COND_NO_ICACHE, INSN_NOP)
 	sync
 	bv		%r0(%r2)
 	nop
-ENDPROC_CFI(flush_kernel_icache_range_asm)
+	.exit
 
-	.text
+	.procend
 
-	/* align should cover use of rfi in disable_sr_hashing_asm and
-	 * srdis_done.
-	 */
-	.align	256
-ENTRY_CFI(disable_sr_hashing_asm)
-	/*
-	 * Switch to real mode
-	 */
-	/* pcxt_ssm_bug */
-	rsm		PSW_SM_I, %r0
-	load32		PA(1f), %r1
-	nop
-	nop
-	nop
-	nop
-	nop
+	.align	128
 
-	rsm		PSW_SM_Q, %r0		/* prep to load iia queue */
+	.export disable_sr_hashing_asm,code
+
+disable_sr_hashing_asm:
+	.proc
+	.callinfo NO_CALLS
+	.entry
+
+	/* Switch to real mode */
+
+	ssm		0, %r0			/* relied upon translation! */
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	
+	rsm		(PSW_SM_Q|PSW_SM_I), %r0 /* disable Q&I to load the iia queue */
+	ldil		L%REAL_MODE_PSW, %r1
+	ldo		R%REAL_MODE_PSW(%r1), %r1
+	mtctl		%r1, %cr22
 	mtctl		%r0, %cr17		/* Clear IIASQ tail */
 	mtctl		%r0, %cr17		/* Clear IIASQ head */
+	ldil		L%PA(1f), %r1
+	ldo		R%PA(1f)(%r1), %r1
 	mtctl		%r1, %cr18		/* IIAOQ head */
 	ldo		4(%r1), %r1
 	mtctl		%r1, %cr18		/* IIAOQ tail */
-	load32		REAL_MODE_PSW, %r1
-	mtctl		%r1, %ipsw
 	rfi
 	nop
 
@@ -1258,36 +1053,34 @@ srdis_pcxl:
 
 srdis_pa20:
 
-	/* Disable Space Register Hashing for PCXU,PCXU+,PCXW,PCXW+,PCXW2 */
+	/* Disable Space Register Hashing for PCXU,PCXU+,PCXW,PCXW+ */
 
 	.word		0x144008bc		/* mfdiag %dr2, %r28 */
 	depdi		0, 54,1, %r28		/* clear DIAG_SPHASH_ENAB (bit 54) */
 	.word		0x145c1840		/* mtdiag %r28, %dr2 */
 
-
 srdis_done:
-	/* Switch back to virtual mode */
-	rsm		PSW_SM_I, %r0		/* prep to load iia queue */
-	load32 	   	2f, %r1
-	nop
-	nop
-	nop
-	nop
-	nop
 
-	rsm		PSW_SM_Q, %r0		/* prep to load iia queue */
+	/* Switch back to virtual mode */
+
+	rsm		PSW_SM_Q, %r0		/* clear Q bit to load iia queue */
+	ldil		L%KERNEL_PSW, %r1
+	ldo		R%KERNEL_PSW(%r1), %r1
+	mtctl		%r1, %cr22
 	mtctl		%r0, %cr17		/* Clear IIASQ tail */
 	mtctl		%r0, %cr17		/* Clear IIASQ head */
+	ldil 	   	L%(2f), %r1
+	ldo     	R%(2f)(%r1), %r1
 	mtctl		%r1, %cr18		/* IIAOQ head */
 	ldo		4(%r1), %r1
 	mtctl		%r1, %cr18		/* IIAOQ tail */
-	load32		KERNEL_PSW, %r1
-	mtctl		%r1, %ipsw
 	rfi
 	nop
 
 2:      bv		%r0(%r2)
 	nop
-ENDPROC_CFI(disable_sr_hashing_asm)
+	.exit
+
+	.procend
 
 	.end

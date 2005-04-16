@@ -1,19 +1,21 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- *
  * Copyright (c) 2004 MIPS Inc
  * Author: chris@mips.com
  *
- * Copyright (C) 2004, 06 Ralf Baechle <ralf@linux-mips.org>
+ * This program is free software; you can redistribute  it and/or modify it
+ * under  the terms of  the GNU General  Public License as published by the
+ * Free Software Foundation;  either version 2 of the  License, or (at your
+ * option) any later version.
  */
+#include <linux/module.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
+#include <asm/ptrace.h>
 #include <linux/sched.h>
 #include <linux/kernel_stat.h>
 #include <asm/io.h>
 #include <asm/irq.h>
 #include <asm/msc01_ic.h>
-#include <asm/traps.h>
 
 static unsigned long _icctrl_msc;
 #define MSC01_IC_REG_BASE	_icctrl_msc
@@ -24,10 +26,8 @@ static unsigned long _icctrl_msc;
 static unsigned int irq_base;
 
 /* mask off an interrupt */
-static inline void mask_msc_irq(struct irq_data *d)
+static inline void mask_msc_irq(unsigned int irq)
 {
-	unsigned int irq = d->irq;
-
 	if (irq < (irq_base + 32))
 		MSCIC_WRITE(MSC01_IC_DISL, 1<<(irq - irq_base));
 	else
@@ -35,10 +35,8 @@ static inline void mask_msc_irq(struct irq_data *d)
 }
 
 /* unmask an interrupt */
-static inline void unmask_msc_irq(struct irq_data *d)
+static inline void unmask_msc_irq(unsigned int irq)
 {
-	unsigned int irq = d->irq;
-
 	if (irq < (irq_base + 32))
 		MSCIC_WRITE(MSC01_IC_ENAL, 1<<(irq - irq_base));
 	else
@@ -46,24 +44,47 @@ static inline void unmask_msc_irq(struct irq_data *d)
 }
 
 /*
+ * Enables the IRQ on SOC-it
+ */
+static void enable_msc_irq(unsigned int irq)
+{
+	unmask_msc_irq(irq);
+}
+
+/*
+ * Initialize the IRQ on SOC-it
+ */
+static unsigned int startup_msc_irq(unsigned int irq)
+{
+	unmask_msc_irq(irq);
+	return 0;
+}
+
+/*
+ * Disables the IRQ on SOC-it
+ */
+static void disable_msc_irq(unsigned int irq)
+{
+	mask_msc_irq(irq);
+}
+
+/*
  * Masks and ACKs an IRQ
  */
-static void level_mask_and_ack_msc_irq(struct irq_data *d)
+static void level_mask_and_ack_msc_irq(unsigned int irq)
 {
-	mask_msc_irq(d);
-	if (!cpu_has_veic)
+	mask_msc_irq(irq);
+	if (!cpu_has_ei)
 		MSCIC_WRITE(MSC01_IC_EOI, 0);
 }
 
 /*
  * Masks and ACKs an IRQ
  */
-static void edge_mask_and_ack_msc_irq(struct irq_data *d)
+static void edge_mask_and_ack_msc_irq(unsigned int irq)
 {
-	unsigned int irq = d->irq;
-
-	mask_msc_irq(d);
-	if (!cpu_has_veic)
+	mask_msc_irq(irq);
+	if (!cpu_has_ei)
 		MSCIC_WRITE(MSC01_IC_EOI, 0);
 	else {
 		u32 r;
@@ -74,82 +95,94 @@ static void edge_mask_and_ack_msc_irq(struct irq_data *d)
 }
 
 /*
+ * End IRQ processing
+ */
+static void end_msc_irq(unsigned int irq)
+{
+	if (!(irq_desc[irq].status & (IRQ_DISABLED|IRQ_INPROGRESS)))
+		unmask_msc_irq(irq);
+}
+
+/*
  * Interrupt handler for interrupts coming from SOC-it.
  */
-void ll_msc_irq(void)
+void ll_msc_irq(struct pt_regs *regs)
 {
-	unsigned int irq;
+ 	unsigned int irq;
 
 	/* read the interrupt vector register */
 	MSCIC_READ(MSC01_IC_VEC, irq);
 	if (irq < 64)
-		do_IRQ(irq + irq_base);
+		do_IRQ(irq + irq_base, regs);
 	else {
 		/* Ignore spurious interrupt */
 	}
 }
 
-static void msc_bind_eic_interrupt(int irq, int set)
+void
+msc_bind_eic_interrupt (unsigned int irq, unsigned int set)
 {
 	MSCIC_WRITE(MSC01_IC_RAMW,
 		    (irq<<MSC01_IC_RAMW_ADDR_SHF) | (set<<MSC01_IC_RAMW_DATA_SHF));
 }
 
-static struct irq_chip msc_levelirq_type = {
-	.name = "SOC-it-Level",
-	.irq_ack = level_mask_and_ack_msc_irq,
-	.irq_mask = mask_msc_irq,
-	.irq_mask_ack = level_mask_and_ack_msc_irq,
-	.irq_unmask = unmask_msc_irq,
-	.irq_eoi = unmask_msc_irq,
+#define shutdown_msc_irq	disable_msc_irq
+
+struct hw_interrupt_type msc_levelirq_type = {
+	"SOC-it-Level",
+	startup_msc_irq,
+	shutdown_msc_irq,
+	enable_msc_irq,
+	disable_msc_irq,
+	level_mask_and_ack_msc_irq,
+	end_msc_irq,
+	NULL
 };
 
-static struct irq_chip msc_edgeirq_type = {
-	.name = "SOC-it-Edge",
-	.irq_ack = edge_mask_and_ack_msc_irq,
-	.irq_mask = mask_msc_irq,
-	.irq_mask_ack = edge_mask_and_ack_msc_irq,
-	.irq_unmask = unmask_msc_irq,
-	.irq_eoi = unmask_msc_irq,
+struct hw_interrupt_type msc_edgeirq_type = {
+	"SOC-it-Edge",
+	startup_msc_irq,
+	shutdown_msc_irq,
+	enable_msc_irq,
+	disable_msc_irq,
+	edge_mask_and_ack_msc_irq,
+	end_msc_irq,
+	NULL
 };
 
 
-void __init init_msc_irqs(unsigned long icubase, unsigned int irqbase, msc_irqmap_t *imp, int nirq)
+void __init init_msc_irqs(unsigned int base, msc_irqmap_t *imp, int nirq)
 {
-	_icctrl_msc = (unsigned long) ioremap(icubase, 0x40000);
+	extern void (*board_bind_eic_interrupt)(unsigned int irq, unsigned int regset);
+
+	_icctrl_msc = (unsigned long) ioremap (MIPS_MSC01_IC_REG_BASE, 0x40000);
 
 	/* Reset interrupt controller - initialises all registers to 0 */
 	MSCIC_WRITE(MSC01_IC_RST, MSC01_IC_RST_RST_BIT);
 
 	board_bind_eic_interrupt = &msc_bind_eic_interrupt;
 
-	for (; nirq > 0; nirq--, imp++) {
+	for (; nirq >= 0; nirq--, imp++) {
 		int n = imp->im_irq;
 
 		switch (imp->im_type) {
 		case MSC01_IRQ_EDGE:
-			irq_set_chip_and_handler_name(irqbase + n,
-						      &msc_edgeirq_type,
-						      handle_edge_irq,
-						      "edge");
-			if (cpu_has_veic)
+			irq_desc[base+n].handler = &msc_edgeirq_type;
+			if (cpu_has_ei)
 				MSCIC_WRITE(MSC01_IC_SUP+n*8, MSC01_IC_SUP_EDGE_BIT);
 			else
 				MSCIC_WRITE(MSC01_IC_SUP+n*8, MSC01_IC_SUP_EDGE_BIT | imp->im_lvl);
 			break;
 		case MSC01_IRQ_LEVEL:
-			irq_set_chip_and_handler_name(irqbase + n,
-						      &msc_levelirq_type,
-						      handle_level_irq,
-						      "level");
-			if (cpu_has_veic)
+			irq_desc[base+n].handler = &msc_levelirq_type;
+			if (cpu_has_ei)
 				MSCIC_WRITE(MSC01_IC_SUP+n*8, 0);
 			else
 				MSCIC_WRITE(MSC01_IC_SUP+n*8, imp->im_lvl);
 		}
 	}
 
-	irq_base = irqbase;
+	irq_base = base;
 
 	MSCIC_WRITE(MSC01_IC_GENA, MSC01_IC_GENA_GENA_BIT);	/* Enable interrupt generation */
 

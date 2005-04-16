@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: GPL-2.0-only
 
 menu "Misc Linux/SPARC drivers"
 
@@ -14,6 +13,15 @@ config SUN_OPENPROMIO
 
 	  If unsure, say Y.
 
+config SUN_MOSTEK_RTC
+	tristate "Mostek real time clock support"
+	help
+	  The Mostek RTC chip is used on all known Sun computers except
+	  some JavaStations. For a JavaStation you need to say Y both here
+	  and to "Enhanced Real Time Clock Support".
+
+	  Say Y here unless you are building a special purpose kernel.
+
 config OBP_FLASH
 	tristate "OBP Flash Device support"
 	depends on SPARC64
@@ -21,57 +29,65 @@ config OBP_FLASH
 	  The OpenBoot PROM on Ultra systems is flashable. If you want to be
 	  able to upgrade the OBP firmware, say Y here.
 
+config SUN_BPP
+	tristate "Bidirectional parallel port support (OBSOLETE)"
+	depends on EXPERIMENTAL
+	help
+	  Say Y here to support Sun's obsolete variant of IEEE1284
+	  bidirectional parallel port protocol as /dev/bppX.  Can be built on
+	  x86 machines.
+
+config SUN_VIDEOPIX
+	tristate "Videopix Frame Grabber (EXPERIMENTAL)"
+	depends on EXPERIMENTAL && (BROKEN || !64BIT)
+	help
+	  Say Y here to support the Videopix Frame Grabber from Sun
+	  Microsystems, commonly found on SPARCstations.  This card, which is
+	  based on the Phillips SAA9051, can handle NTSC and PAL/SECAM and
+	  SVIDEO signals.
+
+config SUN_AURORA
+	tristate "Aurora Multiboard 1600se (EXPERIMENTAL)"
+	depends on EXPERIMENTAL && BROKEN
+	help
+	  The Aurora Multiboard is a multi-port high-speed serial controller.
+	  If you have one of these, say Y.
+
 config TADPOLE_TS102_UCTRL
-	tristate "Tadpole TS102 Microcontroller support"
+	tristate "Tadpole TS102 Microcontroller support (EXPERIMENTAL)"
+	depends on EXPERIMENTAL && SPARC32
 	help
 	  Say Y here to directly support the TS102 Microcontroller interface
 	  on the Tadpole Sparcbook 3.  This device handles power-management
 	  events, and can also notice the attachment/detachment of external
 	  monitors and mice.
 
-config BBC_I2C
-	tristate "UltraSPARC-III bootbus i2c controller driver"
-	depends on PCI && SPARC64
+config SUN_JSFLASH
+	tristate "JavaStation OS Flash SIMM (EXPERIMENTAL)"
+	depends on EXPERIMENTAL && SPARC32
 	help
-	  The BBC devices on the UltraSPARC III have two I2C controllers.  The
-	  first I2C controller connects mainly to configuration PROMs (NVRAM,
-	  CPU configuration, DIMM types, etc.).  The second I2C controller
-	  connects to environmental control devices such as fans and
-	  temperature sensors.  The second controller also connects to the
-	  smartcard reader, if present.  Say Y to enable support for these.
+	  If you say Y here, you will be able to boot from your JavaStation's
+	  Flash memory.
 
-config ENVCTRL
-	tristate "SUNW, envctrl support"
-	depends on PCI && SPARC64
+# XXX Why don't we do "source drivers/char/Config.in" somewhere?
+# no shit
+config APM_RTC_IS_GMT
+	bool
+	depends on EXPERIMENTAL && SPARC32 && PCI
+	default y
 	help
-	  Kernel support for temperature and fan monitoring on Sun SME
-	  machines.
+	  Say Y here if your RTC (Real Time Clock a.k.a. hardware clock)
+	  stores the time in GMT (Greenwich Mean Time). Say N if your RTC
+	  stores localtime.
 
-	  To compile this driver as a module, choose M here: the
-	  module will be called envctrl.
+	  It is in fact recommended to store GMT in your RTC, because then you
+	  don't have to worry about daylight savings time changes. The only
+	  reason not to use GMT in your RTC is if you also run a broken OS
+	  that doesn't understand GMT.
 
-config DISPLAY7SEG
-	tristate "7-Segment Display support"
-	depends on PCI && SPARC64
-	help
-	  This is the driver for the 7-segment display and LED present on
-	  Sun Microsystems CompactPCI models CP1400 and CP1500.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called display7seg.
-
-	  If you do not have a CompactPCI model CP1400 or CP1500, or
-	  another UltraSPARC-IIi-cEngine boardset with a 7-segment display,
-	  you should say N to this option.
-
-config ORACLE_DAX
-	tristate "Oracle Data Analytics Accelerator"
-	depends on SPARC64
-	default m
-	help
-	 Driver for Oracle Data Analytics Accelerator, which is
-	 a coprocessor that performs database operations in hardware.
-	 It is available on M7 and M8 based systems only.
+config RTC
+	tristate "PC-style Real Time Clock Support"
+	depends on PCI && EXPERIMENTAL && SPARC32
 
 endmenu
 

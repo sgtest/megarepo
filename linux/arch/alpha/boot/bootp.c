@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * arch/alpha/boot/bootp.c
  *
@@ -9,13 +8,14 @@
  * based significantly on the arch/alpha/boot/main.c of Linus Torvalds
  */
 #include <linux/kernel.h>
-#include <linux/slab.h>
 #include <linux/string.h>
-#include <generated/utsrelease.h>
+#include <linux/version.h>
 #include <linux/mm.h>
 
+#include <asm/system.h>
 #include <asm/console.h>
 #include <asm/hwrpb.h>
+#include <asm/pgtable.h>
 #include <asm/io.h>
 
 #include <stdarg.h>
@@ -23,7 +23,7 @@
 #include "ksize.h"
 
 extern unsigned long switch_to_osf_pal(unsigned long nr,
-	struct pcb_struct *pcb_va, struct pcb_struct *pcb_pa,
+	struct pcb_struct * pcb_va, struct pcb_struct * pcb_pa,
 	unsigned long *vptb);
 
 extern void move_stack(unsigned long new_stack);

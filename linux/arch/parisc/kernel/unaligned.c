@@ -1,28 +1,48 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *    Unaligned memory access handler
  *
  *    Copyright (C) 2001 Randolph Chung <tausq@debian.org>
- *    Copyright (C) 2022 Helge Deller <deller@gmx.de>
  *    Significantly tweaked by LaMont Jones <lamont@debian.org>
+ *
+ *    This program is free software; you can redistribute it and/or modify
+ *    it under the terms of the GNU General Public License as published by
+ *    the Free Software Foundation; either version 2, or (at your option)
+ *    any later version.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU General Public License for more details.
+ *
+ *    You should have received a copy of the GNU General Public License
+ *    along with this program; if not, write to the Free Software
+ *    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+ *
  */
 
-#include <linux/sched/signal.h>
-#include <linux/signal.h>
-#include <linux/ratelimit.h>
-#include <linux/uaccess.h>
-#include <asm/hardirq.h>
-#include <asm/traps.h>
+#include <linux/config.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <asm/uaccess.h>
 
 /* #define DEBUG_UNALIGNED 1 */
 
 #ifdef DEBUG_UNALIGNED
-#define DPRINTF(fmt, args...) do { printk(KERN_DEBUG "%s:%d:%s ", __FILE__, __LINE__, __func__ ); printk(KERN_DEBUG fmt, ##args ); } while (0)
+#define DPRINTF(fmt, args...) do { printk(KERN_DEBUG "%s:%d:%s ", __FILE__, __LINE__, __FUNCTION__ ); printk(KERN_DEBUG fmt, ##args ); } while (0)
 #else
 #define DPRINTF(fmt, args...)
 #endif
 
-#define RFMT "%#08lx"
+#ifdef __LP64__
+#define RFMT "%016lx"
+#else
+#define RFMT "%08lx"
+#endif
+
+#define FIXUP_BRANCH(lbl) \
+	"\tldil L%%" #lbl ", %%r1\n"			\
+	"\tldo R%%" #lbl "(%%r1), %%r1\n"		\
+	"\tbv,n %%r0(%%r1)\n"
 
 /* 1111 1100 0000 0000 0001 0011 1100 0000 */
 #define OPCODE1(a,b,c)	((a)<<26|(b)<<12|(c)<<6) 
@@ -100,30 +120,46 @@
 #define IM14(i) IM((i),14)
 
 #define ERR_NOTHANDLED	-1
+#define ERR_PAGEFAULT	-2
 
-int unaligned_enabled __read_mostly = 1;
+int unaligned_enabled = 1;
+
+void die_if_kernel (char *str, struct pt_regs *regs, long err);
 
 static int emulate_ldh(struct pt_regs *regs, int toreg)
 {
 	unsigned long saddr = regs->ior;
-	unsigned long val = 0, temp1;
-	ASM_EXCEPTIONTABLE_VAR(ret);
+	unsigned long val = 0;
+	int ret;
 
 	DPRINTF("load " RFMT ":" RFMT " to r%d for 2 bytes\n", 
 		regs->isr, regs->ior, toreg);
 
 	__asm__ __volatile__  (
 "	mtsp	%4, %%sr1\n"
-"1:	ldbs	0(%%sr1,%3), %2\n"
+"1:	ldbs	0(%%sr1,%3), %%r20\n"
 "2:	ldbs	1(%%sr1,%3), %0\n"
-"	depw	%2, 23, 24, %0\n"
+"	depw	%%r20, 23, 24, %0\n"
+"	copy	%%r0, %1\n"
 "3:	\n"
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(1b, 3b)
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(2b, 3b)
-	: "+r" (val), "+r" (ret), "=&r" (temp1)
-	: "r" (saddr), "r" (regs->isr) );
+"	.section .fixup,\"ax\"\n"
+"4:	ldi	-2, %1\n"
+	FIXUP_BRANCH(3b)
+"	.previous\n"
+"	.section __ex_table,\"aw\"\n"
+#ifdef __LP64__
+"	.dword	1b,4b\n"
+"	.dword  2b,4b\n"
+#else
+"	.word	1b,4b\n"
+"	.word	2b,4b\n"
+#endif
+"	.previous\n"
+	: "=r" (val), "=r" (ret)
+	: "0" (val), "r" (saddr), "r" (regs->isr)
+	: "r20" );
 
-	DPRINTF("val = " RFMT "\n", val);
+	DPRINTF("val = 0x" RFMT "\n", val);
 
 	if (toreg)
 		regs->gr[toreg] = val;
@@ -134,28 +170,41 @@ static int emulate_ldh(struct pt_regs *regs, int toreg)
 static int emulate_ldw(struct pt_regs *regs, int toreg, int flop)
 {
 	unsigned long saddr = regs->ior;
-	unsigned long val = 0, temp1, temp2;
-	ASM_EXCEPTIONTABLE_VAR(ret);
+	unsigned long val = 0;
+	int ret;
 
 	DPRINTF("load " RFMT ":" RFMT " to r%d for 4 bytes\n", 
 		regs->isr, regs->ior, toreg);
 
 	__asm__ __volatile__  (
-"	zdep	%4,28,2,%2\n"		/* r19=(ofs&3)*8 */
-"	mtsp	%5, %%sr1\n"
-"	depw	%%r0,31,2,%4\n"
-"1:	ldw	0(%%sr1,%4),%0\n"
-"2:	ldw	4(%%sr1,%4),%3\n"
-"	subi	32,%2,%2\n"
-"	mtctl	%2,11\n"
-"	vshd	%0,%3,%0\n"
+"	zdep	%3,28,2,%%r19\n"		/* r19=(ofs&3)*8 */
+"	mtsp	%4, %%sr1\n"
+"	depw	%%r0,31,2,%3\n"
+"1:	ldw	0(%%sr1,%3),%0\n"
+"2:	ldw	4(%%sr1,%3),%%r20\n"
+"	subi	32,%%r19,%%r19\n"
+"	mtctl	%%r19,11\n"
+"	vshd	%0,%%r20,%0\n"
+"	copy	%%r0, %1\n"
 "3:	\n"
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(1b, 3b)
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(2b, 3b)
-	: "+r" (val), "+r" (ret), "=&r" (temp1), "=&r" (temp2)
-	: "r" (saddr), "r" (regs->isr) );
+"	.section .fixup,\"ax\"\n"
+"4:	ldi	-2, %1\n"
+	FIXUP_BRANCH(3b)
+"	.previous\n"
+"	.section __ex_table,\"aw\"\n"
+#ifdef __LP64__
+"	.dword	1b,4b\n"
+"	.dword  2b,4b\n"
+#else
+"	.word	1b,4b\n"
+"	.word	2b,4b\n"
+#endif
+"	.previous\n"
+	: "=r" (val), "=r" (ret)
+	: "0" (val), "r" (saddr), "r" (regs->isr)
+	: "r19", "r20" );
 
-	DPRINTF("val = " RFMT "\n", val);
+	DPRINTF("val = 0x" RFMT "\n", val);
 
 	if (flop)
 		((__u32*)(regs->fr))[toreg] = val;
@@ -168,15 +217,16 @@ static int emulate_ldd(struct pt_regs *regs, int toreg, int flop)
 {
 	unsigned long saddr = regs->ior;
 	__u64 val = 0;
-	ASM_EXCEPTIONTABLE_VAR(ret);
+	int ret;
 
 	DPRINTF("load " RFMT ":" RFMT " to r%d for 8 bytes\n", 
 		regs->isr, regs->ior, toreg);
+#ifdef CONFIG_PA20
 
-	if (!IS_ENABLED(CONFIG_64BIT) && !flop)
-		return ERR_NOTHANDLED;
-
-#ifdef CONFIG_64BIT
+#ifndef __LP64__
+	if (!flop)
+		return -1;
+#endif
 	__asm__ __volatile__  (
 "	depd,z	%3,60,3,%%r19\n"		/* r19=(ofs&7)*8 */
 "	mtsp	%4, %%sr1\n"
@@ -186,32 +236,59 @@ static int emulate_ldd(struct pt_regs *regs, int toreg, int flop)
 "	subi	64,%%r19,%%r19\n"
 "	mtsar	%%r19\n"
 "	shrpd	%0,%%r20,%%sar,%0\n"
+"	copy	%%r0, %1\n"
 "3:	\n"
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(1b, 3b)
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(2b, 3b)
-	: "=r" (val), "+r" (ret)
+"	.section .fixup,\"ax\"\n"
+"4:	ldi	-2, %1\n"
+	FIXUP_BRANCH(3b)
+"	.previous\n"
+"	.section __ex_table,\"aw\"\n"
+#ifdef __LP64__
+"	.dword	1b,4b\n"
+"	.dword  2b,4b\n"
+#else
+"	.word	1b,4b\n"
+"	.word	2b,4b\n"
+#endif
+"	.previous\n"
+	: "=r" (val), "=r" (ret)
 	: "0" (val), "r" (saddr), "r" (regs->isr)
 	: "r19", "r20" );
 #else
     {
-	unsigned long shift, temp1;
+	unsigned long valh=0,vall=0;
 	__asm__ __volatile__  (
-"	zdep	%2,29,2,%3\n"		/* r19=(ofs&3)*8 */
-"	mtsp	%5, %%sr1\n"
-"	dep	%%r0,31,2,%2\n"
-"1:	ldw	0(%%sr1,%2),%0\n"
-"2:	ldw	4(%%sr1,%2),%R0\n"
-"3:	ldw	8(%%sr1,%2),%4\n"
-"	subi	32,%3,%3\n"
-"	mtsar	%3\n"
-"	vshd	%0,%R0,%0\n"
-"	vshd	%R0,%4,%R0\n"
+"	zdep	%5,29,2,%%r19\n"		/* r19=(ofs&3)*8 */
+"	mtsp	%6, %%sr1\n"
+"	dep	%%r0,31,2,%5\n"
+"1:	ldw	0(%%sr1,%5),%0\n"
+"2:	ldw	4(%%sr1,%5),%1\n"
+"3:	ldw	8(%%sr1,%5),%%r20\n"
+"	subi	32,%%r19,%%r19\n"
+"	mtsar	%%r19\n"
+"	vshd	%0,%1,%0\n"
+"	vshd	%1,%%r20,%1\n"
+"	copy	%%r0, %2\n"
 "4:	\n"
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(1b, 4b)
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(2b, 4b)
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(3b, 4b)
-	: "+r" (val), "+r" (ret), "+r" (saddr), "=&r" (shift), "=&r" (temp1)
-	: "r" (regs->isr) );
+"	.section .fixup,\"ax\"\n"
+"5:	ldi	-2, %2\n"
+	FIXUP_BRANCH(4b)
+"	.previous\n"
+"	.section __ex_table,\"aw\"\n"
+#ifdef __LP64__
+"	.dword	1b,5b\n"
+"	.dword  2b,5b\n"
+"	.dword	3b,5b\n"
+#else
+"	.word	1b,5b\n"
+"	.word	2b,5b\n"
+"	.word	3b,5b\n"
+#endif
+"	.previous\n"
+	: "=r" (valh), "=r" (vall), "=r" (ret)
+	: "0" (valh), "1" (vall), "r" (saddr), "r" (regs->isr)
+	: "r19", "r20" );
+	val=((__u64)valh<<32)|(__u64)vall;
     }
 #endif
 
@@ -227,25 +304,38 @@ static int emulate_ldd(struct pt_regs *regs, int toreg, int flop)
 
 static int emulate_sth(struct pt_regs *regs, int frreg)
 {
-	unsigned long val = regs->gr[frreg], temp1;
-	ASM_EXCEPTIONTABLE_VAR(ret);
+	unsigned long val = regs->gr[frreg];
+	int ret;
 
 	if (!frreg)
 		val = 0;
 
-	DPRINTF("store r%d (" RFMT ") to " RFMT ":" RFMT " for 2 bytes\n", frreg,
+	DPRINTF("store r%d (0x" RFMT ") to " RFMT ":" RFMT " for 2 bytes\n", frreg, 
 		val, regs->isr, regs->ior);
 
 	__asm__ __volatile__ (
-"	mtsp %4, %%sr1\n"
-"	extrw,u %2, 23, 8, %1\n"
-"1:	stb %1, 0(%%sr1, %3)\n"
-"2:	stb %2, 1(%%sr1, %3)\n"
+"	mtsp %3, %%sr1\n"
+"	extrw,u %1, 23, 8, %%r19\n"
+"1:	stb %1, 1(%%sr1, %2)\n"
+"2:	stb %%r19, 0(%%sr1, %2)\n"
+"	copy	%%r0, %0\n"
 "3:	\n"
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(1b, 3b)
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(2b, 3b)
-	: "+r" (ret), "=&r" (temp1)
-	: "r" (val), "r" (regs->ior), "r" (regs->isr) );
+"	.section .fixup,\"ax\"\n"
+"4:	ldi	-2, %0\n"
+	FIXUP_BRANCH(3b)
+"	.previous\n"
+"	.section __ex_table,\"aw\"\n"
+#ifdef __LP64__
+"	.dword	1b,4b\n"
+"	.dword  2b,4b\n"
+#else
+"	.word	1b,4b\n"
+"	.word	2b,4b\n"
+#endif
+"	.previous\n"
+	: "=r" (ret)
+	: "r" (val), "r" (regs->ior), "r" (regs->isr)
+	: "r19" );
 
 	return ret;
 }
@@ -253,7 +343,7 @@ static int emulate_sth(struct pt_regs *regs, int frreg)
 static int emulate_stw(struct pt_regs *regs, int frreg, int flop)
 {
 	unsigned long val;
-	ASM_EXCEPTIONTABLE_VAR(ret);
+	int ret;
 
 	if (flop)
 		val = ((__u32*)(regs->fr))[frreg];
@@ -262,7 +352,7 @@ static int emulate_stw(struct pt_regs *regs, int frreg, int flop)
 	else
 		val = 0;
 
-	DPRINTF("store r%d (" RFMT ") to " RFMT ":" RFMT " for 4 bytes\n", frreg,
+	DPRINTF("store r%d (0x" RFMT ") to " RFMT ":" RFMT " for 4 bytes\n", frreg, 
 		val, regs->isr, regs->ior);
 
 
@@ -282,19 +372,31 @@ static int emulate_stw(struct pt_regs *regs, int frreg, int flop)
 "	or	%%r1, %%r21, %%r21\n"
 "	stw	%%r20,0(%%sr1,%2)\n"
 "	stw	%%r21,4(%%sr1,%2)\n"
+"	copy	%%r0, %0\n"
 "3:	\n"
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(1b, 3b)
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(2b, 3b)
-	: "+r" (ret)
+"	.section .fixup,\"ax\"\n"
+"4:	ldi	-2, %0\n"
+	FIXUP_BRANCH(3b)
+"	.previous\n"
+"	.section __ex_table,\"aw\"\n"
+#ifdef __LP64__
+"	.dword	1b,4b\n"
+"	.dword  2b,4b\n"
+#else
+"	.word	1b,4b\n"
+"	.word	2b,4b\n"
+#endif
+"	.previous\n"
+	: "=r" (ret)
 	: "r" (val), "r" (regs->ior), "r" (regs->isr)
 	: "r19", "r20", "r21", "r22", "r1" );
 
-	return ret;
+	return 0;
 }
 static int emulate_std(struct pt_regs *regs, int frreg, int flop)
 {
 	__u64 val;
-	ASM_EXCEPTIONTABLE_VAR(ret);
+	int ret;
 
 	if (flop)
 		val = regs->fr[frreg];
@@ -306,10 +408,11 @@ static int emulate_std(struct pt_regs *regs, int frreg, int flop)
 	DPRINTF("store r%d (0x%016llx) to " RFMT ":" RFMT " for 8 bytes\n", frreg, 
 		val,  regs->isr, regs->ior);
 
-	if (!IS_ENABLED(CONFIG_64BIT) && !flop)
-		return ERR_NOTHANDLED;
-
-#ifdef CONFIG_64BIT
+#ifdef CONFIG_PA20
+#ifndef __LP64__
+	if (!flop)
+		return -1;
+#endif
 	__asm__ __volatile__ (
 "	mtsp %3, %%sr1\n"
 "	depd,z	%2, 60, 3, %%r19\n"
@@ -326,12 +429,26 @@ static int emulate_std(struct pt_regs *regs, int frreg, int flop)
 "	or	%%r1, %%r21, %%r21\n"
 "3:	std	%%r20,0(%%sr1,%2)\n"
 "4:	std	%%r21,8(%%sr1,%2)\n"
+"	copy	%%r0, %0\n"
 "5:	\n"
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(1b, 5b)
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(2b, 5b)
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(3b, 5b)
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(4b, 5b)
-	: "+r" (ret)
+"	.section .fixup,\"ax\"\n"
+"6:	ldi	-2, %0\n"
+	FIXUP_BRANCH(5b)
+"	.previous\n"
+"	.section __ex_table,\"aw\"\n"
+#ifdef __LP64__
+"	.dword	1b,6b\n"
+"	.dword  2b,6b\n"
+"	.dword	3b,6b\n"
+"	.dword  4b,6b\n"
+#else
+"	.word	1b,6b\n"
+"	.word	2b,6b\n"
+"	.word	3b,6b\n"
+"	.word	4b,6b\n"
+#endif
+"	.previous\n"
+	: "=r" (ret)
 	: "r" (val), "r" (regs->ior), "r" (regs->isr)
 	: "r19", "r20", "r21", "r22", "r1" );
 #else
@@ -340,7 +457,7 @@ static int emulate_std(struct pt_regs *regs, int frreg, int flop)
 	__asm__ __volatile__ (
 "	mtsp	%4, %%sr1\n"
 "	zdep	%2, 29, 2, %%r19\n"
-"	dep	%%r0, 31, 2, %3\n"
+"	dep	%%r0, 31, 2, %2\n"
 "	mtsar	%%r19\n"
 "	zvdepi	-2, 32, %%r19\n"
 "1:	ldw	0(%%sr1,%3),%%r20\n"
@@ -352,16 +469,31 @@ static int emulate_std(struct pt_regs *regs, int frreg, int flop)
 "	andcm	%%r21, %%r19, %%r21\n"
 "	or	%1, %%r20, %1\n"
 "	or	%2, %%r21, %2\n"
-"3:	stw	%1,0(%%sr1,%3)\n"
+"3:	stw	%1,0(%%sr1,%1)\n"
 "4:	stw	%%r1,4(%%sr1,%3)\n"
 "5:	stw	%2,8(%%sr1,%3)\n"
+"	copy	%%r0, %0\n"
 "6:	\n"
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(1b, 6b)
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(2b, 6b)
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(3b, 6b)
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(4b, 6b)
-	ASM_EXCEPTIONTABLE_ENTRY_EFAULT(5b, 6b)
-	: "+r" (ret)
+"	.section .fixup,\"ax\"\n"
+"7:	ldi	-2, %0\n"
+	FIXUP_BRANCH(6b)
+"	.previous\n"
+"	.section __ex_table,\"aw\"\n"
+#ifdef __LP64__
+"	.dword	1b,7b\n"
+"	.dword  2b,7b\n"
+"	.dword	3b,7b\n"
+"	.dword  4b,7b\n"
+"	.dword  5b,7b\n"
+#else
+"	.word	1b,7b\n"
+"	.word	2b,7b\n"
+"	.word	3b,7b\n"
+"	.word	4b,7b\n"
+"	.word  	5b,7b\n"
+#endif
+"	.previous\n"
+	: "=r" (ret)
 	: "r" (valh), "r" (vall), "r" (regs->ior), "r" (regs->isr)
 	: "r19", "r20", "r21", "r1" );
     }
@@ -372,30 +504,32 @@ static int emulate_std(struct pt_regs *regs, int frreg, int flop)
 
 void handle_unaligned(struct pt_regs *regs)
 {
-	static DEFINE_RATELIMIT_STATE(ratelimit, 5 * HZ, 5);
+	static unsigned long unaligned_count = 0;
+	static unsigned long last_time = 0;
 	unsigned long newbase = R1(regs->iir)?regs->gr[R1(regs->iir)]:0;
 	int modify = 0;
 	int ret = ERR_NOTHANDLED;
-
-	__inc_irq_stat(irq_unaligned_count);
+	struct siginfo si;
+	register int flop=0;	/* true if this is a flop */
 
 	/* log a message with pacing */
-	if (user_mode(regs)) {
-		if (current->thread.flags & PARISC_UAC_SIGBUS) {
-			goto force_sigbus;
+	if (user_mode(regs))
+	{
+		if (unaligned_count > 5 && jiffies - last_time > 5*HZ)
+		{
+			unaligned_count = 0;
+			last_time = jiffies;
 		}
-
-		if (!(current->thread.flags & PARISC_UAC_NOPRINT) &&
-			__ratelimit(&ratelimit)) {
-			printk(KERN_WARNING "%s(%d): unaligned access to " RFMT
-				" at ip " RFMT " (iir " RFMT ")\n",
-				current->comm, task_pid_nr(current), regs->ior,
-				regs->iaoq[0], regs->iir);
+		if (++unaligned_count < 5)
+		{
+			char buf[256];
+			sprintf(buf, "%s(%d): unaligned access to 0x" RFMT " at ip=0x" RFMT "\n",
+				current->comm, current->pid, regs->ior, regs->iaoq[0]);
+			printk(KERN_WARNING "%s", buf);
 #ifdef DEBUG_UNALIGNED
 			show_regs(regs);
 #endif		
 		}
-
 		if (!unaligned_enabled)
 			goto force_sigbus;
 	}
@@ -484,7 +618,7 @@ void handle_unaligned(struct pt_regs *regs)
 		ret = emulate_stw(regs, R2(regs->iir),0);
 		break;
 
-#ifdef CONFIG_64BIT
+#ifdef CONFIG_PA20
 	case OPCODE_LDD_I:
 	case OPCODE_LDDA_I:
 	case OPCODE_LDD_S:
@@ -502,11 +636,13 @@ void handle_unaligned(struct pt_regs *regs)
 	case OPCODE_FLDWS:
 	case OPCODE_FLDWXR:
 	case OPCODE_FLDWSR:
+		flop=1;
 		ret = emulate_ldw(regs,FR3(regs->iir),1);
 		break;
 
 	case OPCODE_FLDDX:
 	case OPCODE_FLDDS:
+		flop=1;
 		ret = emulate_ldd(regs,R3(regs->iir),1);
 		break;
 
@@ -514,11 +650,13 @@ void handle_unaligned(struct pt_regs *regs)
 	case OPCODE_FSTWS:
 	case OPCODE_FSTWXR:
 	case OPCODE_FSTWSR:
+		flop=1;
 		ret = emulate_stw(regs,FR3(regs->iir),1);
 		break;
 
 	case OPCODE_FSTDX:
 	case OPCODE_FSTDS:
+		flop=1;
 		ret = emulate_std(regs,R3(regs->iir),1);
 		break;
 
@@ -529,15 +667,19 @@ void handle_unaligned(struct pt_regs *regs)
 		ret = ERR_NOTHANDLED;	/* "undefined", but lets kill them. */
 		break;
 	}
+#ifdef CONFIG_PA20
 	switch (regs->iir & OPCODE2_MASK)
 	{
 	case OPCODE_FLDD_L:
+		flop=1;
 		ret = emulate_ldd(regs,R2(regs->iir),1);
 		break;
 	case OPCODE_FSTD_L:
+		flop=1;
 		ret = emulate_std(regs, R2(regs->iir),1);
 		break;
-#ifdef CONFIG_64BIT
+
+#ifdef CONFIG_PA20
 	case OPCODE_LDD_L:
 		ret = emulate_ldd(regs, R2(regs->iir),0);
 		break;
@@ -546,16 +688,19 @@ void handle_unaligned(struct pt_regs *regs)
 		break;
 #endif
 	}
+#endif
 	switch (regs->iir & OPCODE3_MASK)
 	{
 	case OPCODE_FLDW_L:
-		ret = emulate_ldw(regs, R2(regs->iir), 1);
+		flop=1;
+		ret = emulate_ldw(regs, R2(regs->iir),0);
 		break;
 	case OPCODE_LDW_M:
-		ret = emulate_ldw(regs, R2(regs->iir), 0);
+		ret = emulate_ldw(regs, R2(regs->iir),1);
 		break;
 
 	case OPCODE_FSTW_L:
+		flop=1;
 		ret = emulate_stw(regs, R2(regs->iir),1);
 		break;
 	case OPCODE_STW_M:
@@ -580,7 +725,7 @@ void handle_unaligned(struct pt_regs *regs)
 		break;
 	}
 
-	if (ret == 0 && modify && R1(regs->iir))
+	if (modify && R1(regs->iir))
 		regs->gr[R1(regs->iir)] = newbase;
 
 
@@ -591,28 +736,26 @@ void handle_unaligned(struct pt_regs *regs)
 
 	if (ret)
 	{
-		/*
-		 * The unaligned handler failed.
-		 * If we were called by __get_user() or __put_user() jump
-		 * to it's exception fixup handler instead of crashing.
-		 */
-		if (!user_mode(regs) && fixup_exception(regs))
-			return;
-
 		printk(KERN_CRIT "Unaligned handler failed, ret = %d\n", ret);
 		die_if_kernel("Unaligned data reference", regs, 28);
 
-		if (ret == -EFAULT)
+		if (ret == ERR_PAGEFAULT)
 		{
-			force_sig_fault(SIGSEGV, SEGV_MAPERR,
-					(void __user *)regs->ior);
+			si.si_signo = SIGSEGV;
+			si.si_errno = 0;
+			si.si_code = SEGV_MAPERR;
+			si.si_addr = (void __user *)regs->ior;
+			force_sig_info(SIGSEGV, &si, current);
 		}
 		else
 		{
 force_sigbus:
 			/* couldn't handle it ... */
-			force_sig_fault(SIGBUS, BUS_ADRALN,
-					(void __user *)regs->ior);
+			si.si_signo = SIGBUS;
+			si.si_errno = 0;
+			si.si_code = BUS_ADRALN;
+			si.si_addr = (void __user *)regs->ior;
+			force_sig_info(SIGBUS, &si, current);
 		}
 		
 		return;

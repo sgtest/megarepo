@@ -1,14 +1,31 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /* sc520cdp.c -- MTD map driver for AMD SC520 Customer Development Platform
  *
  * Copyright (C) 2001 Sysgo Real-Time Solutions GmbH
  *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA
+ *
+ * $Id: sc520cdp.c,v 1.21 2004/12/13 10:27:08 dedekind Exp $
+ *
+ *
  * The SC520CDP is an evaluation board for the Elan SC520 processor available
  * from AMD. It has two banks of 32-bit Flash ROM, each 8 Megabytes in size,
  * and up to 512 KiB of 8-bit DIL Flash ROM.
- * For details see https://www.amd.com/products/epd/desiging/evalboards/18.elansc520/520_cdp_brief/index.html
+ * For details see http://www.amd.com/products/epd/desiging/evalboards/18.elansc520/520_cdp_brief/index.html
  */
 
+#include <linux/config.h>
 #include <linux/module.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
@@ -90,7 +107,7 @@ static struct map_info sc520cdp_map[] = {
 	},
 };
 
-#define NUM_FLASH_BANKS	ARRAY_SIZE(sc520cdp_map)
+#define NUM_FLASH_BANKS	(sizeof(sc520cdp_map)/sizeof(struct map_info))
 
 static struct mtd_info *mymtd[NUM_FLASH_BANKS];
 static struct mtd_info *merged_mtd;
@@ -147,7 +164,7 @@ struct sc520_par_table
 	unsigned long default_address;
 };
 
-static const struct sc520_par_table par_table[NUM_FLASH_BANKS] =
+static struct sc520_par_table par_table[NUM_FLASH_BANKS] =
 {
 	{	/* Flash Bank #0: selected by ROMCS0 */
 		SC520_PAR_ROMCS0,
@@ -169,13 +186,13 @@ static const struct sc520_par_table par_table[NUM_FLASH_BANKS] =
 
 static void sc520cdp_setup_par(void)
 {
-	unsigned long __iomem *mmcr;
+	volatile unsigned long __iomem *mmcr;
 	unsigned long mmcr_val;
 	int i, j;
 
 	/* map in SC520's MMCR area */
-	mmcr = ioremap(SC520_MMCR_BASE, SC520_MMCR_EXTENT);
-	if(!mmcr) { /* ioremap failed: skip the PAR reprogramming */
+	mmcr = ioremap_nocache(SC520_MMCR_BASE, SC520_MMCR_EXTENT);
+	if(!mmcr) { /* ioremap_nocache failed: skip the PAR reprogramming */
 		/* force physical address fields to BIOS defaults: */
 		for(i = 0; i < NUM_FLASH_BANKS; i++)
 			sc520cdp_map[i].phys = par_table[i].default_address;
@@ -183,17 +200,17 @@ static void sc520cdp_setup_par(void)
 	}
 
 	/*
-	** Find the PARxx registers that are responsible for activating
+	** Find the PARxx registers that are reponsible for activating
 	** ROMCS0, ROMCS1 and BOOTCS. Reprogram each of these with a
 	** new value from the table.
 	*/
 	for(i = 0; i < NUM_FLASH_BANKS; i++) {		/* for each par_table entry  */
 		for(j = 0; j < NUM_SC520_PAR; j++) {	/* for each PAR register     */
-			mmcr_val = readl(&mmcr[SC520_PAR(j)]);
+			mmcr_val = mmcr[SC520_PAR(j)];
 			/* if target device field matches, reprogram the PAR */
 			if((mmcr_val & SC520_PAR_TRGDEV) == par_table[i].trgdev)
 			{
-				writel(par_table[i].new_par, &mmcr[SC520_PAR(j)]);
+				mmcr[SC520_PAR(j)] = par_table[i].new_par;
 				break;
 			}
 		}
@@ -213,28 +230,21 @@ static void sc520cdp_setup_par(void)
 
 static int __init init_sc520cdp(void)
 {
-	int i, j, devices_found = 0;
-
+	int i, devices_found = 0;
+	
 #ifdef REPROGRAM_PAR
 	/* reprogram PAR registers so flash appears at the desired addresses */
 	sc520cdp_setup_par();
 #endif
 
 	for (i = 0; i < NUM_FLASH_BANKS; i++) {
-		printk(KERN_NOTICE "SC520 CDP flash device: 0x%Lx at 0x%Lx\n",
-			(unsigned long long)sc520cdp_map[i].size,
-			(unsigned long long)sc520cdp_map[i].phys);
+		printk(KERN_NOTICE "SC520 CDP flash device: 0x%lx at 0x%lx\n",
+		       sc520cdp_map[i].size, sc520cdp_map[i].phys);
 
-		sc520cdp_map[i].virt = ioremap(sc520cdp_map[i].phys, sc520cdp_map[i].size);
+		sc520cdp_map[i].virt = ioremap_nocache(sc520cdp_map[i].phys, sc520cdp_map[i].size);
 
 		if (!sc520cdp_map[i].virt) {
-			printk("Failed to ioremap\n");
-			for (j = 0; j < i; j++) {
-				if (mymtd[j]) {
-					map_destroy(mymtd[j]);
-					iounmap(sc520cdp_map[j].virt);
-				}
-			}
+			printk("Failed to ioremap_nocache\n");
 			return -EIO;
 		}
 
@@ -258,23 +268,23 @@ static int __init init_sc520cdp(void)
 		/* Combine the two flash banks into a single MTD device & register it: */
 		merged_mtd = mtd_concat_create(mymtd, 2, "SC520CDP Flash Banks #0 and #1");
 		if(merged_mtd)
-			mtd_device_register(merged_mtd, NULL, 0);
+			add_mtd_device(merged_mtd);
 	}
 	if(devices_found == 3) /* register the third (DIL-Flash) device */
-		mtd_device_register(mymtd[2], NULL, 0);
+		add_mtd_device(mymtd[2]);
 	return(devices_found ? 0 : -ENXIO);
 }
 
 static void __exit cleanup_sc520cdp(void)
 {
 	int i;
-
+	
 	if (merged_mtd) {
-		mtd_device_unregister(merged_mtd);
+		del_mtd_device(merged_mtd);
 		mtd_concat_destroy(merged_mtd);
 	}
 	if (mymtd[2])
-		mtd_device_unregister(mymtd[2]);
+		del_mtd_device(mymtd[2]);
 
 	for (i = 0; i < NUM_FLASH_BANKS; i++) {
 		if (mymtd[i])

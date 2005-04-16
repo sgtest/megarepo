@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  *  linux/include/linux/hfsplus_raw.h
  *
@@ -16,15 +15,15 @@
 
 #include <linux/types.h>
 
+#define __packed __attribute__ ((packed))
+
 /* Some constants */
 #define HFSPLUS_SECTOR_SIZE        512
 #define HFSPLUS_SECTOR_SHIFT         9
 #define HFSPLUS_VOLHEAD_SECTOR       2
 #define HFSPLUS_VOLHEAD_SIG     0x482b
-#define HFSPLUS_VOLHEAD_SIGX    0x4858
 #define HFSPLUS_SUPER_MAGIC     0x482b
-#define HFSPLUS_MIN_VERSION          4
-#define HFSPLUS_CURRENT_VERSION      5
+#define HFSPLUS_CURRENT_VERSION      4
 
 #define HFSP_WRAP_MAGIC         0x4244
 #define HFSP_WRAP_ATTRIB_SLOCK  0x8000
@@ -37,14 +36,10 @@
 #define HFSP_WRAPOFF_EMBEDSIG     0x7C
 #define HFSP_WRAPOFF_EMBEDEXT     0x7E
 
-#define HFSP_HIDDENDIR_NAME \
-	"\xe2\x90\x80\xe2\x90\x80\xe2\x90\x80\xe2\x90\x80HFS+ Private Data"
+#define HFSP_HIDDENDIR_NAME	"\xe2\x90\x80\xe2\x90\x80\xe2\x90\x80\xe2\x90\x80HFS+ Private Data"
 
 #define HFSP_HARDLINK_TYPE	0x686c6e6b	/* 'hlnk' */
 #define HFSP_HFSPLUS_CREATOR	0x6866732b	/* 'hfs+' */
-
-#define HFSP_SYMLINK_TYPE	0x736c6e6b	/* 'slnk' */
-#define HFSP_SYMLINK_CREATOR	0x72686170	/* 'rhap' */
 
 #define HFSP_MOUNT_VERSION	0x482b4c78	/* 'H+Lx' */
 
@@ -53,23 +48,13 @@
 typedef __be32 hfsplus_cnid;
 typedef __be16 hfsplus_unichr;
 
-#define HFSPLUS_MAX_STRLEN 255
-#define HFSPLUS_ATTR_MAX_STRLEN 127
-
 /* A "string" as used in filenames, etc. */
 struct hfsplus_unistr {
 	__be16 length;
-	hfsplus_unichr unicode[HFSPLUS_MAX_STRLEN];
+	hfsplus_unichr unicode[255];
 } __packed;
 
-/*
- * A "string" is used in attributes file
- * for name of extended attribute
- */
-struct hfsplus_attr_unistr {
-	__be16 length;
-	hfsplus_unichr unicode[HFSPLUS_ATTR_MAX_STRLEN];
-} __packed;
+#define HFSPLUS_MAX_STRLEN 255
 
 /* POSIX permissions */
 struct hfsplus_perm {
@@ -128,7 +113,7 @@ struct hfsplus_vh {
 	__be32 write_count;
 	__be64 encodings_bmp;
 
-	u32 finder_info[8];
+	u8 finder_info[32];
 
 	struct hfsplus_fork_raw alloc_file;
 	struct hfsplus_fork_raw ext_file;
@@ -138,14 +123,11 @@ struct hfsplus_vh {
 } __packed;
 
 /* HFS+ volume attributes */
-#define HFSPLUS_VOL_UNMNT		(1 << 8)
-#define HFSPLUS_VOL_SPARE_BLK		(1 << 9)
-#define HFSPLUS_VOL_NOCACHE		(1 << 10)
-#define HFSPLUS_VOL_INCNSTNT		(1 << 11)
-#define HFSPLUS_VOL_NODEID_REUSED	(1 << 12)
-#define HFSPLUS_VOL_JOURNALED		(1 << 13)
-#define HFSPLUS_VOL_SOFTLOCK		(1 << 15)
-#define HFSPLUS_VOL_UNUSED_NODE_FIX	(1 << 31)
+#define HFSPLUS_VOL_UNMNT     (1 << 8)
+#define HFSPLUS_VOL_SPARE_BLK (1 << 9)
+#define HFSPLUS_VOL_NOCACHE   (1 << 10)
+#define HFSPLUS_VOL_INCNSTNT  (1 << 11)
+#define HFSPLUS_VOL_SOFTLOCK  (1 << 15)
 
 /* HFS+ BTree node descriptor */
 struct hfs_bnode_desc {
@@ -158,10 +140,10 @@ struct hfs_bnode_desc {
 } __packed;
 
 /* HFS+ BTree node types */
-#define HFS_NODE_INDEX	0x00	/* An internal (index) node */
-#define HFS_NODE_HEADER	0x01	/* The tree header node (node 0) */
-#define HFS_NODE_MAP	0x02	/* Holds part of the bitmap of used nodes */
-#define HFS_NODE_LEAF	0xFF	/* A leaf (ndNHeight==1) node */
+#define HFS_NODE_INDEX	0x00
+#define HFS_NODE_HEADER	0x01
+#define HFS_NODE_MAP	0x02
+#define HFS_NODE_LEAF	0xFF
 
 /* HFS+ BTree header */
 struct hfs_btree_header_rec {
@@ -177,7 +159,7 @@ struct hfs_btree_header_rec {
 	u16 reserved1;
 	__be32 clump_size;
 	u8 btree_type;
-	u8 key_type;
+	u8 reserved2;
 	__be32 attributes;
 	u32 reserved3[16];
 } __packed;
@@ -189,9 +171,6 @@ struct hfs_btree_header_rec {
 /* HFS+ BTree misc info */
 #define HFSPLUS_TREE_HEAD 0
 #define HFSPLUS_NODE_MXSZ 32768
-#define HFSPLUS_ATTR_TREE_NODE_SIZE		8192
-#define HFSPLUS_BTREE_HDR_NODE_RECS_COUNT	3
-#define HFSPLUS_BTREE_HDR_USER_BYTES		128
 
 /* Some special File ID numbers (stolen from hfs.h) */
 #define HFSPLUS_POR_CNID		1	/* Parent Of the Root */
@@ -205,10 +184,6 @@ struct hfs_btree_header_rec {
 #define HFSPLUS_EXCH_CNID		15	/* ExchangeFiles temp id */
 #define HFSPLUS_FIRSTUSER_CNID		16	/* first available user id */
 
-/* btree key type */
-#define HFSPLUS_KEY_CASEFOLDING		0xCF	/* case-insensitive */
-#define HFSPLUS_KEY_BINARY		0xBC	/* case-sensitive */
-
 /* HFS+ catalog entry key */
 struct hfsplus_cat_key {
 	__be16 key_len;
@@ -216,7 +191,6 @@ struct hfsplus_cat_key {
 	struct hfsplus_unistr name;
 } __packed;
 
-#define HFSPLUS_CAT_KEYLEN	(sizeof(struct hfsplus_cat_key))
 
 /* Structs from hfs.h */
 struct hfsp_point {
@@ -260,12 +234,10 @@ struct hfsplus_cat_folder {
 	__be32 access_date;
 	__be32 backup_date;
 	struct hfsplus_perm permissions;
-	struct_group_attr(info, __packed,
-		struct DInfo user_info;
-		struct DXInfo finder_info;
-	);
+	struct DInfo user_info;
+	struct DXInfo finder_info;
 	__be32 text_encoding;
-	__be32 subfolders;	/* Subfolder count in HFSX. Reserved in HFS+. */
+	u32 reserved;
 } __packed;
 
 /* HFS file info (stolen from hfs.h) */
@@ -296,10 +268,8 @@ struct hfsplus_cat_file {
 	__be32 access_date;
 	__be32 backup_date;
 	struct hfsplus_perm permissions;
-	struct_group_attr(info, __packed,
-		struct FInfo user_info;
-		struct FXInfo finder_info;
-	);
+	struct FInfo user_info;
+	struct FXInfo finder_info;
 	__be32 text_encoding;
 	u32 reserved2;
 
@@ -307,13 +277,9 @@ struct hfsplus_cat_file {
 	struct hfsplus_fork_raw rsrc_fork;
 } __packed;
 
-/* File and folder flag bits */
+/* File attribute bits */
 #define HFSPLUS_FILE_LOCKED		0x0001
 #define HFSPLUS_FILE_THREAD_EXISTS	0x0002
-#define HFSPLUS_XATTR_EXISTS		0x0004
-#define HFSPLUS_ACL_EXISTS		0x0008
-#define HFSPLUS_HAS_FOLDER_COUNT	0x0010	/* Folder has subfolder count
-						 * (HFSX only) */
 
 /* HFS+ catalog thread (part of a cat_entry) */
 struct hfsplus_cat_thread {
@@ -348,65 +314,13 @@ struct hfsplus_ext_key {
 	__be32 start_block;
 } __packed;
 
-#define HFSPLUS_EXT_KEYLEN	sizeof(struct hfsplus_ext_key)
-
-#define HFSPLUS_XATTR_FINDER_INFO_NAME "com.apple.FinderInfo"
-#define HFSPLUS_XATTR_ACL_NAME "com.apple.system.Security"
-
-#define HFSPLUS_ATTR_INLINE_DATA 0x10
-#define HFSPLUS_ATTR_FORK_DATA   0x20
-#define HFSPLUS_ATTR_EXTENTS     0x30
-
-/* HFS+ attributes tree key */
-struct hfsplus_attr_key {
-	__be16 key_len;
-	__be16 pad;
-	hfsplus_cnid cnid;
-	__be32 start_block;
-	struct hfsplus_attr_unistr key_name;
-} __packed;
-
-#define HFSPLUS_ATTR_KEYLEN	sizeof(struct hfsplus_attr_key)
-
-/* HFS+ fork data attribute */
-struct hfsplus_attr_fork_data {
-	__be32 record_type;
-	__be32 reserved;
-	struct hfsplus_fork_raw the_fork;
-} __packed;
-
-/* HFS+ extension attribute */
-struct hfsplus_attr_extents {
-	__be32 record_type;
-	__be32 reserved;
-	struct hfsplus_extent extents;
-} __packed;
-
-#define HFSPLUS_MAX_INLINE_DATA_SIZE 3802
-
-/* HFS+ attribute inline data */
-struct hfsplus_attr_inline_data {
-	__be32 record_type;
-	__be32 reserved1;
-	u8 reserved2[6];
-	__be16 length;
-	u8 raw_bytes[HFSPLUS_MAX_INLINE_DATA_SIZE];
-} __packed;
-
-/* A data record in the attributes tree */
-typedef union {
-	__be32 record_type;
-	struct hfsplus_attr_fork_data fork_data;
-	struct hfsplus_attr_extents extents;
-	struct hfsplus_attr_inline_data inline_data;
-} __packed hfsplus_attr_entry;
+#define HFSPLUS_EXT_KEYLEN 12
 
 /* HFS+ generic BTree key */
 typedef union {
 	__be16 key_len;
 	struct hfsplus_cat_key cat;
 	struct hfsplus_ext_key ext;
-	struct hfsplus_attr_key attr;
 } __packed hfsplus_btree_key;
 
 #endif

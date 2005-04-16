@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /* drivers/atm/eni.h - Efficient Networks ENI155P device driver declarations */
  
 /* Written 1995-2000 by Werner Almesberger, EPFL LRC/ICA */
@@ -9,17 +8,17 @@
 
 #include <linux/atm.h>
 #include <linux/atmdev.h>
-#include <linux/interrupt.h>
 #include <linux/sonet.h>
 #include <linux/skbuff.h>
 #include <linux/time.h>
 #include <linux/pci.h>
 #include <linux/spinlock.h>
-#include <linux/atomic.h>
+#include <asm/atomic.h>
 
 #include "midway.h"
 
 
+#define KERNEL_OFFSET	0xC0000000	/* kernel 0x0 is at phys 0xC0000000 */
 #define DEV_LABEL	"eni"
 
 #define UBR_BUFFER	(128*1024)	/* UBR buffer size */
@@ -60,7 +59,7 @@ struct eni_vcc {
 	int rxing;			/* number of pending PDUs */
 	int servicing;			/* number of waiting VCs (0 or 1) */
 	int txing;			/* number of pending TX bytes */
-	ktime_t timestamp;		/* for RX timing */
+	struct timeval timestamp;	/* for RX timing */
 	struct atm_vcc *next;		/* next pending RX */
 	struct sk_buff *last;		/* last PDU being DMAed (used to carry
 					   discard information) */
@@ -73,7 +72,6 @@ struct eni_dev {
 	u32 events;			/* pending events */
 	/*-------------------------------- base pointers into Midway address
 					   space */
-	void __iomem *ioaddr;
 	void __iomem *phy;		/* PHY interface chip registers */
 	void __iomem *reg;		/* register base */
 	void __iomem *ram;		/* RAM base */
@@ -88,10 +86,6 @@ struct eni_dev {
 	wait_queue_head_t tx_wait;	/* for close */
 	int tx_bw;			/* remaining bandwidth */
 	u32 dma[TX_DMA_BUF*2];		/* DMA request scratch area */
-	struct eni_zero {		/* aligned "magic" zeroes */
-		u32 *addr;
-		dma_addr_t dma;
-	} zero;
 	int tx_mult;			/* buffer size multiplier (percent) */
 	/*-------------------------------- RX part */
 	u32 serv_read;			/* host service read index */

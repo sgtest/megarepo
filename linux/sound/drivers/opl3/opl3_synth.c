@@ -1,20 +1,26 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *  Copyright (c) by Uros Bizjak <uros@kss-loka.si>
  *                   
  *  Routines for OPL2/OPL3/OPL4 control
+ *
+ *   This program is free software; you can redistribute it and/or modify 
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ *
  */
 
-#include <linux/slab.h>
-#include <linux/export.h>
-#include <linux/nospec.h>
 #include <sound/opl3.h>
 #include <sound/asound_fm.h>
-#include "opl3_voice.h"
-
-#if IS_ENABLED(CONFIG_SND_SEQUENCER)
-#define OPL3_SUPPORT_SYNTH
-#endif
 
 /*
  *    There is 18 possible 2 OP voices
@@ -52,50 +58,55 @@ char snd_opl3_regmap[MAX_OPL2_VOICES][4] =
 	{ 0x12, 0x15, 0x00, 0x00 }	/* is selected (only left reg block) */
 };
 
-EXPORT_SYMBOL(snd_opl3_regmap);
-
 /*
  * prototypes
  */
-static int snd_opl3_play_note(struct snd_opl3 * opl3, struct snd_dm_fm_note * note);
-static int snd_opl3_set_voice(struct snd_opl3 * opl3, struct snd_dm_fm_voice * voice);
-static int snd_opl3_set_params(struct snd_opl3 * opl3, struct snd_dm_fm_params * params);
-static int snd_opl3_set_mode(struct snd_opl3 * opl3, int mode);
-static int snd_opl3_set_connection(struct snd_opl3 * opl3, int connection);
+static int snd_opl3_play_note(opl3_t * opl3, snd_dm_fm_note_t * note);
+static int snd_opl3_set_voice(opl3_t * opl3, snd_dm_fm_voice_t * voice);
+static int snd_opl3_set_params(opl3_t * opl3, snd_dm_fm_params_t * params);
+static int snd_opl3_set_mode(opl3_t * opl3, int mode);
+static int snd_opl3_set_connection(opl3_t * opl3, int connection);
 
 /* ------------------------------ */
 
 /*
  * open the device exclusively
  */
-int snd_opl3_open(struct snd_hwdep * hw, struct file *file)
+int snd_opl3_open(snd_hwdep_t * hw, struct file *file)
 {
+	opl3_t *opl3 = hw->private_data;
+
+	down(&opl3->access_mutex);
+	if (opl3->used) {
+		up(&opl3->access_mutex);
+		return -EAGAIN;
+	}
+	opl3->used++;
+	up(&opl3->access_mutex);
+
 	return 0;
 }
 
 /*
  * ioctl for hwdep device:
  */
-int snd_opl3_ioctl(struct snd_hwdep * hw, struct file *file,
+int snd_opl3_ioctl(snd_hwdep_t * hw, struct file *file,
 		   unsigned int cmd, unsigned long arg)
 {
-	struct snd_opl3 *opl3 = hw->private_data;
+	opl3_t *opl3 = hw->private_data;
 	void __user *argp = (void __user *)arg;
 
-	if (snd_BUG_ON(!opl3))
-		return -EINVAL;
+	snd_assert(opl3 != NULL, return -EINVAL);
 
 	switch (cmd) {
 		/* get information */
 	case SNDRV_DM_FM_IOCTL_INFO:
 		{
-			struct snd_dm_fm_info info;
-
-			memset(&info, 0, sizeof(info));
+			snd_dm_fm_info_t info;
 
 			info.fm_mode = opl3->fm_mode;
 			info.rhythm = opl3->rhythm;
-			if (copy_to_user(argp, &info, sizeof(struct snd_dm_fm_info)))
+			if (copy_to_user(argp, &info, sizeof(snd_dm_fm_info_t)))
 				return -EFAULT;
 			return 0;
 		}
@@ -112,8 +123,8 @@ int snd_opl3_ioctl(struct snd_hwdep * hw, struct file *file,
 	case SNDRV_DM_FM_OSS_IOCTL_PLAY_NOTE:
 #endif
 		{
-			struct snd_dm_fm_note note;
-			if (copy_from_user(&note, argp, sizeof(struct snd_dm_fm_note)))
+			snd_dm_fm_note_t note;
+			if (copy_from_user(&note, argp, sizeof(snd_dm_fm_note_t)))
 				return -EFAULT;
 			return snd_opl3_play_note(opl3, &note);
 		}
@@ -123,8 +134,8 @@ int snd_opl3_ioctl(struct snd_hwdep * hw, struct file *file,
 	case SNDRV_DM_FM_OSS_IOCTL_SET_VOICE:
 #endif
 		{
-			struct snd_dm_fm_voice voice;
-			if (copy_from_user(&voice, argp, sizeof(struct snd_dm_fm_voice)))
+			snd_dm_fm_voice_t voice;
+			if (copy_from_user(&voice, argp, sizeof(snd_dm_fm_voice_t)))
 				return -EFAULT;
 			return snd_opl3_set_voice(opl3, &voice);
 		}
@@ -134,8 +145,8 @@ int snd_opl3_ioctl(struct snd_hwdep * hw, struct file *file,
 	case SNDRV_DM_FM_OSS_IOCTL_SET_PARAMS:
 #endif
 		{
-			struct snd_dm_fm_params params;
-			if (copy_from_user(&params, argp, sizeof(struct snd_dm_fm_params)))
+			snd_dm_fm_params_t params;
+			if (copy_from_user(&params, argp, sizeof(snd_dm_fm_params_t)))
 				return -EFAULT;
 			return snd_opl3_set_params(opl3, &params);
 		}
@@ -152,15 +163,9 @@ int snd_opl3_ioctl(struct snd_hwdep * hw, struct file *file,
 #endif
 		return snd_opl3_set_connection(opl3, (int) arg);
 
-#ifdef OPL3_SUPPORT_SYNTH
-	case SNDRV_DM_FM_IOCTL_CLEAR_PATCHES:
-		snd_opl3_clear_patches(opl3);
-		return 0;
-#endif
-
 #ifdef CONFIG_SND_DEBUG
 	default:
-		snd_printk(KERN_WARNING "unknown IOCTL: 0x%x\n", cmd);
+		snd_printk("unknown IOCTL: 0x%x\n", cmd);
 #endif
 	}
 	return -ENOTTY;
@@ -169,183 +174,21 @@ int snd_opl3_ioctl(struct snd_hwdep * hw, struct file *file,
 /*
  * close the device
  */
-int snd_opl3_release(struct snd_hwdep * hw, struct file *file)
+int snd_opl3_release(snd_hwdep_t * hw, struct file *file)
 {
-	struct snd_opl3 *opl3 = hw->private_data;
+	opl3_t *opl3 = hw->private_data;
 
 	snd_opl3_reset(opl3);
-	return 0;
-}
-
-#ifdef OPL3_SUPPORT_SYNTH
-/*
- * write the device - load patches
- */
-long snd_opl3_write(struct snd_hwdep *hw, const char __user *buf, long count,
-		    loff_t *offset)
-{
-	struct snd_opl3 *opl3 = hw->private_data;
-	long result = 0;
-	int err = 0;
-	struct sbi_patch inst;
-
-	while (count >= sizeof(inst)) {
-		unsigned char type;
-		if (copy_from_user(&inst, buf, sizeof(inst)))
-			return -EFAULT;
-		if (!memcmp(inst.key, FM_KEY_SBI, 4) ||
-		    !memcmp(inst.key, FM_KEY_2OP, 4))
-			type = FM_PATCH_OPL2;
-		else if (!memcmp(inst.key, FM_KEY_4OP, 4))
-			type = FM_PATCH_OPL3;
-		else /* invalid type */
-			break;
-		err = snd_opl3_load_patch(opl3, inst.prog, inst.bank, type,
-					  inst.name, inst.extension,
-					  inst.data);
-		if (err < 0)
-			break;
-		result += sizeof(inst);
-		count -= sizeof(inst);
-	}
-	return result > 0 ? result : err;
-}
-
-
-/*
- * Patch management
- */
-
-/* offsets for SBI params */
-#define AM_VIB		0
-#define KSL_LEVEL	2
-#define ATTACK_DECAY	4
-#define SUSTAIN_RELEASE	6
-#define WAVE_SELECT	8
-
-/* offset for SBI instrument */
-#define CONNECTION	10
-#define OFFSET_4OP	11
-
-/*
- * load a patch, obviously.
- *
- * loaded on the given program and bank numbers with the given type
- * (FM_PATCH_OPLx).
- * data is the pointer of SBI record _without_ header (key and name).
- * name is the name string of the patch.
- * ext is the extension data of 7 bytes long (stored in name of SBI
- * data up to offset 25), or NULL to skip.
- * return 0 if successful or a negative error code.
- */
-int snd_opl3_load_patch(struct snd_opl3 *opl3,
-			int prog, int bank, int type,
-			const char *name,
-			const unsigned char *ext,
-			const unsigned char *data)
-{
-	struct fm_patch *patch;
-	int i;
-
-	patch = snd_opl3_find_patch(opl3, prog, bank, 1);
-	if (!patch)
-		return -ENOMEM;
-
-	patch->type = type;
-
-	for (i = 0; i < 2; i++) {
-		patch->inst.op[i].am_vib = data[AM_VIB + i];
-		patch->inst.op[i].ksl_level = data[KSL_LEVEL + i];
-		patch->inst.op[i].attack_decay = data[ATTACK_DECAY + i];
-		patch->inst.op[i].sustain_release = data[SUSTAIN_RELEASE + i];
-		patch->inst.op[i].wave_select = data[WAVE_SELECT + i];
-	}
-	patch->inst.feedback_connection[0] = data[CONNECTION];
-
-	if (type == FM_PATCH_OPL3) {
-		for (i = 0; i < 2; i++) {
-			patch->inst.op[i+2].am_vib =
-				data[OFFSET_4OP + AM_VIB + i];
-			patch->inst.op[i+2].ksl_level =
-				data[OFFSET_4OP + KSL_LEVEL + i];
-			patch->inst.op[i+2].attack_decay =
-				data[OFFSET_4OP + ATTACK_DECAY + i];
-			patch->inst.op[i+2].sustain_release =
-				data[OFFSET_4OP + SUSTAIN_RELEASE + i];
-			patch->inst.op[i+2].wave_select =
-				data[OFFSET_4OP + WAVE_SELECT + i];
-		}
-		patch->inst.feedback_connection[1] =
-			data[OFFSET_4OP + CONNECTION];
-	}
-
-	if (ext) {
-		patch->inst.echo_delay = ext[0];
-		patch->inst.echo_atten = ext[1];
-		patch->inst.chorus_spread = ext[2];
-		patch->inst.trnsps = ext[3];
-		patch->inst.fix_dur = ext[4];
-		patch->inst.modes = ext[5];
-		patch->inst.fix_key = ext[6];
-	}
-
-	if (name)
-		strscpy(patch->name, name, sizeof(patch->name));
+	down(&opl3->access_mutex);
+	opl3->used--;
+	up(&opl3->access_mutex);
 
 	return 0;
 }
-EXPORT_SYMBOL(snd_opl3_load_patch);
-
-/*
- * find a patch with the given program and bank numbers, returns its pointer
- * if no matching patch is found and create_patch is set, it creates a
- * new patch object.
- */
-struct fm_patch *snd_opl3_find_patch(struct snd_opl3 *opl3, int prog, int bank,
-				     int create_patch)
-{
-	/* pretty dumb hash key */
-	unsigned int key = (prog + bank) % OPL3_PATCH_HASH_SIZE;
-	struct fm_patch *patch;
-
-	for (patch = opl3->patch_table[key]; patch; patch = patch->next) {
-		if (patch->prog == prog && patch->bank == bank)
-			return patch;
-	}
-	if (!create_patch)
-		return NULL;
-
-	patch = kzalloc(sizeof(*patch), GFP_KERNEL);
-	if (!patch)
-		return NULL;
-	patch->prog = prog;
-	patch->bank = bank;
-	patch->next = opl3->patch_table[key];
-	opl3->patch_table[key] = patch;
-	return patch;
-}
-EXPORT_SYMBOL(snd_opl3_find_patch);
-
-/*
- * Clear all patches of the given OPL3 instance
- */
-void snd_opl3_clear_patches(struct snd_opl3 *opl3)
-{
-	int i;
-	for (i = 0; i <  OPL3_PATCH_HASH_SIZE; i++) {
-		struct fm_patch *patch, *next;
-		for (patch = opl3->patch_table[i]; patch; patch = next) {
-			next = patch->next;
-			kfree(patch);
-		}
-	}
-	memset(opl3->patch_table, 0, sizeof(opl3->patch_table));
-}
-#endif /* OPL3_SUPPORT_SYNTH */
 
 /* ------------------------------ */
 
-void snd_opl3_reset(struct snd_opl3 * opl3)
+void snd_opl3_reset(opl3_t * opl3)
 {
 	unsigned short opl3_reg;
 
@@ -385,9 +228,8 @@ void snd_opl3_reset(struct snd_opl3 * opl3)
 	opl3->rhythm = 0;
 }
 
-EXPORT_SYMBOL(snd_opl3_reset);
 
-static int snd_opl3_play_note(struct snd_opl3 * opl3, struct snd_dm_fm_note * note)
+static int snd_opl3_play_note(opl3_t * opl3, snd_dm_fm_note_t * note)
 {
 	unsigned short reg_side;
 	unsigned char voice_offset;
@@ -434,11 +276,11 @@ static int snd_opl3_play_note(struct snd_opl3 * opl3, struct snd_dm_fm_note * no
 }
 
 
-static int snd_opl3_set_voice(struct snd_opl3 * opl3, struct snd_dm_fm_voice * voice)
+static int snd_opl3_set_voice(opl3_t * opl3, snd_dm_fm_voice_t * voice)
 {
 	unsigned short reg_side;
 	unsigned char op_offset;
-	unsigned char voice_offset, voice_op;
+	unsigned char voice_offset;
 
 	unsigned short opl3_reg;
 	unsigned char reg_val;
@@ -463,9 +305,7 @@ static int snd_opl3_set_voice(struct snd_opl3 * opl3, struct snd_dm_fm_voice * v
 		voice_offset = voice->voice - MAX_OPL2_VOICES;
 	}
 	/* Get register offset of operator */
-	voice_offset = array_index_nospec(voice_offset, MAX_OPL2_VOICES);
-	voice_op = array_index_nospec(voice->op, 4);
-	op_offset = snd_opl3_regmap[voice_offset][voice_op];
+	op_offset = snd_opl3_regmap[voice_offset][voice->op];
 
 	reg_val = 0x00;
 	/* Set amplitude modulation (tremolo) effect */
@@ -538,7 +378,7 @@ static int snd_opl3_set_voice(struct snd_opl3 * opl3, struct snd_dm_fm_voice * v
 	return 0;
 }
 
-static int snd_opl3_set_params(struct snd_opl3 * opl3, struct snd_dm_fm_params * params)
+static int snd_opl3_set_params(opl3_t * opl3, snd_dm_fm_params_t * params)
 {
 	unsigned char reg_val;
 
@@ -578,7 +418,7 @@ static int snd_opl3_set_params(struct snd_opl3 * opl3, struct snd_dm_fm_params *
 	return 0;
 }
 
-static int snd_opl3_set_mode(struct snd_opl3 * opl3, int mode)
+static int snd_opl3_set_mode(opl3_t * opl3, int mode)
 {
 	if ((mode == SNDRV_DM_FM_MODE_OPL3) && (opl3->hardware < OPL3_HW_OPL3))
 		return -EINVAL;
@@ -590,7 +430,7 @@ static int snd_opl3_set_mode(struct snd_opl3 * opl3, int mode)
 	return 0;
 }
 
-static int snd_opl3_set_connection(struct snd_opl3 * opl3, int connection)
+static int snd_opl3_set_connection(opl3_t * opl3, int connection)
 {
 	unsigned char reg_val;
 
@@ -605,4 +445,3 @@ static int snd_opl3_set_connection(struct snd_opl3 * opl3, int connection)
 
 	return 0;
 }
-

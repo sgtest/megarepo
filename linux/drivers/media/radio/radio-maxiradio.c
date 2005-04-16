@@ -1,36 +1,32 @@
-// SPDX-License-Identifier: GPL-2.0-only
-/*
- * Guillemot Maxi Radio FM 2000 PCI radio card driver for Linux
+/* 
+ * Guillemot Maxi Radio FM 2000 PCI radio card driver for Linux 
  * (C) 2001 Dimitromanolakis Apostolos <apdim@grecian.net>
  *
  * Based in the radio Maestro PCI driver. Actually it uses the same chip
  * for radio but different pci controller.
  *
  * I didn't have any specs I reversed engineered the protocol from
- * the windows driver (radio.dll).
+ * the windows driver (radio.dll). 
  *
  * The card uses the TEA5757 chip that includes a search function but it
- * is useless as I haven't found any way to read back the frequency. If
+ * is useless as I haven't found any way to read back the frequency. If 
  * anybody does please mail me.
  *
  * For the pdf file see:
- * http://www.nxp.com/acrobat_download2/expired_datasheets/TEA5757_5759_3.pdf
+ * http://www.semiconductors.philips.com/pip/TEA5757H/V1
  *
  *
  * CHANGES:
  *   0.75b
  *     - better pci interface thanks to Francois Romieu <romieu@cogenit.fr>
  *
- *   0.75      Sun Feb  4 22:51:27 EET 2001
+ *   0.75
  *     - tiding up
  *     - removed support for multiple devices as it didn't work anyway
  *
- * BUGS:
+ * BUGS: 
  *   - card unmutes if you change frequency
  *
- * (c) 2006, 2007 by Mauro Carvalho Chehab <mchehab@kernel.org>:
- *	- Conversion to V4L2 API
- *      - Uses video_ioctl2 for parsing and to add debug support
  */
 
 
@@ -38,157 +34,296 @@
 #include <linux/init.h>
 #include <linux/ioport.h>
 #include <linux/delay.h>
-#include <linux/mutex.h>
+#include <linux/sched.h>
+#include <asm/io.h>
+#include <asm/uaccess.h>
+#include <asm/semaphore.h>
 #include <linux/pci.h>
-#include <linux/videodev2.h>
-#include <linux/io.h>
-#include <linux/slab.h>
-#include <media/drv-intf/tea575x.h>
-#include <media/v4l2-device.h>
-#include <media/v4l2-ioctl.h>
-#include <media/v4l2-fh.h>
-#include <media/v4l2-ctrls.h>
-#include <media/v4l2-event.h>
+#include <linux/videodev.h>
 
-MODULE_AUTHOR("Dimitromanolakis Apostolos, apdim@grecian.net");
-MODULE_DESCRIPTION("Radio driver for the Guillemot Maxi Radio FM2000.");
-MODULE_LICENSE("GPL");
-MODULE_VERSION("1.0.0");
+/* version 0.75      Sun Feb  4 22:51:27 EET 2001 */
+#define DRIVER_VERSION	"0.75"
 
-static int radio_nr = -1;
-module_param(radio_nr, int, 0644);
-MODULE_PARM_DESC(radio_nr, "Radio device number");
+#ifndef PCI_VENDOR_ID_GUILLEMOT
+#define PCI_VENDOR_ID_GUILLEMOT 0x5046
+#endif
+
+#ifndef PCI_DEVICE_ID_GUILLEMOT
+#define PCI_DEVICE_ID_GUILLEMOT_MAXIRADIO 0x1001
+#endif
+
 
 /* TEA5757 pin mappings */
-static const int clk = 1, data = 2, wren = 4, mo_st = 8, power = 16;
+static const int clk = 1, data = 2, wren = 4, mo_st = 8, power = 16 ;
 
-static atomic_t maxiradio_instance = ATOMIC_INIT(0);
+static int radio_nr = -1;
+module_param(radio_nr, int, 0);
 
-#define PCI_VENDOR_ID_GUILLEMOT 0x5046
-#define PCI_DEVICE_ID_GUILLEMOT_MAXIRADIO 0x1001
 
-struct maxiradio
+#define FREQ_LO		 50*16000
+#define FREQ_HI		150*16000
+
+#define FREQ_IF         171200 /* 10.7*16000   */
+#define FREQ_STEP       200    /* 12.5*16      */
+
+#define FREQ2BITS(x)	((( (unsigned int)(x)+FREQ_IF+(FREQ_STEP<<1))\
+			/(FREQ_STEP<<2))<<2) /* (x==fmhz*16*1000) -> bits */
+
+#define BITS2FREQ(x)	((x) * FREQ_STEP - FREQ_IF)
+
+
+static int radio_ioctl(struct inode *inode, struct file *file,
+		       unsigned int cmd, unsigned long arg);
+
+static struct file_operations maxiradio_fops = {
+	.owner		= THIS_MODULE,
+	.open           = video_exclusive_open,
+	.release        = video_exclusive_release,
+	.ioctl	        = radio_ioctl,
+	.llseek         = no_llseek,
+};
+static struct video_device maxiradio_radio =
 {
-	struct snd_tea575x tea;
-	struct v4l2_device v4l2_dev;
-	struct pci_dev *pdev;
-
-	u16	io;	/* base of radio io */
+	.owner		= THIS_MODULE,
+	.name		= "Maxi Radio FM2000 radio",
+	.type		= VID_TYPE_TUNER,
+	.hardware	= VID_HARDWARE_SF16MI,
+	.fops           = &maxiradio_fops,
 };
 
-static inline struct maxiradio *to_maxiradio(struct v4l2_device *v4l2_dev)
+static struct radio_device
 {
-	return container_of(v4l2_dev, struct maxiradio, v4l2_dev);
+	__u16	io,	/* base of radio io */
+		muted,	/* VIDEO_AUDIO_MUTE */
+		stereo,	/* VIDEO_TUNER_STEREO_ON */	
+		tuned;	/* signal strength (0 or 0xffff) */
+		
+	unsigned long freq;
+	
+	struct  semaphore lock;
+} radio_unit = {0, 0, 0, 0, };
+
+
+static void outbit(unsigned long bit, __u16 io)
+{
+	if(bit != 0)
+		{
+			outb(  power|wren|data     ,io); udelay(4);
+			outb(  power|wren|data|clk ,io); udelay(4);
+			outb(  power|wren|data     ,io); udelay(4);
+		}
+	else	
+		{
+			outb(  power|wren          ,io); udelay(4);
+			outb(  power|wren|clk      ,io); udelay(4);
+			outb(  power|wren          ,io); udelay(4);
+		}
 }
 
-static void maxiradio_tea575x_set_pins(struct snd_tea575x *tea, u8 pins)
+static void turn_power(__u16 io, int p)
 {
-	struct maxiradio *dev = tea->private_data;
-	u8 bits = 0;
-
-	bits |= (pins & TEA575X_DATA) ? data : 0;
-	bits |= (pins & TEA575X_CLK)  ? clk  : 0;
-	bits |= (pins & TEA575X_WREN) ? wren : 0;
-	bits |= power;
-
-	outb(bits, dev->io);
+	if(p != 0) outb(power, io); else outb(0,io);
 }
 
-/* Note: this card cannot read out the data of the shift registers,
-   only the mono/stereo pin works. */
-static u8 maxiradio_tea575x_get_pins(struct snd_tea575x *tea)
-{
-	struct maxiradio *dev = tea->private_data;
-	u8 bits = inb(dev->io);
 
-	return  ((bits & data) ? TEA575X_DATA : 0) |
-		((bits & mo_st) ? TEA575X_MOST : 0);
+static void set_freq(__u16 io, __u32 data)
+{
+	unsigned long int si;
+	int bl;
+	
+	/* TEA5757 shift register bits (see pdf) */
+
+	outbit(0,io); // 24  search 
+	outbit(1,io); // 23  search up/down
+	
+	outbit(0,io); // 22  stereo/mono
+
+	outbit(0,io); // 21  band
+	outbit(0,io); // 20  band (only 00=FM works I think)
+
+	outbit(0,io); // 19  port ?
+	outbit(0,io); // 18  port ?
+	
+	outbit(0,io); // 17  search level
+	outbit(0,io); // 16  search level
+ 
+	si = 0x8000;
+	for(bl = 1; bl <= 16 ; bl++) { outbit(data & si,io); si >>=1; }
+	
+	outb(power,io);
 }
 
-static void maxiradio_tea575x_set_direction(struct snd_tea575x *tea, bool output)
-{
+static int get_stereo(__u16 io)
+{	
+	outb(power,io); udelay(4);
+	return !(inb(io) & mo_st);
 }
 
-static const struct snd_tea575x_ops maxiradio_tea_ops = {
-	.set_pins = maxiradio_tea575x_set_pins,
-	.get_pins = maxiradio_tea575x_get_pins,
-	.set_direction = maxiradio_tea575x_set_direction,
-};
+static int get_tune(__u16 io)
+{	
+	outb(power+clk,io); udelay(4);
+	return !(inb(io) & mo_st);
+}
 
-static int maxiradio_probe(struct pci_dev *pdev,
-			   const struct pci_device_id *ent)
+
+inline static int radio_function(struct inode *inode, struct file *file,
+				 unsigned int cmd, void *arg)
 {
-	struct maxiradio *dev;
-	struct v4l2_device *v4l2_dev;
-	int retval = -ENOMEM;
+	struct video_device *dev = video_devdata(file);
+	struct radio_device *card=dev->priv;
 
-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
-	if (dev == NULL) {
-		dev_err(&pdev->dev, "not enough memory\n");
-		return -ENOMEM;
+	switch(cmd) {
+		case VIDIOCGCAP: {
+			struct video_capability *v = arg;
+			
+			memset(v,0,sizeof(*v));
+			strcpy(v->name, "Maxi Radio FM2000 radio");
+			v->type=VID_TYPE_TUNER;
+			v->channels=v->audios=1;
+			return 0;
+		}
+		case VIDIOCGTUNER: {
+			struct video_tuner *v = arg;
+			
+			if(v->tuner)
+				return -EINVAL;
+				
+			card->stereo = 0xffff * get_stereo(card->io);
+			card->tuned = 0xffff * get_tune(card->io);
+			
+			v->flags = VIDEO_TUNER_LOW | card->stereo;
+			v->signal = card->tuned;
+			
+			strcpy(v->name, "FM");
+			
+			v->rangelow = FREQ_LO;
+			v->rangehigh = FREQ_HI;
+			v->mode = VIDEO_MODE_AUTO;
+			
+			return 0;
+		}
+		case VIDIOCSTUNER: {
+			struct video_tuner *v = arg;
+			if(v->tuner!=0)
+				return -EINVAL;
+			return 0;
+		}
+		case VIDIOCGFREQ: {
+			unsigned long *freq = arg;
+			
+			*freq = card->freq;
+			return 0;
+		}
+		case VIDIOCSFREQ: {
+			unsigned long *freq = arg;
+			
+			if (*freq < FREQ_LO || *freq > FREQ_HI)
+				return -EINVAL;
+			card->freq = *freq;
+			set_freq(card->io, FREQ2BITS(card->freq));
+			msleep(125);
+			return 0;
+		}
+		case VIDIOCGAUDIO: {	
+			struct video_audio *v = arg;
+			memset(v,0,sizeof(*v));
+			strcpy(v->name, "Radio");
+			v->flags=VIDEO_AUDIO_MUTABLE | card->muted;
+			v->mode=VIDEO_SOUND_STEREO;
+			return 0;		
+		}
+		
+		case VIDIOCSAUDIO: {
+			struct video_audio *v = arg;
+			
+			if(v->audio)
+				return -EINVAL;
+			card->muted = v->flags & VIDEO_AUDIO_MUTE;
+			if(card->muted)
+				turn_power(card->io, 0);
+			else
+				set_freq(card->io, FREQ2BITS(card->freq));
+			return 0;
+		}
+		case VIDIOCGUNIT: {
+			struct video_unit *v = arg;
+			
+			v->video=VIDEO_NO_UNIT;
+			v->vbi=VIDEO_NO_UNIT;
+			v->radio=dev->minor;
+			v->audio=0;
+			v->teletext=VIDEO_NO_UNIT;
+			return 0;		
+		}
+		default: return -ENOIOCTLCMD;
 	}
+}
 
-	v4l2_dev = &dev->v4l2_dev;
-	v4l2_device_set_name(v4l2_dev, "maxiradio", &maxiradio_instance);
+static int radio_ioctl(struct inode *inode, struct file *file,
+		       unsigned int cmd, unsigned long arg)
+{
+	struct video_device *dev = video_devdata(file);
+	struct radio_device *card=dev->priv;
+	int ret;
+	
+	down(&card->lock);
+	ret = video_usercopy(inode, file, cmd, arg, radio_function);
+	up(&card->lock);
+	return ret;
+}
 
-	retval = v4l2_device_register(&pdev->dev, v4l2_dev);
-	if (retval < 0) {
-		v4l2_err(v4l2_dev, "Could not register v4l2_device\n");
-		goto errfr;
-	}
-	dev->tea.private_data = dev;
-	dev->tea.ops = &maxiradio_tea_ops;
-	/* The data pin cannot be read. This may be a hardware limitation, or
-	   we just don't know how to read it. */
-	dev->tea.cannot_read_data = true;
-	dev->tea.v4l2_dev = v4l2_dev;
-	dev->tea.radio_nr = radio_nr;
-	strscpy(dev->tea.card, "Maxi Radio FM2000", sizeof(dev->tea.card));
+MODULE_AUTHOR("Dimitromanolakis Apostolos, apdim@grecian.net");
+MODULE_DESCRIPTION("Radio driver for the Guillemot Maxi Radio FM2000 radio.");
+MODULE_LICENSE("GPL");
 
-	retval = -ENODEV;
 
-	if (!request_region(pci_resource_start(pdev, 0),
-			   pci_resource_len(pdev, 0), v4l2_dev->name)) {
-		dev_err(&pdev->dev, "can't reserve I/O ports\n");
-		goto err_hdl;
+static int __devinit maxiradio_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+{
+	if(!request_region(pci_resource_start(pdev, 0),
+	                   pci_resource_len(pdev, 0), "Maxi Radio FM 2000")) {
+	        printk(KERN_ERR "radio-maxiradio: can't reserve I/O ports\n");
+	        goto err_out;
 	}
 
 	if (pci_enable_device(pdev))
-		goto err_out_free_region;
+	        goto err_out_free_region;
 
-	dev->io = pci_resource_start(pdev, 0);
-	if (snd_tea575x_init(&dev->tea, THIS_MODULE)) {
-		printk(KERN_ERR "radio-maxiradio: Unable to detect TEA575x tuner\n");
-		goto err_out_free_region;
+	radio_unit.io = pci_resource_start(pdev, 0);
+	init_MUTEX(&radio_unit.lock);
+	maxiradio_radio.priv = &radio_unit;
+
+	if(video_register_device(&maxiradio_radio, VFL_TYPE_RADIO, radio_nr)==-1) {
+	        printk("radio-maxiradio: can't register device!");
+	        goto err_out_free_region;
 	}
+
+	printk(KERN_INFO "radio-maxiradio: version "
+	       DRIVER_VERSION
+	       " time "
+	       __TIME__ "  "
+	       __DATE__
+	       "\n");
+
+	printk(KERN_INFO "radio-maxiradio: found Guillemot MAXI Radio device (io = 0x%x)\n",
+	       radio_unit.io);
 	return 0;
 
 err_out_free_region:
 	release_region(pci_resource_start(pdev, 0), pci_resource_len(pdev, 0));
-err_hdl:
-	v4l2_device_unregister(v4l2_dev);
-errfr:
-	kfree(dev);
-	return retval;
+err_out:
+	return -ENODEV;
 }
 
-static void maxiradio_remove(struct pci_dev *pdev)
+static void __devexit maxiradio_remove_one(struct pci_dev *pdev)
 {
-	struct v4l2_device *v4l2_dev = pci_get_drvdata(pdev);
-	struct maxiradio *dev = to_maxiradio(v4l2_dev);
-
-	snd_tea575x_exit(&dev->tea);
-	/* Turn off power */
-	outb(0, dev->io);
-	v4l2_device_unregister(v4l2_dev);
+	video_unregister_device(&maxiradio_radio);
 	release_region(pci_resource_start(pdev, 0), pci_resource_len(pdev, 0));
-	kfree(dev);
 }
 
-static const struct pci_device_id maxiradio_pci_tbl[] = {
+static struct pci_device_id maxiradio_pci_tbl[] = {
 	{ PCI_VENDOR_ID_GUILLEMOT, PCI_DEVICE_ID_GUILLEMOT_MAXIRADIO,
 		PCI_ANY_ID, PCI_ANY_ID, },
-	{ 0 }
+	{ 0,}
 };
 
 MODULE_DEVICE_TABLE(pci, maxiradio_pci_tbl);
@@ -196,8 +331,19 @@ MODULE_DEVICE_TABLE(pci, maxiradio_pci_tbl);
 static struct pci_driver maxiradio_driver = {
 	.name		= "radio-maxiradio",
 	.id_table	= maxiradio_pci_tbl,
-	.probe		= maxiradio_probe,
-	.remove		= maxiradio_remove,
+	.probe		= maxiradio_init_one,
+	.remove		= __devexit_p(maxiradio_remove_one),
 };
 
-module_pci_driver(maxiradio_driver);
+static int __init maxiradio_radio_init(void)
+{
+	return pci_module_init(&maxiradio_driver);
+}
+
+static void __exit maxiradio_radio_exit(void)
+{
+	pci_unregister_driver(&maxiradio_driver);
+}
+
+module_init(maxiradio_radio_init);
+module_exit(maxiradio_radio_exit);

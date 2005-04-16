@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *  linux/fs/ufs/util.c
  *
@@ -9,12 +8,20 @@
  
 #include <linux/string.h>
 #include <linux/slab.h>
+#include <linux/ufs_fs.h>
 #include <linux/buffer_head.h>
 
-#include "ufs_fs.h"
-#include "ufs.h"
 #include "swab.h"
 #include "util.h"
+
+#undef UFS_UTILS_DEBUG
+
+#ifdef UFS_UTILS_DEBUG
+#define UFSD(x) printk("(%s, %d), %s: ", __FILE__, __LINE__, __FUNCTION__); printk x;
+#else
+#define UFSD(x)
+#endif
+
 
 struct ufs_buffer_head * _ubh_bread_ (struct ufs_sb_private_info * uspi,
 	struct super_block *sb, u64 fragment, u64 size)
@@ -27,7 +34,8 @@ struct ufs_buffer_head * _ubh_bread_ (struct ufs_sb_private_info * uspi,
 	count = size >> uspi->s_fshift;
 	if (count > UFS_MAXFRAG)
 		return NULL;
-	ubh = kmalloc (sizeof (struct ufs_buffer_head), GFP_NOFS);
+	ubh = (struct ufs_buffer_head *)
+		kmalloc (sizeof (struct ufs_buffer_head), GFP_KERNEL);
 	if (!ubh)
 		return NULL;
 	ubh->fragment = fragment;
@@ -55,17 +63,17 @@ struct ufs_buffer_head * ubh_bread_uspi (struct ufs_sb_private_info * uspi,
 	count = size >> uspi->s_fshift;
 	if (count <= 0 || count > UFS_MAXFRAG)
 		return NULL;
-	USPI_UBH(uspi)->fragment = fragment;
-	USPI_UBH(uspi)->count = count;
+	USPI_UBH->fragment = fragment;
+	USPI_UBH->count = count;
 	for (i = 0; i < count; i++)
-		if (!(USPI_UBH(uspi)->bh[i] = sb_bread(sb, fragment + i)))
+		if (!(USPI_UBH->bh[i] = sb_bread(sb, fragment + i)))
 			goto failed;
 	for (; i < UFS_MAXFRAG; i++)
-		USPI_UBH(uspi)->bh[i] = NULL;
-	return USPI_UBH(uspi);
+		USPI_UBH->bh[i] = NULL;
+	return USPI_UBH;
 failed:
 	for (j = 0; j < i; j++)
-		brelse (USPI_UBH(uspi)->bh[j]);
+		brelse (USPI_UBH->bh[j]);
 	return NULL;
 }
 
@@ -82,11 +90,11 @@ void ubh_brelse (struct ufs_buffer_head * ubh)
 void ubh_brelse_uspi (struct ufs_sb_private_info * uspi)
 {
 	unsigned i;
-	if (!USPI_UBH(uspi))
+	if (!USPI_UBH)
 		return;
-	for ( i = 0; i < USPI_UBH(uspi)->count; i++ ) {
-		brelse (USPI_UBH(uspi)->bh[i]);
-		USPI_UBH(uspi)->bh[i] = NULL;
+	for ( i = 0; i < USPI_UBH->count; i++ ) {
+		brelse (USPI_UBH->bh[i]);
+		USPI_UBH->bh[i] = NULL;
 	}
 }
 
@@ -113,17 +121,34 @@ void ubh_mark_buffer_uptodate (struct ufs_buffer_head * ubh, int flag)
 	}
 }
 
-void ubh_sync_block(struct ufs_buffer_head *ubh)
+void ubh_ll_rw_block (int rw, unsigned nr, struct ufs_buffer_head * ubh[])
 {
-	if (ubh) {
-		unsigned i;
+	unsigned i;
+	if (!ubh)
+		return;
+	for ( i = 0; i < nr; i++ )
+		ll_rw_block (rw, ubh[i]->count, ubh[i]->bh);
+}
 
-		for (i = 0; i < ubh->count; i++)
-			write_dirty_buffer(ubh->bh[i], 0);
+void ubh_wait_on_buffer (struct ufs_buffer_head * ubh)
+{
+	unsigned i;
+	if (!ubh)
+		return;
+	for ( i = 0; i < ubh->count; i++ )
+		wait_on_buffer (ubh->bh[i]);
+}
 
-		for (i = 0; i < ubh->count; i++)
-			wait_on_buffer(ubh->bh[i]);
-	}
+unsigned ubh_max_bcount (struct ufs_buffer_head * ubh)
+{
+	unsigned i;
+	unsigned max = 0;
+	if (!ubh)
+		return 0;
+	for ( i = 0; i < ubh->count; i++ ) 
+		if ( atomic_read(&ubh->bh[i]->b_count) > max )
+			max = atomic_read(&ubh->bh[i]->b_count);
+	return max;
 }
 
 void ubh_bforget (struct ufs_buffer_head * ubh)
@@ -181,13 +206,14 @@ void _ubh_memcpyubh_(struct ufs_sb_private_info * uspi,
 dev_t
 ufs_get_inode_dev(struct super_block *sb, struct ufs_inode_info *ufsi)
 {
-	__u32 fs32;
+	__fs32 fs32;
 	dev_t dev;
 
 	if ((UFS_SB(sb)->s_flags & UFS_ST_MASK) == UFS_ST_SUNx86)
-		fs32 = fs32_to_cpu(sb, ufsi->i_u1.i_data[1]);
+		fs32 = ufsi->i_u1.i_data[1];
 	else
-		fs32 = fs32_to_cpu(sb, ufsi->i_u1.i_data[0]);
+		fs32 = ufsi->i_u1.i_data[0];
+	fs32 = fs32_to_cpu(sb, fs32);
 	switch (UFS_SB(sb)->s_flags & UFS_ST_MASK) {
 	case UFS_ST_SUNx86:
 	case UFS_ST_SUN:
@@ -208,7 +234,7 @@ ufs_get_inode_dev(struct super_block *sb, struct ufs_inode_info *ufsi)
 void
 ufs_set_inode_dev(struct super_block *sb, struct ufs_inode_info *ufsi, dev_t dev)
 {
-	__u32 fs32;
+	__fs32 fs32;
 
 	switch (UFS_SB(sb)->s_flags & UFS_ST_MASK) {
 	case UFS_ST_SUNx86:
@@ -223,49 +249,9 @@ ufs_set_inode_dev(struct super_block *sb, struct ufs_inode_info *ufsi, dev_t dev
 		fs32 = old_encode_dev(dev);
 		break;
 	}
+	fs32 = cpu_to_fs32(sb, fs32);
 	if ((UFS_SB(sb)->s_flags & UFS_ST_MASK) == UFS_ST_SUNx86)
-		ufsi->i_u1.i_data[1] = cpu_to_fs32(sb, fs32);
+		ufsi->i_u1.i_data[1] = fs32;
 	else
-		ufsi->i_u1.i_data[0] = cpu_to_fs32(sb, fs32);
-}
-
-/**
- * ufs_get_locked_page() - locate, pin and lock a pagecache page, if not exist
- * read it from disk.
- * @mapping: the address_space to search
- * @index: the page index
- *
- * Locates the desired pagecache page, if not exist we'll read it,
- * locks it, increments its reference
- * count and returns its address.
- *
- */
-
-struct page *ufs_get_locked_page(struct address_space *mapping,
-				 pgoff_t index)
-{
-	struct inode *inode = mapping->host;
-	struct page *page = find_lock_page(mapping, index);
-	if (!page) {
-		page = read_mapping_page(mapping, index, NULL);
-
-		if (IS_ERR(page)) {
-			printk(KERN_ERR "ufs_change_blocknr: "
-			       "read_mapping_page error: ino %lu, index: %lu\n",
-			       mapping->host->i_ino, index);
-			return page;
-		}
-
-		lock_page(page);
-
-		if (unlikely(page->mapping == NULL)) {
-			/* Truncate got there first */
-			unlock_page(page);
-			put_page(page);
-			return NULL;
-		}
-	}
-	if (!page_has_buffers(page))
-		create_empty_buffers(page, 1 << inode->i_blkbits, 0);
-	return page;
+		ufsi->i_u1.i_data[0] = fs32;
 }

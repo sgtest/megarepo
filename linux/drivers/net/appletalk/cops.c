@@ -4,7 +4,7 @@
  *      - Jay Schulist <jschlst@samba.org>
  *
  *	With more than a little help from;
- *	- Alan Cox <alan@lxorguk.ukuu.org.uk>
+ *	- Alan Cox <Alan.Cox@linux.org> 
  *
  *      Derived from:
  *      - skeleton.c: A network driver outline for linux.
@@ -48,6 +48,7 @@ static const char *version =
  *	  the driver figure it out.
  */
 
+#include <linux/config.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/types.h>
@@ -56,6 +57,7 @@ static const char *version =
 #include <linux/ptrace.h>
 #include <linux/ioport.h>
 #include <linux/in.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/errno.h>
 #include <linux/init.h>
@@ -63,15 +65,13 @@ static const char *version =
 #include <linux/etherdevice.h>
 #include <linux/skbuff.h>
 #include <linux/if_arp.h>
-#include <linux/if_ltalk.h>
+#include <linux/if_ltalk.h>	/* For ltalk_setup() */
 #include <linux/delay.h>	/* For udelay() */
 #include <linux/atalk.h>
 #include <linux/spinlock.h>
 #include <linux/bitops.h>
-#include <linux/jiffies.h>
 
-#include <net/Space.h>
-
+#include <asm/system.h>
 #include <asm/io.h>
 #include <asm/dma.h>
 
@@ -120,7 +120,7 @@ static int irq = 5;		/* Default IRQ */
  *      DAYNA driver mode:
  *              Dayna DL2000/DaynaTalk PC (Half Length), COPS LT-95, 
  *		Farallon PhoneNET PC III, Farallon PhoneNET PC II
- *	Other cards possibly supported mode unknown though:
+ *	Other cards possibly supported mode unkown though:
  *		Dayna DL2000 (Full length), COPS LT/M (Micro-Channel)
  *
  *	Cards NOT supported by this driver but supported by the ltpc.c
@@ -157,7 +157,6 @@ static int cops_irqlist[] = {
 };
 
 static struct timer_list cops_timer;
-static struct net_device *cops_timer_dev;
 
 /* use 0 for production, 1 for verification, 2 for debug, 3 for verbose debug */
 #ifndef COPS_DEBUG
@@ -172,6 +171,7 @@ static unsigned int cops_debug = COPS_DEBUG;
 
 struct cops_local
 {
+        struct net_device_stats stats;
         int board;			/* Holds what board type is. */
 	int nodeid;			/* Set to 1 once have nodeid. */
         unsigned char node_acquire;	/* Node ID when acquired. */
@@ -189,15 +189,19 @@ static void cops_reset (struct net_device *dev, int sleep);
 static void cops_load (struct net_device *dev);
 static int  cops_nodeid (struct net_device *dev, int nodeid);
 
-static irqreturn_t cops_interrupt (int irq, void *dev_id);
-static void cops_poll(struct timer_list *t);
-static void cops_timeout(struct net_device *dev, unsigned int txqueue);
+static irqreturn_t cops_interrupt (int irq, void *dev_id, struct pt_regs *regs);
+static void cops_poll (unsigned long ltdev);
+static void cops_timeout(struct net_device *dev);
 static void cops_rx (struct net_device *dev);
-static netdev_tx_t  cops_send_packet (struct sk_buff *skb,
-					    struct net_device *dev);
+static int  cops_send_packet (struct sk_buff *skb, struct net_device *dev);
 static void set_multicast_list (struct net_device *dev);
+static int  cops_hard_header (struct sk_buff *skb, struct net_device *dev,
+			      unsigned short type, void *daddr, void *saddr, 
+			      unsigned len);
+
 static int  cops_ioctl (struct net_device *dev, struct ifreq *rq, int cmd);
 static int  cops_close (struct net_device *dev);
+static struct net_device_stats *cops_get_stats (struct net_device *dev);
 
 static void cleanup_card(struct net_device *dev)
 {
@@ -219,7 +223,7 @@ struct net_device * __init cops_probe(int unit)
 	int base_addr;
 	int err = 0;
 
-	dev = alloc_ltalkdev(sizeof(struct cops_local));
+	dev = alloc_netdev(sizeof(struct cops_local), "lt%d", ltalk_setup);
 	if (!dev)
 		return ERR_PTR(-ENOMEM);
 
@@ -231,6 +235,8 @@ struct net_device * __init cops_probe(int unit)
 	} else {
 		base_addr = dev->base_addr = io;
 	}
+
+	SET_MODULE_OWNER(dev);
 
 	if (base_addr > 0x1ff) {    /* Check a single specified location. */
 		err = cops_probe1(dev, base_addr);
@@ -259,15 +265,6 @@ out:
 	free_netdev(dev);
 	return ERR_PTR(err);
 }
-
-static const struct net_device_ops cops_netdev_ops = {
-	.ndo_open               = cops_open,
-        .ndo_stop               = cops_close,
-	.ndo_start_xmit   	= cops_send_packet,
-	.ndo_tx_timeout		= cops_timeout,
-        .ndo_do_ioctl           = cops_ioctl,
-	.ndo_set_rx_mode	= set_multicast_list,
-};
 
 /*
  *      This is the real probe routine. Linux has a history of friendly device
@@ -303,7 +300,7 @@ static int __init cops_probe1(struct net_device *dev, int ioaddr)
 			dev->irq = cops_irq(ioaddr, board);
 			if (dev->irq)
 				break;
-			fallthrough;	/* Once no IRQ found on this port */
+			/* No IRQ found on this port, fallthrough */
 		case 1:
 			retval = -EINVAL;
 			goto err_out;
@@ -327,24 +324,32 @@ static int __init cops_probe1(struct net_device *dev, int ioaddr)
 			break;
 	}
 
-	dev->base_addr = ioaddr;
-
 	/* Reserve any actual interrupt. */
 	if (dev->irq) {
-		retval = request_irq(dev->irq, cops_interrupt, 0, dev->name, dev);
+		retval = request_irq(dev->irq, &cops_interrupt, 0, dev->name, dev);
 		if (retval)
 			goto err_out;
 	}
 
+	dev->base_addr = ioaddr;
+
         lp = netdev_priv(dev);
+        memset(lp, 0, sizeof(struct cops_local));
         spin_lock_init(&lp->lock);
 
 	/* Copy local board variable to lp struct. */
 	lp->board               = board;
 
-	dev->netdev_ops 	= &cops_netdev_ops;
+	dev->hard_start_xmit    = cops_send_packet;
+	dev->tx_timeout		= cops_timeout;
 	dev->watchdog_timeo	= HZ * 2;
-
+	dev->hard_header	= cops_hard_header;
+        dev->get_stats          = cops_get_stats;
+	dev->open               = cops_open;
+        dev->stop               = cops_close;
+        dev->do_ioctl           = cops_ioctl;
+	dev->set_multicast_list = set_multicast_list;
+        dev->mc_list            = NULL;
 
 	/* Tell the user where the card is and what mode we're in. */
 	if(board==DAYNA)
@@ -427,8 +432,9 @@ static int cops_open(struct net_device *dev)
 		 */
 		if(lp->board==TANGENT)	/* Poll 20 times per second */
 		{
-		    cops_timer_dev = dev;
-		    timer_setup(&cops_timer, cops_poll, 0);
+		    init_timer(&cops_timer);
+		    cops_timer.function = cops_poll;
+		    cops_timer.data 	= (unsigned long)dev;
 		    cops_timer.expires 	= jiffies + HZ/20;
 		    add_timer(&cops_timer);
 		} 
@@ -500,13 +506,19 @@ static void cops_reset(struct net_device *dev, int sleep)
         {
                 outb(0, ioaddr+DAYNA_RESET);	/* Assert the reset port */
                 inb(ioaddr+DAYNA_RESET);	/* Clear the reset */
-		if (sleep)
-			msleep(333);
-		else
-			mdelay(333);
-        }
+                if(sleep)
+                {
+                        long snap=jiffies;
 
+			/* Let card finish initializing, about 1/3 second */
+	                while(jiffies-snap<HZ/3)
+                                schedule();
+                }
+                else
+                        mdelay(333);
+        }
 	netif_wake_queue(dev);
+	return;
 }
 
 static void cops_load (struct net_device *dev)
@@ -594,6 +606,8 @@ static void cops_load (struct net_device *dev)
                 tangent_wait_reset(ioaddr);
                 inb(ioaddr);	/* Clear initial ready signal. */
         }
+
+        return;
 }
 
 /*
@@ -609,12 +623,12 @@ static int cops_nodeid (struct net_device *dev, int nodeid)
 
 	if(lp->board == DAYNA)
         {
-		/* Empty any pending adapter responses. */
+        	/* Empty any pending adapter responses. */
                 while((inb(ioaddr+DAYNA_CARD_STATUS)&DAYNA_TX_READY)==0)
                 {
 			outb(0, ioaddr+COPS_CLEAR_INT);	/* Clear interrupts. */
-			if((inb(ioaddr+DAYNA_CARD_STATUS)&0x03)==DAYNA_RX_REQUEST)
-				cops_rx(dev);	/* Kick any packets waiting. */
+        		if((inb(ioaddr+DAYNA_CARD_STATUS)&0x03)==DAYNA_RX_REQUEST)
+                		cops_rx(dev);	/* Kick any packets waiting. */
 			schedule();
                 }
 
@@ -630,13 +644,13 @@ static int cops_nodeid (struct net_device *dev, int nodeid)
                 while(inb(ioaddr+TANG_CARD_STATUS)&TANG_RX_READY)
                 {
 			outb(0, ioaddr+COPS_CLEAR_INT);	/* Clear interrupt. */
-			cops_rx(dev);          	/* Kick out packets waiting. */
+                	cops_rx(dev);          	/* Kick out packets waiting. */
 			schedule();
                 }
 
 		/* Not sure what Tangent does if nodeid picked is used. */
                 if(nodeid == 0)	         		/* Seed. */
-			nodeid = jiffies&0xFF;		/* Get a random try */
+                	nodeid = jiffies&0xFF;		/* Get a random try */
                 outb(2, ioaddr);        		/* Command length LSB */
                 outb(0, ioaddr);       			/* Command length MSB */
                 outb(LAP_INIT, ioaddr); 		/* Send LAP_INIT byte */
@@ -651,13 +665,13 @@ static int cops_nodeid (struct net_device *dev, int nodeid)
 
 		if(lp->board == DAYNA)
 		{
-			if((inb(ioaddr+DAYNA_CARD_STATUS)&0x03)==DAYNA_RX_REQUEST)
-				cops_rx(dev);	/* Grab the nodeid put in lp->node_acquire. */
+                	if((inb(ioaddr+DAYNA_CARD_STATUS)&0x03)==DAYNA_RX_REQUEST)
+                		cops_rx(dev);	/* Grab the nodeid put in lp->node_acquire. */
 		}
 		if(lp->board == TANGENT)
 		{	
 			if(inb(ioaddr+TANG_CARD_STATUS)&TANG_RX_READY)
-				cops_rx(dev);   /* Grab the nodeid put in lp->node_acquire. */
+                                cops_rx(dev);   /* Grab the nodeid put in lp->node_acquire. */
 		}
 		schedule();
 	}
@@ -675,11 +689,12 @@ static int cops_nodeid (struct net_device *dev, int nodeid)
  *	Poll the Tangent type cards to see if we have work.
  */
  
-static void cops_poll(struct timer_list *unused)
+static void cops_poll(unsigned long ltdev)
 {
 	int ioaddr, status;
 	int boguscount = 0;
-	struct net_device *dev = cops_timer_dev;
+
+	struct net_device *dev = (struct net_device *)ltdev;
 
 	del_timer(&cops_timer);
 
@@ -699,13 +714,15 @@ static void cops_poll(struct timer_list *unused)
 	/* poll 20 times per second */
 	cops_timer.expires = jiffies + HZ/20;
 	add_timer(&cops_timer);
+
+	return;
 }
 
 /*
  *      The typical workload of the driver:
  *      Handle the network interface interrupts.
  */
-static irqreturn_t cops_interrupt(int irq, void *dev_id)
+static irqreturn_t cops_interrupt(int irq, void *dev_id, struct pt_regs * regs)
 {
         struct net_device *dev = dev_id;
         struct cops_local *lp;
@@ -719,16 +736,16 @@ static irqreturn_t cops_interrupt(int irq, void *dev_id)
 	{
 		do {
 			outb(0, ioaddr + COPS_CLEAR_INT);
-			status=inb(ioaddr+DAYNA_CARD_STATUS);
-			if((status&0x03)==DAYNA_RX_REQUEST)
-				cops_rx(dev);
-			netif_wake_queue(dev);
+                       	status=inb(ioaddr+DAYNA_CARD_STATUS);
+                       	if((status&0x03)==DAYNA_RX_REQUEST)
+                       	        cops_rx(dev);
+                	netif_wake_queue(dev);
 		} while(++boguscount < 20);
 	}
 	else
 	{
 		do {
-			status=inb(ioaddr+TANG_CARD_STATUS);
+                       	status=inb(ioaddr+TANG_CARD_STATUS);
 			if(status & TANG_RX_READY)
 				cops_rx(dev);
 			if(status & TANG_TX_READY)
@@ -779,7 +796,10 @@ static void cops_rx(struct net_device *dev)
         }
 
         /* Get response length. */
-	pkt_len = inb(ioaddr);
+	if(lp->board==DAYNA)
+        	pkt_len = inb(ioaddr) & 0xFF;
+	else
+		pkt_len = inb(ioaddr) & 0x00FF;
         pkt_len |= (inb(ioaddr) << 8);
         /* Input IO code. */
         rsp_type=inb(ioaddr);
@@ -790,7 +810,7 @@ static void cops_rx(struct net_device *dev)
         {
                 printk(KERN_WARNING "%s: Memory squeeze, dropping packet.\n",
 			dev->name);
-                dev->stats.rx_dropped++;
+                lp->stats.rx_dropped++;
                 while(pkt_len--)        /* Discard packet */
                         inb(ioaddr);
                 spin_unlock_irqrestore(&lp->lock, flags);
@@ -812,7 +832,7 @@ static void cops_rx(struct net_device *dev)
         {
 		printk(KERN_WARNING "%s: Bad packet length of %d bytes.\n", 
 			dev->name, pkt_len);
-                dev->stats.tx_errors++;
+                lp->stats.tx_errors++;
                 dev_kfree_skb_any(skb);
                 return;
         }
@@ -829,37 +849,38 @@ static void cops_rx(struct net_device *dev)
         if(rsp_type != LAP_RESPONSE)
         {
                 printk(KERN_WARNING "%s: Bad packet type %d.\n", dev->name, rsp_type);
-                dev->stats.tx_errors++;
+                lp->stats.tx_errors++;
                 dev_kfree_skb_any(skb);
                 return;
         }
 
-        skb_reset_mac_header(skb);    /* Point to entire packet. */
+        skb->mac.raw    = skb->data;    /* Point to entire packet. */
         skb_pull(skb,3);
-        skb_reset_transport_header(skb);    /* Point to data (Skip header). */
+        skb->h.raw      = skb->data;    /* Point to data (Skip header). */
 
         /* Update the counters. */
-        dev->stats.rx_packets++;
-        dev->stats.rx_bytes += skb->len;
+        lp->stats.rx_packets++;
+        lp->stats.rx_bytes += skb->len;
 
         /* Send packet to a higher place. */
         netif_rx(skb);
+	dev->last_rx = jiffies;
 }
 
-static void cops_timeout(struct net_device *dev, unsigned int txqueue)
+static void cops_timeout(struct net_device *dev)
 {
         struct cops_local *lp = netdev_priv(dev);
         int ioaddr = dev->base_addr;
 
-	dev->stats.tx_errors++;
+	lp->stats.tx_errors++;
         if(lp->board==TANGENT)
         {
 		if((inb(ioaddr+TANG_CARD_STATUS)&TANG_TX_READY)==0)
-			printk(KERN_WARNING "%s: No TX complete interrupt.\n", dev->name);
+               		printk(KERN_WARNING "%s: No TX complete interrupt.\n", dev->name);
 	}
 	printk(KERN_WARNING "%s: Transmit timed out.\n", dev->name);
 	cops_jumpstart(dev);	/* Restart the card. */
-	netif_trans_update(dev); /* prevent tx timeout */
+	dev->trans_start = jiffies;
 	netif_wake_queue(dev);
 }
 
@@ -868,8 +889,7 @@ static void cops_timeout(struct net_device *dev, unsigned int txqueue)
  *	Make the card transmit a LocalTalk packet.
  */
 
-static netdev_tx_t cops_send_packet(struct sk_buff *skb,
-					  struct net_device *dev)
+static int cops_send_packet(struct sk_buff *skb, struct net_device *dev)
 {
         struct cops_local *lp = netdev_priv(dev);
         int ioaddr = dev->base_addr;
@@ -891,13 +911,16 @@ static netdev_tx_t cops_send_packet(struct sk_buff *skb,
 
 	/* Output IO length. */
 	outb(skb->len, ioaddr);
-	outb(skb->len >> 8, ioaddr);
+	if(lp->board == DAYNA)
+               	outb(skb->len >> 8, ioaddr);
+	else
+		outb((skb->len >> 8)&0x0FF, ioaddr);
 
 	/* Output IO code. */
 	outb(LAP_WRITE, ioaddr);
 
 	if(lp->board == DAYNA)	/* Check the transmit buffer again. */
-		while((inb(ioaddr+DAYNA_CARD_STATUS)&DAYNA_TX_READY)==0);
+        	while((inb(ioaddr+DAYNA_CARD_STATUS)&DAYNA_TX_READY)==0);
 
 	outsb(ioaddr, skb->data, skb->len);	/* Send out the data. */
 
@@ -907,10 +930,11 @@ static netdev_tx_t cops_send_packet(struct sk_buff *skb,
 	spin_unlock_irqrestore(&lp->lock, flags);	/* Restore interrupts. */
 
 	/* Done sending packet, update counters and cleanup. */
-	dev->stats.tx_packets++;
-	dev->stats.tx_bytes += skb->len;
+	lp->stats.tx_packets++;
+	lp->stats.tx_bytes += skb->len;
+	dev->trans_start = jiffies;
 	dev_kfree_skb (skb);
-	return NETDEV_TX_OK;
+        return 0;
 }
 
 /*
@@ -924,6 +948,19 @@ static void set_multicast_list(struct net_device *dev)
 }
 
 /*
+ *      Another Dummy function to keep the Appletalk layer happy.
+ */
+ 
+static int cops_hard_header(struct sk_buff *skb, struct net_device *dev,
+			    unsigned short type, void *daddr, void *saddr, 
+			    unsigned len)
+{
+        if(cops_debug >= 3)
+                printk("%s: cops_hard_header executed. Wow!\n", dev->name);
+        return 0;
+}
+
+/*
  *      System ioctls for the COPS LocalTalk card.
  */
  
@@ -931,7 +968,7 @@ static int cops_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 {
         struct cops_local *lp = netdev_priv(dev);
         struct sockaddr_at *sa = (struct sockaddr_at *)&ifr->ifr_addr;
-        struct atalk_addr *aa = &lp->node_addr;
+        struct atalk_addr *aa = (struct atalk_addr *)&lp->node_addr;
 
         switch(cmd)
         {
@@ -945,8 +982,8 @@ static int cops_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
                         dev->broadcast[0]       = 0xFF;
 			
 			/* Set hardware address. */
+                        dev->dev_addr[0]        = aa->s_node;
                         dev->addr_len           = 1;
-			dev_addr_set(dev, &aa->s_node);
                         return 0;
 
                 case SIOCGIFADDR:
@@ -976,30 +1013,47 @@ static int cops_close(struct net_device *dev)
         return 0;
 }
 
+/*
+ *      Get the current statistics.
+ *      This may be called with the card open or closed.
+ */
+static struct net_device_stats *cops_get_stats(struct net_device *dev)
+{
+        struct cops_local *lp = netdev_priv(dev);
+        return &lp->stats;
+}
 
 #ifdef MODULE
 static struct net_device *cops_dev;
 
 MODULE_LICENSE("GPL");
-module_param_hw(io, int, ioport, 0);
-module_param_hw(irq, int, irq, 0);
-module_param_hw(board_type, int, other, 0);
+module_param(io, int, 0);
+module_param(irq, int, 0);
+module_param(board_type, int, 0);
 
-static int __init cops_module_init(void)
+int init_module(void)
 {
 	if (io == 0)
 		printk(KERN_WARNING "%s: You shouldn't autoprobe with insmod\n",
 			cardname);
 	cops_dev = cops_probe(-1);
-	return PTR_ERR_OR_ZERO(cops_dev);
+	if (IS_ERR(cops_dev))
+		return PTR_ERR(cops_dev);
+        return 0;
 }
 
-static void __exit cops_module_exit(void)
+void cleanup_module(void)
 {
 	unregister_netdev(cops_dev);
 	cleanup_card(cops_dev);
 	free_netdev(cops_dev);
 }
-module_init(cops_module_init);
-module_exit(cops_module_exit);
 #endif /* MODULE */
+
+/*
+ * Local variables:
+ *  compile-command: "gcc -DMODVERSIONS -DMODULE -D__KERNEL__ -Wall -Wstrict-prototypes -O2 -c cops.c"
+ *  c-basic-offset: 4
+ *  c-file-offsets: ((substatement-open . 0))
+ * End:
+ */

@@ -1,12 +1,16 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  *  linux/arch/arm/lib/backtrace.S
  *
  *  Copyright (C) 1995, 1996 Russell King
  *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
  * 27/03/03 Ian Molton Clean up CONFIG_CPU
+ *
  */
-#include <linux/kern_levels.h>
+#include <linux/config.h>
 #include <linux/linkage.h>
 #include <asm/assembler.h>
 		.text
@@ -14,118 +18,140 @@
 @ fp is 0 or stack frame
 
 #define frame	r4
-#define sv_fp	r5
-#define sv_pc	r6
+#define next	r5
+#define save	r6
 #define mask	r7
 #define offset	r8
-#define loglvl	r9
+
+ENTRY(__backtrace)
+		mov	r1, #0x10
+		mov	r0, fp
 
 ENTRY(c_backtrace)
 
-#if !defined(CONFIG_FRAME_POINTER) || !defined(CONFIG_PRINTK)
-		ret	lr
-ENDPROC(c_backtrace)
+#ifndef CONFIG_FRAME_POINTER
+		mov	pc, lr
 #else
-		stmfd	sp!, {r4 - r9, lr}	@ Save an extra register so we have a location...
-		movs	frame, r0		@ if frame pointer is zero
-		beq	no_frame		@ we have no stack frames
-		mov	loglvl, r2
 
-		tst	r1, #0x10		@ 26 or 32-bit mode?
- ARM(		moveq	mask, #0xfc000003	)
- THUMB(		moveq	mask, #0xfc000000	)
- THUMB(		orreq	mask, #0x03		)
-		movne	mask, #0		@ mask for 32-bit
+		stmfd	sp!, {r4 - r8, lr}	@ Save an extra register so we have a location...
+		tst	r1, #0x10		@ 26 or 32-bit?
+		moveq	mask, #0xfc000003
+		movne	mask, #0
+		tst	mask, r0
+		movne	r0, #0
+		movs	frame, r0
+1:		moveq	r0, #-2
+		LOADREGS(eqfd, sp!, {r4 - r8, pc})
 
-1:		stmfd	sp!, {pc}		@ calculate offset of PC stored
-		ldr	r0, [sp], #4		@ by stmfd for this CPU
-		adr	r1, 1b
+2:		stmfd	sp!, {pc}		@ calculate offset of PC in STMIA instruction
+		ldr	r0, [sp], #4
+		adr	r1, 2b - 4
 		sub	offset, r0, r1
 
-/*
- * Stack frame layout:
- *             optionally saved caller registers (r4 - r10)
- *             saved fp
- *             saved sp
- *             saved lr
- *    frame => saved pc
- *             optionally saved arguments (r0 - r3)
- * saved sp => <next word>
- *
- * Functions start with the following code sequence:
- *                  mov   ip, sp
- *                  stmfd sp!, {r0 - r3} (optional)
- * corrected pc =>  stmfd sp!, {..., fp, ip, lr, pc}
- */
-for_each_frame:	tst	frame, mask		@ Check for address exceptions
-		bne	no_frame
+3:		tst	frame, mask		@ Check for address exceptions...
+		bne	1b
 
-1001:		ldr	sv_pc, [frame, #0]	@ get saved pc
-1002:		ldr	sv_fp, [frame, #-12]	@ get saved fp
-
-		sub	sv_pc, sv_pc, offset	@ Correct PC for prefetching
-		bic	sv_pc, sv_pc, mask	@ mask PC/LR for the mode
-
-1003:		ldr	r2, [sv_pc, #-4]	@ if stmfd sp!, {args} exists,
-		ldr	r3, .Ldsi+4		@ adjust saved 'pc' back one
-		teq	r3, r2, lsr #11		@ instruction
-		subne	r0, sv_pc, #4		@ allow for mov
-		subeq	r0, sv_pc, #8		@ allow for mov + stmia
-
-		ldr	r1, [frame, #-4]	@ get saved lr
-		mov	r2, frame
-		bic	r1, r1, mask		@ mask PC/LR for the mode
-		mov	r3, loglvl
+1001:		ldr	next, [frame, #-12]	@ get fp
+1002:		ldr	r2, [frame, #-4]	@ get lr
+1003:		ldr	r3, [frame, #0]		@ get pc
+		sub	save, r3, offset	@ Correct PC for prefetching
+		bic	save, save, mask
+1004:		ldr	r1, [save, #0]		@ get instruction at function
+		mov	r1, r1, lsr #10
+		ldr	r3, .Ldsi+4
+		teq	r1, r3
+		subeq	save, save, #4
+		mov	r0, save
+		bic	r1, r2, mask
 		bl	dump_backtrace_entry
 
-		ldr	r1, [sv_pc, #-4]	@ if stmfd sp!, {args} exists,
-		ldr	r3, .Ldsi+4
-		teq	r3, r1, lsr #11
-		ldreq	r0, [frame, #-8]	@ get sp
-		subeq	r0, r0, #4		@ point at the last arg
-		mov	r2, loglvl
-		bleq	dump_backtrace_stm	@ dump saved registers
+		ldr	r0, [frame, #-8]	@ get sp
+		sub	r0, r0, #4
+1005:		ldr	r1, [save, #4]		@ get instruction at function+4
+		mov	r3, r1, lsr #10
+		ldr	r2, .Ldsi+4
+		teq	r3, r2			@ Check for stmia sp!, {args}
+		addeq	save, save, #4		@ next instruction
+		bleq	.Ldumpstm
 
-1004:		ldr	r1, [sv_pc, #0]		@ if stmfd sp!, {..., fp, ip, lr, pc}
-		ldr	r3, .Ldsi		@ instruction exists,
-		teq	r3, r1, lsr #11
-		subeq	r0, frame, #16
-		mov	r2, loglvl
-		bleq	dump_backtrace_stm	@ dump saved registers
+		sub	r0, frame, #16
+1006:		ldr	r1, [save, #4]		@ Get 'stmia sp!, {rlist, fp, ip, lr, pc}' instruction
+		mov	r3, r1, lsr #10
+		ldr	r2, .Ldsi
+		teq	r3, r2
+		bleq	.Ldumpstm
 
-		teq	sv_fp, #0		@ zero saved fp means
-		beq	no_frame		@ no further frames
+		/*
+		 * A zero next framepointer means we're done.
+		 */
+		teq	next, #0
+		LOADREGS(eqfd, sp!, {r4 - r8, pc})
 
-		cmp	sv_fp, frame		@ next frame must be
-		mov	frame, sv_fp		@ above the current frame
-#ifdef CONFIG_IRQSTACKS
-		@
-		@ Kernel stacks may be discontiguous in memory. If the next
-		@ frame is below the previous frame, accept it as long as it
-		@ lives in kernel memory.
-		@
-		cmpls	sv_fp, #PAGE_OFFSET
-#endif
-		bhi	for_each_frame
+		/*
+		 * The next framepointer must be above the
+		 * current framepointer.
+		 */
+		cmp	next, frame
+		mov	frame, next
+		bhi	3b
+		b	1007f
 
-1006:		adr	r0, .Lbad
-		mov	r1, loglvl
-		mov	r2, frame
-		bl	_printk
-no_frame:	ldmfd	sp!, {r4 - r9, pc}
-ENDPROC(c_backtrace)
+/*
+ * Fixup for LDMDB
+ */
+		.section .fixup,"ax"
+		.align	0
+1007:		ldr	r0, =.Lbad
+		mov	r1, frame
+		bl	printk
+		LOADREGS(fd, sp!, {r4 - r8, pc})
+		.ltorg
+		.previous
 		
-		.pushsection __ex_table,"a"
+		.section __ex_table,"a"
 		.align	3
-		.long	1001b, 1006b
-		.long	1002b, 1006b
-		.long	1003b, 1006b
-		.long	1004b, 1006b
-		.popsection
+		.long	1001b, 1007b
+		.long	1002b, 1007b
+		.long	1003b, 1007b
+		.long	1004b, 1007b
+		.long	1005b, 1007b
+		.long	1006b, 1007b
+		.previous
 
-.Lbad:		.asciz	"%sBacktrace aborted due to bad frame pointer <%p>\n"
+#define instr r4
+#define reg   r5
+#define stack r6
+
+.Ldumpstm:	stmfd	sp!, {instr, reg, stack, r7, lr}
+		mov	stack, r0
+		mov	instr, r1
+		mov	reg, #9
+		mov	r7, #0
+1:		mov	r3, #1
+		tst	instr, r3, lsl reg
+		beq	2f
+		add	r7, r7, #1
+		teq	r7, #4
+		moveq	r7, #0
+		moveq	r3, #'\n'
+		movne	r3, #' '
+		ldr	r2, [stack], #-4
+		mov	r1, reg
+		adr	r0, .Lfp
+		bl	printk
+2:		subs	reg, reg, #1
+		bpl	1b
+		teq	r7, #0
+		adrne	r0, .Lcr
+		blne	printk
+		mov	r0, stack
+		LOADREGS(fd, sp!, {instr, reg, stack, r7, pc})
+
+.Lfp:		.asciz	" r%d = %08X%c"
+.Lcr:		.asciz	"\n"
+.Lbad:		.asciz	"Backtrace aborted due to bad frame pointer <%p>\n"
 		.align
-.Ldsi:		.word	0xe92dd800 >> 11	@ stmfd sp!, {... fp, ip, lr, pc}
-		.word	0xe92d0000 >> 11	@ stmfd sp!, {}
+.Ldsi:		.word	0x00e92dd8 >> 2
+		.word	0x00e92d00 >> 2
 
 #endif

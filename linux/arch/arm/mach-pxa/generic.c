@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  *  linux/arch/arm/mach-pxa/generic.c
  *
@@ -8,106 +7,231 @@
  *
  * Code common to all PXA machines.
  *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
  * Since this file should be linked before any other machine specific file,
  * the __initcall() here will be executed first.  This serves as default
  * initialization stuff for PXA machines which can be overridden later if
  * need be.
  */
-#include <linux/gpio.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
-#include <linux/soc/pxa/cpu.h>
-#include <linux/soc/pxa/smemc.h>
-#include <linux/clk/pxa.h>
+#include <linux/delay.h>
+#include <linux/device.h>
+#include <linux/ioport.h>
+#include <linux/pm.h>
 
+#include <asm/hardware.h>
+#include <asm/irq.h>
+#include <asm/system.h>
+#include <asm/pgtable.h>
 #include <asm/mach/map.h>
-#include <asm/mach-types.h>
 
-#include "addr-map.h"
-#include "irqs.h"
-#include "reset.h"
-#include "smemc.h"
-#include "pxa3xx-regs.h"
+#include <asm/arch/pxa-regs.h>
+#include <asm/arch/udc.h>
+#include <asm/arch/pxafb.h>
+#include <asm/arch/mmc.h>
 
 #include "generic.h"
-#include <clocksource/pxa.h>
-
-void clear_reset_status(unsigned int mask)
-{
-	if (cpu_is_pxa2xx())
-		pxa2xx_clear_reset_status(mask);
-	else {
-		/* RESET_STATUS_* has a 1:1 mapping with ARSR */
-		ARSR = mask;
-	}
-}
 
 /*
- * For non device-tree builds, keep legacy timer init
+ * Handy function to set GPIO alternate functions
  */
-void __init pxa_timer_init(void)
+
+void pxa_gpio_mode(int gpio_mode)
 {
-	if (cpu_is_pxa25x())
-		pxa25x_clocks_init(io_p2v(0x41300000));
-	if (cpu_is_pxa27x())
-		pxa27x_clocks_init(io_p2v(0x41300000));
-	if (cpu_is_pxa3xx())
-		pxa3xx_clocks_init(io_p2v(0x41340000), io_p2v(0x41350000));
-	pxa_timer_nodt_init(IRQ_OST0, io_p2v(0x40a00000));
+	unsigned long flags;
+	int gpio = gpio_mode & GPIO_MD_MASK_NR;
+	int fn = (gpio_mode & GPIO_MD_MASK_FN) >> 8;
+	int gafr;
+
+	local_irq_save(flags);
+	if (gpio_mode & GPIO_DFLT_LOW)
+		GPCR(gpio) = GPIO_bit(gpio);
+	else if (gpio_mode & GPIO_DFLT_HIGH)
+		GPSR(gpio) = GPIO_bit(gpio);
+	if (gpio_mode & GPIO_MD_MASK_DIR)
+		GPDR(gpio) |= GPIO_bit(gpio);
+	else
+		GPDR(gpio) &= ~GPIO_bit(gpio);
+	gafr = GAFR(gpio) & ~(0x3 << (((gpio) & 0xf)*2));
+	GAFR(gpio) = gafr |  (fn  << (((gpio) & 0xf)*2));
+	local_irq_restore(flags);
 }
 
-void pxa_smemc_set_pcmcia_timing(int sock, u32 mcmem, u32 mcatt, u32 mcio)
-{
-	__raw_writel(mcmem, MCMEM(sock));
-	__raw_writel(mcatt, MCATT(sock));
-	__raw_writel(mcio, MCIO(sock));
-}
-EXPORT_SYMBOL_GPL(pxa_smemc_set_pcmcia_timing);
+EXPORT_SYMBOL(pxa_gpio_mode);
 
-void pxa_smemc_set_pcmcia_socket(int nr)
+/*
+ * Routine to safely enable or disable a clock in the CKEN
+ */
+void pxa_set_cken(int clock, int enable)
 {
-	switch (nr) {
-	case 0:
-		__raw_writel(0, MECR);
-		break;
-	case 1:
-		/*
-		 * We have at least one socket, so set MECR:CIT
-		 * (Card Is There)
-		 */
-		__raw_writel(MECR_CIT, MECR);
-		break;
-	case 2:
-		/* Set CIT and MECR:NOS (Number Of Sockets) */
-		__raw_writel(MECR_CIT | MECR_NOS, MECR);
-		break;
-	}
-}
-EXPORT_SYMBOL_GPL(pxa_smemc_set_pcmcia_socket);
+	unsigned long flags;
+	local_irq_save(flags);
 
-void __iomem *pxa_smemc_get_mdrefr(void)
-{
-	return MDREFR;
+	if (enable)
+		CKEN |= clock;
+	else
+		CKEN &= ~clock;
+
+	local_irq_restore(flags);
 }
+
+EXPORT_SYMBOL(pxa_set_cken);
 
 /*
  * Intel PXA2xx internal register mapping.
  *
- * Note: virtual 0xfffe0000-0xffffffff is reserved for the vector table
- *       and cache flush area.
+ * Note 1: not all PXA2xx variants implement all those addresses.
+ *
+ * Note 2: virtual 0xfffe0000-0xffffffff is reserved for the vector table
+ *         and cache flush area.
  */
-static struct map_desc common_io_desc[] __initdata = {
-  	{	/* Devs */
-		.virtual	= (unsigned long)PERIPH_VIRT,
-		.pfn		= __phys_to_pfn(PERIPH_PHYS),
-		.length		= PERIPH_SIZE,
-		.type		= MT_DEVICE
-	}
+static struct map_desc standard_io_desc[] __initdata = {
+ /* virtual     physical    length      type */
+  { 0xf2000000, 0x40000000, 0x02000000, MT_DEVICE }, /* Devs */
+  { 0xf4000000, 0x44000000, 0x00100000, MT_DEVICE }, /* LCD */
+  { 0xf6000000, 0x48000000, 0x00100000, MT_DEVICE }, /* Mem Ctl */
+  { 0xf8000000, 0x4c000000, 0x00100000, MT_DEVICE }, /* USB host */
+  { 0xfa000000, 0x50000000, 0x00100000, MT_DEVICE }, /* Camera */
+  { 0xfe000000, 0x58000000, 0x00100000, MT_DEVICE }, /* IMem ctl */
+  { 0xff000000, 0x00000000, 0x00100000, MT_DEVICE }  /* UNCACHED_PHYS_0 */
 };
 
 void __init pxa_map_io(void)
 {
-	debug_ll_io_init();
-	iotable_init(ARRAY_AND_SIZE(common_io_desc));
+	iotable_init(standard_io_desc, ARRAY_SIZE(standard_io_desc));
+	get_clk_frequency_khz(1);
 }
+
+
+static struct resource pxamci_resources[] = {
+	[0] = {
+		.start	= 0x41100000,
+		.end	= 0x41100fff,
+		.flags	= IORESOURCE_MEM,
+	},
+	[1] = {
+		.start	= IRQ_MMC,
+		.end	= IRQ_MMC,
+		.flags	= IORESOURCE_IRQ,
+	},
+};
+
+static u64 pxamci_dmamask = 0xffffffffUL;
+
+static struct platform_device pxamci_device = {
+	.name		= "pxa2xx-mci",
+	.id		= -1,
+	.dev		= {
+		.dma_mask = &pxamci_dmamask,
+		.coherent_dma_mask = 0xffffffff,
+	},
+	.num_resources	= ARRAY_SIZE(pxamci_resources),
+	.resource	= pxamci_resources,
+};
+
+void __init pxa_set_mci_info(struct pxamci_platform_data *info)
+{
+	pxamci_device.dev.platform_data = info;
+}
+
+
+static struct pxa2xx_udc_mach_info pxa_udc_info;
+
+void __init pxa_set_udc_info(struct pxa2xx_udc_mach_info *info)
+{
+	memcpy(&pxa_udc_info, info, sizeof *info);
+}
+
+static struct resource pxa2xx_udc_resources[] = {
+	[0] = {
+		.start	= 0x40600000,
+		.end	= 0x4060ffff,
+		.flags	= IORESOURCE_MEM,
+	},
+	[1] = {
+		.start	= IRQ_USB,
+		.end	= IRQ_USB,
+		.flags	= IORESOURCE_IRQ,
+	},
+};
+
+static u64 udc_dma_mask = ~(u32)0;
+
+static struct platform_device udc_device = {
+	.name		= "pxa2xx-udc",
+	.id		= -1,
+	.resource	= pxa2xx_udc_resources,
+	.num_resources	= ARRAY_SIZE(pxa2xx_udc_resources),
+	.dev		=  {
+		.platform_data	= &pxa_udc_info,
+		.dma_mask	= &udc_dma_mask,
+	}
+};
+
+static struct pxafb_mach_info pxa_fb_info;
+
+void __init set_pxa_fb_info(struct pxafb_mach_info *hard_pxa_fb_info)
+{
+	memcpy(&pxa_fb_info,hard_pxa_fb_info,sizeof(struct pxafb_mach_info));
+}
+
+static struct resource pxafb_resources[] = {
+	[0] = {
+		.start	= 0x44000000,
+		.end	= 0x4400ffff,
+		.flags	= IORESOURCE_MEM,
+	},
+	[1] = {
+		.start	= IRQ_LCD,
+		.end	= IRQ_LCD,
+		.flags	= IORESOURCE_IRQ,
+	},
+};
+
+static u64 fb_dma_mask = ~(u64)0;
+
+static struct platform_device pxafb_device = {
+	.name		= "pxa2xx-fb",
+	.id		= -1,
+	.dev		= {
+ 		.platform_data	= &pxa_fb_info,
+		.dma_mask	= &fb_dma_mask,
+		.coherent_dma_mask = 0xffffffff,
+	},
+	.num_resources	= ARRAY_SIZE(pxafb_resources),
+	.resource	= pxafb_resources,
+};
+
+static struct platform_device ffuart_device = {
+	.name		= "pxa2xx-uart",
+	.id		= 0,
+};
+static struct platform_device btuart_device = {
+	.name		= "pxa2xx-uart",
+	.id		= 1,
+};
+static struct platform_device stuart_device = {
+	.name		= "pxa2xx-uart",
+	.id		= 2,
+};
+
+static struct platform_device *devices[] __initdata = {
+	&pxamci_device,
+	&udc_device,
+	&pxafb_device,
+	&ffuart_device,
+	&btuart_device,
+	&stuart_device,
+};
+
+static int __init pxa_init(void)
+{
+	return platform_add_devices(devices, ARRAY_SIZE(devices));
+}
+
+subsys_initcall(pxa_init);

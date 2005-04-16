@@ -1,10 +1,14 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *	LASI Device Driver
  *
  *	(c) Copyright 1999 Red Hat Software
  *	Portions (c) Copyright 1999 The Puffin Group Inc.
  *	Portions (c) Copyright 1999 Hewlett-Packard
+ *
+ *	This program is free software; you can redistribute it and/or modify
+ *	it under the terms of the GNU General Public License as published by
+ *      the Free Software Foundation; either version 2 of the License, or
+ *      (at your option) any later version.
  *
  *	by Alan Cox <alan@redhat.com> and 
  * 	   Alex deVries <alex@onefishtwo.ca>
@@ -16,6 +20,7 @@
 #include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/pm.h>
+#include <linux/slab.h>
 #include <linux/types.h>
 
 #include <asm/io.h>
@@ -103,7 +108,7 @@ lasi_init_irq(struct gsc_asic *this_lasi)
 
 #else
 
-static void __init lasi_led_init(unsigned long lasi_hpa)
+void __init lasi_led_init(unsigned long lasi_hpa)
 {
 	unsigned long datareg;
 
@@ -146,7 +151,7 @@ static void __init lasi_led_init(unsigned long lasi_hpa)
  * 
  */
 
-static unsigned long lasi_power_off_hpa __read_mostly;
+static unsigned long lasi_power_off_hpa;
 
 static void lasi_power_off(void)
 {
@@ -159,18 +164,19 @@ static void lasi_power_off(void)
 	gsc_writel(0x02, datareg);
 }
 
-static int __init lasi_init_chip(struct parisc_device *dev)
+int __init
+lasi_init_chip(struct parisc_device *dev)
 {
-	extern void (*chassis_power_off)(void);
 	struct gsc_asic *lasi;
+	struct gsc_irq gsc_irq;
 	int ret;
 
-	lasi = kzalloc(sizeof(*lasi), GFP_KERNEL);
+	lasi = kmalloc(sizeof(*lasi), GFP_KERNEL);
 	if (!lasi)
 		return -ENOMEM;
 
 	lasi->name = "Lasi";
-	lasi->hpa = dev->hpa.start;
+	lasi->hpa = dev->hpa;
 
 	/* Check the 4-bit (yes, only 4) version register */
 	lasi->version = gsc_readl(lasi->hpa + LASI_VER) & 0xf;
@@ -184,17 +190,17 @@ static int __init lasi_init_chip(struct parisc_device *dev)
 	lasi_init_irq(lasi);
 
 	/* the IRQ lasi should use */
-	dev->irq = gsc_alloc_irq(&lasi->gsc_irq);
+	dev->irq = gsc_alloc_irq(&gsc_irq);
 	if (dev->irq < 0) {
 		printk(KERN_ERR "%s(): cannot get GSC irq\n",
-				__func__);
+				__FUNCTION__);
 		kfree(lasi);
 		return -EBUSY;
 	}
 
-	lasi->eim = ((u32) lasi->gsc_irq.txn_addr) | lasi->gsc_irq.txn_data;
+	lasi->eim = ((u32) gsc_irq.txn_addr) | gsc_irq.txn_data;
 
-	ret = request_irq(lasi->gsc_irq.irq, gsc_asic_intr, 0, "lasi", lasi);
+	ret = request_irq(gsc_irq.irq, gsc_asic_intr, 0, "lasi", lasi);
 	if (ret < 0) {
 		kfree(lasi);
 		return ret;
@@ -217,18 +223,18 @@ static int __init lasi_init_chip(struct parisc_device *dev)
 	 * ensure that only the first LASI (the one controlling the power off)
 	 * should set the HPA here */
 	lasi_power_off_hpa = lasi->hpa;
-	chassis_power_off = lasi_power_off;
+	pm_power_off = lasi_power_off;
 	
 	return ret;
 }
 
-static struct parisc_device_id lasi_tbl[] __initdata = {
+static struct parisc_device_id lasi_tbl[] = {
 	{ HPHW_BA, HVERSION_REV_ANY_ID, HVERSION_ANY_ID, 0x00081 },
 	{ 0, }
 };
 
-struct parisc_driver lasi_driver __refdata = {
-	.name =		"lasi",
+struct parisc_driver lasi_driver = {
+	.name =		"Lasi",
 	.id_table =	lasi_tbl,
 	.probe =	lasi_init_chip,
 };

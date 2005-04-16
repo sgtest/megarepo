@@ -1,12 +1,12 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /* 
- * Copyright (C) 2001 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
+ * Copyright (C) 2001, 2002 Jeff Dike (jdike@karaya.com)
+ * Licensed under the GPL
  */
 
 #ifndef __UM_TUNTAP_H
 #define __UM_TUNTAP_H
 
-#include <net_user.h>
+#include "net_user.h"
 
 struct tuntap_data {
 	char *dev_name;
@@ -16,6 +16,17 @@ struct tuntap_data {
 	void *dev;
 };
 
-extern const struct net_user_info tuntap_user_info;
+extern struct net_user_info tuntap_user_info;
 
 #endif
+
+/*
+ * Overrides for Emacs so that we follow Linus's tabbing style.
+ * Emacs will notice this stuff at the end of the file and automatically
+ * adjust the settings for this buffer only.  This must remain at the end
+ * of the file.
+ * ---------------------------------------------------------------------------
+ * Local variables:
+ * c-file-style: "linux"
+ * End:
+ */

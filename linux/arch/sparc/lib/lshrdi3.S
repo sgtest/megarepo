@@ -1,8 +1,7 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-#include <linux/linkage.h>
-#include <asm/export.h>
+/* $Id: lshrdi3.S,v 1.1 1999/03/21 06:37:45 davem Exp $ */
 
-ENTRY(__lshrdi3)
+	.globl	__lshrdi3
+__lshrdi3:
 	cmp	%o2, 0
 	be	3f
 	 mov	0x20, %g2
@@ -26,5 +25,3 @@ ENTRY(__lshrdi3)
 3:
 	retl 
 	 nop 
-ENDPROC(__lshrdi3)
-EXPORT_SYMBOL(__lshrdi3)

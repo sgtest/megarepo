@@ -1,15 +1,33 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /* IEEE754 floating point arithmetic
  * single precision square root
  */
 /*
  * MIPS floating point support
  * Copyright (C) 1994-2000 Algorithmics Ltd.
+ * http://www.algor.co.uk
+ *
+ * ########################################################################
+ *
+ *  This program is free software; you can distribute it and/or modify it
+ *  under the terms of the GNU General Public License (Version 2) as
+ *  published by the Free Software Foundation.
+ *
+ *  This program is distributed in the hope it will be useful, but WITHOUT
+ *  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ *  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ *  for more details.
+ *
+ *  You should have received a copy of the GNU General Public License along
+ *  with this program; if not, write to the Free Software Foundation, Inc.,
+ *  59 Temple Place - Suite 330, Boston MA 02111-1307, USA.
+ *
+ * ########################################################################
  */
+
 
 #include "ieee754sp.h"
 
-union ieee754sp ieee754sp_sqrt(union ieee754sp x)
+ieee754sp ieee754sp_sqrt(ieee754sp x)
 {
 	int ix, s, q, m, t, i;
 	unsigned int r;
@@ -18,37 +36,34 @@ union ieee754sp ieee754sp_sqrt(union ieee754sp x)
 	/* take care of Inf and NaN */
 
 	EXPLODEXSP;
-	ieee754_clearcx();
+	CLEARCX;
 	FLUSHXSP;
 
 	/* x == INF or NAN? */
 	switch (xc) {
-	case IEEE754_CLASS_SNAN:
-		return ieee754sp_nanxcpt(x);
-
 	case IEEE754_CLASS_QNAN:
 		/* sqrt(Nan) = Nan */
-		return x;
-
+		return ieee754sp_nanxcpt(x, "sqrt");
+	case IEEE754_CLASS_SNAN:
+		SETCX(IEEE754_INVALID_OPERATION);
+		return ieee754sp_nanxcpt(ieee754sp_indef(), "sqrt");
 	case IEEE754_CLASS_ZERO:
 		/* sqrt(0) = 0 */
 		return x;
-
 	case IEEE754_CLASS_INF:
 		if (xs) {
 			/* sqrt(-Inf) = Nan */
-			ieee754_setcx(IEEE754_INVALID_OPERATION);
-			return ieee754sp_indef();
+			SETCX(IEEE754_INVALID_OPERATION);
+			return ieee754sp_nanxcpt(ieee754sp_indef(), "sqrt");
 		}
 		/* sqrt(+Inf) = Inf */
 		return x;
-
 	case IEEE754_CLASS_DNORM:
 	case IEEE754_CLASS_NORM:
 		if (xs) {
 			/* sqrt(-x) = Nan */
-			ieee754_setcx(IEEE754_INVALID_OPERATION);
-			return ieee754sp_indef();
+			SETCX(IEEE754_INVALID_OPERATION);
+			return ieee754sp_nanxcpt(ieee754sp_indef(), "sqrt");
 		}
 		break;
 	}
@@ -70,8 +85,7 @@ union ieee754sp ieee754sp_sqrt(union ieee754sp x)
 
 	/* generate sqrt(x) bit by bit */
 	ix += ix;
-	s = 0;
-	q = 0;			/* q = sqrt(x) */
+	q = s = 0;		/* q = sqrt(x) */
 	r = 0x01000000;		/* r = moving bit from right to left */
 
 	while (r != 0) {
@@ -86,12 +100,12 @@ union ieee754sp ieee754sp_sqrt(union ieee754sp x)
 	}
 
 	if (ix != 0) {
-		ieee754_setcx(IEEE754_INEXACT);
+		SETCX(IEEE754_INEXACT);
 		switch (ieee754_csr.rm) {
-		case FPU_CSR_RU:
+		case IEEE754_RP:
 			q += 2;
 			break;
-		case FPU_CSR_RN:
+		case IEEE754_RN:
 			q += (q & 1);
 			break;
 		}

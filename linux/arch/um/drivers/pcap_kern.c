@@ -1,11 +1,13 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (C) 2002 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
+ * Copyright (C) 2002 Jeff Dike <jdike@karaya.com>
+ * Licensed under the GPL.
  */
 
-#include <linux/init.h>
-#include <linux/netdevice.h>
-#include <net_kern.h>
+#include "linux/init.h"
+#include "linux/netdevice.h"
+#include "linux/etherdevice.h"
+#include "net_kern.h"
+#include "net_user.h"
 #include "pcap_user.h"
 
 struct pcap_init {
@@ -21,29 +23,30 @@ void pcap_init(struct net_device *dev, void *data)
 	struct pcap_data *ppri;
 	struct pcap_init *init = data;
 
-	pri = netdev_priv(dev);
+	pri = dev->priv;
 	ppri = (struct pcap_data *) pri->user;
 	ppri->host_if = init->host_if;
 	ppri->promisc = init->promisc;
 	ppri->optimize = init->optimize;
 	ppri->filter = init->filter;
-
-	printk("pcap backend, host interface %s\n", ppri->host_if);
 }
 
-static int pcap_read(int fd, struct sk_buff *skb, struct uml_net_private *lp)
+static int pcap_read(int fd, struct sk_buff **skb, 
+		       struct uml_net_private *lp)
 {
-	return pcap_user_read(fd, skb_mac_header(skb),
-			      skb->dev->mtu + ETH_HEADER_OTHER,
-			      (struct pcap_data *) &lp->user);
+	*skb = ether_adjust_skb(*skb, ETH_HEADER_OTHER);
+	if(*skb == NULL) return(-ENOMEM);
+	return(pcap_user_read(fd, (*skb)->mac.raw, 
+			      (*skb)->dev->mtu + ETH_HEADER_OTHER,
+			      (struct pcap_data *) &lp->user));
 }
 
-static int pcap_write(int fd, struct sk_buff *skb, struct uml_net_private *lp)
+static int pcap_write(int fd, struct sk_buff **skb, struct uml_net_private *lp)
 {
-	return -EPERM;
+	return(-EPERM);
 }
 
-static const struct net_kern_info pcap_kern_info = {
+static struct net_kern_info pcap_kern_info = {
 	.init			= pcap_init,
 	.protocol		= eth_protocol,
 	.read			= pcap_read,
@@ -62,36 +65,32 @@ int pcap_setup(char *str, char **mac_out, void *data)
 		  .optimize 	= 0,
 		  .filter 	= NULL });
 
-	remain = split_if_spec(str, &host_if, &init->filter,
-			       &options[0], &options[1], mac_out, NULL);
-	if (remain != NULL) {
+	remain = split_if_spec(str, &host_if, &init->filter, 
+			       &options[0], &options[1], NULL);
+	if(remain != NULL){
 		printk(KERN_ERR "pcap_setup - Extra garbage on "
 		       "specification : '%s'\n", remain);
-		return 0;
+		return(0);
 	}
 
-	if (host_if != NULL)
+	if(host_if != NULL)
 		init->host_if = host_if;
 
-	for (i = 0; i < ARRAY_SIZE(options); i++) {
-		if (options[i] == NULL)
+	for(i = 0; i < sizeof(options)/sizeof(options[0]); i++){
+		if(options[i] == NULL)
 			continue;
-		if (!strcmp(options[i], "promisc"))
+		if(!strcmp(options[i], "promisc"))
 			init->promisc = 1;
-		else if (!strcmp(options[i], "nopromisc"))
+		else if(!strcmp(options[i], "nopromisc"))
 			init->promisc = 0;
-		else if (!strcmp(options[i], "optimize"))
+		else if(!strcmp(options[i], "optimize"))
 			init->optimize = 1;
-		else if (!strcmp(options[i], "nooptimize"))
+		else if(!strcmp(options[i], "nooptimize"))
 			init->optimize = 0;
-		else {
-			printk(KERN_ERR "pcap_setup : bad option - '%s'\n",
-			       options[i]);
-			return 0;
-		}
+		else printk("pcap_setup : bad option - '%s'\n", options[i]);
 	}
 
-	return 1;
+	return(1);
 }
 
 static struct transport pcap_transport = {
@@ -107,7 +106,18 @@ static struct transport pcap_transport = {
 static int register_pcap(void)
 {
 	register_transport(&pcap_transport);
-	return 0;
+	return(1);
 }
 
-late_initcall(register_pcap);
+__initcall(register_pcap);
+
+/*
+ * Overrides for Emacs so that we follow Linus's tabbing style.
+ * Emacs will notice this stuff at the end of the file and automatically
+ * adjust the settings for this buffer only.  This must remain at the end
+ * of the file.
+ * ---------------------------------------------------------------------------
+ * Local variables:
+ * c-file-style: "linux"
+ * End:
+ */

@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /***************************************************************************
  *            au88x0_cxtalk.c
  *
@@ -8,6 +7,19 @@
  ****************************************************************************/
 
 /*
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU Library General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, write to the Free Software
+ *  Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
  */
 
 #include "au88x0_xtalk.h"
@@ -17,67 +29,61 @@
 static short const sXtalkWideKLeftEq = 0x269C;
 static short const sXtalkWideKRightEq = 0x269C;
 static short const sXtalkWideKLeftXt = 0xF25E;
-static __maybe_unused short const sXtalkWideKRightXt = 0xF25E;
+static short const sXtalkWideKRightXt = 0xF25E;
 static short const sXtalkWideShiftLeftEq = 1;
 static short const sXtalkWideShiftRightEq = 1;
 static short const sXtalkWideShiftLeftXt = 0;
-static __maybe_unused short const sXtalkWideShiftRightXt = 0;
+static short const sXtalkWideShiftRightXt = 0;
 static unsigned short const wXtalkWideLeftDelay = 0xd;
 static unsigned short const wXtalkWideRightDelay = 0xd;
 static short const sXtalkNarrowKLeftEq = 0x468D;
 static short const sXtalkNarrowKRightEq = 0x468D;
 static short const sXtalkNarrowKLeftXt = 0xF82E;
-static __maybe_unused short const sXtalkNarrowKRightXt = 0xF82E;
+static short const sXtalkNarrowKRightXt = 0xF82E;
 static short const sXtalkNarrowShiftLeftEq = 0x3;
 static short const sXtalkNarrowShiftRightEq = 0x3;
 static short const sXtalkNarrowShiftLeftXt = 0;
-static __maybe_unused short const sXtalkNarrowShiftRightXt = 0;
+static short const sXtalkNarrowShiftRightXt = 0;
 static unsigned short const wXtalkNarrowLeftDelay = 0x7;
 static unsigned short const wXtalkNarrowRightDelay = 0x7;
 
-static __maybe_unused xtalk_gains_t const asXtalkGainsDefault = {
-	0x4000, 0x4000, 0x4000, 0x4000, 0x4000,
-	0x4000, 0x4000, 0x4000, 0x4000,	0x4000
+static xtalk_gains_t const asXtalkGainsDefault = {
+	0x4000, 0x4000, 4000, 0x4000, 4000, 0x4000, 4000, 0x4000, 4000,
+	0x4000
 };
 
-static __maybe_unused xtalk_gains_t const asXtalkGainsTest = {
-	0x7fff, 0x8000, 0x0000, 0x0000, 0x0001,
-	0xffff, 0x4000, 0xc000, 0x0002, 0xfffe
+static xtalk_gains_t const asXtalkGainsTest = {
+	0x8000, 0x7FFF, 0, 0xFFFF, 0x0001, 0xC000, 0x4000, 0xFFFE, 0x0002,
+	0
 };
-
-static __maybe_unused xtalk_gains_t const asXtalkGains1Chan = {
-	0x7FFF, 0, 0, 0, 0,
-	0x7FFF, 0, 0, 0, 0,
+static xtalk_gains_t const asXtalkGains1Chan = {
+	0x7FFF, 0, 0, 0, 0x7FFF, 0, 0, 0, 0, 0
 };
 
 // Input gain for 4 A3D slices. One possible input pair is left zero.
 static xtalk_gains_t const asXtalkGainsAllChan = {
-	0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0,
-	0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF,	0
+	0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF,
+	0
+	    //0x7FFF,0x7FFF,0x7FFF,0x7FFF,0x7fff,0x7FFF,0x7FFF,0x7FFF,0x7FFF,0x7fff
 };
-
 static xtalk_gains_t const asXtalkGainsZeros = {
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 };
 
 static xtalk_dline_t const alXtalkDlineZeros = {
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0
 };
-static __maybe_unused xtalk_dline_t const alXtalkDlineTest = {
-	0x0000fc18, 0xfff03e8, 0x000186a0, 0xfffe7960, 1, 0xffffffff, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0
-};
-
-static xtalk_instate_t const asXtalkInStateZeros = {
+static xtalk_dline_t const alXtalkDlineTest = {
+	0xFC18, 0x03E8FFFF, 0x186A0, 0x7960FFFE, 1, 0xFFFFFFFF,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	0, 0, 0, 0
 };
 
-static __maybe_unused xtalk_instate_t const asXtalkInStateTest = {
-	0x0080, 0xff80, 0x0001, 0xffff
-};
-
+static xtalk_instate_t const asXtalkInStateZeros = { 0, 0, 0, 0 };
+static xtalk_instate_t const asXtalkInStateTest =
+    { 0xFF80, 0x0080, 0xFFFF, 0x0001 };
 static xtalk_state_t const asXtalkOutStateZeros = {
 	{0, 0, 0, 0},
 	{0, 0, 0, 0},
@@ -85,44 +91,43 @@ static xtalk_state_t const asXtalkOutStateZeros = {
 	{0, 0, 0, 0},
 	{0, 0, 0, 0}
 };
-
 static short const sDiamondKLeftEq = 0x401d;
 static short const sDiamondKRightEq = 0x401d;
 static short const sDiamondKLeftXt = 0xF90E;
-static __maybe_unused short const sDiamondKRightXt = 0xF90E;
-static short const sDiamondShiftLeftEq = 1;
+static short const sDiamondKRightXt = 0xF90E;
+static short const sDiamondShiftLeftEq = 1;	/* 0xF90E Is this a bug ??? */
 static short const sDiamondShiftRightEq = 1;
 static short const sDiamondShiftLeftXt = 0;
-static __maybe_unused short const sDiamondShiftRightXt = 0;
+static short const sDiamondShiftRightXt = 0;
 static unsigned short const wDiamondLeftDelay = 0xb;
 static unsigned short const wDiamondRightDelay = 0xb;
 
 static xtalk_coefs_t const asXtalkWideCoefsLeftEq = {
 	{0xEC4C, 0xDCE9, 0xFDC2, 0xFEEC, 0},
 	{0x5F60, 0xCBCB, 0xFC26, 0x0305, 0},
-	{0x340B, 0xe8f5, 0x236c, 0xe40d, 0},
-	{0x76d5, 0xc78d, 0x05ac, 0xfa5b, 0},
+	{0x340B, 0xf504, 0x6CE8, 0x0D23, 0x00E4},
+	{0xD500, 0x8D76, 0xACC7, 0x5B05, 0x00FA},
 	{0x7F04, 0xC0FA, 0x0263, 0xFDA2, 0}
 };
 static xtalk_coefs_t const asXtalkWideCoefsRightEq = {
 	{0xEC4C, 0xDCE9, 0xFDC2, 0xFEEC, 0},
 	{0x5F60, 0xCBCB, 0xFC26, 0x0305, 0},
-	{0x340B, 0xe8f5, 0x236c, 0xe40d, 0},
-	{0x76d5, 0xc78d, 0x05ac, 0xfa5b, 0},
+	{0x340B, 0xF504, 0x6CE8, 0x0D23, 0x00E4},
+	{0xD500, 0x8D76, 0xACC7, 0x5B05, 0x00FA},
 	{0x7F04, 0xC0FA, 0x0263, 0xFDA2, 0}
 };
 static xtalk_coefs_t const asXtalkWideCoefsLeftXt = {
-	{0x55c6, 0xc97b, 0x005b, 0x0047, 0},
-	{0x6a60, 0xca20, 0xffc6, 0x0040, 0},
-	{0x6411, 0xd711, 0xfca1, 0x0190, 0},
-	{0x77dc, 0xc79e, 0xffb8, 0x000a, 0},
+	{0x86C3, 0x7B55, 0x89C3, 0x005B, 0x0047},
+	{0x6000, 0x206A, 0xC6CA, 0x40FF, 0},
+	{0x1100, 0x1164, 0xA1D7, 0x90FC, 0x0001},
+	{0xDC00, 0x9E77, 0xB8C7, 0x0AFF, 0},
 	{0, 0, 0, 0, 0}
 };
-static __maybe_unused xtalk_coefs_t const asXtalkWideCoefsRightXt = {
-	{0x55c6, 0xc97b, 0x005b, 0x0047, 0},
-	{0x6a60, 0xca20, 0xffc6, 0x0040, 0},
-	{0x6411, 0xd711, 0xfca1, 0x0190, 0},
-	{0x77dc, 0xc79e, 0xffb8, 0x000a, 0},
+static xtalk_coefs_t const asXtalkWideCoefsRightXt = {
+	{0x86C3, 0x7B55, 0x89C3, 0x005B, 0x0047},
+	{0x6000, 0x206A, 0xC6CA, 0x40FF, 0},
+	{0x1100, 0x1164, 0xA1D7, 0x90FC, 0x0001},
+	{0xDC00, 0x9E77, 0xB8C7, 0x0AFF, 0},
 	{0, 0, 0, 0, 0}
 };
 static xtalk_coefs_t const asXtalkNarrowCoefsLeftEq = {
@@ -149,7 +154,7 @@ static xtalk_coefs_t const asXtalkNarrowCoefsLeftXt = {
 	{0, 0, 0, 0, 0}
 };
 
-static __maybe_unused xtalk_coefs_t const asXtalkNarrowCoefsRightXt = {
+static xtalk_coefs_t const asXtalkNarrowCoefsRightXt = {
 	{0x3CB2, 0xDF49, 0xF6EA, 0x095B, 0},
 	{0x6777, 0xC915, 0xFEAF, 0x00B1, 0},
 	{0x7762, 0xC7D9, 0x025B, 0xFDA6, 0},
@@ -164,7 +169,6 @@ static xtalk_coefs_t const asXtalkCoefsZeros = {
 	{0, 0, 0, 0, 0},
 	{0, 0, 0, 0, 0}
 };
-
 static xtalk_coefs_t const asXtalkCoefsPipe = {
 	{0, 0, 0x0FA0, 0, 0},
 	{0, 0, 0x0FA0, 0, 0},
@@ -172,7 +176,7 @@ static xtalk_coefs_t const asXtalkCoefsPipe = {
 	{0, 0, 0x0FA0, 0, 0},
 	{0, 0, 0x1180, 0, 0},
 };
-static __maybe_unused xtalk_coefs_t const asXtalkCoefsNegPipe = {
+static xtalk_coefs_t const asXtalkCoefsNegPipe = {
 	{0, 0, 0xF380, 0, 0},
 	{0, 0, 0xF380, 0, 0},
 	{0, 0, 0xF380, 0, 0},
@@ -180,7 +184,7 @@ static __maybe_unused xtalk_coefs_t const asXtalkCoefsNegPipe = {
 	{0, 0, 0xF200, 0, 0}
 };
 
-static __maybe_unused xtalk_coefs_t const asXtalkCoefsNumTest = {
+static xtalk_coefs_t const asXtalkCoefsNumTest = {
 	{0, 0, 0xF380, 0x8000, 0x6D60},
 	{0, 0, 0, 0, 0},
 	{0, 0, 0, 0, 0},
@@ -188,7 +192,7 @@ static __maybe_unused xtalk_coefs_t const asXtalkCoefsNumTest = {
 	{0, 0, 0, 0, 0}
 };
 
-static __maybe_unused xtalk_coefs_t const asXtalkCoefsDenTest = {
+static xtalk_coefs_t const asXtalkCoefsDenTest = {
 	{0xC000, 0x2000, 0x4000, 0, 0},
 	{0, 0, 0, 0, 0},
 	{0, 0, 0, 0, 0},
@@ -196,10 +200,10 @@ static __maybe_unused xtalk_coefs_t const asXtalkCoefsDenTest = {
 	{0, 0, 0, 0, 0}
 };
 
-static __maybe_unused xtalk_state_t const asXtalkOutStateTest = {
+static xtalk_state_t const asXtalkOutStateTest = {
 	{0x7FFF, 0x0004, 0xFFFC, 0},
 	{0xFE00, 0x0008, 0xFFF8, 0x4000},
-	{0x0200, 0x0010, 0xFFF0, 0xC000},
+	{0x200, 0x0010, 0xFFF0, 0xC000},
 	{0x8000, 0x0020, 0xFFE0, 0},
 	{0, 0, 0, 0}
 };
@@ -228,7 +232,7 @@ static xtalk_coefs_t const asDiamondCoefsLeftXt = {
 	{0, 0, 0, 0, 0}
 };
 
-static __maybe_unused xtalk_coefs_t const asDiamondCoefsRightXt = {
+static xtalk_coefs_t const asDiamondCoefsRightXt = {
 	{0x3B50, 0xFE08, 0xF959, 0x0060, 0},
 	{0x9FCB, 0xD8F1, 0x00A2, 0x003A, 0},
 	{0, 0, 0, 0, 0},
@@ -319,10 +323,10 @@ vortex_XtalkHw_SetLeftEQStates(vortex_t * vortex,
 		hwwrite(vortex->mmio, 0x2421C + i * 0x24, coefs[i][2]);
 		hwwrite(vortex->mmio, 0x24220 + i * 0x24, coefs[i][3]);
 	}
-	hwwrite(vortex->mmio, 0x244F8, arg_0[0]);
-	hwwrite(vortex->mmio, 0x244FC, arg_0[1]);
-	hwwrite(vortex->mmio, 0x24500, arg_0[2]);
-	hwwrite(vortex->mmio, 0x24504, arg_0[3]);
+	hwwrite(vortex->mmio, 0x244F8 + i * 0x24, arg_0[0]);
+	hwwrite(vortex->mmio, 0x244FC + i * 0x24, arg_0[1]);
+	hwwrite(vortex->mmio, 0x24500 + i * 0x24, arg_0[2]);
+	hwwrite(vortex->mmio, 0x24504 + i * 0x24, arg_0[3]);
 }
 
 static void
@@ -338,10 +342,10 @@ vortex_XtalkHw_SetRightEQStates(vortex_t * vortex,
 		hwwrite(vortex->mmio, 0x242D0 + i * 0x24, coefs[i][2]);
 		hwwrite(vortex->mmio, 0x244D4 + i * 0x24, coefs[i][3]);
 	}
-	hwwrite(vortex->mmio, 0x24508, arg_0[0]);
-	hwwrite(vortex->mmio, 0x2450C, arg_0[1]);
-	hwwrite(vortex->mmio, 0x24510, arg_0[2]);
-	hwwrite(vortex->mmio, 0x24514, arg_0[3]);
+	hwwrite(vortex->mmio, 0x24508 + i * 0x24, arg_0[0]);
+	hwwrite(vortex->mmio, 0x2450C + i * 0x24, arg_0[1]);
+	hwwrite(vortex->mmio, 0x24510 + i * 0x24, arg_0[2]);
+	hwwrite(vortex->mmio, 0x24514 + i * 0x24, arg_0[3]);
 }
 
 static void
@@ -357,10 +361,10 @@ vortex_XtalkHw_SetLeftXTStates(vortex_t * vortex,
 		hwwrite(vortex->mmio, 0x24384 + i * 0x24, coefs[i][2]);
 		hwwrite(vortex->mmio, 0x24388 + i * 0x24, coefs[i][3]);
 	}
-	hwwrite(vortex->mmio, 0x24518, arg_0[0]);
-	hwwrite(vortex->mmio, 0x2451C, arg_0[1]);
-	hwwrite(vortex->mmio, 0x24520, arg_0[2]);
-	hwwrite(vortex->mmio, 0x24524, arg_0[3]);
+	hwwrite(vortex->mmio, 0x24518 + i * 0x24, arg_0[0]);
+	hwwrite(vortex->mmio, 0x2451C + i * 0x24, arg_0[1]);
+	hwwrite(vortex->mmio, 0x24520 + i * 0x24, arg_0[2]);
+	hwwrite(vortex->mmio, 0x24524 + i * 0x24, arg_0[3]);
 }
 
 static void
@@ -376,10 +380,10 @@ vortex_XtalkHw_SetRightXTStates(vortex_t * vortex,
 		hwwrite(vortex->mmio, 0x24438 + i * 0x24, coefs[i][2]);
 		hwwrite(vortex->mmio, 0x2443C + i * 0x24, coefs[i][3]);
 	}
-	hwwrite(vortex->mmio, 0x24528, arg_0[0]);
-	hwwrite(vortex->mmio, 0x2452C, arg_0[1]);
-	hwwrite(vortex->mmio, 0x24530, arg_0[2]);
-	hwwrite(vortex->mmio, 0x24534, arg_0[3]);
+	hwwrite(vortex->mmio, 0x24528 + i * 0x24, arg_0[0]);
+	hwwrite(vortex->mmio, 0x2452C + i * 0x24, arg_0[1]);
+	hwwrite(vortex->mmio, 0x24530 + i * 0x24, arg_0[2]);
+	hwwrite(vortex->mmio, 0x24534 + i * 0x24, arg_0[3]);
 }
 
 #if 0
@@ -463,10 +467,10 @@ vortex_XtalkHw_GetLeftEQStates(vortex_t * vortex, xtalk_instate_t arg_0,
 		coefs[i][2] = hwread(vortex->mmio, 0x2421C + i * 0x24);
 		coefs[i][3] = hwread(vortex->mmio, 0x24220 + i * 0x24);
 	}
-	arg_0[0] = hwread(vortex->mmio, 0x244F8);
-	arg_0[1] = hwread(vortex->mmio, 0x244FC);
-	arg_0[2] = hwread(vortex->mmio, 0x24500);
-	arg_0[3] = hwread(vortex->mmio, 0x24504);
+	arg_0[0] = hwread(vortex->mmio, 0x244F8 + i * 0x24);
+	arg_0[1] = hwread(vortex->mmio, 0x244FC + i * 0x24);
+	arg_0[2] = hwread(vortex->mmio, 0x24500 + i * 0x24);
+	arg_0[3] = hwread(vortex->mmio, 0x24504 + i * 0x24);
 }
 
 static void
@@ -481,10 +485,10 @@ vortex_XtalkHw_GetRightEQStates(vortex_t * vortex, xtalk_instate_t arg_0,
 		coefs[i][2] = hwread(vortex->mmio, 0x242D0 + i * 0x24);
 		coefs[i][3] = hwread(vortex->mmio, 0x242D4 + i * 0x24);
 	}
-	arg_0[0] = hwread(vortex->mmio, 0x24508);
-	arg_0[1] = hwread(vortex->mmio, 0x2450C);
-	arg_0[2] = hwread(vortex->mmio, 0x24510);
-	arg_0[3] = hwread(vortex->mmio, 0x24514);
+	arg_0[0] = hwread(vortex->mmio, 0x24508 + i * 0x24);
+	arg_0[1] = hwread(vortex->mmio, 0x2450C + i * 0x24);
+	arg_0[2] = hwread(vortex->mmio, 0x24510 + i * 0x24);
+	arg_0[3] = hwread(vortex->mmio, 0x24514 + i * 0x24);
 }
 
 static void
@@ -499,10 +503,10 @@ vortex_XtalkHw_GetLeftXTStates(vortex_t * vortex, xtalk_instate_t arg_0,
 		coefs[i][2] = hwread(vortex->mmio, 0x24384 + i * 0x24);
 		coefs[i][3] = hwread(vortex->mmio, 0x24388 + i * 0x24);
 	}
-	arg_0[0] = hwread(vortex->mmio, 0x24518);
-	arg_0[1] = hwread(vortex->mmio, 0x2451C);
-	arg_0[2] = hwread(vortex->mmio, 0x24520);
-	arg_0[3] = hwread(vortex->mmio, 0x24524);
+	arg_0[0] = hwread(vortex->mmio, 0x24518 + i * 0x24);
+	arg_0[1] = hwread(vortex->mmio, 0x2451C + i * 0x24);
+	arg_0[2] = hwread(vortex->mmio, 0x24520 + i * 0x24);
+	arg_0[3] = hwread(vortex->mmio, 0x24524 + i * 0x24);
 }
 
 static void
@@ -517,10 +521,10 @@ vortex_XtalkHw_GetRightXTStates(vortex_t * vortex, xtalk_instate_t arg_0,
 		coefs[i][2] = hwread(vortex->mmio, 0x24438 + i * 0x24);
 		coefs[i][3] = hwread(vortex->mmio, 0x2443C + i * 0x24);
 	}
-	arg_0[0] = hwread(vortex->mmio, 0x24528);
-	arg_0[1] = hwread(vortex->mmio, 0x2452C);
-	arg_0[2] = hwread(vortex->mmio, 0x24530);
-	arg_0[3] = hwread(vortex->mmio, 0x24534);
+	arg_0[0] = hwread(vortex->mmio, 0x24528 + i * 0x24);
+	arg_0[1] = hwread(vortex->mmio, 0x2452C + i * 0x24);
+	arg_0[2] = hwread(vortex->mmio, 0x24530 + i * 0x24);
+	arg_0[3] = hwread(vortex->mmio, 0x24534 + i * 0x24);
 }
 
 #endif
@@ -558,7 +562,7 @@ static void
 vortex_XtalkHw_SetDelay(vortex_t * vortex, unsigned short right,
 			unsigned short left)
 {
-	u32 esp0 = 0;
+	int esp0 = 0;
 
 	esp0 &= 0x1FFFFFFF;
 	esp0 |= 0xA0000000;
@@ -628,18 +632,18 @@ static void vortex_XtalkHw_GetRightDline(vortex_t * vortex, xtalk_dline_t dline)
 /* Control/Global stuff */
 
 #if 0
-static void vortex_XtalkHw_SetControlReg(vortex_t * vortex, u32 ctrl)
+static void vortex_XtalkHw_SetControlReg(vortex_t * vortex, unsigned long ctrl)
 {
 	hwwrite(vortex->mmio, 0x24660, ctrl);
 }
-static void vortex_XtalkHw_GetControlReg(vortex_t * vortex, u32 *ctrl)
+static void vortex_XtalkHw_GetControlReg(vortex_t * vortex, unsigned long *ctrl)
 {
 	*ctrl = hwread(vortex->mmio, 0x24660);
 }
 #endif
-static void vortex_XtalkHw_SetSampleRate(vortex_t * vortex, u32 sr)
+static void vortex_XtalkHw_SetSampleRate(vortex_t * vortex, int sr)
 {
-	u32 temp;
+	int temp;
 
 	temp = (hwread(vortex->mmio, 0x24660) & 0x1FFFFFFF) | 0xC0000000;
 	temp = (temp & 0xffffff07) | ((sr & 0x1f) << 3);
@@ -647,7 +651,7 @@ static void vortex_XtalkHw_SetSampleRate(vortex_t * vortex, u32 sr)
 }
 
 #if 0
-static void vortex_XtalkHw_GetSampleRate(vortex_t * vortex, u32 *sr)
+static void vortex_XtalkHw_GetSampleRate(vortex_t * vortex, int *sr)
 {
 	*sr = (hwread(vortex->mmio, 0x24660) >> 3) & 0x1f;
 }
@@ -655,7 +659,7 @@ static void vortex_XtalkHw_GetSampleRate(vortex_t * vortex, u32 *sr)
 #endif
 static void vortex_XtalkHw_Enable(vortex_t * vortex)
 {
-	u32 temp;
+	int temp;
 
 	temp = (hwread(vortex->mmio, 0x24660) & 0x1FFFFFFF) | 0xC0000000;
 	temp |= 1;
@@ -665,7 +669,7 @@ static void vortex_XtalkHw_Enable(vortex_t * vortex)
 
 static void vortex_XtalkHw_Disable(vortex_t * vortex)
 {
-	u32 temp;
+	int temp;
 
 	temp = (hwread(vortex->mmio, 0x24660) & 0x1FFFFFFF) | 0xC0000000;
 	temp &= 0xfffffffe;

@@ -28,7 +28,9 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $Id: //depot/aic7xxx/aic7xxx/aic7xxx_93cx6.c#19 $
+ * $Id: //depot/aic7xxx/aic7xxx/aic7xxx_93cx6.c#17 $
+ *
+ * $FreeBSD$
  */
 
 /*
@@ -62,32 +64,31 @@
  *   is preceded by an initial zero (leading 0, followed by 16-bits, MSB
  *   first).  The clock cycling from low to high initiates the next data
  *   bit to be sent from the chip.
+ *
  */
 
+#ifdef __linux__
 #include "aic7xxx_osm.h"
 #include "aic7xxx_inline.h"
 #include "aic7xxx_93cx6.h"
+#else
+#include <dev/aic7xxx/aic7xxx_osm.h>
+#include <dev/aic7xxx/aic7xxx_inline.h>
+#include <dev/aic7xxx/aic7xxx_93cx6.h>
+#endif
 
 /*
  * Right now, we only have to read the SEEPROM.  But we make it easier to
  * add other 93Cx6 functions.
  */
-struct seeprom_cmd {
-	uint8_t len;
-	uint8_t bits[11];
-};
+static struct seeprom_cmd {
+  	uint8_t len;
+ 	uint8_t bits[9];
+} seeprom_read = {3, {1, 1, 0}};
 
-/* Short opcodes for the c46 */
-static const struct seeprom_cmd seeprom_ewen = {9, {1, 0, 0, 1, 1, 0, 0, 0, 0}};
-static const struct seeprom_cmd seeprom_ewds = {9, {1, 0, 0, 0, 0, 0, 0, 0, 0}};
-
-/* Long opcodes for the C56/C66 */
-static const struct seeprom_cmd seeprom_long_ewen = {11, {1, 0, 0, 1, 1, 0, 0, 0, 0}};
-static const struct seeprom_cmd seeprom_long_ewds = {11, {1, 0, 0, 0, 0, 0, 0, 0, 0}};
-
-/* Common opcodes */
-static const struct seeprom_cmd seeprom_write = {3, {1, 0, 1}};
-static const struct seeprom_cmd seeprom_read  = {3, {1, 1, 0}};
+static struct seeprom_cmd seeprom_ewen = {9, {1, 0, 0, 1, 1, 0, 0, 0, 0}};
+static struct seeprom_cmd seeprom_ewds = {9, {1, 0, 0, 0, 0, 0, 0, 0, 0}};
+static struct seeprom_cmd seeprom_write = {3, {1, 0, 1}};
 
 /*
  * Wait for the SEERDY to go high; about 800 ns.
@@ -102,7 +103,7 @@ static const struct seeprom_cmd seeprom_read  = {3, {1, 1, 0}};
  * Send a START condition and the given command
  */
 static void
-send_seeprom_cmd(struct seeprom_descriptor *sd, const struct seeprom_cmd *cmd)
+send_seeprom_cmd(struct seeprom_descriptor *sd, struct seeprom_cmd *cmd)
 {
 	uint8_t temp;
 	int i = 0;
@@ -201,14 +202,14 @@ ahc_read_seeprom(struct seeprom_descriptor *sd, uint16_t *buf,
 		reset_seeprom(sd);
 	}
 #ifdef AHC_DUMP_EEPROM
-	printk("\nSerial EEPROM:\n\t");
+	printf("\nSerial EEPROM:\n\t");
 	for (k = 0; k < count; k = k + 1) {
 		if (((k % 8) == 0) && (k != 0)) {
-			printk(KERN_CONT "\n\t");
+			printf ("\n\t");
 		}
-		printk(KERN_CONT " 0x%x", buf[k]);
+		printf (" 0x%x", buf[k]);
 	}
-	printk(KERN_CONT "\n");
+	printf ("\n");
 #endif
 	return (1);
 }
@@ -221,25 +222,12 @@ int
 ahc_write_seeprom(struct seeprom_descriptor *sd, uint16_t *buf,
 		  u_int start_addr, u_int count)
 {
-	const struct seeprom_cmd *ewen, *ewds;
 	uint16_t v;
 	uint8_t temp;
 	int i, k;
 
 	/* Place the chip into write-enable mode */
-	if (sd->sd_chip == C46) {
-		ewen = &seeprom_ewen;
-		ewds = &seeprom_ewds;
-	} else if (sd->sd_chip == C56_66) {
-		ewen = &seeprom_long_ewen;
-		ewds = &seeprom_long_ewds;
-	} else {
-		printk("ahc_write_seeprom: unsupported seeprom type %d\n",
-		       sd->sd_chip);
-		return (0);
-	}
-
-	send_seeprom_cmd(sd, ewen);
+	send_seeprom_cmd(sd, &seeprom_ewen);
 	reset_seeprom(sd);
 
 	/* Write all requested data out to the seeprom. */
@@ -289,7 +277,7 @@ ahc_write_seeprom(struct seeprom_descriptor *sd, uint16_t *buf,
 	}
 
 	/* Put the chip back into write-protect mode */
-	send_seeprom_cmd(sd, ewds);
+	send_seeprom_cmd(sd, &seeprom_ewds);
 	reset_seeprom(sd);
 
 	return (1);

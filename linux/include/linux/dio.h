@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /* header file for DIO boards for the HP300 architecture.
  * Maybe this should handle DIO-II later?
  * The general structure of this is vaguely based on how
@@ -242,15 +241,20 @@ struct dio_driver {
 
 extern int dio_find(int deviceid);
 extern unsigned long dio_scodetophysaddr(int scode);
-extern int dio_create_sysfs_dev_files(struct dio_dev *);
+extern void dio_create_sysfs_dev_files(struct dio_dev *);
 
 /* New-style probing */
 extern int dio_register_driver(struct dio_driver *);
 extern void dio_unregister_driver(struct dio_driver *);
+extern const struct dio_device_id *dio_match_device(const struct dio_device_id *ids, const struct dio_dev *z);
+static inline struct dio_driver *dio_dev_driver(const struct dio_dev *d)
+{
+    return d->driver;
+}
 
 #define dio_resource_start(d) ((d)->resource.start)
 #define dio_resource_end(d)   ((d)->resource.end)
-#define dio_resource_len(d)   (resource_size(&(d)->resource))
+#define dio_resource_len(d)   ((d)->resource.end-(d)->resource.start+1)
 #define dio_resource_flags(d) ((d)->resource.flags)
 
 #define dio_request_device(d, name) \
@@ -270,6 +274,38 @@ static inline void *dio_get_drvdata (struct dio_dev *d)
 static inline void dio_set_drvdata (struct dio_dev *d, void *data)
 {
 	dev_set_drvdata(&d->dev, data);
+}
+
+/*
+ * A helper function which helps ensure correct dio_driver
+ * setup and cleanup for commonly-encountered hotplug/modular cases
+ *
+ * This MUST stay in a header, as it checks for -DMODULE
+ */
+static inline int dio_module_init(struct dio_driver *drv)
+{
+	int rc = dio_register_driver(drv);
+
+	if (rc > 0)
+		return 0;
+
+	/* iff CONFIG_HOTPLUG and built into kernel, we should
+	 * leave the driver around for future hotplug events.
+	 * For the module case, a hotplug daemon of some sort
+	 * should load a module in response to an insert event. */
+#if defined(CONFIG_HOTPLUG) && !defined(MODULE)
+	if (rc == 0)
+		return 0;
+#else
+	if (rc == 0)
+		rc = -ENODEV;
+#endif
+
+	/* if we get here, we need to clean up DIO driver instance
+	 * and return some sort of error */
+	dio_unregister_driver(drv);
+
+	return rc;
 }
 
 #endif /* __KERNEL__ */

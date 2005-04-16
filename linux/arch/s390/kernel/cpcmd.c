@@ -1,114 +1,111 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
+ *  arch/s390/kernel/cpcmd.c
+ *
  *  S390 version
- *    Copyright IBM Corp. 1999, 2007
+ *    Copyright (C) 1999,2000 IBM Deutschland Entwicklung GmbH, IBM Corporation
  *    Author(s): Martin Schwidefsky (schwidefsky@de.ibm.com),
  *               Christian Borntraeger (cborntra@de.ibm.com),
  */
 
-#define KMSG_COMPONENT "cpcmd"
-#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
-
 #include <linux/kernel.h>
-#include <linux/export.h>
+#include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/stddef.h>
 #include <linux/string.h>
-#include <linux/mm.h>
-#include <asm/diag.h>
 #include <asm/ebcdic.h>
 #include <asm/cpcmd.h>
-#include <asm/io.h>
+#include <asm/system.h>
 
 static DEFINE_SPINLOCK(cpcmd_lock);
-static char cpcmd_buf[241];
-
-static int diag8_noresponse(int cmdlen)
-{
-	asm volatile(
-		"	diag	%[rx],%[ry],0x8\n"
-		: [ry] "+&d" (cmdlen)
-		: [rx] "d" (__pa(cpcmd_buf))
-		: "cc");
-	return cmdlen;
-}
-
-static int diag8_response(int cmdlen, char *response, int *rlen)
-{
-	union register_pair rx, ry;
-	int cc;
-
-	rx.even = __pa(cpcmd_buf);
-	rx.odd	= __pa(response);
-	ry.even = cmdlen | 0x40000000L;
-	ry.odd	= *rlen;
-	asm volatile(
-		"	diag	%[rx],%[ry],0x8\n"
-		"	ipm	%[cc]\n"
-		"	srl	%[cc],28\n"
-		: [cc] "=&d" (cc), [ry] "+&d" (ry.pair)
-		: [rx] "d" (rx.pair)
-		: "cc");
-	if (cc)
-		*rlen += ry.odd;
-	else
-		*rlen = ry.odd;
-	return ry.even;
-}
+static char cpcmd_buf[240];
 
 /*
- * __cpcmd has some restrictions over cpcmd
- *  - __cpcmd is unlocked and therefore not SMP-safe
+ * the caller of __cpcmd has to ensure that the response buffer is below 2 GB
  */
-int  __cpcmd(const char *cmd, char *response, int rlen, int *response_code)
+void __cpcmd(char *cmd, char *response, int rlen)
 {
+	const int mask = 0x40000000L;
+	unsigned long flags;
 	int cmdlen;
-	int rc;
-	int response_len;
 
+	spin_lock_irqsave(&cpcmd_lock, flags);
 	cmdlen = strlen(cmd);
 	BUG_ON(cmdlen > 240);
-	memcpy(cpcmd_buf, cmd, cmdlen);
+	strcpy(cpcmd_buf, cmd);
 	ASCEBC(cpcmd_buf, cmdlen);
 
-	diag_stat_inc(DIAG_STAT_X008);
-	if (response) {
+	if (response != NULL && rlen > 0) {
 		memset(response, 0, rlen);
-		response_len = rlen;
-		rc = diag8_response(cmdlen, response, &rlen);
-		EBCASC(response, response_len);
+#ifndef CONFIG_ARCH_S390X
+		asm volatile ("LRA   2,0(%0)\n\t"
+                              "LR    4,%1\n\t"
+                              "O     4,%4\n\t"
+                              "LRA   3,0(%2)\n\t"
+                              "LR    5,%3\n\t"
+                              ".long 0x83240008 # Diagnose X'08'\n\t"
+                              : /* no output */
+                              : "a" (cpcmd_buf), "d" (cmdlen),
+                                "a" (response), "d" (rlen), "m" (mask)
+                              : "cc", "2", "3", "4", "5" );
+#else /* CONFIG_ARCH_S390X */
+                asm volatile ("   lrag  2,0(%0)\n"
+                              "   lgr   4,%1\n"
+                              "   o     4,%4\n"
+                              "   lrag  3,0(%2)\n"
+                              "   lgr   5,%3\n"
+                              "   sam31\n"
+                              "   .long 0x83240008 # Diagnose X'08'\n"
+                              "   sam64"
+                              : /* no output */
+                              : "a" (cpcmd_buf), "d" (cmdlen),
+                                "a" (response), "d" (rlen), "m" (mask)
+                              : "cc", "2", "3", "4", "5" );
+#endif /* CONFIG_ARCH_S390X */
+                EBCASC(response, rlen);
         } else {
-		rc = diag8_noresponse(cmdlen);
+#ifndef CONFIG_ARCH_S390X
+                asm volatile ("LRA   2,0(%0)\n\t"
+                              "LR    3,%1\n\t"
+                              ".long 0x83230008 # Diagnose X'08'\n\t"
+                              : /* no output */
+                              : "a" (cpcmd_buf), "d" (cmdlen)
+                              : "2", "3"  );
+#else /* CONFIG_ARCH_S390X */
+                asm volatile ("   lrag  2,0(%0)\n"
+                              "   lgr   3,%1\n"
+                              "   sam31\n"
+                              "   .long 0x83230008 # Diagnose X'08'\n"
+                              "   sam64"
+                              : /* no output */
+                              : "a" (cpcmd_buf), "d" (cmdlen)
+                              : "2", "3"  );
+#endif /* CONFIG_ARCH_S390X */
         }
-	if (response_code)
-		*response_code = rc;
-	return rlen;
+	spin_unlock_irqrestore(&cpcmd_lock, flags);
 }
+
 EXPORT_SYMBOL(__cpcmd);
 
-int cpcmd(const char *cmd, char *response, int rlen, int *response_code)
+#ifdef CONFIG_ARCH_S390X
+void cpcmd(char *cmd, char *response, int rlen)
 {
-	unsigned long flags;
 	char *lowbuf;
-	int len;
-
-	if (is_vmalloc_or_module_addr(response)) {
-		lowbuf = kmalloc(rlen, GFP_KERNEL);
+	if ((rlen == 0) || (response == NULL)
+	    || !((unsigned long)response >> 31))
+		__cpcmd(cmd, response, rlen);
+	else {
+		lowbuf = kmalloc(rlen, GFP_KERNEL | GFP_DMA);
 		if (!lowbuf) {
-			pr_warn("The cpcmd kernel function failed to allocate a response buffer\n");
-			return -ENOMEM;
+			printk(KERN_WARNING
+				"cpcmd: could not allocate response buffer\n");
+			return;
 		}
-		spin_lock_irqsave(&cpcmd_lock, flags);
-		len = __cpcmd(cmd, lowbuf, rlen, response_code);
-		spin_unlock_irqrestore(&cpcmd_lock, flags);
+		__cpcmd(cmd, lowbuf, rlen);
 		memcpy(response, lowbuf, rlen);
 		kfree(lowbuf);
-	} else {
-		spin_lock_irqsave(&cpcmd_lock, flags);
-		len = __cpcmd(cmd, response, rlen, response_code);
-		spin_unlock_irqrestore(&cpcmd_lock, flags);
 	}
-	return len;
 }
+
 EXPORT_SYMBOL(cpcmd);
+#endif		/* CONFIG_ARCH_S390X */

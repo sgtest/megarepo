@@ -1,22 +1,26 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  *  linux/arch/arm/lib/io-writesw-armv3.S
  *
  *  Copyright (C) 1995-2000 Russell King
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  */
 #include <linux/linkage.h>
 #include <asm/assembler.h>
+#include <asm/hardware.h>
 
-.Loutsw_bad_alignment:
-		adr	r0, .Loutsw_bad_align_msg
+.outsw_bad_alignment:
+		adr	r0, .outsw_bad_align_msg
 		mov	r2, lr
 		b	panic
-.Loutsw_bad_align_msg:
+.outsw_bad_align_msg:
 		.asciz	"outsw: bad buffer alignment (0x%p, lr=0x%08lX)\n"
 		.align
 
-.Loutsw_align:	tst	r1, #1
-		bne	.Loutsw_bad_alignment
+.outsw_align:	tst	r1, #1
+		bne	.outsw_bad_alignment
 
 		add	r1, r1, #2
 
@@ -25,20 +29,20 @@
 		orr	r3, r3, r3, lsl #16
 		str	r3, [r0]
 		subs	r2, r2, #1
-		reteq	lr
+		RETINSTR(moveq, pc, lr)
 
 ENTRY(__raw_writesw)
 		teq	r2, #0		@ do we have to check for the zero len?
-		reteq	lr
+		moveq	pc, lr
 		tst	r1, #3
-		bne	.Loutsw_align
+		bne	.outsw_align
 
-		stmfd	sp!, {r4, r5, r6, lr}
+.outsw_aligned:	stmfd	sp!, {r4, r5, r6, lr}
 
 		subs	r2, r2, #8
-		bmi	.Lno_outsw_8
+		bmi	.no_outsw_8
 
-.Loutsw_8_lp:	ldmia	r1!, {r3, r4, r5, r6}
+.outsw_8_lp:	ldmia	r1!, {r3, r4, r5, r6}
 
 		mov	ip, r3, lsl #16
 		orr	ip, ip, ip, lsr #16
@@ -73,13 +77,13 @@ ENTRY(__raw_writesw)
 		str	ip, [r0]
 
 		subs	r2, r2, #8
-		bpl	.Loutsw_8_lp
+		bpl	.outsw_8_lp
 
 		tst	r2, #7
-		ldmfdeq	sp!, {r4, r5, r6, pc}
+		LOADREGS(eqfd, sp!, {r4, r5, r6, pc})
 
-.Lno_outsw_8:	tst	r2, #4
-		beq	.Lno_outsw_4
+.no_outsw_8:	tst	r2, #4
+		beq	.no_outsw_4
 
 		ldmia	r1!, {r3, r4}
 
@@ -99,8 +103,8 @@ ENTRY(__raw_writesw)
 		orr	ip, ip, ip, lsl #16
 		str	ip, [r0]
 
-.Lno_outsw_4:	tst	r2, #2
-		beq	.Lno_outsw_2
+.no_outsw_4:	tst	r2, #2
+		beq	.no_outsw_2
 
 		ldr	r3, [r1], #4
 
@@ -112,7 +116,7 @@ ENTRY(__raw_writesw)
 		orr	ip, ip, ip, lsl #16
 		str	ip, [r0]
 
-.Lno_outsw_2:	tst	r2, #1
+.no_outsw_2:	tst	r2, #1
 
 		ldrne	r3, [r1]
 
@@ -120,4 +124,4 @@ ENTRY(__raw_writesw)
 		orrne	ip, ip, ip, lsr #16
 		strne	ip, [r0]
 
-		ldmfd	sp!, {r4, r5, r6, pc}
+		LOADREGS(fd, sp!, {r4, r5, r6, pc})

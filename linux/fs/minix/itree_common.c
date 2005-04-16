@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /* Generic part */
 
 typedef struct {
@@ -24,7 +23,7 @@ static inline int verify_chain(Indirect *from, Indirect *to)
 
 static inline block_t *block_end(struct buffer_head *bh)
 {
-	return (block_t *)((char*)bh->b_data + bh->b_size);
+	return (block_t *)((char*)bh->b_data + BLOCK_SIZE);
 }
 
 static inline Indirect *get_branch(struct inode *inode,
@@ -75,7 +74,6 @@ static int alloc_branch(struct inode *inode,
 	int n = 0;
 	int i;
 	int parent = minix_new_block(inode);
-	int err = -ENOSPC;
 
 	branch[0].key = cpu_to_block(parent);
 	if (parent) for (n = 1; n < num; n++) {
@@ -86,13 +84,8 @@ static int alloc_branch(struct inode *inode,
 			break;
 		branch[n].key = cpu_to_block(nr);
 		bh = sb_getblk(inode->i_sb, parent);
-		if (!bh) {
-			minix_free_block(inode, nr);
-			err = -ENOMEM;
-			break;
-		}
 		lock_buffer(bh);
-		memset(bh->b_data, 0, bh->b_size);
+		memset(bh->b_data, 0, BLOCK_SIZE);
 		branch[n].bh = bh;
 		branch[n].p = (block_t*) bh->b_data + offsets[n];
 		*branch[n].p = branch[n].key;
@@ -109,7 +102,7 @@ static int alloc_branch(struct inode *inode,
 		bforget(branch[i].bh);
 	for (i = 0; i < n; i++)
 		minix_free_block(inode, block_to_cpu(branch[i].key));
-	return err;
+	return -ENOSPC;
 }
 
 static inline int splice_branch(struct inode *inode,
@@ -131,7 +124,7 @@ static inline int splice_branch(struct inode *inode,
 
 	/* We are done with atomic stuff, now do the rest of housekeeping */
 
-	inode->i_ctime = current_time(inode);
+	inode->i_ctime = CURRENT_TIME_SEC;
 
 	/* had we spliced it onto indirect block? */
 	if (where->bh)
@@ -149,7 +142,7 @@ changed:
 	return -EAGAIN;
 }
 
-static int get_block(struct inode * inode, sector_t block,
+static inline int get_block(struct inode * inode, sector_t block,
 			struct buffer_head *bh, int create)
 {
 	int err = -EIO;
@@ -299,7 +292,6 @@ static void free_branches(struct inode *inode, block_t *p, block_t *q, int depth
 
 static inline void truncate (struct inode * inode)
 {
-	struct super_block *sb = inode->i_sb;
 	block_t *idata = i_data(inode);
 	int offsets[DEPTH];
 	Indirect chain[DEPTH];
@@ -309,7 +301,7 @@ static inline void truncate (struct inode * inode)
 	int first_whole;
 	long iblock;
 
-	iblock = (inode->i_size + sb->s_blocksize -1) >> sb->s_blocksize_bits;
+	iblock = (inode->i_size + BLOCK_SIZE-1) >> 10;
 	block_truncate_page(inode->i_mapping, inode->i_size, get_block);
 
 	n = block_to_path(inode, iblock, offsets);
@@ -350,20 +342,19 @@ do_indirects:
 		}
 		first_whole++;
 	}
-	inode->i_mtime = inode->i_ctime = current_time(inode);
+	inode->i_mtime = inode->i_ctime = CURRENT_TIME_SEC;
 	mark_inode_dirty(inode);
 }
 
-static inline unsigned nblocks(loff_t size, struct super_block *sb)
+static inline unsigned nblocks(loff_t size)
 {
-	int k = sb->s_blocksize_bits - 10;
 	unsigned blocks, res, direct = DIRECT, i = DEPTH;
-	blocks = (size + sb->s_blocksize - 1) >> (BLOCK_SIZE_BITS + k);
+	blocks = (size + BLOCK_SIZE - 1) >> BLOCK_SIZE_BITS;
 	res = blocks;
 	while (--i && blocks > direct) {
 		blocks -= direct;
-		blocks += sb->s_blocksize/sizeof(block_t) - 1;
-		blocks /= sb->s_blocksize/sizeof(block_t);
+		blocks += BLOCK_SIZE/sizeof(block_t) - 1;
+		blocks /= BLOCK_SIZE/sizeof(block_t);
 		res += blocks;
 		direct = 1;
 	}

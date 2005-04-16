@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *  linux/fs/adfs/file.c
  *
@@ -20,17 +19,25 @@
  *
  *  adfs regular file handling primitives           
  */
+#include <linux/errno.h>
+#include <linux/fs.h>
+#include <linux/fcntl.h>
+#include <linux/time.h>
+#include <linux/stat.h>
+#include <linux/buffer_head.h>			/* for file_fsync() */
+#include <linux/adfs_fs.h>
+
 #include "adfs.h"
 
-const struct file_operations adfs_file_operations = {
+struct file_operations adfs_file_operations = {
 	.llseek		= generic_file_llseek,
-	.read_iter	= generic_file_read_iter,
+	.read		= generic_file_read,
 	.mmap		= generic_file_mmap,
-	.fsync		= generic_file_fsync,
-	.write_iter	= generic_file_write_iter,
-	.splice_read	= generic_file_splice_read,
+	.fsync		= file_fsync,
+	.write		= generic_file_write,
+	.sendfile	= generic_file_sendfile,
 };
 
-const struct inode_operations adfs_file_inode_operations = {
+struct inode_operations adfs_file_inode_operations = {
 	.setattr	= adfs_notify_change,
 };

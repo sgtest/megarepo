@@ -1,10 +1,24 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * IBM ASM Service Processor Device Driver
  *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+ *
  * Copyright (C) IBM Corporation, 2004
  *
- * Author: Max AsbÃ¶ck <amax@us.ibm.com>
+ * Author: Max Asböck <amax@us.ibm.com> 
+ *
  */
 
 #pragma pack(1)
@@ -12,9 +26,9 @@ struct i2o_header {
 	u8	version;
 	u8	message_flags;
 	u16	message_size;
-	u8	target;
+	u8	target;           
 	u8	initiator_and_target;
-	u8	initiator;
+	u8	initiator;        
 	u8	function;
 	u32	initiator_context;
 };
@@ -50,12 +64,12 @@ static inline unsigned short outgoing_message_size(unsigned int data_size)
 	size = sizeof(struct i2o_header) + data_size;
 
 	i2o_size = size / sizeof(u32);
-
+	
 	if (size % sizeof(u32))
 	       i2o_size++;
 
 	return i2o_size;
-}
+}	
 
 static inline u32 incoming_data_size(struct i2o_message *i2o_message)
 {

@@ -12,22 +12,109 @@
 #ifndef __PKTCDVD_H
 #define __PKTCDVD_H
 
+#include <linux/types.h>
+
+/*
+ * 1 for normal debug messages, 2 is very verbose. 0 to turn it off.
+ */
+#define PACKET_DEBUG		1
+
+#define	MAX_WRITERS		8
+
+#define PKT_RB_POOL_SIZE	512
+
+/*
+ * How long we should hold a non-full packet before starting data gathering.
+ */
+#define PACKET_WAIT_TIME	(HZ * 5 / 1000)
+
+/*
+ * use drive write caching -- we need deferred error handling to be
+ * able to sucessfully recover with this option (drive will return good
+ * status as soon as the cdb is validated).
+ */
+#if defined(CONFIG_CDROM_PKTCDVD_WCACHE)
+#define USE_WCACHING		1
+#else
+#define USE_WCACHING		0
+#endif
+
+/*
+ * No user-servicable parts beyond this point ->
+ */
+
+/*
+ * device types
+ */
+#define PACKET_CDR		1
+#define	PACKET_CDRW		2
+#define PACKET_DVDR		3
+#define PACKET_DVDRW		4
+
+/*
+ * flags
+ */
+#define PACKET_WRITABLE		1	/* pd is writable */
+#define PACKET_NWA_VALID	2	/* next writable address valid */
+#define PACKET_LRA_VALID	3	/* last recorded address valid */
+#define PACKET_MERGE_SEGS	4	/* perform segment merging to keep */
+					/* underlying cdrom device happy */
+
+/*
+ * Disc status -- from READ_DISC_INFO
+ */
+#define PACKET_DISC_EMPTY	0
+#define PACKET_DISC_INCOMPLETE	1
+#define PACKET_DISC_COMPLETE	2
+#define PACKET_DISC_OTHER	3
+
+/*
+ * write type, and corresponding data block type
+ */
+#define PACKET_MODE1		1
+#define PACKET_MODE2		2
+#define PACKET_BLOCK_MODE1	8
+#define PACKET_BLOCK_MODE2	10
+
+/*
+ * Last session/border status
+ */
+#define PACKET_SESSION_EMPTY		0
+#define PACKET_SESSION_INCOMPLETE	1
+#define PACKET_SESSION_RESERVED		2
+#define PACKET_SESSION_COMPLETE		3
+
+#define PACKET_MCN			"4a656e734178626f65323030300000"
+
+#undef PACKET_USE_LS
+
+#define PKT_CTRL_CMD_SETUP	0
+#define PKT_CTRL_CMD_TEARDOWN	1
+#define PKT_CTRL_CMD_STATUS	2
+
+struct pkt_ctrl_command {
+	__u32 command;				/* in: Setup, teardown, status */
+	__u32 dev_index;			/* in/out: Device index */
+	__u32 dev;				/* in/out: Device nr for cdrw device */
+	__u32 pkt_dev;				/* in/out: Device nr for packet device */
+	__u32 num_devices;			/* out: Largest device index + 1 */
+	__u32 padding;				/* Not used */
+};
+
+/*
+ * packet ioctls
+ */
+#define PACKET_IOCTL_MAGIC	('X')
+#define PACKET_CTRL_CMD		_IOWR(PACKET_IOCTL_MAGIC, 1, struct pkt_ctrl_command)
+
+#ifdef __KERNEL__
 #include <linux/blkdev.h>
 #include <linux/completion.h>
 #include <linux/cdrom.h>
-#include <linux/kobject.h>
-#include <linux/sysfs.h>
-#include <linux/mempool.h>
-#include <uapi/linux/pktcdvd.h>
-
-/* default bio write queue congestion marks */
-#define PKT_WRITE_CONGESTION_ON    10000
-#define PKT_WRITE_CONGESTION_OFF   9000
-
 
 struct packet_settings
 {
-	__u32			size;		/* packet size in (512 byte) sectors */
+	__u8			size;		/* packet size in (512 byte) sectors */
 	__u8			fp;		/* fixed packets */
 	__u8			link_loss;	/* the rest is specified
 						 * as per Mt Fuji */
@@ -68,20 +155,19 @@ struct packet_iosched
 	atomic_t		attention;	/* Set to non-zero when queue processing is needed */
 	int			writing;	/* Non-zero when writing, zero when reading */
 	spinlock_t		lock;		/* Protecting read/write queue manipulations */
-	struct bio_list		read_queue;
-	struct bio_list		write_queue;
-	sector_t		last_write;	/* The sector where the last write ended */
+	struct bio		*read_queue;
+	struct bio		*read_queue_tail;
+	struct bio		*write_queue;
+	struct bio		*write_queue_tail;
+	int			high_prio_read;	/* An important read request has been queued */
 	int			successive_reads;
 };
 
 /*
  * 32 buffers of 2048 bytes
  */
-#if (PAGE_SIZE % CD_FRAMESIZE) != 0
-#error "PAGE_SIZE must be a multiple of CD_FRAMESIZE"
-#endif
-#define PACKET_MAX_SIZE		128
-#define FRAMES_PER_PAGE		(PAGE_SIZE / CD_FRAMESIZE)
+#define PACKET_MAX_SIZE		32
+#define PAGES_PER_PACKET	(PACKET_MAX_SIZE * CD_FRAMESIZE / PAGE_SIZE)
 #define PACKET_MAX_SECTORS	(PACKET_MAX_SIZE * CD_FRAMESIZE >> 9)
 
 enum packet_data_state {
@@ -109,8 +195,8 @@ struct packet_data
 	spinlock_t		lock;		/* Lock protecting state transitions and */
 						/* orig_bios list */
 
-	struct bio_list		orig_bios;	/* Original bios passed to pkt_make_request */
-						/* that will be handled by this packet */
+	struct bio		*orig_bios;	/* Original bios passed to pkt_make_request */
+	struct bio		*orig_bios_tail;/* that will be handled by this packet */
 	int			write_size;	/* Total size of all bios in the orig_bios */
 						/* list, measured in number of frames */
 
@@ -130,7 +216,7 @@ struct packet_data
 	atomic_t		io_errors;	/* Number of read/write errors during IO */
 
 	struct bio		*r_bios[PACKET_MAX_SIZE]; /* bios to use during data gathering */
-	struct page		*pages[PACKET_MAX_SIZE / FRAMES_PER_PAGE];
+	struct page		*pages[PAGES_PER_PACKET];
 
 	int			cache_valid;	/* If non-zero, the data for the zone defined */
 						/* by the sector variable is completely cached */
@@ -175,23 +261,15 @@ struct pktcdvd_device
 	spinlock_t		lock;		/* Serialize access to bio_queue */
 	struct rb_root		bio_queue;	/* Work queue of bios we need to handle */
 	int			bio_queue_size;	/* Number of nodes in bio_queue */
-	bool			congested;	/* Someone is waiting for bio_queue_size
-						 * to drop. */
 	sector_t		current_sector;	/* Keep track of where the elevator is */
 	atomic_t		scan_queue;	/* Set to non-zero when pkt_handle_queue */
 						/* needs to be run. */
-	mempool_t		rb_pool;	/* mempool for pkt_rb_node allocations */
+	mempool_t		*rb_pool;	/* mempool for pkt_rb_node allocations */
 
 	struct packet_iosched   iosched;
 	struct gendisk		*disk;
-
-	int			write_congestion_off;
-	int			write_congestion_on;
-
-	struct device		*dev;		/* sysfs pktcdvd[0-7] dev */
-
-	struct dentry		*dfs_d_root;	/* debugfs: devname directory */
-	struct dentry		*dfs_f_info;	/* debugfs: info file */
 };
+
+#endif /* __KERNEL__ */
 
 #endif /* __PKTCDVD_H */

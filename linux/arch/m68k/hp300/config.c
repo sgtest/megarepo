@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *  linux/arch/m68k/hp300/config.c
  *
@@ -8,28 +7,26 @@
  *  called by setup.c.
  */
 
+#include <linux/config.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/string.h>
 #include <linux/kernel.h>
 #include <linux/console.h>
-#include <linux/rtc.h>
 
 #include <asm/bootinfo.h>
-#include <asm/bootinfo-hp300.h>
-#include <asm/byteorder.h>
 #include <asm/machdep.h>
 #include <asm/blinken.h>
 #include <asm/io.h>                               /* readb() and writeb() */
 #include <asm/hp300hw.h>
-#include <asm/config.h>
+#include <asm/rtc.h>
 
+#include "ints.h"
 #include "time.h"
 
 unsigned long hp300_model;
 unsigned long hp300_uart_scode = -1;
-unsigned char hp300_ledstate;
-EXPORT_SYMBOL(hp300_ledstate);
+unsigned char ledstate;
 
 static char s_hp330[] __initdata = "330";
 static char s_hp340[] __initdata = "340";
@@ -67,6 +64,8 @@ static char *hp300_models[] __initdata = {
 static char hp300_model_name[13] = "HP9000/";
 
 extern void hp300_reset(void);
+extern irqreturn_t (*hp300_default_handler[])(int, void *, struct pt_regs *);
+extern int show_hp300_interrupts(struct seq_file *, void *);
 #ifdef CONFIG_SERIAL_8250_CONSOLE
 extern int hp300_setup_serial_console(void) __init;
 #endif
@@ -74,22 +73,22 @@ extern int hp300_setup_serial_console(void) __init;
 int __init hp300_parse_bootinfo(const struct bi_record *record)
 {
 	int unknown = 0;
-	const void *data = record->data;
+	const unsigned long *data = record->data;
 
-	switch (be16_to_cpu(record->tag)) {
+	switch (record->tag) {
 	case BI_HP300_MODEL:
-		hp300_model = be32_to_cpup(data);
+		hp300_model = *data;
 		break;
 
 	case BI_HP300_UART_SCODE:
-		hp300_uart_scode = be32_to_cpup(data);
+		hp300_uart_scode = *data;
 		break;
 
 	case BI_HP300_UART_ADDR:
 		/* serial port address: ignored here */
 		break;
 
-	default:
+        default:
 		unknown = 1;
 	}
 
@@ -240,27 +239,38 @@ static int hp300_hwclk(int op, struct rtc_time *t)
 	return 0;
 }
 
-static void __init hp300_init_IRQ(void)
+static unsigned int hp300_get_ss(void)
 {
+	return hp300_rtc_read(RTC_REG_SEC1) * 10 +
+		hp300_rtc_read(RTC_REG_SEC2);
 }
 
 void __init config_hp300(void)
 {
 	mach_sched_init      = hp300_sched_init;
 	mach_init_IRQ        = hp300_init_IRQ;
+	mach_request_irq     = hp300_request_irq;
+	mach_free_irq        = hp300_free_irq;
 	mach_get_model       = hp300_get_model;
+	mach_get_irq_list    = show_hp300_interrupts;
+	mach_gettimeoffset   = hp300_gettimeoffset;
+	mach_default_handler = &hp300_default_handler;
 	mach_hwclk	     = hp300_hwclk;
+	mach_get_ss	     = hp300_get_ss;
 	mach_reset           = hp300_reset;
 #ifdef CONFIG_HEARTBEAT
 	mach_heartbeat       = hp300_pulse;
 #endif
+#ifdef CONFIG_DUMMY_CONSOLE
+	conswitchp	     = &dummy_con;
+#endif
+	mach_max_dma_address = 0xffffffff;
 
-	if (hp300_model >= HP_330 && hp300_model <= HP_433S &&
-	    hp300_model != HP_350) {
-		pr_info("Detected HP9000 model %s\n",
-			hp300_models[hp300_model-HP_320]);
+	if (hp300_model >= HP_330 && hp300_model <= HP_433S && hp300_model != HP_350) {
+		printk(KERN_INFO "Detected HP9000 model %s\n", hp300_models[hp300_model-HP_320]);
 		strcat(hp300_model_name, hp300_models[hp300_model-HP_320]);
-	} else {
+	}
+	else {
 		panic("Unknown HP9000 Model");
 	}
 #ifdef CONFIG_SERIAL_8250_CONSOLE

@@ -1,9 +1,9 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef SUN3X_TIME_H
 #define SUN3X_TIME_H
 
 extern int sun3x_hwclk(int set, struct rtc_time *t);
-void sun3x_sched_init(void);
+unsigned long sun3x_gettimeoffset (void);
+void sun3x_sched_init(irqreturn_t (*vector)(int, void *, struct pt_regs *));
 
 struct mostek_dt {
 	volatile unsigned char csr;

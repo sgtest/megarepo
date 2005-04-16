@@ -30,6 +30,7 @@
 #ifndef _LINUX_TI113X_H
 #define _LINUX_TI113X_H
 
+#include <linux/config.h>
 
 /* Register definitions for TI 113X PCI-to-CardBus bridges */
 
@@ -58,7 +59,6 @@
 
 #define  TI122X_SCR_SER_STEP		0xc0000000
 #define  TI122X_SCR_INTRTIE		0x20000000
-#define  TIXX21_SCR_TIEALL		0x10000000
 #define  TI122X_SCR_CBRSVD		0x00400000
 #define  TI122X_SCR_MRBURSTDN		0x00008000
 #define  TI122X_SCR_MRBURSTUP		0x00004000
@@ -153,12 +153,8 @@
 /* EnE test register */
 #define ENE_TEST_C9			0xc9	/* 8bit */
 #define ENE_TEST_C9_TLTENABLE		0x02
-#define ENE_TEST_C9_PFENABLE_F0		0x04
-#define ENE_TEST_C9_PFENABLE_F1		0x08
-#define ENE_TEST_C9_PFENABLE		(ENE_TEST_C9_PFENABLE_F0 | ENE_TEST_C9_PFENABLE_F1)
-#define ENE_TEST_C9_WPDISALBLE_F0	0x40
-#define ENE_TEST_C9_WPDISALBLE_F1	0x80
-#define ENE_TEST_C9_WPDISALBLE		(ENE_TEST_C9_WPDISALBLE_F0 | ENE_TEST_C9_WPDISALBLE_F1)
+
+#ifdef CONFIG_CARDBUS
 
 /*
  * Texas Instruments CardBus controller overrides.
@@ -296,7 +292,7 @@ static int ti_init(struct yenta_socket *socket)
 	u8 new, reg = exca_readb(socket, I365_INTCTL);
 
 	new = reg & ~I365_INTR_ENA;
-	if (socket->dev->irq)
+	if (socket->cb_irq)
 		new |= I365_INTR_ENA;
 	if (new != reg)
 		exca_writeb(socket, I365_INTCTL, new);
@@ -316,47 +312,14 @@ static int ti_override(struct yenta_socket *socket)
 	return 0;
 }
 
-static void ti113x_use_isa_irq(struct yenta_socket *socket)
-{
-	int isa_irq = -1;
-	u8 intctl;
-	u32 isa_irq_mask = 0;
-
-	if (!isa_probe)
-		return;
-
-	/* get a free isa int */
-	isa_irq_mask = yenta_probe_irq(socket, isa_interrupts);
-	if (!isa_irq_mask)
-		return; /* no useable isa irq found */
-
-	/* choose highest available */
-	for (; isa_irq_mask; isa_irq++)
-		isa_irq_mask >>= 1;
-	socket->cb_irq = isa_irq;
-
-	exca_writeb(socket, I365_CSCINT, (isa_irq << 4));
-
-	intctl = exca_readb(socket, I365_INTCTL);
-	intctl &= ~(I365_INTR_ENA | I365_IRQ_MASK);     /* CSC Enable */
-	exca_writeb(socket, I365_INTCTL, intctl);
-
-	dev_info(&socket->dev->dev,
-		"Yenta TI113x: using isa irq %d for CardBus\n", isa_irq);
-}
-
-
 static int ti113x_override(struct yenta_socket *socket)
 {
 	u8 cardctl;
 
 	cardctl = config_readb(socket, TI113X_CARD_CONTROL);
 	cardctl &= ~(TI113X_CCR_PCI_IRQ_ENA | TI113X_CCR_PCI_IREQ | TI113X_CCR_PCI_CSC);
-	if (socket->dev->irq)
+	if (socket->cb_irq)
 		cardctl |= TI113X_CCR_PCI_IRQ_ENA | TI113X_CCR_PCI_CSC | TI113X_CCR_PCI_IREQ;
-	else
-		ti113x_use_isa_irq(socket);
-
 	config_writeb(socket, TI113X_CARD_CONTROL, cardctl);
 
 	return ti_override(socket);
@@ -372,8 +335,8 @@ static void ti12xx_irqroute_func0(struct yenta_socket *socket)
 
 	mfunc = mfunc_old = config_readl(socket, TI122X_MFUNC);
 	devctl = config_readb(socket, TI113X_DEVICE_CONTROL);
-	dev_info(&socket->dev->dev, "TI: mfunc 0x%08x, devctl 0x%02x\n",
-		 mfunc, devctl);
+	printk(KERN_INFO "Yenta TI: socket %s, mfunc 0x%08x, devctl 0x%02x\n",
+	       pci_name(socket->dev), mfunc, devctl);
 
 	/* make sure PCI interrupts are enabled before probing */
 	ti_init(socket);
@@ -387,8 +350,8 @@ static void ti12xx_irqroute_func0(struct yenta_socket *socket)
 	 * We're here which means PCI interrupts are _not_ delivered. try to
 	 * find the right setting (all serial or parallel)
 	 */
-	dev_info(&socket->dev->dev,
-		 "TI: probing PCI interrupt failed, trying to fix\n");
+	printk(KERN_INFO "Yenta TI: socket %s probing PCI interrupt failed, trying to fix\n",
+	       pci_name(socket->dev));
 
 	/* for serial PCI make sure MFUNC3 is set to IRQSER */
 	if ((devctl & TI113X_DCR_IMODE_MASK) == TI12XX_DCR_IMODE_ALL_SERIAL) {
@@ -412,8 +375,8 @@ static void ti12xx_irqroute_func0(struct yenta_socket *socket)
 
 				pci_irq_status = yenta_probe_cb_irq(socket);
 				if (pci_irq_status == 1) {
-					dev_info(&socket->dev->dev,
-						 "TI: all-serial interrupts ok\n");
+					printk(KERN_INFO "Yenta TI: socket %s all-serial interrupts ok\n",
+					       pci_name(socket->dev));
 					mfunc_old = mfunc;
 					goto out;
 				}
@@ -428,8 +391,8 @@ static void ti12xx_irqroute_func0(struct yenta_socket *socket)
 		}
 
 		/* serial PCI interrupts not working fall back to parallel */
-		dev_info(&socket->dev->dev,
-			 "TI: falling back to parallel PCI interrupts\n");
+		printk(KERN_INFO "Yenta TI: socket %s falling back to parallel PCI interrupts\n",
+		       pci_name(socket->dev));
 		devctl &= ~TI113X_DCR_IMODE_MASK;
 		devctl |= TI113X_DCR_IMODE_SERIAL; /* serial ISA could be right */
 		config_writeb(socket, TI113X_DEVICE_CONTROL, devctl);
@@ -460,7 +423,8 @@ static void ti12xx_irqroute_func0(struct yenta_socket *socket)
 	pci_irq_status = yenta_probe_cb_irq(socket);
 	if (pci_irq_status == 1) {
 		mfunc_old = mfunc;
-		dev_info(&socket->dev->dev, "TI: parallel PCI interrupts ok\n");
+		printk(KERN_INFO "Yenta TI: socket %s parallel PCI interrupts ok\n",
+		       pci_name(socket->dev));
 	} else {
 		/* not working, back to old value */
 		mfunc = mfunc_old;
@@ -472,30 +436,11 @@ static void ti12xx_irqroute_func0(struct yenta_socket *socket)
 out:
 	if (pci_irq_status < 1) {
 		socket->cb_irq = 0;
-		dev_info(&socket->dev->dev,
-			 "Yenta TI: no PCI interrupts. Fish. Please report.\n");
+		printk(KERN_INFO "Yenta TI: socket %s no PCI interrupts. Fish. Please report.\n",
+		       pci_name(socket->dev));
 	}
 }
 
-
-/* changes the irq of func1 to match that of func0 */
-static int ti12xx_align_irqs(struct yenta_socket *socket, int *old_irq)
-{
-	struct pci_dev *func0;
-
-	/* find func0 device */
-	func0 = pci_get_slot(socket->dev->bus, socket->dev->devfn & ~0x07);
-	if (!func0)
-		return 0;
-
-	if (old_irq)
-		*old_irq = socket->cb_irq;
-	socket->cb_irq = socket->dev->irq = func0->irq;
-
-	pci_dev_put(func0);
-
-	return 1;
-}
 
 /*
  * ties INTA and INTB together. also changes the devices irq to that of
@@ -504,21 +449,25 @@ static int ti12xx_align_irqs(struct yenta_socket *socket, int *old_irq)
  */
 static int ti12xx_tie_interrupts(struct yenta_socket *socket, int *old_irq)
 {
+	struct pci_dev *func0;
 	u32 sysctl;
-	int ret;
 
 	sysctl = config_readl(socket, TI113X_SYSTEM_CONTROL);
 	if (sysctl & TI122X_SCR_INTRTIE)
 		return 0;
 
-	/* align */
-	ret = ti12xx_align_irqs(socket, old_irq);
-	if (!ret)
+	/* find func0 device */
+	func0 = pci_get_slot(socket->dev->bus, socket->dev->devfn & ~0x07);
+	if (!func0)
 		return 0;
 
-	/* tie */
+	/* change the interrupt to match func0, tie 'em up */
+	*old_irq = socket->cb_irq;
+	socket->cb_irq = socket->dev->irq = func0->irq;
 	sysctl |= TI122X_SCR_INTRTIE;
 	config_writel(socket, TI113X_SYSTEM_CONTROL, sysctl);
+
+	pci_dev_put(func0);
 
 	return 1;
 }
@@ -540,18 +489,13 @@ static void ti12xx_untie_interrupts(struct yenta_socket *socket, int old_irq)
  */
 static void ti12xx_irqroute_func1(struct yenta_socket *socket)
 {
-	u32 mfunc, mfunc_old, devctl, sysctl;
+	u32 mfunc, mfunc_old, devctl;
 	int pci_irq_status;
 
 	mfunc = mfunc_old = config_readl(socket, TI122X_MFUNC);
 	devctl = config_readb(socket, TI113X_DEVICE_CONTROL);
-	dev_info(&socket->dev->dev, "TI: mfunc 0x%08x, devctl 0x%02x\n",
-		 mfunc, devctl);
-
-	/* if IRQs are configured as tied, align irq of func1 with func0 */
-	sysctl = config_readl(socket, TI113X_SYSTEM_CONTROL);
-	if (sysctl & TI122X_SCR_INTRTIE)
-		ti12xx_align_irqs(socket, NULL);
+	printk(KERN_INFO "Yenta TI: socket %s, mfunc 0x%08x, devctl 0x%02x\n",
+	       pci_name(socket->dev), mfunc, devctl);
 
 	/* make sure PCI interrupts are enabled before probing */
 	ti_init(socket);
@@ -565,8 +509,9 @@ static void ti12xx_irqroute_func1(struct yenta_socket *socket)
 	 * We're here which means PCI interrupts are _not_ delivered. try to
 	 * find the right setting
 	 */
-	dev_info(&socket->dev->dev,
-		 "TI: probing PCI interrupt failed, trying to fix\n");
+	printk(KERN_INFO "Yenta TI: socket %s probing PCI interrupt failed, trying to fix\n",
+	       pci_name(socket->dev));
+
 
 	/* if all serial: set INTRTIE, probe again */
 	if ((devctl & TI113X_DCR_IMODE_MASK) == TI12XX_DCR_IMODE_ALL_SERIAL) {
@@ -575,8 +520,8 @@ static void ti12xx_irqroute_func1(struct yenta_socket *socket)
 		if (ti12xx_tie_interrupts(socket, &old_irq)) {
 			pci_irq_status = yenta_probe_cb_irq(socket);
 			if (pci_irq_status == 1) {
-				dev_info(&socket->dev->dev,
-					 "TI: all-serial interrupts, tied ok\n");
+				printk(KERN_INFO "Yenta TI: socket %s all-serial interrupts, tied ok\n",
+				       pci_name(socket->dev));
 				goto out;
 			}
 
@@ -613,8 +558,8 @@ static void ti12xx_irqroute_func1(struct yenta_socket *socket)
 
 			pci_irq_status = yenta_probe_cb_irq(socket);
 			if (pci_irq_status == 1) {
-				dev_info(&socket->dev->dev,
-					 "TI: parallel PCI interrupts ok\n");
+				printk(KERN_INFO "Yenta TI: socket %s parallel PCI interrupts ok\n",
+				       pci_name(socket->dev));
 				goto out;
 			}
 
@@ -624,13 +569,13 @@ static void ti12xx_irqroute_func1(struct yenta_socket *socket)
 			if (pci_irq_status == -1)
 				goto out;
 		}
-
+		
 		/* still nothing: set INTRTIE */
 		if (ti12xx_tie_interrupts(socket, &old_irq)) {
 			pci_irq_status = yenta_probe_cb_irq(socket);
 			if (pci_irq_status == 1) {
-				dev_info(&socket->dev->dev,
-					 "TI: parallel PCI interrupts, tied ok\n");
+				printk(KERN_INFO "Yenta TI: socket %s parallel PCI interrupts, tied ok\n",
+				       pci_name(socket->dev));
 				goto out;
 			}
 
@@ -641,202 +586,9 @@ static void ti12xx_irqroute_func1(struct yenta_socket *socket)
 out:
 	if (pci_irq_status < 1) {
 		socket->cb_irq = 0;
-		dev_info(&socket->dev->dev,
-			 "TI: no PCI interrupts. Fish. Please report.\n");
+		printk(KERN_INFO "Yenta TI: socket %s no PCI interrupts. Fish. Please report.\n",
+		       pci_name(socket->dev));
 	}
-}
-
-
-/* Returns true value if the second slot of a two-slot controller is empty */
-static int ti12xx_2nd_slot_empty(struct yenta_socket *socket)
-{
-	struct pci_dev *func;
-	struct yenta_socket *slot2;
-	int devfn;
-	unsigned int state;
-	int ret = 1;
-	u32 sysctl;
-
-	/* catch the two-slot controllers */
-	switch (socket->dev->device) {
-	case PCI_DEVICE_ID_TI_1220:
-	case PCI_DEVICE_ID_TI_1221:
-	case PCI_DEVICE_ID_TI_1225:
-	case PCI_DEVICE_ID_TI_1251A:
-	case PCI_DEVICE_ID_TI_1251B:
-	case PCI_DEVICE_ID_TI_1420:
-	case PCI_DEVICE_ID_TI_1450:
-	case PCI_DEVICE_ID_TI_1451A:
-	case PCI_DEVICE_ID_TI_1520:
-	case PCI_DEVICE_ID_TI_1620:
-	case PCI_DEVICE_ID_TI_4520:
-	case PCI_DEVICE_ID_TI_4450:
-	case PCI_DEVICE_ID_TI_4451:
-		/*
-		 * there are way more, but they need to be added in yenta_socket.c
-		 * and pci_ids.h first anyway.
-		 */
-		break;
-
-	case PCI_DEVICE_ID_TI_XX12:
-	case PCI_DEVICE_ID_TI_X515:
-	case PCI_DEVICE_ID_TI_X420:
-	case PCI_DEVICE_ID_TI_X620:
-	case PCI_DEVICE_ID_TI_XX21_XX11:
-	case PCI_DEVICE_ID_TI_7410:
-	case PCI_DEVICE_ID_TI_7610:
-		/*
-		 * those are either single or dual slot CB with additional functions
-		 * like 1394, smartcard reader, etc. check the TIEALL flag for them
-		 * the TIEALL flag binds the IRQ of all functions together.
-		 * we catch the single slot variants later.
-		 */
-		sysctl = config_readl(socket, TI113X_SYSTEM_CONTROL);
-		if (sysctl & TIXX21_SCR_TIEALL)
-			return 0;
-
-		break;
-
-	/* single-slot controllers have the 2nd slot empty always :) */
-	default:
-		return 1;
-	}
-
-	/* get other slot */
-	devfn = socket->dev->devfn & ~0x07;
-	func = pci_get_slot(socket->dev->bus,
-	                    (socket->dev->devfn & 0x07) ? devfn : devfn | 0x01);
-	if (!func)
-		return 1;
-
-	/*
-	 * check that the device id of both slots match. this is needed for the
-	 * XX21 and the XX11 controller that share the same device id for single
-	 * and dual slot controllers. return '2nd slot empty'. we already checked
-	 * if the interrupt is tied to another function.
-	 */
-	if (socket->dev->device != func->device)
-		goto out;
-
-	slot2 = pci_get_drvdata(func);
-	if (!slot2)
-		goto out;
-
-	/* check state */
-	yenta_get_status(&slot2->socket, &state);
-	if (state & SS_DETECT) {
-		ret = 0;
-		goto out;
-	}
-
-out:
-	pci_dev_put(func);
-	return ret;
-}
-
-/*
- * TI specifiy parts for the power hook.
- *
- * some TI's with some CB's produces interrupt storm on power on. it has been
- * seen with atheros wlan cards on TI1225 and TI1410. solution is simply to
- * disable any CB interrupts during this time.
- */
-static int ti12xx_power_hook(struct pcmcia_socket *sock, int operation)
-{
-	struct yenta_socket *socket = container_of(sock, struct yenta_socket, socket);
-	u32 mfunc, devctl, sysctl;
-	u8 gpio3;
-
-	/* only POWER_PRE and POWER_POST are interesting */
-	if ((operation != HOOK_POWER_PRE) && (operation != HOOK_POWER_POST))
-		return 0;
-
-	devctl = config_readb(socket, TI113X_DEVICE_CONTROL);
-	sysctl = config_readl(socket, TI113X_SYSTEM_CONTROL);
-	mfunc = config_readl(socket, TI122X_MFUNC);
-
-	/*
-	 * all serial/tied: only disable when modparm set. always doing it
-	 * would mean a regression for working setups 'cos it disables the
-	 * interrupts for both both slots on 2-slot controllers
-	 * (and users of single slot controllers where it's save have to
-	 * live with setting the modparm, most don't have to anyway)
-	 */
-	if (((devctl & TI113X_DCR_IMODE_MASK) == TI12XX_DCR_IMODE_ALL_SERIAL) &&
-	    (pwr_irqs_off || ti12xx_2nd_slot_empty(socket))) {
-		switch (socket->dev->device) {
-		case PCI_DEVICE_ID_TI_1250:
-		case PCI_DEVICE_ID_TI_1251A:
-		case PCI_DEVICE_ID_TI_1251B:
-		case PCI_DEVICE_ID_TI_1450:
-		case PCI_DEVICE_ID_TI_1451A:
-		case PCI_DEVICE_ID_TI_4450:
-		case PCI_DEVICE_ID_TI_4451:
-			/* these chips have no IRQSER setting in MFUNC3  */
-			break;
-
-		default:
-			if (operation == HOOK_POWER_PRE)
-				mfunc = (mfunc & ~TI122X_MFUNC3_MASK);
-			else
-				mfunc = (mfunc & ~TI122X_MFUNC3_MASK) | TI122X_MFUNC3_IRQSER;
-		}
-
-		return 0;
-	}
-
-	/* do the job differently for func0/1 */
-	if ((PCI_FUNC(socket->dev->devfn) == 0) ||
-	    ((sysctl & TI122X_SCR_INTRTIE) &&
-	     (pwr_irqs_off || ti12xx_2nd_slot_empty(socket)))) {
-		/* some bridges are different */
-		switch (socket->dev->device) {
-		case PCI_DEVICE_ID_TI_1250:
-		case PCI_DEVICE_ID_TI_1251A:
-		case PCI_DEVICE_ID_TI_1251B:
-		case PCI_DEVICE_ID_TI_1450:
-			/* those oldies use gpio3 for INTA */
-			gpio3 = config_readb(socket, TI1250_GPIO3_CONTROL);
-			if (operation == HOOK_POWER_PRE)
-				gpio3 = (gpio3 & ~TI1250_GPIO_MODE_MASK) | 0x40;
-			else
-				gpio3 &= ~TI1250_GPIO_MODE_MASK;
-			config_writeb(socket, TI1250_GPIO3_CONTROL, gpio3);
-			break;
-
-		default:
-			/* all new bridges are the same */
-			if (operation == HOOK_POWER_PRE)
-				mfunc &= ~TI122X_MFUNC0_MASK;
-			else
-				mfunc |= TI122X_MFUNC0_INTA;
-			config_writel(socket, TI122X_MFUNC, mfunc);
-		}
-	} else {
-		switch (socket->dev->device) {
-		case PCI_DEVICE_ID_TI_1251A:
-		case PCI_DEVICE_ID_TI_1251B:
-		case PCI_DEVICE_ID_TI_1450:
-			/* those have INTA elsewhere and INTB in MFUNC0 */
-			if (operation == HOOK_POWER_PRE)
-				mfunc &= ~TI122X_MFUNC0_MASK;
-			else
-				mfunc |= TI125X_MFUNC0_INTB;
-			config_writel(socket, TI122X_MFUNC, mfunc);
-
-			break;
-
-		default:
-			/* all new bridges are the same */
-			if (operation == HOOK_POWER_PRE)
-				mfunc &= ~TI122X_MFUNC1_MASK;
-			else
-				mfunc |= TI122X_MFUNC1_INTB;
-			config_writel(socket, TI122X_MFUNC, mfunc);
-		}
-	}
-
-	return 0;
 }
 
 static int ti12xx_override(struct yenta_socket *socket)
@@ -846,35 +598,41 @@ static int ti12xx_override(struct yenta_socket *socket)
 	/* make sure that memory burst is active */
 	val_orig = val = config_readl(socket, TI113X_SYSTEM_CONTROL);
 	if (disable_clkrun && PCI_FUNC(socket->dev->devfn) == 0) {
-		dev_info(&socket->dev->dev, "Disabling CLKRUN feature\n");
+		printk(KERN_INFO "Yenta: Disabling CLKRUN feature\n");
 		val |= TI113X_SCR_KEEPCLK;
 	}
 	if (!(val & TI122X_SCR_MRBURSTUP)) {
-		dev_info(&socket->dev->dev,
-			 "Enabling burst memory read transactions\n");
+		printk(KERN_INFO "Yenta: Enabling burst memory read transactions\n");
 		val |= TI122X_SCR_MRBURSTUP;
 	}
 	if (val_orig != val)
 		config_writel(socket, TI113X_SYSTEM_CONTROL, val);
 
 	/*
+	 * for EnE bridges only: clear testbit TLTEnable. this makes the
+	 * RME Hammerfall DSP sound card working.
+	 */
+	if (socket->dev->vendor == PCI_VENDOR_ID_ENE) {
+		u8 test_c9 = config_readb(socket, ENE_TEST_C9);
+		test_c9 &= ~ENE_TEST_C9_TLTENABLE;
+		config_writeb(socket, ENE_TEST_C9, test_c9);
+	}
+
+	/*
 	 * Yenta expects controllers to use CSCINT to route
 	 * CSC interrupts to PCI rather than INTVAL.
 	 */
 	val = config_readb(socket, TI1250_DIAGNOSTIC);
-	dev_info(&socket->dev->dev, "Using %s to route CSC interrupts to PCI\n",
-		 (val & TI1250_DIAG_PCI_CSC) ? "CSCINT" : "INTVAL");
-	dev_info(&socket->dev->dev, "Routing CardBus interrupts to %s\n",
-		 (val & TI1250_DIAG_PCI_IREQ) ? "PCI" : "ISA");
+	printk(KERN_INFO "Yenta: Using %s to route CSC interrupts to PCI\n",
+		(val & TI1250_DIAG_PCI_CSC) ? "CSCINT" : "INTVAL");
+	printk(KERN_INFO "Yenta: Routing CardBus interrupts to %s\n",
+		(val & TI1250_DIAG_PCI_IREQ) ? "PCI" : "ISA");
 
 	/* do irqrouting, depending on function */
 	if (PCI_FUNC(socket->dev->devfn) == 0)
 		ti12xx_irqroute_func0(socket);
 	else
 		ti12xx_irqroute_func1(socket);
-
-	/* install power hook */
-	socket->socket.power_hook = ti12xx_power_hook;
 
 	return ti_override(socket);
 }
@@ -890,89 +648,15 @@ static int ti1250_override(struct yenta_socket *socket)
 		diag |= TI1250_DIAG_PCI_CSC | TI1250_DIAG_PCI_IREQ;
 
 	if (diag != old) {
-		dev_info(&socket->dev->dev,
-			 "adjusting diagnostic: %02x -> %02x\n",
-			 old, diag);
+		printk(KERN_INFO "Yenta: adjusting diagnostic: %02x -> %02x\n",
+			old, diag);
 		config_writeb(socket, TI1250_DIAGNOSTIC, diag);
 	}
 
 	return ti12xx_override(socket);
 }
 
-
-/**
- * EnE specific part. EnE bridges are register compatible with TI bridges but
- * have their own test registers and more important their own little problems.
- * Some fixup code to make everybody happy (TM).
- */
-
-#ifdef CONFIG_YENTA_ENE_TUNE
-/*
- * set/clear various test bits:
- * Defaults to clear the bit.
- * - mask (u8) defines what bits to change
- * - bits (u8) is the values to change them to
- * -> it's
- * 	current = (current & ~mask) | bits
- */
-/* pci ids of devices that wants to have the bit set */
-#define DEVID(_vend,_dev,_subvend,_subdev,mask,bits) {		\
-		.vendor		= _vend,			\
-		.device		= _dev,				\
-		.subvendor	= _subvend,			\
-		.subdevice	= _subdev,			\
-		.driver_data	= ((mask) << 8 | (bits)),	\
-	}
-static struct pci_device_id ene_tune_tbl[] = {
-	/* Echo Audio products based on motorola DSP56301 and DSP56361 */
-	DEVID(PCI_VENDOR_ID_MOTOROLA, 0x1801, 0xECC0, PCI_ANY_ID,
-		ENE_TEST_C9_TLTENABLE | ENE_TEST_C9_PFENABLE, ENE_TEST_C9_TLTENABLE),
-	DEVID(PCI_VENDOR_ID_MOTOROLA, 0x3410, 0xECC0, PCI_ANY_ID,
-		ENE_TEST_C9_TLTENABLE | ENE_TEST_C9_PFENABLE, ENE_TEST_C9_TLTENABLE),
-
-	{}
-};
-
-static void ene_tune_bridge(struct pcmcia_socket *sock, struct pci_bus *bus)
-{
-	struct yenta_socket *socket = container_of(sock, struct yenta_socket, socket);
-	struct pci_dev *dev;
-	struct pci_device_id *id = NULL;
-	u8 test_c9, old_c9, mask, bits;
-
-	list_for_each_entry(dev, &bus->devices, bus_list) {
-		id = (struct pci_device_id *) pci_match_id(ene_tune_tbl, dev);
-		if (id)
-			break;
-	}
-
-	test_c9 = old_c9 = config_readb(socket, ENE_TEST_C9);
-	if (id) {
-		mask = (id->driver_data >> 8) & 0xFF;
-		bits = id->driver_data & 0xFF;
-
-		test_c9 = (test_c9 & ~mask) | bits;
-	}
-	else
-		/* default to clear TLTEnable bit, old behaviour */
-		test_c9 &= ~ENE_TEST_C9_TLTENABLE;
-
-	dev_info(&socket->dev->dev,
-		 "EnE: changing testregister 0xC9, %02x -> %02x\n",
-		 old_c9, test_c9);
-	config_writeb(socket, ENE_TEST_C9, test_c9);
-}
-
-static int ene_override(struct yenta_socket *socket)
-{
-	/* install tune_bridge() function */
-	socket->socket.tune_bridge = ene_tune_bridge;
-
-	return ti1250_override(socket);
-}
-#else
-#  define ene_override ti1250_override
-#endif /* !CONFIG_YENTA_ENE_TUNE */
+#endif /* CONFIG_CARDBUS */
 
 #endif /* _LINUX_TI113X_H */
 

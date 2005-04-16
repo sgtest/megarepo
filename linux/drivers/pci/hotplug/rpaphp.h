@@ -1,10 +1,24 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * PCI Hot Plug Controller Driver for RPA-compliant PPC64 platform.
  *
  * Copyright (C) 2003 Linda Xie <lxie@us.ibm.com>
  *
  * All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or (at
+ * your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE, GOOD TITLE or
+ * NON INFRINGEMENT.  See the GNU General Public License for more
+ * details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  *
  * Send feedback to <lxie@us.ibm.com>,
  *
@@ -14,7 +28,11 @@
 #define _PPC64PHP_H
 
 #include <linux/pci.h>
-#include <linux/pci_hotplug.h>
+#include "pci_hotplug.h"
+
+#define	PHB     2
+#define	HOTPLUG	1
+#define	EMBEDDED 0
 
 #define DR_INDICATOR 9002
 #define DR_ENTITY_SENSE 9003
@@ -32,16 +50,20 @@
 #define PRESENT         1	/* Card in slot */
 
 #define MY_NAME "rpaphp"
-extern bool rpaphp_debug;
+extern int debug;
 #define dbg(format, arg...)					\
 	do {							\
-		if (rpaphp_debug)				\
+		if (debug)					\
 			printk(KERN_DEBUG "%s: " format,	\
-				MY_NAME, ## arg);		\
+				MY_NAME , ## arg); 		\
 	} while (0)
-#define err(format, arg...) printk(KERN_ERR "%s: " format, MY_NAME, ## arg)
-#define info(format, arg...) printk(KERN_INFO "%s: " format, MY_NAME, ## arg)
-#define warn(format, arg...) printk(KERN_WARNING "%s: " format, MY_NAME, ## arg)
+#define err(format, arg...) printk(KERN_ERR "%s: " format, MY_NAME , ## arg)
+#define info(format, arg...) printk(KERN_INFO "%s: " format, MY_NAME , ## arg)
+#define warn(format, arg...) printk(KERN_WARNING "%s: " format, MY_NAME , ## arg)
+
+/* slot types */
+#define VIO_DEV	1
+#define PCI_DEV	2
 
 /* slot states */
 
@@ -50,9 +72,10 @@ extern bool rpaphp_debug;
 #define	CONFIGURED	1
 #define	EMPTY		0
 
-/* DRC constants */
-
-#define MAX_DRC_NAME_LEN 64
+struct rpaphp_pci_func {
+	struct pci_dev *pci_dev;
+	struct list_head sibling;
+};
 
 /*
  * struct slot - slot information for each *physical* slot
@@ -63,37 +86,53 @@ struct slot {
 	u32 index;
 	u32 type;
 	u32 power_domain;
-	u8 attention_status;
 	char *name;
-	struct device_node *dn;
-	struct pci_bus *bus;
-	struct list_head *pci_devs;
-	struct hotplug_slot hotplug_slot;
+	char *location;
+	u8 removable;
+	u8 dev_type;		/* VIO or PCI */
+	struct device_node *dn;	/* slot's device_node in OFDT */
+				/* dn has phb info */
+	struct pci_dev *bridge;	/* slot's pci_dev in pci_devices */
+	union {
+		struct list_head *pci_devs; /* pci_devs in PCI slot */
+		struct vio_dev *vio_dev; /* vio_dev in VIO slot */
+	} dev;
+	struct hotplug_slot *hotplug_slot;
 };
 
-extern const struct hotplug_slot_ops rpaphp_hotplug_slot_ops;
+extern struct hotplug_slot_ops rpaphp_hotplug_slot_ops;
 extern struct list_head rpaphp_slot_head;
-
-static inline struct slot *to_slot(struct hotplug_slot *hotplug_slot)
-{
-	return container_of(hotplug_slot, struct slot, hotplug_slot);
-}
+extern int num_slots;
 
 /* function prototypes */
 
 /* rpaphp_pci.c */
-int rpaphp_enable_slot(struct slot *slot);
-int rpaphp_get_sensor_state(struct slot *slot, int *state);
+extern struct pci_dev *rpaphp_find_pci_dev(struct device_node *dn);
+extern int rpaphp_claim_resource(struct pci_dev *dev, int resource);
+extern int rpaphp_enable_pci_slot(struct slot *slot);
+extern int register_pci_slot(struct slot *slot);
+extern int rpaphp_unconfig_pci_adapter(struct slot *slot);
+extern int rpaphp_get_pci_adapter_status(struct slot *slot, int is_init, u8 * value);
+extern struct hotplug_slot *rpaphp_find_hotplug_slot(struct pci_dev *dev);
 
 /* rpaphp_core.c */
-int rpaphp_add_slot(struct device_node *dn);
-int rpaphp_check_drc_props(struct device_node *dn, char *drc_name,
-		char *drc_type);
+extern int rpaphp_add_slot(struct device_node *dn);
+extern int rpaphp_remove_slot(struct slot *slot);
+extern int rpaphp_get_drc_props(struct device_node *dn, int *drc_index,
+		char **drc_name, char **drc_type, int *drc_power_domain);
+
+/* rpaphp_vio.c */
+extern int rpaphp_get_vio_adapter_status(struct slot *slot, int is_init, u8 * value);
+extern int rpaphp_unconfig_vio_adapter(struct slot *slot);
+extern int register_vio_slot(struct device_node *dn);
+extern int rpaphp_enable_vio_slot(struct slot *slot);
 
 /* rpaphp_slot.c */
-void dealloc_slot_struct(struct slot *slot);
-struct slot *alloc_slot_struct(struct device_node *dn, int drc_index, char *drc_name, int power_domain);
-int rpaphp_register_slot(struct slot *slot);
-int rpaphp_deregister_slot(struct slot *slot);
-
+extern void dealloc_slot_struct(struct slot *slot);
+extern struct slot *alloc_slot_struct(struct device_node *dn, int drc_index, char *drc_name, int power_domain);
+extern int register_slot(struct slot *slot);
+extern int deregister_slot(struct slot *slot);
+extern int rpaphp_get_power_status(struct slot *slot, u8 * value);
+extern int rpaphp_set_attention_status(struct slot *slot, u8 status);
+	
 #endif				/* _PPC64PHP_H */

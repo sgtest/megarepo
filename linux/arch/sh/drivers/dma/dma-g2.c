@@ -1,18 +1,21 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * arch/sh/drivers/dma/dma-g2.c
  *
  * G2 bus DMA support
  *
- * Copyright (C) 2003 - 2006  Paul Mundt
+ * Copyright (C) 2003, 2004  Paul Mundt
+ *
+ * This file is subject to the terms and conditions of the GNU General Public
+ * License.  See the file "COPYING" in the main directory of this archive
+ * for more details.
  */
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/interrupt.h>
-#include <asm/cacheflush.h>
-#include <mach/sysasic.h>
-#include <mach/dma.h>
+
+#include <asm/mach/sysasic.h>
+#include <asm/mach/dma.h>
 #include <asm/dma.h>
 
 struct g2_channel {
@@ -44,31 +47,17 @@ struct g2_dma_info {
 
 static volatile struct g2_dma_info *g2_dma = (volatile struct g2_dma_info *)0xa05f7800;
 
-#define g2_bytes_remaining(i) \
-	((g2_dma->channel[i].size - \
-	  g2_dma->status[i].size) & 0x0fffffff)
-
-static irqreturn_t g2_dma_interrupt(int irq, void *dev_id)
+static irqreturn_t g2_dma_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 {
-	int i;
-
-	for (i = 0; i < G2_NR_DMA_CHANNELS; i++) {
-		if (g2_dma->status[i].status & 0x20000000) {
-			unsigned int bytes = g2_bytes_remaining(i);
-
-			if (likely(bytes == 0)) {
-				struct dma_info *info = dev_id;
-				struct dma_channel *chan = info->channels + i;
-
-				wake_up(&chan->wait_queue);
-
-				return IRQ_HANDLED;
-			}
-		}
-	}
-
-	return IRQ_NONE;
+	/* FIXME: Do some meaningful completion work here.. */
+	return IRQ_HANDLED;
 }
+
+static struct irqaction g2_dma_irq = {
+	.name		= "g2 DMA handler",
+	.handler	= g2_dma_interrupt,
+	.flags		= SA_INTERRUPT,
+};
 
 static int g2_enable_dma(struct dma_channel *chan)
 {
@@ -146,18 +135,12 @@ static int g2_xfer_dma(struct dma_channel *chan)
 	return 0;
 }
 
-static int g2_get_residue(struct dma_channel *chan)
-{
-	return g2_bytes_remaining(chan->chan);
-}
-
 static struct dma_ops g2_dma_ops = {
 	.xfer		= g2_xfer_dma,
-	.get_residue	= g2_get_residue,
 };
 
 static struct dma_info g2_dma_info = {
-	.name		= "g2_dmac",
+	.name		= "G2 DMA",
 	.nr_channels	= 4,
 	.ops		= &g2_dma_ops,
 	.flags		= DMAC_CHANNELS_TEI_CAPABLE,
@@ -165,28 +148,18 @@ static struct dma_info g2_dma_info = {
 
 static int __init g2_dma_init(void)
 {
-	int ret;
-
-	ret = request_irq(HW_EVENT_G2_DMA, g2_dma_interrupt, 0,
-			  "g2 DMA handler", &g2_dma_info);
-	if (unlikely(ret))
-		return -EINVAL;
+	setup_irq(HW_EVENT_G2_DMA, &g2_dma_irq);
 
 	/* Magic */
 	g2_dma->wait_state	= 27;
 	g2_dma->magic		= 0x4659404f;
 
-	ret = register_dmac(&g2_dma_info);
-	if (unlikely(ret != 0))
-		free_irq(HW_EVENT_G2_DMA, &g2_dma_info);
-
-	return ret;
+	return register_dmac(&g2_dma_info);
 }
 
 static void __exit g2_dma_exit(void)
 {
-	free_irq(HW_EVENT_G2_DMA, &g2_dma_info);
-	unregister_dmac(&g2_dma_info);
+	free_irq(HW_EVENT_G2_DMA, 0);
 }
 
 subsys_initcall(g2_dma_init);
@@ -194,4 +167,5 @@ module_exit(g2_dma_exit);
 
 MODULE_AUTHOR("Paul Mundt <lethal@linux-sh.org>");
 MODULE_DESCRIPTION("G2 bus DMA driver");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
+

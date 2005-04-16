@@ -1,5 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
-/* SCTP kernel implementation
+/* SCTP kernel reference Implementation
  * Copyright (c) 1999-2000 Cisco, Inc.
  * Copyright (c) 1999-2001 Motorola, Inc.
  * Copyright (c) 2001-2002 International Business Machines, Corp.
@@ -7,13 +6,37 @@
  * Copyright (c) 2001 Nokia, Inc.
  * Copyright (c) 2001 La Monte H.P. Yarroll
  *
- * This file is part of the SCTP kernel implementation
+ * This file is part of the SCTP kernel reference Implementation
  *
  * This abstraction represents an SCTP endpoint.
  *
+ * This file is part of the implementation of the add-IP extension,
+ * based on <draft-ietf-tsvwg-addip-sctp-02.txt> June 29, 2001,
+ * for the SCTP kernel reference Implementation.
+ *
+ * The SCTP reference implementation is free software;
+ * you can redistribute it and/or modify it under the terms of
+ * the GNU General Public License as published by
+ * the Free Software Foundation; either version 2, or (at your option)
+ * any later version.
+ *
+ * The SCTP reference implementation is distributed in the hope that it
+ * will be useful, but WITHOUT ANY WARRANTY; without even the implied
+ *                 ************************
+ * warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with GNU CC; see the file COPYING.  If not, write to
+ * the Free Software Foundation, 59 Temple Place - Suite 330,
+ * Boston, MA 02111-1307, USA.
+ *
  * Please send any bug reports or fixes you make to the
  * email address(es):
- *    lksctp developers <linux-sctp@vger.kernel.org>
+ *    lksctp developers <lksctp-developers@lists.sourceforge.net>
+ *
+ * Or submit a bug report through the following website:
+ *    http://www.sf.net/projects/lksctp
  *
  * Written or modified by:
  *    La Monte H.P. Yarroll <piggy@acm.org>
@@ -21,123 +44,113 @@
  *    Jon Grimm <jgrimm@austin.ibm.com>
  *    Daisy Chang <daisyc@us.ibm.com>
  *    Dajiang Zhang <dajiang.zhang@nokia.com>
+ *
+ * Any bugs reported given to us we will try to fix... any fixes shared will
+ * be incorporated into the next SCTP release.
  */
 
 #include <linux/types.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/in.h>
 #include <linux/random.h>	/* get_random_bytes() */
+#include <linux/crypto.h>
 #include <net/sock.h>
 #include <net/ipv6.h>
 #include <net/sctp/sctp.h>
 #include <net/sctp/sm.h>
 
 /* Forward declarations for internal helpers. */
-static void sctp_endpoint_bh_rcv(struct work_struct *work);
+static void sctp_endpoint_bh_rcv(struct sctp_endpoint *ep);
 
 /*
  * Initialize the base fields of the endpoint structure.
  */
 static struct sctp_endpoint *sctp_endpoint_init(struct sctp_endpoint *ep,
-						struct sock *sk,
-						gfp_t gfp)
+						struct sock *sk, int gfp)
 {
-	struct net *net = sock_net(sk);
-	struct sctp_shared_key *null_key;
-
-	ep->digest = kzalloc(SCTP_SIGNATURE_SIZE, gfp);
-	if (!ep->digest)
-		return NULL;
-
-	ep->asconf_enable = net->sctp.addip_enable;
-	ep->auth_enable = net->sctp.auth_enable;
-	if (ep->auth_enable) {
-		if (sctp_auth_init(ep, gfp))
-			goto nomem;
-		if (ep->asconf_enable) {
-			sctp_auth_ep_add_chunkid(ep, SCTP_CID_ASCONF);
-			sctp_auth_ep_add_chunkid(ep, SCTP_CID_ASCONF_ACK);
-		}
-	}
+	struct sctp_sock *sp = sctp_sk(sk);
+	memset(ep, 0, sizeof(struct sctp_endpoint));
 
 	/* Initialize the base structure. */
 	/* What type of endpoint are we?  */
 	ep->base.type = SCTP_EP_TYPE_SOCKET;
 
 	/* Initialize the basic object fields. */
-	refcount_set(&ep->base.refcnt, 1);
-	ep->base.dead = false;
+	atomic_set(&ep->base.refcnt, 1);
+	ep->base.dead = 0;
+	ep->base.malloced = 1;
 
 	/* Create an input queue.  */
 	sctp_inq_init(&ep->base.inqueue);
 
 	/* Set its top-half handler */
-	sctp_inq_set_th_handler(&ep->base.inqueue, sctp_endpoint_bh_rcv);
+	sctp_inq_set_th_handler(&ep->base.inqueue,
+				(void (*)(void *))sctp_endpoint_bh_rcv, ep);
 
 	/* Initialize the bind addr area */
 	sctp_bind_addr_init(&ep->base.bind_addr, 0);
+	rwlock_init(&ep->base.addr_lock);
+
+	/* Remember who we are attached to.  */
+	ep->base.sk = sk;
+	sock_hold(ep->base.sk);
 
 	/* Create the lists of associations.  */
 	INIT_LIST_HEAD(&ep->asocs);
 
-	/* Use SCTP specific send buffer space queues.  */
-	ep->sndbuf_policy = net->sctp.sndbuf_policy;
+	/* Set up the base timeout information.  */
+	ep->timeouts[SCTP_EVENT_TIMEOUT_NONE] = 0;
+	ep->timeouts[SCTP_EVENT_TIMEOUT_T1_COOKIE] =
+		SCTP_DEFAULT_TIMEOUT_T1_COOKIE;
+	ep->timeouts[SCTP_EVENT_TIMEOUT_T1_INIT] =
+		SCTP_DEFAULT_TIMEOUT_T1_INIT;
+	ep->timeouts[SCTP_EVENT_TIMEOUT_T2_SHUTDOWN] =
+		msecs_to_jiffies(sp->rtoinfo.srto_initial);
+	ep->timeouts[SCTP_EVENT_TIMEOUT_T3_RTX] = 0;
+	ep->timeouts[SCTP_EVENT_TIMEOUT_T4_RTO] = 0;
 
-	sk->sk_data_ready = sctp_data_ready;
+	/* sctpimpguide-05 Section 2.12.2
+	 * If the 'T5-shutdown-guard' timer is used, it SHOULD be set to the
+	 * recommended value of 5 times 'RTO.Max'.
+	 */
+        ep->timeouts[SCTP_EVENT_TIMEOUT_T5_SHUTDOWN_GUARD]
+		= 5 * msecs_to_jiffies(sp->rtoinfo.srto_max);
+
+	ep->timeouts[SCTP_EVENT_TIMEOUT_HEARTBEAT] =
+		SCTP_DEFAULT_TIMEOUT_HEARTBEAT;
+	ep->timeouts[SCTP_EVENT_TIMEOUT_SACK] =
+		SCTP_DEFAULT_TIMEOUT_SACK;
+	ep->timeouts[SCTP_EVENT_TIMEOUT_AUTOCLOSE] =
+		sp->autoclose * HZ;
+
+	/* Use SCTP specific send buffer space queues.  */
 	sk->sk_write_space = sctp_write_space;
 	sock_set_flag(sk, SOCK_USE_WRITE_QUEUE);
 
-	/* Get the receive buffer policy for this endpoint */
-	ep->rcvbuf_policy = net->sctp.rcvbuf_policy;
-
 	/* Initialize the secret key used with cookie. */
-	get_random_bytes(ep->secret_key, sizeof(ep->secret_key));
+	get_random_bytes(&ep->secret_key[0], SCTP_SECRET_SIZE);
+	ep->last_key = ep->current_key = 0;
+	ep->key_changed_at = jiffies;
 
-	/* SCTP-AUTH extensions*/
-	INIT_LIST_HEAD(&ep->endpoint_shared_keys);
-	null_key = sctp_auth_shkey_create(0, gfp);
-	if (!null_key)
-		goto nomem_shkey;
-
-	list_add(&null_key->key_list, &ep->endpoint_shared_keys);
-
-	/* Add the null key to the endpoint shared keys list and
-	 * set the hmcas and chunks pointers.
-	 */
-	ep->prsctp_enable = net->sctp.prsctp_enable;
-	ep->reconf_enable = net->sctp.reconf_enable;
-	ep->ecn_enable = net->sctp.ecn_enable;
-
-	/* Remember who we are attached to.  */
-	ep->base.sk = sk;
-	ep->base.net = sock_net(sk);
-	sock_hold(ep->base.sk);
-
+	ep->debug_name = "unnamedEndpoint";
 	return ep;
-
-nomem_shkey:
-	sctp_auth_free(ep);
-nomem:
-	kfree(ep->digest);
-	return NULL;
-
 }
 
 /* Create a sctp_endpoint with all that boring stuff initialized.
  * Returns NULL if there isn't enough memory.
  */
-struct sctp_endpoint *sctp_endpoint_new(struct sock *sk, gfp_t gfp)
+struct sctp_endpoint *sctp_endpoint_new(struct sock *sk, int gfp)
 {
 	struct sctp_endpoint *ep;
 
 	/* Build a local endpoint. */
-	ep = kzalloc(sizeof(*ep), gfp);
+	ep = t_new(struct sctp_endpoint, gfp);
 	if (!ep)
 		goto fail;
-
 	if (!sctp_endpoint_init(ep, sk, gfp))
 		goto fail_init;
-
+	ep->base.malloced = 1;
 	SCTP_DBG_OBJCNT_INC(ep);
 	return ep;
 
@@ -153,19 +166,12 @@ void sctp_endpoint_add_asoc(struct sctp_endpoint *ep,
 {
 	struct sock *sk = ep->base.sk;
 
-	/* If this is a temporary association, don't bother
-	 * since we'll be removing it shortly and don't
-	 * want anyone to find it anyway.
-	 */
-	if (asoc->temp)
-		return;
-
 	/* Now just add it to our list of asocs */
 	list_add_tail(&asoc->asocs, &ep->asocs);
 
 	/* Increment the backlog value for a TCP-style listening socket. */
 	if (sctp_style(sk, TCP) && sctp_sstate(sk, LISTENING))
-		sk_acceptq_added(sk);
+		sk->sk_ack_backlog++;
 }
 
 /* Free the endpoint structure.  Delay cleanup until
@@ -173,65 +179,47 @@ void sctp_endpoint_add_asoc(struct sctp_endpoint *ep,
  */
 void sctp_endpoint_free(struct sctp_endpoint *ep)
 {
-	ep->base.dead = true;
-
-	inet_sk_set_state(ep->base.sk, SCTP_SS_CLOSED);
-
-	/* Unlink this endpoint, so we can't find it again! */
-	sctp_unhash_endpoint(ep);
-
+	ep->base.dead = 1;
 	sctp_endpoint_put(ep);
 }
 
 /* Final destructor for endpoint.  */
-static void sctp_endpoint_destroy_rcu(struct rcu_head *head)
-{
-	struct sctp_endpoint *ep = container_of(head, struct sctp_endpoint, rcu);
-	struct sock *sk = ep->base.sk;
-
-	sctp_sk(sk)->ep = NULL;
-	sock_put(sk);
-
-	kfree(ep);
-	SCTP_DBG_OBJCNT_DEC(ep);
-}
-
 static void sctp_endpoint_destroy(struct sctp_endpoint *ep)
 {
-	struct sock *sk;
+	SCTP_ASSERT(ep->base.dead, "Endpoint is not dead", return);
 
-	if (unlikely(!ep->base.dead)) {
-		WARN(1, "Attempt to destroy undead endpoint %p!\n", ep);
-		return;
-	}
+	ep->base.sk->sk_state = SCTP_SS_CLOSED;
 
-	/* Free the digest buffer */
-	kfree(ep->digest);
+	/* Unlink this endpoint, so we can't find it again! */
+	sctp_unhash_endpoint(ep);
 
-	/* SCTP-AUTH: Free up AUTH releated data such as shared keys
-	 * chunks and hmacs arrays that were allocated
-	 */
-	sctp_auth_destroy_keys(&ep->endpoint_shared_keys);
-	sctp_auth_free(ep);
+	/* Free up the HMAC transform. */
+	if (sctp_sk(ep->base.sk)->hmac)
+		sctp_crypto_free_tfm(sctp_sk(ep->base.sk)->hmac);
 
 	/* Cleanup. */
 	sctp_inq_free(&ep->base.inqueue);
 	sctp_bind_addr_free(&ep->base.bind_addr);
 
-	memset(ep->secret_key, 0, sizeof(ep->secret_key));
-
-	sk = ep->base.sk;
 	/* Remove and free the port */
-	if (sctp_sk(sk)->bind_hash)
-		sctp_put_port(sk);
+	if (sctp_sk(ep->base.sk)->bind_hash)
+		sctp_put_port(ep->base.sk);
 
-	call_rcu(&ep->rcu, sctp_endpoint_destroy_rcu);
+	/* Give up our hold on the sock. */
+	if (ep->base.sk)
+		sock_put(ep->base.sk);
+
+	/* Finally, free up our memory. */
+	if (ep->base.malloced) {
+		kfree(ep);
+		SCTP_DBG_OBJCNT_DEC(ep);
+	}
 }
 
 /* Hold a reference to an endpoint. */
-int sctp_endpoint_hold(struct sctp_endpoint *ep)
+void sctp_endpoint_hold(struct sctp_endpoint *ep)
 {
-	return refcount_inc_not_zero(&ep->base.refcnt);
+	atomic_inc(&ep->base.refcnt);
 }
 
 /* Release a reference to an endpoint and clean up if there are
@@ -239,99 +227,115 @@ int sctp_endpoint_hold(struct sctp_endpoint *ep)
  */
 void sctp_endpoint_put(struct sctp_endpoint *ep)
 {
-	if (refcount_dec_and_test(&ep->base.refcnt))
+	if (atomic_dec_and_test(&ep->base.refcnt))
 		sctp_endpoint_destroy(ep);
 }
 
 /* Is this the endpoint we are looking for?  */
 struct sctp_endpoint *sctp_endpoint_is_match(struct sctp_endpoint *ep,
-					       struct net *net,
 					       const union sctp_addr *laddr)
 {
-	struct sctp_endpoint *retval = NULL;
+	struct sctp_endpoint *retval;
 
-	if ((htons(ep->base.bind_addr.port) == laddr->v4.sin_port) &&
-	    net_eq(ep->base.net, net)) {
+	sctp_read_lock(&ep->base.addr_lock);
+	if (ep->base.bind_addr.port == laddr->v4.sin_port) {
 		if (sctp_bind_addr_match(&ep->base.bind_addr, laddr,
-					 sctp_sk(ep->base.sk)))
+					 sctp_sk(ep->base.sk))) {
 			retval = ep;
+			goto out;
+		}
 	}
 
+	retval = NULL;
+
+out:
+	sctp_read_unlock(&ep->base.addr_lock);
 	return retval;
 }
 
 /* Find the association that goes with this chunk.
- * We lookup the transport from hashtable at first, then get association
- * through t->assoc.
+ * We do a linear search of the associations for this endpoint.
+ * We return the matching transport address too.
  */
+static struct sctp_association *__sctp_endpoint_lookup_assoc(
+	const struct sctp_endpoint *ep,
+	const union sctp_addr *paddr,
+	struct sctp_transport **transport)
+{
+	int rport;
+	struct sctp_association *asoc;
+	struct list_head *pos;
+
+	rport = paddr->v4.sin_port;
+
+	list_for_each(pos, &ep->asocs) {
+		asoc = list_entry(pos, struct sctp_association, asocs);
+		if (rport == asoc->peer.port) {
+			sctp_read_lock(&asoc->base.addr_lock);
+			*transport = sctp_assoc_lookup_paddr(asoc, paddr);
+			sctp_read_unlock(&asoc->base.addr_lock);
+
+			if (*transport)
+				return asoc;
+		}
+	}
+
+	*transport = NULL;
+	return NULL;
+}
+
+/* Lookup association on an endpoint based on a peer address.  BH-safe.  */
 struct sctp_association *sctp_endpoint_lookup_assoc(
 	const struct sctp_endpoint *ep,
 	const union sctp_addr *paddr,
 	struct sctp_transport **transport)
 {
-	struct sctp_association *asoc = NULL;
-	struct sctp_transport *t;
+	struct sctp_association *asoc;
 
-	*transport = NULL;
+	sctp_local_bh_disable();
+	asoc = __sctp_endpoint_lookup_assoc(ep, paddr, transport);
+	sctp_local_bh_enable();
 
-	/* If the local port is not set, there can't be any associations
-	 * on this endpoint.
-	 */
-	if (!ep->base.bind_addr.port)
-		return NULL;
-
-	rcu_read_lock();
-	t = sctp_epaddr_lookup_transport(ep, paddr);
-	if (!t)
-		goto out;
-
-	*transport = t;
-	asoc = t->asoc;
-out:
-	rcu_read_unlock();
 	return asoc;
 }
 
 /* Look for any peeled off association from the endpoint that matches the
  * given peer address.
  */
-bool sctp_endpoint_is_peeled_off(struct sctp_endpoint *ep,
-				 const union sctp_addr *paddr)
+int sctp_endpoint_is_peeled_off(struct sctp_endpoint *ep,
+				const union sctp_addr *paddr)
 {
+	struct list_head *pos;
 	struct sctp_sockaddr_entry *addr;
-	struct net *net = ep->base.net;
 	struct sctp_bind_addr *bp;
 
+	sctp_read_lock(&ep->base.addr_lock);
 	bp = &ep->base.bind_addr;
-	/* This function is called with the socket lock held,
-	 * so the address_list can not change.
-	 */
-	list_for_each_entry(addr, &bp->address_list, list) {
-		if (sctp_has_association(net, &addr->a, paddr))
-			return true;
+	list_for_each(pos, &bp->address_list) {
+		addr = list_entry(pos, struct sctp_sockaddr_entry, list);
+		if (sctp_has_association(&addr->a, paddr)) {
+			sctp_read_unlock(&ep->base.addr_lock);
+			return 1;
+		}
 	}
+	sctp_read_unlock(&ep->base.addr_lock);
 
-	return false;
+	return 0;
 }
 
 /* Do delayed input processing.  This is scheduled by sctp_rcv().
  * This may be called on BH or task time.
  */
-static void sctp_endpoint_bh_rcv(struct work_struct *work)
+static void sctp_endpoint_bh_rcv(struct sctp_endpoint *ep)
 {
-	struct sctp_endpoint *ep =
-		container_of(work, struct sctp_endpoint,
-			     base.inqueue.immediate);
 	struct sctp_association *asoc;
 	struct sock *sk;
-	struct net *net;
 	struct sctp_transport *transport;
 	struct sctp_chunk *chunk;
 	struct sctp_inq *inqueue;
-	union sctp_subtype subtype;
-	enum sctp_state state;
+	sctp_subtype_t subtype;
+	sctp_state_t state;
 	int error = 0;
-	int first_time = 1;	/* is this the first time through the loop */
 
 	if (ep->base.dead)
 		return;
@@ -339,34 +343,10 @@ static void sctp_endpoint_bh_rcv(struct work_struct *work)
 	asoc = NULL;
 	inqueue = &ep->base.inqueue;
 	sk = ep->base.sk;
-	net = sock_net(sk);
 
 	while (NULL != (chunk = sctp_inq_pop(inqueue))) {
 		subtype = SCTP_ST_CHUNK(chunk->chunk_hdr->type);
 
-		/* If the first chunk in the packet is AUTH, do special
-		 * processing specified in Section 6.3 of SCTP-AUTH spec
-		 */
-		if (first_time && (subtype.chunk == SCTP_CID_AUTH)) {
-			struct sctp_chunkhdr *next_hdr;
-
-			next_hdr = sctp_inq_peek(inqueue);
-			if (!next_hdr)
-				goto normal;
-
-			/* If the next chunk is COOKIE-ECHO, skip the AUTH
-			 * chunk while saving a pointer to it so we can do
-			 * Authentication later (during cookie-echo
-			 * processing).
-			 */
-			if (next_hdr->type == SCTP_CID_COOKIE_ECHO) {
-				chunk->auth_chunk = skb_clone(chunk->skb,
-								GFP_ATOMIC);
-				chunk->auth = 1;
-				continue;
-			}
-		}
-normal:
 		/* We might have grown an association since last we
 		 * looked, so try again.
 		 *
@@ -382,25 +362,20 @@ normal:
 		}
 
 		state = asoc ? asoc->state : SCTP_STATE_CLOSED;
-		if (sctp_auth_recv_cid(subtype.chunk, asoc) && !chunk->auth)
-			continue;
 
 		/* Remember where the last DATA chunk came from so we
 		 * know where to send the SACK.
 		 */
 		if (asoc && sctp_chunk_is_data(chunk))
 			asoc->peer.last_data_from = chunk->transport;
-		else {
-			SCTP_INC_STATS(ep->base.net, SCTP_MIB_INCTRLCHUNKS);
-			if (asoc)
-				asoc->stats.ictrlchunks++;
-		}
+		else
+			SCTP_INC_STATS(SCTP_MIB_INCTRLCHUNKS);
 
 		if (chunk->transport)
-			chunk->transport->last_time_heard = ktime_get();
+			chunk->transport->last_time_heard = jiffies;
 
-		error = sctp_do_sm(net, SCTP_EVENT_T_CHUNK, subtype, state,
-				   ep, asoc, chunk, GFP_ATOMIC);
+		error = sctp_do_sm(SCTP_EVENT_T_CHUNK, subtype, state,
+                                   ep, asoc, chunk, GFP_ATOMIC);
 
 		if (error && chunk)
 			chunk->pdiscard = 1;
@@ -410,8 +385,5 @@ normal:
 		 */
 		if (!sctp_sk(sk)->ep)
 			break;
-
-		if (first_time)
-			first_time = 0;
 	}
 }

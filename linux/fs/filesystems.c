@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *  linux/fs/filesystems.c
  *
@@ -9,14 +8,11 @@
 
 #include <linux/syscalls.h>
 #include <linux/fs.h>
-#include <linux/proc_fs.h>
-#include <linux/seq_file.h>
+#include <linux/slab.h>
 #include <linux/kmod.h>
 #include <linux/init.h>
 #include <linux/module.h>
-#include <linux/slab.h>
-#include <linux/uaccess.h>
-#include <linux/fs_parser.h>
+#include <asm/uaccess.h>
 
 /*
  * Handling of filesystem drivers list.
@@ -35,10 +31,9 @@ static struct file_system_type *file_systems;
 static DEFINE_RWLOCK(file_systems_lock);
 
 /* WARNING: This can be used only if we _already_ own a reference */
-struct file_system_type *get_filesystem(struct file_system_type *fs)
+void get_filesystem(struct file_system_type *fs)
 {
 	__module_get(fs->owner);
-	return fs;
 }
 
 void put_filesystem(struct file_system_type *fs)
@@ -46,12 +41,11 @@ void put_filesystem(struct file_system_type *fs)
 	module_put(fs->owner);
 }
 
-static struct file_system_type **find_filesystem(const char *name, unsigned len)
+static struct file_system_type **find_filesystem(const char *name)
 {
 	struct file_system_type **p;
-	for (p = &file_systems; *p; p = &(*p)->next)
-		if (strncmp((*p)->name, name, len) == 0 &&
-		    !(*p)->name[len])
+	for (p=&file_systems; *p; p=&(*p)->next)
+		if (strcmp((*p)->name,name) == 0)
 			break;
 	return p;
 }
@@ -74,15 +68,13 @@ int register_filesystem(struct file_system_type * fs)
 	int res = 0;
 	struct file_system_type ** p;
 
-	if (fs->parameters &&
-	    !fs_validate_description(fs->name, fs->parameters))
+	if (!fs)
 		return -EINVAL;
-
-	BUG_ON(strchr(fs->name, '.'));
 	if (fs->next)
 		return -EBUSY;
+	INIT_LIST_HEAD(&fs->fs_supers);
 	write_lock(&file_systems_lock);
-	p = find_filesystem(fs->name, strlen(fs->name));
+	p = find_filesystem(fs->name);
 	if (*p)
 		res = -EBUSY;
 	else
@@ -116,23 +108,20 @@ int unregister_filesystem(struct file_system_type * fs)
 			*tmp = fs->next;
 			fs->next = NULL;
 			write_unlock(&file_systems_lock);
-			synchronize_rcu();
 			return 0;
 		}
 		tmp = &(*tmp)->next;
 	}
 	write_unlock(&file_systems_lock);
-
 	return -EINVAL;
 }
 
 EXPORT_SYMBOL(unregister_filesystem);
 
-#ifdef CONFIG_SYSFS_SYSCALL
 static int fs_index(const char __user * __name)
 {
 	struct file_system_type * tmp;
-	struct filename *name;
+	char * name;
 	int err, index;
 
 	name = getname(__name);
@@ -143,7 +132,7 @@ static int fs_index(const char __user * __name)
 	err = -EINVAL;
 	read_lock(&file_systems_lock);
 	for (tmp=file_systems, index=0 ; tmp ; tmp=tmp->next, index++) {
-		if (strcmp(tmp->name, name->name) == 0) {
+		if (strcmp(tmp->name,name) == 0) {
 			err = index;
 			break;
 		}
@@ -188,7 +177,7 @@ static int fs_maxindex(void)
 /*
  * Whee.. Weird sysv syscall. 
  */
-SYSCALL_DEFINE3(sysfs, int, option, unsigned long, arg1, unsigned long, arg2)
+asmlinkage long sys_sysfs(int option, unsigned long arg1, unsigned long arg2)
 {
 	int retval = -EINVAL;
 
@@ -207,86 +196,39 @@ SYSCALL_DEFINE3(sysfs, int, option, unsigned long, arg1, unsigned long, arg2)
 	}
 	return retval;
 }
-#endif
 
-int __init list_bdev_fs_names(char *buf, size_t size)
+int get_filesystem_list(char * buf)
 {
-	struct file_system_type *p;
-	size_t len;
-	int count = 0;
-
-	read_lock(&file_systems_lock);
-	for (p = file_systems; p; p = p->next) {
-		if (!(p->fs_flags & FS_REQUIRES_DEV))
-			continue;
-		len = strlen(p->name) + 1;
-		if (len > size) {
-			pr_warn("%s: truncating file system list\n", __func__);
-			break;
-		}
-		memcpy(buf, p->name, len);
-		buf += len;
-		size -= len;
-		count++;
-	}
-	read_unlock(&file_systems_lock);
-	return count;
-}
-
-#ifdef CONFIG_PROC_FS
-static int filesystems_proc_show(struct seq_file *m, void *v)
-{
+	int len = 0;
 	struct file_system_type * tmp;
 
 	read_lock(&file_systems_lock);
 	tmp = file_systems;
-	while (tmp) {
-		seq_printf(m, "%s\t%s\n",
+	while (tmp && len < PAGE_SIZE - 80) {
+		len += sprintf(buf+len, "%s\t%s\n",
 			(tmp->fs_flags & FS_REQUIRES_DEV) ? "" : "nodev",
 			tmp->name);
 		tmp = tmp->next;
 	}
 	read_unlock(&file_systems_lock);
-	return 0;
-}
-
-static int __init proc_filesystems_init(void)
-{
-	proc_create_single("filesystems", 0, NULL, filesystems_proc_show);
-	return 0;
-}
-module_init(proc_filesystems_init);
-#endif
-
-static struct file_system_type *__get_fs_type(const char *name, int len)
-{
-	struct file_system_type *fs;
-
-	read_lock(&file_systems_lock);
-	fs = *(find_filesystem(name, len));
-	if (fs && !try_module_get(fs->owner))
-		fs = NULL;
-	read_unlock(&file_systems_lock);
-	return fs;
+	return len;
 }
 
 struct file_system_type *get_fs_type(const char *name)
 {
 	struct file_system_type *fs;
-	const char *dot = strchr(name, '.');
-	int len = dot ? dot - name : strlen(name);
 
-	fs = __get_fs_type(name, len);
-	if (!fs && (request_module("fs-%.*s", len, name) == 0)) {
-		fs = __get_fs_type(name, len);
-		if (!fs)
-			pr_warn_once("request_module fs-%.*s succeeded, but still no fs?\n",
-				     len, name);
-	}
-
-	if (dot && fs && !(fs->fs_flags & FS_HAS_SUBTYPE)) {
-		put_filesystem(fs);
+	read_lock(&file_systems_lock);
+	fs = *(find_filesystem(name));
+	if (fs && !try_module_get(fs->owner))
 		fs = NULL;
+	read_unlock(&file_systems_lock);
+	if (!fs && (request_module("%s", name) == 0)) {
+		read_lock(&file_systems_lock);
+		fs = *(find_filesystem(name));
+		if (fs && !try_module_get(fs->owner))
+			fs = NULL;
+		read_unlock(&file_systems_lock);
 	}
 	return fs;
 }

@@ -1,17 +1,73 @@
-// SPDX-License-Identifier: GPL-2.0
 /* 
- * Copyright (C) 2001 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
+ * Copyright (C) 2001 - 2004 Jeff Dike (jdike@addtoit.com)
+ * Licensed under the GPL
  */
 
-#include <linux/module.h>
-#include <os.h>
+#include "linux/config.h"
+#include "linux/module.h"
+#include "linux/string.h"
+#include "linux/smp_lock.h"
+#include "linux/spinlock.h"
+#include "linux/highmem.h"
+#include "asm/current.h"
+#include "asm/delay.h"
+#include "asm/processor.h"
+#include "asm/unistd.h"
+#include "asm/pgalloc.h"
+#include "asm/pgtable.h"
+#include "asm/page.h"
+#include "asm/tlbflush.h"
+#include "kern_util.h"
+#include "user_util.h"
+#include "mem_user.h"
+#include "os.h"
+#include "helper.h"
 
-EXPORT_SYMBOL(um_set_signals);
-EXPORT_SYMBOL(signals_enabled);
+EXPORT_SYMBOL(stop);
+EXPORT_SYMBOL(uml_physmem);
+EXPORT_SYMBOL(set_signals);
+EXPORT_SYMBOL(get_signals);
+EXPORT_SYMBOL(kernel_thread);
+EXPORT_SYMBOL(__const_udelay);
+EXPORT_SYMBOL(__udelay);
+EXPORT_SYMBOL(sys_waitpid);
+EXPORT_SYMBOL(task_size);
+EXPORT_SYMBOL(flush_tlb_range);
+EXPORT_SYMBOL(host_task_size);
+EXPORT_SYMBOL(arch_validate);
+EXPORT_SYMBOL(get_kmem_end);
+
+EXPORT_SYMBOL(page_to_phys);
+EXPORT_SYMBOL(phys_to_page);
+EXPORT_SYMBOL(high_physmem);
+EXPORT_SYMBOL(empty_zero_page);
+EXPORT_SYMBOL(um_virt_to_phys);
+EXPORT_SYMBOL(__virt_to_page);
+EXPORT_SYMBOL(to_phys);
+EXPORT_SYMBOL(to_virt);
+EXPORT_SYMBOL(mode_tt);
+EXPORT_SYMBOL(handle_page_fault);
+EXPORT_SYMBOL(find_iomem);
+EXPORT_SYMBOL(end_iomem);
+
+#ifdef CONFIG_MODE_TT
+EXPORT_SYMBOL(strncpy_from_user_tt);
+EXPORT_SYMBOL(copy_from_user_tt);
+EXPORT_SYMBOL(copy_to_user_tt);
+#endif
+
+#ifdef CONFIG_MODE_SKAS
+EXPORT_SYMBOL(strncpy_from_user_skas);
+EXPORT_SYMBOL(copy_to_user_skas);
+EXPORT_SYMBOL(copy_from_user_skas);
+#endif
+EXPORT_SYMBOL(uml_strdup);
 
 EXPORT_SYMBOL(os_stat_fd);
 EXPORT_SYMBOL(os_stat_file);
 EXPORT_SYMBOL(os_access);
+EXPORT_SYMBOL(os_print_error);
+EXPORT_SYMBOL(os_get_exec_close);
 EXPORT_SYMBOL(os_set_exec_close);
 EXPORT_SYMBOL(os_getpid);
 EXPORT_SYMBOL(os_open_file);
@@ -35,14 +91,47 @@ EXPORT_SYMBOL(os_connect_socket);
 EXPORT_SYMBOL(os_accept_connection);
 EXPORT_SYMBOL(os_rcv_fd);
 EXPORT_SYMBOL(run_helper);
-EXPORT_SYMBOL(os_major);
-EXPORT_SYMBOL(os_minor);
-EXPORT_SYMBOL(os_makedev);
-EXPORT_SYMBOL(os_eventfd);
-EXPORT_SYMBOL(os_sendmsg_fds);
+EXPORT_SYMBOL(start_thread);
+EXPORT_SYMBOL(dump_thread);
 
-EXPORT_SYMBOL(add_sigio_fd);
-EXPORT_SYMBOL(ignore_sigio_fd);
-EXPORT_SYMBOL(sigio_broken);
+EXPORT_SYMBOL(do_gettimeofday);
+EXPORT_SYMBOL(do_settimeofday);
 
-EXPORT_SYMBOL(syscall);
+/* This is here because UML expands open to sys_open, not to a system
+ * call instruction.
+ */
+EXPORT_SYMBOL(sys_open);
+EXPORT_SYMBOL(sys_lseek);
+EXPORT_SYMBOL(sys_read);
+EXPORT_SYMBOL(sys_wait4);
+
+#ifdef CONFIG_SMP
+
+/* required for SMP */
+
+extern void FASTCALL( __write_lock_failed(rwlock_t *rw));
+EXPORT_SYMBOL(__write_lock_failed);
+
+extern void FASTCALL( __read_lock_failed(rwlock_t *rw));
+EXPORT_SYMBOL(__read_lock_failed);
+
+#endif
+
+#ifdef CONFIG_HIGHMEM
+EXPORT_SYMBOL(kmap);
+EXPORT_SYMBOL(kunmap);
+EXPORT_SYMBOL(kmap_atomic);
+EXPORT_SYMBOL(kunmap_atomic);
+EXPORT_SYMBOL(kmap_atomic_to_page);
+#endif
+
+/*
+ * Overrides for Emacs so that we follow Linus's tabbing style.
+ * Emacs will notice this stuff at the end of the file and automatically
+ * adjust the settings for this buffer only.  This must remain at the end
+ * of the file.
+ * ---------------------------------------------------------------------------
+ * Local variables:
+ * c-file-style: "linux"
+ * End:
+ */

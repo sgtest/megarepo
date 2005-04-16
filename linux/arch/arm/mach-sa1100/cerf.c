@@ -1,39 +1,42 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * linux/arch/arm/mach-sa1100/cerf.c
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  *
  * Apr-2003 : Removed some old PDA crud [FB]
  * Oct-2003 : Added uart2 resource [FB]
  * Jan-2004 : Removed io map for flash [FB]
  */
 
+#include <linux/config.h>
 #include <linux/init.h>
-#include <linux/gpio/machine.h>
 #include <linux/kernel.h>
 #include <linux/tty.h>
-#include <linux/platform_data/sa11x0-serial.h>
-#include <linux/platform_device.h>
-#include <linux/irq.h>
+#include <linux/device.h>
 #include <linux/mtd/mtd.h>
 #include <linux/mtd/partitions.h>
-#include <linux/gpio.h>
-#include <linux/leds.h>
 
-#include <mach/hardware.h>
+#include <asm/irq.h>
+#include <asm/hardware.h>
 #include <asm/setup.h>
 
 #include <asm/mach-types.h>
 #include <asm/mach/arch.h>
 #include <asm/mach/flash.h>
 #include <asm/mach/map.h>
+#include <asm/mach/serial_sa1100.h>
 
-#include <mach/cerf.h>
-#include <linux/platform_data/mfd-mcp-sa11x0.h>
-#include <mach/irqs.h>
+#include <asm/arch/cerf.h>
 #include "generic.h"
 
 static struct resource cerfuart2_resources[] = {
-	[0] = DEFINE_RES_MEM(0x80030000, SZ_64K),
+	[0] = {
+		.start	= 0x80030000,
+		.end	= 0x8003ffff,
+		.flags	= IORESOURCE_MEM,
+	},
 };
 
 static struct platform_device cerfuart2_device = {
@@ -41,49 +44,6 @@ static struct platform_device cerfuart2_device = {
 	.id		= 2,
 	.num_resources	= ARRAY_SIZE(cerfuart2_resources),
 	.resource	= cerfuart2_resources,
-};
-
-/* Compact Flash */
-static struct gpiod_lookup_table cerf_cf_gpio_table = {
-	.dev_id = "sa11x0-pcmcia.1",
-	.table = {
-		GPIO_LOOKUP("gpio", 19, "bvd2", GPIO_ACTIVE_HIGH),
-		GPIO_LOOKUP("gpio", 20, "bvd1", GPIO_ACTIVE_HIGH),
-		GPIO_LOOKUP("gpio", 21, "reset", GPIO_ACTIVE_HIGH),
-		GPIO_LOOKUP("gpio", 22, "ready", GPIO_ACTIVE_HIGH),
-		GPIO_LOOKUP("gpio", 23, "detect", GPIO_ACTIVE_LOW),
-		{ },
-	},
-};
-
-/* LEDs */
-struct gpio_led cerf_gpio_leds[] = {
-	{
-		.name			= "cerf:d0",
-		.default_trigger	= "heartbeat",
-		.gpio			= 0,
-	},
-	{
-		.name			= "cerf:d1",
-		.default_trigger	= "cpu0",
-		.gpio			= 1,
-	},
-	{
-		.name			= "cerf:d2",
-		.default_trigger	= "default-on",
-		.gpio			= 2,
-	},
-	{
-		.name			= "cerf:d3",
-		.default_trigger	= "default-on",
-		.gpio			= 3,
-	},
-
-};
-
-static struct gpio_led_platform_data cerf_gpio_led_info = {
-	.leds		= cerf_gpio_leds,
-	.num_leds	= ARRAY_SIZE(cerf_gpio_leds),
 };
 
 static struct platform_device *cerf_devices[] __initdata = {
@@ -126,22 +86,21 @@ static struct flash_platform_data cerf_flash_data = {
 	.nr_parts	= ARRAY_SIZE(cerf_partitions),
 };
 
-static struct resource cerf_flash_resource =
-	DEFINE_RES_MEM(SA1100_CS0_PHYS, SZ_32M);
+static struct resource cerf_flash_resource = {
+	.start		= SA1100_CS0_PHYS,
+	.end		= SA1100_CS0_PHYS + SZ_32M - 1,
+	.flags		= IORESOURCE_MEM,
+};
 
 static void __init cerf_init_irq(void)
 {
 	sa1100_init_irq();
-	irq_set_irq_type(CERF_ETH_IRQ, IRQ_TYPE_EDGE_RISING);
+	set_irq_type(CERF_ETH_IRQ, IRQT_RISING);
 }
 
 static struct map_desc cerf_io_desc[] __initdata = {
-  	{	/* Crystal Ethernet Chip */
-		.virtual	=  0xf0000000,
-		.pfn		= __phys_to_pfn(0x08000000),
-		.length		= 0x00100000,
-		.type		= MT_DEVICE
-	}
+  /* virtual	 physical    length	 type */
+  { 0xf0000000, 0x08000000, 0x00100000, MT_DEVICE }  /* Crystal Ethernet Chip */
 };
 
 static void __init cerf_map_io(void)
@@ -152,30 +111,22 @@ static void __init cerf_map_io(void)
 	sa1100_register_uart(0, 3);
 	sa1100_register_uart(1, 2); /* disable this and the uart2 device for sa1100_fir */
 	sa1100_register_uart(2, 1);
-}
 
-static struct mcp_plat_data cerf_mcp_data = {
-	.mccr0		= MCCR0_ADM,
-	.sclk_rate	= 11981000,
-};
+	/* set some GPDR bits here while it's safe */
+	GPDR |= CERF_GPIO_CF_RESET;
+}
 
 static void __init cerf_init(void)
 {
-	sa11x0_ppc_configure_mcp();
 	platform_add_devices(cerf_devices, ARRAY_SIZE(cerf_devices));
-	gpio_led_register_device(-1, &cerf_gpio_led_info);
-	sa11x0_register_mtd(&cerf_flash_data, &cerf_flash_resource, 1);
-	sa11x0_register_mcp(&cerf_mcp_data);
-	sa11x0_register_pcmcia(1, &cerf_cf_gpio_table);
+	sa11x0_set_flash_data(&cerf_flash_data, &cerf_flash_resource, 1);
 }
 
 MACHINE_START(CERF, "Intrinsyc CerfBoard/CerfCube")
-	/* Maintainer: support@intrinsyc.com */
-	.map_io		= cerf_map_io,
-	.nr_irqs	= SA1100_NR_IRQS,
-	.init_irq	= cerf_init_irq,
-	.init_time	= sa1100_timer_init,
+	MAINTAINER("support@intrinsyc.com")
+	BOOT_MEM(0xc0000000, 0x80000000, 0xf8000000)
+	MAPIO(cerf_map_io)
+	INITIRQ(cerf_init_irq)
+	.timer		= &sa1100_timer,
 	.init_machine	= cerf_init,
-	.init_late	= sa11x0_init_late,
-	.restart	= sa11x0_restart,
 MACHINE_END

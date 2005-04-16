@@ -1,104 +1,56 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (c) 2000-2003,2005 Silicon Graphics, Inc.
- * All Rights Reserved.
+ * Copyright (c) 2000-2003 Silicon Graphics, Inc.  All Rights Reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms of version 2 of the GNU General Public License as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it would be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ *
+ * Further, this software is distributed without any warranty that it is
+ * free of the rightful claim of any third person regarding infringement
+ * or the like.  Any license provided herein, whether implied or
+ * otherwise, applies only to this software file.  Patent licenses, if
+ * any, provided herein do not apply to combinations of this program with
+ * other software, or any other product whatsoever.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write the Free Software Foundation, Inc., 59
+ * Temple Place - Suite 330, Boston MA 02111-1307, USA.
+ *
+ * Contact information: Silicon Graphics, Inc., 1600 Amphitheatre Pkwy,
+ * Mountain View, CA  94043, or:
+ *
+ * http://www.sgi.com
+ *
+ * For further information regarding this notice, see:
+ *
+ * http://oss.sgi.com/projects/GenInfo/SGIGPLNoticeExplan/
  */
 #ifndef	__XFS_LOG_H__
 #define __XFS_LOG_H__
 
-struct xfs_cil_ctx;
+/* get lsn fields */
 
-struct xfs_log_vec {
-	struct list_head	lv_list;	/* CIL lv chain ptrs */
-	uint32_t		lv_order_id;	/* chain ordering info */
-	int			lv_niovecs;	/* number of iovecs in lv */
-	struct xfs_log_iovec	*lv_iovecp;	/* iovec array */
-	struct xfs_log_item	*lv_item;	/* owner */
-	char			*lv_buf;	/* formatted buffer */
-	int			lv_bytes;	/* accounted space in buffer */
-	int			lv_buf_len;	/* aligned size of buffer */
-	int			lv_size;	/* size of allocated lv */
-};
+#define CYCLE_LSN(lsn) ((uint)((lsn)>>32))
+#define BLOCK_LSN(lsn) ((uint)(lsn))
+/* this is used in a spot where we might otherwise double-endian-flip */
+#define CYCLE_LSN_DISK(lsn) (((uint *)&(lsn))[0])
 
-#define XFS_LOG_VEC_ORDERED	(-1)
-
+#ifdef __KERNEL__
 /*
- * Calculate the log iovec length for a given user buffer length. Intended to be
- * used by ->iop_size implementations when sizing buffers of arbitrary
- * alignments.
- */
-static inline int
-xlog_calc_iovec_len(int len)
-{
-	return roundup(len, sizeof(uint32_t));
-}
-
-void *xlog_prepare_iovec(struct xfs_log_vec *lv, struct xfs_log_iovec **vecp,
-		uint type);
-
-static inline void
-xlog_finish_iovec(struct xfs_log_vec *lv, struct xfs_log_iovec *vec,
-		int data_len)
-{
-	struct xlog_op_header	*oph = vec->i_addr;
-	int			len;
-
-	/*
-	 * Always round up the length to the correct alignment so callers don't
-	 * need to know anything about this log vec layout requirement. This
-	 * means we have to zero the area the data to be written does not cover.
-	 * This is complicated by fact the payload region is offset into the
-	 * logvec region by the opheader that tracks the payload.
-	 */
-	len = xlog_calc_iovec_len(data_len);
-	if (len - data_len != 0) {
-		char	*buf = vec->i_addr + sizeof(struct xlog_op_header);
-
-		memset(buf + data_len, 0, len - data_len);
-	}
-
-	/*
-	 * The opheader tracks aligned payload length, whilst the logvec tracks
-	 * the overall region length.
-	 */
-	oph->oh_len = cpu_to_be32(len);
-
-	len += sizeof(struct xlog_op_header);
-	lv->lv_buf_len += len;
-	lv->lv_bytes += len;
-	vec->i_len = len;
-
-	/* Catch buffer overruns */
-	ASSERT((void *)lv->lv_buf + lv->lv_bytes <= (void *)lv + lv->lv_size);
-}
-
-/*
- * Copy the amount of data requested by the caller into a new log iovec.
- */
-static inline void *
-xlog_copy_iovec(struct xfs_log_vec *lv, struct xfs_log_iovec **vecp,
-		uint type, void *data, int len)
-{
-	void *buf;
-
-	buf = xlog_prepare_iovec(lv, vecp, type);
-	memcpy(buf, data, len);
-	xlog_finish_iovec(lv, *vecp, len);
-	return buf;
-}
-
-static inline void *
-xlog_copy_from_iovec(struct xfs_log_vec *lv, struct xfs_log_iovec **vecp,
-		const struct xfs_log_iovec *src)
-{
-	return xlog_copy_iovec(lv, vecp, src->i_type, src->i_addr, src->i_len);
-}
-
-/*
- * By comparing each component, we don't have to worry about extra
+ * By comparing each compnent, we don't have to worry about extra
  * endian issues in treating two 32 bit numbers as one 64 bit number
  */
-static inline xfs_lsn_t	_lsn_cmp(xfs_lsn_t lsn1, xfs_lsn_t lsn2)
+static
+#if defined(__GNUC__) && (__GNUC__ == 2) && ( (__GNUC_MINOR__ == 95) || (__GNUC_MINOR__ == 96))
+__attribute__((unused))	/* gcc 2.95, 2.96 miscompile this when inlined */
+#else
+__inline__
+#endif
+xfs_lsn_t	_lsn_cmp(xfs_lsn_t lsn1, xfs_lsn_t lsn2)
 {
 	if (CYCLE_LSN(lsn1) != CYCLE_LSN(lsn2))
 		return (CYCLE_LSN(lsn1)<CYCLE_LSN(lsn2))? -999 : 999;
@@ -112,55 +64,119 @@ static inline xfs_lsn_t	_lsn_cmp(xfs_lsn_t lsn1, xfs_lsn_t lsn2)
 #define	XFS_LSN_CMP(x,y) _lsn_cmp(x,y)
 
 /*
+ * Macros, structures, prototypes for interface to the log manager.
+ */
+
+/*
+ * Flags to xfs_log_mount
+ */
+#define XFS_LOG_RECOVER		0x1
+
+/*
+ * Flags to xfs_log_done()
+ */
+#define XFS_LOG_REL_PERM_RESERV	0x1
+
+
+/*
+ * Flags to xfs_log_reserve()
+ *
+ *	XFS_LOG_SLEEP:	 If space is not available, sleep (default)
+ *	XFS_LOG_NOSLEEP: If space is not available, return error
+ *	XFS_LOG_PERM_RESERV: Permanent reservation.  When writes are
+ *		performed against this type of reservation, the reservation
+ *		is not decreased.  Long running transactions should use this.
+ */
+#define XFS_LOG_SLEEP		0x0
+#define XFS_LOG_NOSLEEP		0x1
+#define XFS_LOG_PERM_RESERV	0x2
+#define XFS_LOG_RESV_ALL	(XFS_LOG_NOSLEEP|XFS_LOG_PERM_RESERV)
+
+
+/*
  * Flags to xfs_log_force()
  *
  *	XFS_LOG_SYNC:	Synchronous force in-core log to disk
+ *	XFS_LOG_FORCE:	Start in-core log write now.
+ *	XFS_LOG_URGE:	Start write within some window of time.
+ *
+ * Note: Either XFS_LOG_FORCE or XFS_LOG_URGE must be set.
  */
 #define XFS_LOG_SYNC		0x1
+#define XFS_LOG_FORCE		0x2
+#define XFS_LOG_URGE		0x4
 
+#endif	/* __KERNEL__ */
+
+
+/* Log Clients */
+#define XFS_TRANSACTION		0x69
+#define XFS_VOLUME		0x2
+#define XFS_LOG			0xaa
+
+typedef struct xfs_log_iovec {
+	xfs_caddr_t		i_addr;		/* beginning address of region */
+	int		i_len;		/* length in bytes of region */
+} xfs_log_iovec_t;
+
+typedef void* xfs_log_ticket_t;
+
+/*
+ * Structure used to pass callback function and the function's argument
+ * to the log manager.
+ */
+typedef struct xfs_log_callback {
+	struct xfs_log_callback	*cb_next;
+	void			(*cb_func)(void *, int);
+	void			*cb_arg;
+} xfs_log_callback_t;
+
+
+#ifdef __KERNEL__
 /* Log manager interfaces */
 struct xfs_mount;
-struct xlog_in_core;
-struct xlog_ticket;
-struct xfs_log_item;
-struct xfs_item_ops;
-struct xfs_trans;
-struct xlog;
-
-int	  xfs_log_force(struct xfs_mount *mp, uint flags);
-int	  xfs_log_force_seq(struct xfs_mount *mp, xfs_csn_t seq, uint flags,
-		int *log_forced);
+xfs_lsn_t xfs_log_done(struct xfs_mount *mp,
+		       xfs_log_ticket_t ticket,
+		       void		**iclog,
+		       uint		flags);
+int	  xfs_log_force(struct xfs_mount *mp,
+			xfs_lsn_t	 lsn,
+			uint		 flags);
 int	  xfs_log_mount(struct xfs_mount	*mp,
 			struct xfs_buftarg	*log_target,
 			xfs_daddr_t		start_block,
 			int		 	num_bblocks);
-int	  xfs_log_mount_finish(struct xfs_mount *mp);
-void	xfs_log_mount_cancel(struct xfs_mount *);
-xfs_lsn_t xlog_assign_tail_lsn(struct xfs_mount *mp);
-xfs_lsn_t xlog_assign_tail_lsn_locked(struct xfs_mount *mp);
-void	xfs_log_space_wake(struct xfs_mount *mp);
-int	xfs_log_reserve(struct xfs_mount *mp, int length, int count,
-			struct xlog_ticket **ticket, bool permanent);
-int	xfs_log_regrant(struct xfs_mount *mp, struct xlog_ticket *tic);
-void	xfs_log_unmount(struct xfs_mount *mp);
-bool	xfs_log_writable(struct xfs_mount *mp);
+int	  xfs_log_mount_finish(struct xfs_mount *mp, int);
+void	  xfs_log_move_tail(struct xfs_mount	*mp,
+			    xfs_lsn_t		tail_lsn);
+int	  xfs_log_notify(struct xfs_mount	*mp,
+			 void			*iclog,
+			 xfs_log_callback_t	*callback_entry);
+int	  xfs_log_release_iclog(struct xfs_mount *mp,
+			 void			 *iclog_hndl);
+int	  xfs_log_reserve(struct xfs_mount *mp,
+			  int		   length,
+			  int		   count,
+			  xfs_log_ticket_t *ticket,
+			  __uint8_t	   clientid,
+			  uint		   flags);
+int	  xfs_log_write(struct xfs_mount *mp,
+			xfs_log_iovec_t  region[],
+			int		 nentries,
+			xfs_log_ticket_t ticket,
+			xfs_lsn_t	 *start_lsn);
+int	  xfs_log_unmount(struct xfs_mount *mp);
+int	  xfs_log_unmount_write(struct xfs_mount *mp);
+void      xfs_log_unmount_dealloc(struct xfs_mount *mp);
+int	  xfs_log_force_umount(struct xfs_mount *mp, int logerror);
+int	  xfs_log_need_covered(struct xfs_mount *mp);
 
-struct xlog_ticket *xfs_log_ticket_get(struct xlog_ticket *ticket);
-void	  xfs_log_ticket_put(struct xlog_ticket *ticket);
+void	  xlog_iodone(struct xfs_buf *);
 
-void	xlog_cil_process_committed(struct list_head *list);
-bool	xfs_log_item_in_current_chkpt(struct xfs_log_item *lip);
+#endif
 
-void	xfs_log_work_queue(struct xfs_mount *mp);
-int	xfs_log_quiesce(struct xfs_mount *mp);
-void	xfs_log_clean(struct xfs_mount *mp);
-bool	xfs_log_check_lsn(struct xfs_mount *, xfs_lsn_t);
 
-xfs_lsn_t xlog_grant_push_threshold(struct xlog *log, int need_bytes);
-bool	  xlog_force_shutdown(struct xlog *log, uint32_t shutdown_flags);
+extern int xlog_debug;		/* set to 1 to enable real log */
 
-void xlog_use_incompat_feat(struct xlog *log);
-void xlog_drop_incompat_feat(struct xlog *log);
-int xfs_attr_use_log_assist(struct xfs_mount *mp);
 
 #endif	/* __XFS_LOG_H__ */

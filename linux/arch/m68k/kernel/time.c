@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  *  linux/arch/m68k/kernel/time.c
  *
@@ -11,33 +10,47 @@
  *		"A Kernel Model for Precision Timekeeping" by Dave Mills
  */
 
+#include <linux/config.h> /* CONFIG_HEARTBEAT */
 #include <linux/errno.h>
-#include <linux/export.h>
 #include <linux/module.h>
 #include <linux/sched.h>
-#include <linux/sched/loadavg.h>
 #include <linux/kernel.h>
 #include <linux/param.h>
 #include <linux/string.h>
 #include <linux/mm.h>
 #include <linux/rtc.h>
-#include <linux/platform_device.h>
 
 #include <asm/machdep.h>
 #include <asm/io.h>
-#include <asm/irq_regs.h>
 
 #include <linux/time.h>
 #include <linux/timex.h>
 #include <linux/profile.h>
 
+u64 jiffies_64 = INITIAL_JIFFIES;
 
-unsigned long (*mach_random_get_entropy)(void);
-EXPORT_SYMBOL_GPL(mach_random_get_entropy);
+EXPORT_SYMBOL(jiffies_64);
+
+static inline int set_rtc_mmss(unsigned long nowtime)
+{
+  if (mach_set_clock_mmss)
+    return mach_set_clock_mmss (nowtime);
+  return -1;
+}
+
+/*
+ * timer_interrupt() needs to keep up the real-time clock,
+ * as well as call the "do_timer()" routine every clocktick
+ */
+static irqreturn_t timer_interrupt(int irq, void *dummy, struct pt_regs * regs)
+{
+	do_timer(regs);
+#ifndef CONFIG_SMP
+	update_process_times(user_mode(regs));
+#endif
+	profile_tick(CPU_PROFILING, regs);
 
 #ifdef CONFIG_HEARTBEAT
-void timer_heartbeat(void)
-{
 	/* use power LED as a heartbeat instead -- much more useful
 	   for debugging -- based on the version for PReP by Cort */
 	/* acts like an actual heart beat -- ie thump-thump-pause... */
@@ -59,99 +72,116 @@ void timer_heartbeat(void)
 		dist = period / 4;
 	    }
 	}
-}
 #endif /* CONFIG_HEARTBEAT */
+	return IRQ_HANDLED;
+}
 
-#ifdef CONFIG_M68KCLASSIC
-/* machine dependent timer functions */
-int (*mach_hwclk) (int, struct rtc_time*);
-EXPORT_SYMBOL(mach_hwclk);
-
-int (*mach_get_rtc_pll)(struct rtc_pll_info *);
-int (*mach_set_rtc_pll)(struct rtc_pll_info *);
-EXPORT_SYMBOL(mach_get_rtc_pll);
-EXPORT_SYMBOL(mach_set_rtc_pll);
-
-#if !IS_BUILTIN(CONFIG_RTC_DRV_GENERIC)
-void read_persistent_clock64(struct timespec64 *ts)
+void time_init(void)
 {
 	struct rtc_time time;
 
-	ts->tv_sec = 0;
-	ts->tv_nsec = 0;
+	if (mach_hwclk) {
+		mach_hwclk(0, &time);
 
-	if (!mach_hwclk)
-		return;
+		if ((time.tm_year += 1900) < 1970)
+			time.tm_year += 100;
+		xtime.tv_sec = mktime(time.tm_year, time.tm_mon, time.tm_mday,
+				      time.tm_hour, time.tm_min, time.tm_sec);
+		xtime.tv_nsec = 0;
+	}
+	wall_to_monotonic.tv_sec = -xtime.tv_sec;
 
-	mach_hwclk(0, &time);
-
-	ts->tv_sec = mktime64(time.tm_year + 1900, time.tm_mon + 1, time.tm_mday,
-			      time.tm_hour, time.tm_min, time.tm_sec);
-}
-#endif
-
-#if IS_ENABLED(CONFIG_RTC_DRV_GENERIC)
-static int rtc_generic_get_time(struct device *dev, struct rtc_time *tm)
-{
-	mach_hwclk(0, tm);
-	return 0;
+	mach_sched_init(timer_interrupt);
 }
 
-static int rtc_generic_set_time(struct device *dev, struct rtc_time *tm)
+/*
+ * This version of gettimeofday has near microsecond resolution.
+ */
+void do_gettimeofday(struct timeval *tv)
 {
-	if (mach_hwclk(1, tm) < 0)
-		return -EOPNOTSUPP;
-	return 0;
-}
+	unsigned long flags;
+	extern unsigned long wall_jiffies;
+	unsigned long seq;
+	unsigned long usec, sec, lost;
+	unsigned long max_ntp_tick = tick_usec - tickadj;
 
-static int rtc_ioctl(struct device *dev, unsigned int cmd, unsigned long arg)
-{
-	struct rtc_pll_info pll;
-	struct rtc_pll_info __user *argp = (void __user *)arg;
+	do {
+		seq = read_seqbegin_irqsave(&xtime_lock, flags);
 
-	switch (cmd) {
-	case RTC_PLL_GET:
-		if (!mach_get_rtc_pll || mach_get_rtc_pll(&pll))
-			return -EINVAL;
-		return copy_to_user(argp, &pll, sizeof pll) ? -EFAULT : 0;
+		usec = mach_gettimeoffset();
+		lost = jiffies - wall_jiffies;
 
-	case RTC_PLL_SET:
-		if (!mach_set_rtc_pll)
-			return -EINVAL;
-		if (!capable(CAP_SYS_TIME))
-			return -EACCES;
-		if (copy_from_user(&pll, argp, sizeof(pll)))
-			return -EFAULT;
-		return mach_set_rtc_pll(&pll);
+		/*
+		 * If time_adjust is negative then NTP is slowing the clock
+		 * so make sure not to go into next possible interval.
+		 * Better to lose some accuracy than have time go backwards..
+		 */
+		if (unlikely(time_adjust < 0)) {
+			usec = min(usec, max_ntp_tick);
+
+			if (lost)
+				usec += lost * max_ntp_tick;
+		}
+		else if (unlikely(lost))
+			usec += lost * tick_usec;
+
+		sec = xtime.tv_sec;
+		usec += xtime.tv_nsec/1000;
+	} while (read_seqretry_irqrestore(&xtime_lock, seq, flags));
+
+
+	while (usec >= 1000000) {
+		usec -= 1000000;
+		sec++;
 	}
 
-	return -ENOIOCTLCMD;
+	tv->tv_sec = sec;
+	tv->tv_usec = usec;
 }
 
-static const struct rtc_class_ops generic_rtc_ops = {
-	.ioctl = rtc_ioctl,
-	.read_time = rtc_generic_get_time,
-	.set_time = rtc_generic_set_time,
-};
+EXPORT_SYMBOL(do_gettimeofday);
 
-static int __init rtc_init(void)
+int do_settimeofday(struct timespec *tv)
 {
-	struct platform_device *pdev;
+	time_t wtm_sec, sec = tv->tv_sec;
+	long wtm_nsec, nsec = tv->tv_nsec;
+	extern unsigned long wall_jiffies;
 
-	if (!mach_hwclk)
-		return -ENODEV;
+	if ((unsigned long)tv->tv_nsec >= NSEC_PER_SEC)
+		return -EINVAL;
 
-	pdev = platform_device_register_data(NULL, "rtc-generic", -1,
-					     &generic_rtc_ops,
-					     sizeof(generic_rtc_ops));
-	return PTR_ERR_OR_ZERO(pdev);
+	write_seqlock_irq(&xtime_lock);
+	/* This is revolting. We need to set the xtime.tv_nsec
+	 * correctly. However, the value in this location is
+	 * is value at the last tick.
+	 * Discover what correction gettimeofday
+	 * would have done, and then undo it!
+	 */
+	nsec -= 1000 * (mach_gettimeoffset() +
+			(jiffies - wall_jiffies) * (1000000 / HZ));
+
+	wtm_sec  = wall_to_monotonic.tv_sec + (xtime.tv_sec - sec);
+	wtm_nsec = wall_to_monotonic.tv_nsec + (xtime.tv_nsec - nsec);
+
+	set_normalized_timespec(&xtime, sec, nsec);
+	set_normalized_timespec(&wall_to_monotonic, wtm_sec, wtm_nsec);
+
+	time_adjust = 0;		/* stop active adjtime() */
+	time_status |= STA_UNSYNC;
+	time_maxerror = NTP_PHASE_LIMIT;
+	time_esterror = NTP_PHASE_LIMIT;
+	write_sequnlock_irq(&xtime_lock);
+	clock_was_set();
+	return 0;
 }
 
-module_init(rtc_init);
-#endif /* CONFIG_RTC_DRV_GENERIC */
-#endif /* CONFIG M68KCLASSIC */
+EXPORT_SYMBOL(do_settimeofday);
 
-void __init time_init(void)
+/*
+ * Scheduler clock - returns current time in ns units.
+ */
+unsigned long long sched_clock(void)
 {
-	mach_sched_init();
+       return (unsigned long long)jiffies*(1000000000/HZ);
 }
+

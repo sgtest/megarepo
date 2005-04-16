@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * EFI call stub.
  *
@@ -7,7 +6,7 @@
  *
  * This stub allows us to make EFI calls in physical mode with interrupts
  * turned off.  We need this because we can't call SetVirtualMap() until
- * the kernel has booted far enough to allow allocation of struct vm_area_struct
+ * the kernel has booted far enough to allow allocation of struct vma_struct
  * entries (which we would need to map stuff with memory attributes other
  * than uncached or writeback...).  Since the GetTime() service gets called
  * earlier than that, we need to be able to make physical mode EFI calls from
@@ -62,7 +61,7 @@ GLOBAL_ENTRY(efi_call_phys)
 	or loc3=loc3,r17
 	mov b6=r2
 	;;
-	andcm r16=loc3,r16	// get psr with IT, DT, and RT bits cleared
+	andcm r16=loc3,r16		// get psr with IT, DT, and RT bits cleared
 	br.call.sptk.many rp=ia64_switch_mode_phys
 .ret0:	mov out4=in5
 	mov out0=in1

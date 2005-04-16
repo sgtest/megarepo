@@ -1,8 +1,7 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  *  Copyright (c) 2004 James Courtier-Dutton <James@superbug.demon.co.uk>
  *  Driver CA0106 chips. e.g. Sound Blaster Audigy LS and Live 24bit
- *  Version: 0.0.22
+ *  Version: 0.0.20
  *
  *  FEATURES currently supported:
  *    See ca0106_main.c for features.
@@ -46,28 +45,40 @@
  *    Added I2C and SPI registers. Filled in interrupt enable.
  *  0.0.20
  *    Added GPIO info for SB Live 24bit.
- *  0.0.21
- *   Implement support for Line-in capture on SB Live 24bit.
- *  0.0.22
- *    Add support for mute control on SB Live 24bit (cards w/ SPI DAC)
  *
- *  This code was initially based on code from ALSA's emu10k1x.c which is:
+ *
+ *  This code was initally based on code from ALSA's emu10k1x.c which is:
  *  Copyright (c) by Francisco Moraes <fmoraes@nc.rr.com>
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ *
  */
 
 /************************************************************************************************/
 /* PCI function 0 registers, address = <val> + PCIBASE0						*/
 /************************************************************************************************/
 
-#define CA0106_PTR		0x00		/* Indexed register set pointer register	*/
+#define PTR			0x00		/* Indexed register set pointer register	*/
 						/* NOTE: The CHANNELNUM and ADDRESS words can	*/
 						/* be modified independently of each other.	*/
 						/* CNL[1:0], ADDR[27:16]                        */
 
-#define CA0106_DATA		0x04		/* Indexed register set data register		*/
+#define DATA			0x04		/* Indexed register set data register		*/
 						/* DATA[31:0]					*/
 
-#define CA0106_IPR		0x08		/* Global interrupt pending register		*/
+#define IPR			0x08		/* Global interrupt pending register		*/
 						/* Clear pending interrupts by writing a 1 to	*/
 						/* the relevant bits and zero to the other bits	*/
 #define IPR_MIDI_RX_B		0x00020000	/* MIDI UART-B Receive buffer non-empty		*/
@@ -88,7 +99,7 @@
 #define IPR_MIDI_TX_A		0x00000002	/* MIDI UART-A Transmit buffer empty		*/
 #define IPR_PCI			0x00000001	/* PCI Bus error				*/
 
-#define CA0106_INTE		0x0c		/* Interrupt enable register			*/
+#define INTE			0x0c		/* Interrupt enable register			*/
 
 #define INTE_MIDI_RX_B		0x00020000	/* MIDI UART-B Receive buffer non-empty		*/
 #define INTE_MIDI_TX_B		0x00010000	/* MIDI UART-B Transmit buffer empty		*/
@@ -108,8 +119,8 @@
 #define INTE_MIDI_TX_A		0x00000002	/* MIDI UART-A Transmit buffer empty		*/
 #define INTE_PCI		0x00000001	/* PCI Bus error				*/
 
-#define CA0106_UNKNOWN10	0x10		/* Unknown ??. Defaults to 0 */
-#define CA0106_HCFG		0x14		/* Hardware config register			*/
+#define UNKNOWN10		0x10		/* Unknown ??. Defaults to 0 */
+#define HCFG			0x14		/* Hardware config register			*/
 						/* 0x1000 causes AC3 to fails. It adds a dither bit. */
 
 #define HCFG_STAC		0x10000000	/* Special mode for STAC9460 Codec. */
@@ -133,7 +144,7 @@
 #define HCFG_AUDIOENABLE	0x00000001	/* 0 = CODECs transmit zero-valued samples	*/
 						/* Should be set to 1 when the EMU10K1 is	*/
 						/* completely initialized.			*/
-#define CA0106_GPIO		0x18		/* Defaults: 005f03a3-Analog, 005f02a2-SPDIF.   */
+#define GPIO			0x18		/* Defaults: 005f03a3-Analog, 005f02a2-SPDIF.   */
 						/* Here pins 0,1,2,3,4,,6 are output. 5,7 are input */
 						/* For the Audigy LS, pin 0 (or bit 8) controls the SPDIF/Analog jack. */
 						/* SB Live 24bit:
@@ -141,7 +152,7 @@
 						 * bit 9 0 = Mute / 1 = Analog out.
 						 * bit 10 0 = Line-in / 1 = Mic-in.
 						 * bit 11 0 = ? / 1 = ?
-						 * bit 12 0 = 48 Khz / 1 = 96 Khz Analog out on SB Live 24bit.
+						 * bit 12 0 = ? / 1 = ?
 						 * bit 13 0 = ? / 1 = ?
 						 * bit 14 0 = Mute / 1 = Analog out
 						 * bit 15 0 = ? / 1 = ?
@@ -152,15 +163,15 @@
 						 * GPO [15:8] Default 0x9. (Default to SPDIF jack enabled for SPDIF)
 						 * GPO Enable [23:16] Default 0x0f. Setting a bit to 1, causes the pin to be an output pin.
 						 */
-#define CA0106_AC97DATA		0x1c		/* AC97 register set data register (16 bit)	*/
+#define AC97DATA		0x1c		/* AC97 register set data register (16 bit)	*/
 
-#define CA0106_AC97ADDRESS	0x1e		/* AC97 register set address register (8 bit)	*/
+#define AC97ADDRESS		0x1e		/* AC97 register set address register (8 bit)	*/
 
 /********************************************************************************************************/
 /* CA0106 pointer-offset register set, accessed through the PTR and DATA registers                     */
 /********************************************************************************************************/
                                                                                                                            
-/* Initially all registers from 0x00 to 0x3f have zero contents. */
+/* Initally all registers from 0x00 to 0x3f have zero contents. */
 #define PLAYBACK_LIST_ADDR	0x00		/* Base DMA address of a list of pointers to each period/size */
 						/* One list entry: 4 bytes for DMA address, 
 						 * 4 bytes for period_size << 16.
@@ -173,7 +184,7 @@
 #define PLAYBACK_LIST_PTR	0x02		/* Pointer to the current period being played */
 						/* PTR[5:0], Default: 0x0 */
 #define PLAYBACK_UNKNOWN3	0x03		/* Not used ?? */
-#define PLAYBACK_DMA_ADDR	0x04		/* Playback DMA address */
+#define PLAYBACK_DMA_ADDR	0x04		/* Playback DMA addresss */
 						/* DMA[31:0], Default: 0x0 */
 #define PLAYBACK_PERIOD_SIZE	0x05		/* Playback period size. win2000 uses 0x04000000 */
 						/* SIZE[31:16], Default: 0x0 */
@@ -208,7 +219,7 @@
  * The jack has 4 poles. I will call 1 - Tip, 2 - Next to 1, 3 - Next to 2, 4 - Next to 3
  * For Analogue: 1 -> Center Speaker, 2 -> Sub Woofer, 3 -> Ground, 4 -> Ground
  * For Digital: 1 -> Front SPDIF, 2 -> Rear SPDIF, 3 -> Center/Subwoofer SPDIF, 4 -> Ground.
- * Standard 4 pole Video A/V cable with RCA outputs: 1 -> White, 2 -> Yellow, 3 -> Shield on all three, 4 -> Red.
+ * Standard 4 pole Video A/V cable with RCA outputs: 1 -> White, 2 -> Yellow, 3 -> Sheild on all three, 4 -> Red.
  * So, from this you can see that you cannot use a Standard 4 pole Video A/V cable with the SB Audigy LS card.
  */
 /* The Front SPDIF PCM gets mixed with samples from the AC97 codec, so can only work for Stereo PCM and not AC3/DTS
@@ -256,6 +267,7 @@
 #define SPCS_WORD_LENGTH_19	0x00000002	/* Word Length 19 bit				*/
 #define SPCS_WORD_LENGTH_20A	0x0000000a	/* Word Length 20 bit				*/
 #define SPCS_WORD_LENGTH_20	0x00000009	/* Word Length 20 bit (both 0xa and 0x9 are 20 bit) */
+#define SPCS_WORD_LENGTH_21	0x00000007	/* Word Length 21 bit				*/
 #define SPCS_WORD_LENGTH_21	0x00000007	/* Word Length 21 bit				*/
 #define SPCS_WORD_LENGTH_22	0x00000005	/* Word Length 22 bit				*/
 #define SPCS_WORD_LENGTH_23	0x00000003	/* Word Length 23 bit				*/
@@ -385,24 +397,10 @@
 #define PLAYBACK_VOLUME2        0x6a            /* Playback Analog volume per channel. Does not effect AC3 output */
 						/* Similar to register 0x66, except that the destination is the I2S mixer instead of the SPDIF mixer. I.E. Outputs to the Analog outputs instead of SPDIF. */
 #define UNKNOWN6b               0x6b            /* Unknown. Readonly. Default 00400000 00400000 00400000 00400000 */
-#define MIDI_UART_A_DATA		0x6c            /* Midi Uart A Data */
-#define MIDI_UART_A_CMD		0x6d            /* Midi Uart A Command/Status */
-#define MIDI_UART_B_DATA		0x6e            /* Midi Uart B Data (currently unused) */
-#define MIDI_UART_B_CMD		0x6f            /* Midi Uart B Command/Status (currently unused) */
-
-/* unique channel identifier for midi->channel */
-
-#define CA0106_MIDI_CHAN_A		0x1
-#define CA0106_MIDI_CHAN_B		0x2
-
-/* from mpu401 */
-
-#define CA0106_MIDI_INPUT_AVAIL 	0x80
-#define CA0106_MIDI_OUTPUT_READY	0x40
-#define CA0106_MPU401_RESET		0xff
-#define CA0106_MPU401_ENTER_UART	0x3f
-#define CA0106_MPU401_ACK		0xfe
-
+#define UART_A_DATA		0x6c            /* Uart, used in setting sample rates, bits per sample etc. */
+#define UART_A_CMD		0x6d            /* Uart, used in setting sample rates, bits per sample etc. */
+#define UART_B_DATA		0x6e            /* Uart, Unknown. */
+#define UART_B_CMD		0x6f            /* Uart, Unknown. */
 #define SAMPLE_RATE_TRACKER_STATUS 0x70         /* Readonly. Default 00108000 00108000 00500000 00500000 */
 						/* Estimated sample rate [19:0] Relative to 48kHz. 0x8000 =  1.0
 						 * Rate Locked [20]
@@ -477,56 +475,9 @@
 						/* Causes interrupts based on timer intervals. */
 #define SPI			0x7a		/* SPI: Serial Interface Register */
 #define I2C_A			0x7b		/* I2C Address. 32 bit */
-#define I2C_D0			0x7c		/* I2C Data Port 0. 32 bit */
-#define I2C_D1			0x7d		/* I2C Data Port 1. 32 bit */
-//I2C values
-#define I2C_A_ADC_ADD_MASK	0x000000fe	//The address is a 7 bit address
-#define I2C_A_ADC_RW_MASK	0x00000001	//bit mask for R/W
-#define I2C_A_ADC_TRANS_MASK	0x00000010  	//Bit mask for I2c address DAC value
-#define I2C_A_ADC_ABORT_MASK	0x00000020	//Bit mask for I2C transaction abort flag
-#define I2C_A_ADC_LAST_MASK	0x00000040	//Bit mask for Last word transaction
-#define I2C_A_ADC_BYTE_MASK	0x00000080	//Bit mask for Byte Mode
+#define I2C_0			0x7c		/* I2C Data Port 0. 32 bit */
+#define I2C_1			0x7d		/* I2C Data Port 1. 32 bit */
 
-#define I2C_A_ADC_ADD		0x00000034	//This is the Device address for ADC 
-#define I2C_A_ADC_READ		0x00000001	//To perform a read operation
-#define I2C_A_ADC_START		0x00000100	//Start I2C transaction
-#define I2C_A_ADC_ABORT		0x00000200	//I2C transaction abort
-#define I2C_A_ADC_LAST		0x00000400	//I2C last transaction
-#define I2C_A_ADC_BYTE		0x00000800	//I2C one byte mode
-
-#define I2C_D_ADC_REG_MASK	0xfe000000  	//ADC address register 
-#define I2C_D_ADC_DAT_MASK	0x01ff0000  	//ADC data register
-
-#define ADC_TIMEOUT		0x00000007	//ADC Timeout Clock Disable
-#define ADC_IFC_CTRL		0x0000000b	//ADC Interface Control
-#define ADC_MASTER		0x0000000c	//ADC Master Mode Control
-#define ADC_POWER		0x0000000d	//ADC PowerDown Control
-#define ADC_ATTEN_ADCL		0x0000000e	//ADC Attenuation ADCL
-#define ADC_ATTEN_ADCR		0x0000000f	//ADC Attenuation ADCR
-#define ADC_ALC_CTRL1		0x00000010	//ADC ALC Control 1
-#define ADC_ALC_CTRL2		0x00000011	//ADC ALC Control 2
-#define ADC_ALC_CTRL3		0x00000012	//ADC ALC Control 3
-#define ADC_NOISE_CTRL		0x00000013	//ADC Noise Gate Control
-#define ADC_LIMIT_CTRL		0x00000014	//ADC Limiter Control
-#define ADC_MUX			0x00000015  	//ADC Mux offset
-
-#if 0
-/* FIXME: Not tested yet. */
-#define ADC_GAIN_MASK		0x000000ff	//Mask for ADC Gain
-#define ADC_ZERODB		0x000000cf	//Value to set ADC to 0dB
-#define ADC_MUTE_MASK		0x000000c0	//Mask for ADC mute
-#define ADC_MUTE		0x000000c0	//Value to mute ADC
-#define ADC_OSR			0x00000008	//Mask for ADC oversample rate select
-#define ADC_TIMEOUT_DISABLE	0x00000008	//Value and mask to disable Timeout clock
-#define ADC_HPF_DISABLE		0x00000100	//Value and mask to disable High pass filter
-#define ADC_TRANWIN_MASK	0x00000070	//Mask for Length of Transient Window
-#endif
-
-#define ADC_MUX_MASK		0x0000000f	//Mask for ADC Mux
-#define ADC_MUX_PHONE		0x00000001	//Value to select TAD at ADC Mux (Not used)
-#define ADC_MUX_MIC		0x00000002	//Value to select Mic at ADC Mux
-#define ADC_MUX_LINEIN		0x00000004	//Value to select LineIn at ADC Mux
-#define ADC_MUX_AUX		0x00000008	//Value to select Aux at ADC Mux
 
 #define SET_CHANNEL 0  /* Testing channel outputs 0=Front, 1=Center/LFE, 2=Unknown, 3=Rear */
 #define PCM_FRONT_CHANNEL 0
@@ -538,189 +489,61 @@
 #define CONTROL_CENTER_LFE_CHANNEL 1
 #define CONTROL_UNKNOWN_CHANNEL 2
 
-
-/* Based on WM8768 Datasheet Rev 4.2 page 32 */
-#define SPI_REG_MASK	0x1ff	/* 16-bit SPI writes have a 7-bit address */
-#define SPI_REG_SHIFT	9	/* followed by 9 bits of data */
-
-#define SPI_LDA1_REG		0	/* digital attenuation */
-#define SPI_RDA1_REG		1
-#define SPI_LDA2_REG		4
-#define SPI_RDA2_REG		5
-#define SPI_LDA3_REG		6
-#define SPI_RDA3_REG		7
-#define SPI_LDA4_REG		13
-#define SPI_RDA4_REG		14
-#define SPI_MASTDA_REG		8
-
-#define SPI_DA_BIT_UPDATE	(1<<8)	/* update attenuation values */
-#define SPI_DA_BIT_0dB		0xff	/* 0 dB */
-#define SPI_DA_BIT_infdB	0x00	/* inf dB attenuation (mute) */
-
-#define SPI_PL_REG		2
-#define SPI_PL_BIT_L_M		(0<<5)	/* left channel = mute */
-#define SPI_PL_BIT_L_L		(1<<5)	/* left channel = left */
-#define SPI_PL_BIT_L_R		(2<<5)	/* left channel = right */
-#define SPI_PL_BIT_L_C		(3<<5)	/* left channel = (L+R)/2 */
-#define SPI_PL_BIT_R_M		(0<<7)	/* right channel = mute */
-#define SPI_PL_BIT_R_L		(1<<7)	/* right channel = left */
-#define SPI_PL_BIT_R_R		(2<<7)	/* right channel = right */
-#define SPI_PL_BIT_R_C		(3<<7)	/* right channel = (L+R)/2 */
-#define SPI_IZD_REG		2
-#define SPI_IZD_BIT		(0<<4)	/* infinite zero detect */
-
-#define SPI_FMT_REG		3
-#define SPI_FMT_BIT_RJ		(0<<0)	/* right justified mode */
-#define SPI_FMT_BIT_LJ		(1<<0)	/* left justified mode */
-#define SPI_FMT_BIT_I2S		(2<<0)	/* I2S mode */
-#define SPI_FMT_BIT_DSP		(3<<0)	/* DSP Modes A or B */
-#define SPI_LRP_REG		3
-#define SPI_LRP_BIT		(1<<2)	/* invert LRCLK polarity */
-#define SPI_BCP_REG		3
-#define SPI_BCP_BIT		(1<<3)	/* invert BCLK polarity */
-#define SPI_IWL_REG		3
-#define SPI_IWL_BIT_16		(0<<4)	/* 16-bit world length */
-#define SPI_IWL_BIT_20		(1<<4)	/* 20-bit world length */
-#define SPI_IWL_BIT_24		(2<<4)	/* 24-bit world length */
-#define SPI_IWL_BIT_32		(3<<4)	/* 32-bit world length */
-
-#define SPI_MS_REG		10
-#define SPI_MS_BIT		(1<<5)	/* master mode */
-#define SPI_RATE_REG		10	/* only applies in master mode */
-#define SPI_RATE_BIT_128	(0<<6)	/* MCLK = LRCLK * 128 */
-#define SPI_RATE_BIT_192	(1<<6)
-#define SPI_RATE_BIT_256	(2<<6)
-#define SPI_RATE_BIT_384	(3<<6)
-#define SPI_RATE_BIT_512	(4<<6)
-#define SPI_RATE_BIT_768	(5<<6)
-
-/* They really do label the bit for the 4th channel "4" and not "3" */
-#define SPI_DMUTE0_REG		9
-#define SPI_DMUTE1_REG		9
-#define SPI_DMUTE2_REG		9
-#define SPI_DMUTE4_REG		15
-#define SPI_DMUTE0_BIT		(1<<3)
-#define SPI_DMUTE1_BIT		(1<<4)
-#define SPI_DMUTE2_BIT		(1<<5)
-#define SPI_DMUTE4_BIT		(1<<2)
-
-#define SPI_PHASE0_REG		3
-#define SPI_PHASE1_REG		3
-#define SPI_PHASE2_REG		3
-#define SPI_PHASE4_REG		15
-#define SPI_PHASE0_BIT		(1<<6)
-#define SPI_PHASE1_BIT		(1<<7)
-#define SPI_PHASE2_BIT		(1<<8)
-#define SPI_PHASE4_BIT		(1<<3)
-
-#define SPI_PDWN_REG		2	/* power down all DACs */
-#define SPI_PDWN_BIT		(1<<2)
-#define SPI_DACD0_REG		10	/* power down individual DACs */
-#define SPI_DACD1_REG		10
-#define SPI_DACD2_REG		10
-#define SPI_DACD4_REG		15
-#define SPI_DACD0_BIT		(1<<1)
-#define SPI_DACD1_BIT		(1<<2)
-#define SPI_DACD2_BIT		(1<<3)
-#define SPI_DACD4_BIT		(1<<0)	/* datasheet error says it's 1 */
-
-#define SPI_PWRDNALL_REG	10	/* power down everything */
-#define SPI_PWRDNALL_BIT	(1<<4)
-
-#include "ca_midi.h"
-
-struct snd_ca0106;
+typedef struct snd_ca0106_channel ca0106_channel_t;
+typedef struct snd_ca0106 ca0106_t;
+typedef struct snd_ca0106_pcm ca0106_pcm_t;
 
 struct snd_ca0106_channel {
-	struct snd_ca0106 *emu;
+	ca0106_t *emu;
 	int number;
 	int use;
-	void (*interrupt)(struct snd_ca0106 *emu, struct snd_ca0106_channel *channel);
-	struct snd_ca0106_pcm *epcm;
+	void (*interrupt)(ca0106_t *emu, ca0106_channel_t *channel);
+	ca0106_pcm_t *epcm;
 };
 
 struct snd_ca0106_pcm {
-	struct snd_ca0106 *emu;
-	struct snd_pcm_substream *substream;
+	ca0106_t *emu;
+	snd_pcm_substream_t *substream;
         int channel_id;
 	unsigned short running;
 };
 
-struct snd_ca0106_details {
-        u32 serial;
-        char * name;
-	int ac97;	/* ac97 = 0 -> Select MIC, Line in, TAD in, AUX in.
-			   ac97 = 1 -> Default to AC97 in. */
-	int gpio_type;	/* gpio_type = 1 -> shared mic-in/line-in
-			   gpio_type = 2 -> shared side-out/line-in. */
-	int i2c_adc;	/* with i2c_adc=1, the driver adds some capture volume
-			   controls, phone, mic, line-in and aux. */
-	u16 spi_dac;	/* spi_dac = 0 -> no spi interface for DACs
-			   spi_dac = 0x<front><rear><center-lfe><side>
-			   -> specifies DAC id for each channel pair. */
-};
-
 // definition of the chip-specific record
 struct snd_ca0106 {
-	struct snd_card *card;
-	const struct snd_ca0106_details *details;
+	snd_card_t *card;
 	struct pci_dev *pci;
 
 	unsigned long port;
+	struct resource *res_port;
 	int irq;
 
+	unsigned int revision;		/* chip revision */
 	unsigned int serial;            /* serial number */
 	unsigned short model;		/* subsystem id */
 
 	spinlock_t emu_lock;
 
-	struct snd_ac97 *ac97;
-	struct snd_pcm *pcm[4];
+	ac97_t *ac97;
+	snd_pcm_t *pcm;
 
-	struct snd_ca0106_channel playback_channels[4];
-	struct snd_ca0106_channel capture_channels[4];
-	u32 spdif_bits[4];             /* s/pdif out default setup */
-	u32 spdif_str_bits[4];         /* s/pdif out per-stream setup */
+	ca0106_channel_t playback_channels[4];
+	ca0106_channel_t capture_channels[4];
+	u32 spdif_bits[4];             /* s/pdif out setup */
 	int spdif_enable;
 	int capture_source;
-	int i2c_capture_source;
-	u8 i2c_capture_volume[4][2];
-	int capture_mic_line_in;
 
-	struct snd_dma_buffer *buffer;
-
-	struct snd_ca_midi midi;
-	struct snd_ca_midi midi2;
-
-	u16 spi_dac_reg[16];
-
-#ifdef CONFIG_PM_SLEEP
-#define NUM_SAVED_VOLUMES	9
-	unsigned int saved_vol[NUM_SAVED_VOLUMES];
-#endif
+	struct snd_dma_buffer buffer;
 };
 
-int snd_ca0106_mixer(struct snd_ca0106 *emu);
-int snd_ca0106_proc_init(struct snd_ca0106 * emu);
+int __devinit snd_ca0106_mixer(ca0106_t *emu);
+int __devinit snd_ca0106_proc_init(ca0106_t * emu);
 
-unsigned int snd_ca0106_ptr_read(struct snd_ca0106 * emu, 
-				 unsigned int reg, 
-				 unsigned int chn);
+unsigned int snd_ca0106_ptr_read(ca0106_t * emu, 
+					  unsigned int reg, 
+					  unsigned int chn);
 
-void snd_ca0106_ptr_write(struct snd_ca0106 *emu, 
-			  unsigned int reg, 
-			  unsigned int chn, 
-			  unsigned int data);
-
-int snd_ca0106_i2c_write(struct snd_ca0106 *emu, u32 reg, u32 value);
-
-int snd_ca0106_spi_write(struct snd_ca0106 * emu,
+void snd_ca0106_ptr_write(ca0106_t *emu, 
+				   unsigned int reg, 
+				   unsigned int chn, 
 				   unsigned int data);
 
-#ifdef CONFIG_PM_SLEEP
-void snd_ca0106_mixer_suspend(struct snd_ca0106 *chip);
-void snd_ca0106_mixer_resume(struct snd_ca0106 *chip);
-#else
-#define snd_ca0106_mixer_suspend(chip)	do { } while (0)
-#define snd_ca0106_mixer_resume(chip)	do { } while (0)
-#endif

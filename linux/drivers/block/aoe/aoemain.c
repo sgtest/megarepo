@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 Coraid, Inc.  See COPYING for GPL terms. */
+/* Copyright (c) 2004 Coraid, Inc.  See COPYING for GPL terms. */
 /*
  * aoemain.c
  * Module initialization routines, discover timer
@@ -7,36 +7,62 @@
 #include <linux/hdreg.h>
 #include <linux/blkdev.h>
 #include <linux/module.h>
-#include <linux/skbuff.h>
 #include "aoe.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Sam Hopkins <sah@coraid.com>");
-MODULE_DESCRIPTION("AoE block/char driver for 2.6.2 and newer 2.6 kernels");
+MODULE_DESCRIPTION("AoE block/char driver for 2.6.[0-9]+");
 MODULE_VERSION(VERSION);
 
-static struct timer_list timer;
-struct workqueue_struct *aoe_wq;
+enum { TINIT, TRUN, TKILL };
 
-static void discover_timer(struct timer_list *t)
+static void
+discover_timer(ulong vp)
 {
-	mod_timer(t, jiffies + HZ * 60); /* one minute */
+	static struct timer_list t;
+	static volatile ulong die;
+	static spinlock_t lock;
+	ulong flags;
+	enum { DTIMERTICK = HZ * 60 }; /* one minute */
 
-	aoecmd_cfg(0xffff, 0xff);
+	switch (vp) {
+	case TINIT:
+		init_timer(&t);
+		spin_lock_init(&lock);
+		t.data = TRUN;
+		t.function = discover_timer;
+		die = 0;
+	case TRUN:
+		spin_lock_irqsave(&lock, flags);
+		if (!die) {
+			t.expires = jiffies + DTIMERTICK;
+			add_timer(&t);
+		}
+		spin_unlock_irqrestore(&lock, flags);
+
+		aoecmd_cfg(0xffff, 0xff);
+		return;
+	case TKILL:
+		spin_lock_irqsave(&lock, flags);
+		die = 1;
+		spin_unlock_irqrestore(&lock, flags);
+
+		del_timer_sync(&t);
+	default:
+		return;
+	}
 }
 
-static void __exit
+static void
 aoe_exit(void)
 {
-	del_timer_sync(&timer);
+	discover_timer(TKILL);
 
 	aoenet_exit();
 	unregister_blkdev(AOE_MAJOR, DEVICE_NAME);
-	aoecmd_exit();
 	aoechr_exit();
 	aoedev_exit();
 	aoeblk_exit();		/* free cache after de-allocating bufs */
-	destroy_workqueue(aoe_wq);
 }
 
 static int __init
@@ -44,13 +70,9 @@ aoe_init(void)
 {
 	int ret;
 
-	aoe_wq = alloc_workqueue("aoe_wq", 0, 0);
-	if (!aoe_wq)
-		return -ENOMEM;
-
 	ret = aoedev_init();
 	if (ret)
-		goto dev_fail;
+		return ret;
 	ret = aoechr_init();
 	if (ret)
 		goto chr_fail;
@@ -60,22 +82,19 @@ aoe_init(void)
 	ret = aoenet_init();
 	if (ret)
 		goto net_fail;
-	ret = aoecmd_init();
-	if (ret)
-		goto cmd_fail;
 	ret = register_blkdev(AOE_MAJOR, DEVICE_NAME);
 	if (ret < 0) {
-		printk(KERN_ERR "aoe: can't register major\n");
+		printk(KERN_ERR "aoe: aoeblk_init: can't register major\n");
 		goto blkreg_fail;
 	}
-	printk(KERN_INFO "aoe: AoE v%s initialised.\n", VERSION);
 
-	timer_setup(&timer, discover_timer, 0);
-	discover_timer(&timer);
+	printk(KERN_INFO
+	       "aoe: aoe_init: AoE v2.6-%s initialised.\n",
+	       VERSION);
+	discover_timer(TINIT);
 	return 0;
+
  blkreg_fail:
-	aoecmd_exit();
- cmd_fail:
 	aoenet_exit();
  net_fail:
 	aoeblk_exit();
@@ -83,10 +102,8 @@ aoe_init(void)
 	aoechr_exit();
  chr_fail:
 	aoedev_exit();
- dev_fail:
-	destroy_workqueue(aoe_wq);
-
-	printk(KERN_INFO "aoe: initialisation failure.\n");
+	
+	printk(KERN_INFO "aoe: aoe_init: initialisation failure.\n");
 	return ret;
 }
 

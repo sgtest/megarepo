@@ -1,152 +1,146 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *  i2c-pca-isa.c driver for PCA9564 on ISA boards
  *    Copyright (C) 2004 Arcom Control Systems
- *    Copyright (C) 2008 Pengutronix
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program; if not, write to the Free Software
+ *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
+#include <linux/config.h>
 #include <linux/kernel.h>
 #include <linux/ioport.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/delay.h>
-#include <linux/jiffies.h>
+#include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
+#include <linux/pci.h>
 #include <linux/wait.h>
-#include <linux/isa.h>
+
 #include <linux/i2c.h>
 #include <linux/i2c-algo-pca.h>
-#include <linux/io.h>
 
+#include <asm/io.h>
 #include <asm/irq.h>
 
-#define DRIVER "i2c-pca-isa"
+#include "../algos/i2c-algo-pca.h"
+
 #define IO_SIZE 4
 
-static unsigned long base;
-static int irq = -1;
+#undef DEBUG_IO
+//#define DEBUG_IO
+
+static unsigned long base   = 0x330;
+static int irq 	  = 10;
 
 /* Data sheet recommends 59kHz for 100kHz operation due to variation
  * in the actual clock rate */
-static int clock  = 59000;
+static int clock  = I2C_PCA_CON_59kHz;
 
-static struct i2c_adapter pca_isa_ops;
+static int own    = 0x55;
+
 static wait_queue_head_t pca_wait;
 
-static void pca_isa_writebyte(void *pd, int reg, int val)
+static int pca_isa_getown(struct i2c_algo_pca_data *adap)
+{
+	return (own);
+}
+
+static int pca_isa_getclock(struct i2c_algo_pca_data *adap)
+{
+	return (clock);
+}
+
+static void
+pca_isa_writebyte(struct i2c_algo_pca_data *adap, int reg, int val)
 {
 #ifdef DEBUG_IO
 	static char *names[] = { "T/O", "DAT", "ADR", "CON" };
-	printk(KERN_DEBUG "*** write %s at %#lx <= %#04x\n", names[reg],
-	       base+reg, val);
+	printk("*** write %s at %#lx <= %#04x\n", names[reg], base+reg, val);
 #endif
 	outb(val, base+reg);
 }
 
-static int pca_isa_readbyte(void *pd, int reg)
+static int
+pca_isa_readbyte(struct i2c_algo_pca_data *adap, int reg)
 {
 	int res = inb(base+reg);
 #ifdef DEBUG_IO
 	{
-		static char *names[] = { "STA", "DAT", "ADR", "CON" };
-		printk(KERN_DEBUG "*** read  %s => %#04x\n", names[reg], res);
+		static char *names[] = { "STA", "DAT", "ADR", "CON" };	
+		printk("*** read  %s => %#04x\n", names[reg], res);
 	}
 #endif
 	return res;
 }
 
-static int pca_isa_waitforcompletion(void *pd)
+static int pca_isa_waitforinterrupt(struct i2c_algo_pca_data *adap)
 {
-	unsigned long timeout;
-	long ret;
+	int ret = 0;
 
 	if (irq > -1) {
-		ret = wait_event_timeout(pca_wait,
-				pca_isa_readbyte(pd, I2C_PCA_CON)
-				& I2C_PCA_CON_SI, pca_isa_ops.timeout);
+		ret = wait_event_interruptible(pca_wait,
+					       pca_isa_readbyte(adap, I2C_PCA_CON) & I2C_PCA_CON_SI);
 	} else {
-		/* Do polling */
-		timeout = jiffies + pca_isa_ops.timeout;
-		do {
-			ret = time_before(jiffies, timeout);
-			if (pca_isa_readbyte(pd, I2C_PCA_CON)
-					& I2C_PCA_CON_SI)
-				break;
+		while ((pca_isa_readbyte(adap, I2C_PCA_CON) & I2C_PCA_CON_SI) == 0) 
 			udelay(100);
-		} while (ret);
 	}
-
-	return ret > 0;
+	return ret;
 }
 
-static void pca_isa_resetchip(void *pd)
-{
-	/* apparently only an external reset will do it. not a lot can be done */
-	printk(KERN_WARNING DRIVER ": Haven't figured out how to do a reset yet\n");
-}
-
-static irqreturn_t pca_handler(int this_irq, void *dev_id) {
-	wake_up(&pca_wait);
+static irqreturn_t pca_handler(int this_irq, void *dev_id, struct pt_regs *regs) {
+	wake_up_interruptible(&pca_wait);
 	return IRQ_HANDLED;
 }
 
 static struct i2c_algo_pca_data pca_isa_data = {
-	/* .data intentionally left NULL, not needed with ISA */
+	.get_own		= pca_isa_getown,
+	.get_clock		= pca_isa_getclock,
 	.write_byte		= pca_isa_writebyte,
 	.read_byte		= pca_isa_readbyte,
-	.wait_for_completion	= pca_isa_waitforcompletion,
-	.reset_chip		= pca_isa_resetchip,
+	.wait_for_interrupt	= pca_isa_waitforinterrupt,
 };
 
 static struct i2c_adapter pca_isa_ops = {
 	.owner          = THIS_MODULE,
+	.id		= I2C_HW_A_ISA,
 	.algo_data	= &pca_isa_data,
-	.name		= "PCA9564/PCA9665 ISA Adapter",
-	.timeout	= HZ,
+	.name		= "PCA9564 ISA Adapter",
 };
 
-static int pca_isa_match(struct device *dev, unsigned int id)
+static int __init pca_isa_init(void)
 {
-	int match = base != 0;
 
-	if (match) {
-		if (irq <= -1)
-			dev_warn(dev, "Using polling mode (specify irq)\n");
-	} else
-		dev_err(dev, "Please specify I/O base\n");
-
-	return match;
-}
-
-static int pca_isa_probe(struct device *dev, unsigned int id)
-{
 	init_waitqueue_head(&pca_wait);
 
-	dev_info(dev, "i/o base %#08lx. irq %d\n", base, irq);
-
-#ifdef CONFIG_PPC
-	if (check_legacy_ioport(base)) {
-		dev_err(dev, "I/O address %#08lx is not available\n", base);
-		goto out;
-	}
-#endif
+	printk(KERN_INFO "i2c-pca-isa: i/o base %#08lx. irq %d\n", base, irq);
 
 	if (!request_region(base, IO_SIZE, "i2c-pca-isa")) {
-		dev_err(dev, "I/O address %#08lx is in use\n", base);
+		printk(KERN_ERR "i2c-pca-isa: I/O address %#08lx is in use.\n", base);
 		goto out;
 	}
 
 	if (irq > -1) {
 		if (request_irq(irq, pca_handler, 0, "i2c-pca-isa", &pca_isa_ops) < 0) {
-			dev_err(dev, "Request irq%d failed\n", irq);
+			printk(KERN_ERR "i2c-pca-isa: Request irq%d failed\n", irq);
 			goto out_region;
 		}
 	}
 
-	pca_isa_data.i2c_clock = clock;
 	if (i2c_pca_add_bus(&pca_isa_ops) < 0) {
-		dev_err(dev, "Failed to add i2c bus\n");
+		printk(KERN_ERR "i2c-pca-isa: Failed to add i2c bus\n");
 		goto out_irq;
 	}
 
@@ -161,41 +155,30 @@ static int pca_isa_probe(struct device *dev, unsigned int id)
 	return -ENODEV;
 }
 
-static void pca_isa_remove(struct device *dev, unsigned int id)
+static void pca_isa_exit(void)
 {
-	i2c_del_adapter(&pca_isa_ops);
+	i2c_pca_del_bus(&pca_isa_ops);
 
-	if (irq > -1) {
+	if (irq > 0) {
 		disable_irq(irq);
 		free_irq(irq, &pca_isa_ops);
 	}
 	release_region(base, IO_SIZE);
 }
 
-static struct isa_driver pca_isa_driver = {
-	.match		= pca_isa_match,
-	.probe		= pca_isa_probe,
-	.remove		= pca_isa_remove,
-	.driver = {
-		.owner	= THIS_MODULE,
-		.name	= DRIVER,
-	}
-};
-
 MODULE_AUTHOR("Ian Campbell <icampbell@arcom.com>");
-MODULE_DESCRIPTION("ISA base PCA9564/PCA9665 driver");
+MODULE_DESCRIPTION("ISA base PCA9564 driver");
 MODULE_LICENSE("GPL");
 
-module_param_hw(base, ulong, ioport, 0);
+module_param(base, ulong, 0);
 MODULE_PARM_DESC(base, "I/O base address");
-module_param_hw(irq, int, irq, 0);
+
+module_param(irq, int, 0);
 MODULE_PARM_DESC(irq, "IRQ");
 module_param(clock, int, 0);
-MODULE_PARM_DESC(clock, "Clock rate in hertz.\n\t\t"
-		"For PCA9564: 330000,288000,217000,146000,"
-		"88000,59000,44000,36000\n"
-		"\t\tFor PCA9665:\tStandard: 60300 - 100099\n"
-		"\t\t\t\tFast: 100100 - 400099\n"
-		"\t\t\t\tFast+: 400100 - 10000099\n"
-		"\t\t\t\tTurbo: Up to 1265800");
-module_isa_driver(pca_isa_driver, 1);
+MODULE_PARM_DESC(clock, "Clock rate as described in table 1 of PCA9564 datasheet");
+
+module_param(own, int, 0); /* the driver can't do slave mode, so there's no real point in this */
+
+module_init(pca_isa_init);
+module_exit(pca_isa_exit);

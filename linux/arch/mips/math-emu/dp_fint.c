@@ -1,21 +1,39 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /* IEEE754 floating point arithmetic
  * double precision: common utilities
  */
 /*
  * MIPS floating point support
  * Copyright (C) 1994-2000 Algorithmics Ltd.
+ * http://www.algor.co.uk
+ *
+ * ########################################################################
+ *
+ *  This program is free software; you can distribute it and/or modify it
+ *  under the terms of the GNU General Public License (Version 2) as
+ *  published by the Free Software Foundation.
+ *
+ *  This program is distributed in the hope it will be useful, but WITHOUT
+ *  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ *  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ *  for more details.
+ *
+ *  You should have received a copy of the GNU General Public License along
+ *  with this program; if not, write to the Free Software Foundation, Inc.,
+ *  59 Temple Place - Suite 330, Boston MA 02111-1307, USA.
+ *
+ * ########################################################################
  */
+
 
 #include "ieee754dp.h"
 
-union ieee754dp ieee754dp_fint(int x)
+ieee754dp ieee754dp_fint(int x)
 {
-	u64 xm;
-	int xe;
-	int xs;
+	COMPXDP;
 
-	ieee754_clearcx();
+	CLEARCX;
+
+	xc = ( 0 ? xc : xc );
 
 	if (x == 0)
 		return ieee754dp_zero(0);
@@ -34,11 +52,29 @@ union ieee754dp ieee754dp_fint(int x)
 		xm = x;
 	}
 
+#if 1
 	/* normalize - result can never be inexact or overflow */
-	xe = DP_FBITS;
-	while ((xm >> DP_FBITS) == 0) {
+	xe = DP_MBITS;
+	while ((xm >> DP_MBITS) == 0) {
 		xm <<= 1;
 		xe--;
 	}
 	return builddp(xs, xe + DP_EBIAS, xm & ~DP_HIDDEN_BIT);
+#else
+	/* normalize */
+	xe = DP_MBITS + 3;
+	while ((xm >> (DP_MBITS + 3)) == 0) {
+		xm <<= 1;
+		xe--;
+	}
+	DPNORMRET1(xs, xe, xm, "fint", x);
+#endif
+}
+
+ieee754dp ieee754dp_funs(unsigned int u)
+{
+	if ((int) u < 0)
+		return ieee754dp_add(ieee754dp_1e31(),
+				     ieee754dp_fint(u & ~(1 << 31)));
+	return ieee754dp_fint(u);
 }

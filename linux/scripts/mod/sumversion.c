@@ -7,7 +7,6 @@
 #include <ctype.h>
 #include <errno.h>
 #include <string.h>
-#include <limits.h>
 #include "modpost.h"
 
 /*
@@ -214,7 +213,7 @@ static void md4_final_ascii(struct md4_ctx *mctx, char *out, unsigned int len)
 	mctx->block[14] = mctx->byte_count << 3;
 	mctx->block[15] = mctx->byte_count >> 29;
 	le32_to_cpu_array(mctx->block, (sizeof(mctx->block) -
-			  sizeof(uint64_t)) / sizeof(uint32_t));
+	                  sizeof(uint64_t)) / sizeof(uint32_t));
 	md4_transform(mctx->hash, mctx->block);
 	cpu_to_le32_array(mctx->hash, sizeof(mctx->hash) / sizeof(uint32_t));
 
@@ -253,13 +252,14 @@ static int parse_comment(const char *file, unsigned long len)
 }
 
 /* FIXME: Handle .s files differently (eg. # starts comments) --RR */
-static int parse_file(const char *fname, struct md4_ctx *md)
+static int parse_file(const signed char *fname, struct md4_ctx *md)
 {
-	char *file;
+	signed char *file;
 	unsigned long i, len;
 
-	file = read_text_file(fname);
-	len = strlen(file);
+	file = grab_file(fname, &len);
+	if (!file)
+		return 0;
 
 	for (i = 0; i < len; i++) {
 		/* Collapse and ignore \ and CR. */
@@ -286,23 +286,17 @@ static int parse_file(const char *fname, struct md4_ctx *md)
 
 		add_char(file[i], md);
 	}
-	free(file);
+	release_file(file, len);
 	return 1;
 }
-/* Check whether the file is a static library or not */
-static bool is_static_library(const char *objfile)
-{
-	int len = strlen(objfile);
 
-	return objfile[len - 2] == '.' && objfile[len - 1] == 'a';
-}
-
-/* We have dir/file.o.  Open dir/.file.o.cmd, look for source_ and deps_ line
- * to figure out source files. */
+/* We have dir/file.o.  Open dir/.file.o.cmd, look for deps_ line to
+ * figure out source file. */
 static int parse_source_files(const char *objfile, struct md4_ctx *md)
 {
-	char *cmd, *file, *line, *dir, *pos;
+	char *cmd, *file, *line, *dir;
 	const char *base;
+	unsigned long flen, pos = 0;
 	int dirlen, ret = 0, check_files = 0;
 
 	cmd = NOFAIL(malloc(strlen(objfile) + sizeof("..cmd")));
@@ -320,28 +314,25 @@ static int parse_source_files(const char *objfile, struct md4_ctx *md)
 	strncpy(dir, objfile, dirlen);
 	dir[dirlen] = '\0';
 
-	file = read_text_file(cmd);
+	file = grab_file(cmd, &flen);
+	if (!file) {
+		fprintf(stderr, "Warning: could not find %s for %s\n",
+			cmd, objfile);
+		goto out;
+	}
 
-	pos = file;
+	/* There will be a line like so:
+		deps_drivers/net/dummy.o := \
+		  drivers/net/dummy.c \
+		    $(wildcard include/config/net/fastroute.h) \
+		  include/linux/config.h \
+		    $(wildcard include/config/h.h) \
+		  include/linux/module.h \
 
-	/* Sum all files in the same dir or subdirs. */
-	while ((line = get_line(&pos))) {
-		char* p = line;
-
-		if (strncmp(line, "source_", sizeof("source_")-1) == 0) {
-			p = strrchr(line, ' ');
-			if (!p) {
-				warn("malformed line: %s\n", line);
-				goto out_file;
-			}
-			p++;
-			if (!parse_file(p, md)) {
-				warn("could not open %s: %s\n",
-				     p, strerror(errno));
-				goto out_file;
-			}
-			continue;
-		}
+	   Sum all files in the same dir or subdirs.
+	*/
+	while ((line = get_next_line(&pos, file, flen)) != NULL) {
+		signed char* p = line;
 		if (strncmp(line, "deps_", sizeof("deps_")-1) == 0) {
 			check_files = 1;
 			continue;
@@ -354,7 +345,7 @@ static int parse_source_files(const char *objfile, struct md4_ctx *md)
 			break;
 		/* Terminate line at first space, to get rid of final ' \' */
 		while (*p) {
-			if (isspace(*p)) {
+                       if (isspace(*p)) {
 				*p = '\0';
 				break;
 			}
@@ -364,8 +355,9 @@ static int parse_source_files(const char *objfile, struct md4_ctx *md)
 		/* Check if this file is in same dir as objfile */
 		if ((strstr(line, dir)+strlen(dir)-1) == strrchr(line, '/')) {
 			if (!parse_file(line, md)) {
-				warn("could not open %s: %s\n",
-				     line, strerror(errno));
+				fprintf(stderr,
+					"Warning: could not open %s: %s\n",
+					line, strerror(errno));
 				goto out_file;
 			}
 
@@ -376,7 +368,8 @@ static int parse_source_files(const char *objfile, struct md4_ctx *md)
 	/* Everyone parsed OK */
 	ret = 1;
 out_file:
-	free(file);
+	release_file(file, flen);
+out:
 	free(dir);
 	free(cmd);
 	return ret;
@@ -385,26 +378,121 @@ out_file:
 /* Calc and record src checksum. */
 void get_src_version(const char *modname, char sum[], unsigned sumlen)
 {
-	char *buf;
+	void *file;
+	unsigned long len;
 	struct md4_ctx md;
-	char *fname;
-	char filelist[PATH_MAX + 1];
+	char *sources, *end, *fname;
+	const char *basename;
+	char filelist[strlen(getenv("MODVERDIR")) + strlen("/") +
+		      strlen(modname) - strlen(".o") + strlen(".mod") + 1 ];
 
-	/* objects for a module are listed in the first line of *.mod file. */
-	snprintf(filelist, sizeof(filelist), "%s.mod", modname);
+	/* Source files for module are in .tmp_versions/modname.mod,
+	   after the first line. */
+	if (strrchr(modname, '/'))
+		basename = strrchr(modname, '/') + 1;
+	else
+		basename = modname;
+	sprintf(filelist, "%s/%.*s.mod", getenv("MODVERDIR"),
+		(int) strlen(basename) - 2, basename);
 
-	buf = read_text_file(filelist);
+	file = grab_file(filelist, &len);
+	if (!file) {
+		fprintf(stderr, "Warning: could not find versions for %s\n",
+			filelist);
+		return;
+	}
+
+	sources = strchr(file, '\n');
+	if (!sources) {
+		fprintf(stderr, "Warning: malformed versions file for %s\n",
+			modname);
+		goto release;
+	}
+
+	sources++;
+	end = strchr(sources, '\n');
+	if (!end) {
+		fprintf(stderr, "Warning: bad ending versions file for %s\n",
+			modname);
+		goto release;
+	}
+	*end = '\0';
 
 	md4_init(&md);
-	while ((fname = strsep(&buf, "\n"))) {
+	while ((fname = strsep(&sources, " ")) != NULL) {
 		if (!*fname)
 			continue;
-		if (!(is_static_library(fname)) &&
-				!parse_source_files(fname, &md))
-			goto free;
+		if (!parse_source_files(fname, &md))
+			goto release;
 	}
 
 	md4_final_ascii(&md, sum, sumlen);
-free:
-	free(buf);
+release:
+	release_file(file, len);
+}
+
+static void write_version(const char *filename, const char *sum,
+			  unsigned long offset)
+{
+	int fd;
+
+	fd = open(filename, O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "Warning: changing sum in %s failed: %s\n",
+			filename, strerror(errno));
+		return;
+	}
+
+	if (lseek(fd, offset, SEEK_SET) == (off_t)-1) {
+		fprintf(stderr, "Warning: changing sum in %s:%lu failed: %s\n",
+			filename, offset, strerror(errno));
+		goto out;
+	}
+
+	if (write(fd, sum, strlen(sum)+1) != strlen(sum)+1) {
+		fprintf(stderr, "Warning: writing sum in %s failed: %s\n",
+			filename, strerror(errno));
+		goto out;
+	}
+out:
+	close(fd);
+}
+
+static int strip_rcs_crap(signed char *version)
+{
+	unsigned int len, full_len;
+
+	if (strncmp(version, "$Revision", strlen("$Revision")) != 0)
+		return 0;
+
+	/* Space for version string follows. */
+	full_len = strlen(version) + strlen(version + strlen(version) + 1) + 2;
+
+	/* Move string to start with version number: prefix will be
+	 * $Revision$ or $Revision: */
+	len = strlen("$Revision");
+	if (version[len] == ':' || version[len] == '$')
+		len++;
+	while (isspace(version[len]))
+		len++;
+	memmove(version, version+len, full_len-len);
+	full_len -= len;
+
+	/* Preserve up to next whitespace. */
+	len = 0;
+	while (version[len] && !isspace(version[len]))
+		len++;
+	memmove(version + len, version + strlen(version),
+		full_len - strlen(version));
+	return 1;
+}
+
+/* Clean up RCS-style version numbers. */
+void maybe_frob_rcs_version(const char *modfilename,
+			    char *version,
+			    void *modinfo,
+			    unsigned long version_offset)
+{
+	if (strip_rcs_crap(version))
+		write_version(modfilename, version, version_offset);
 }

@@ -1,5 +1,8 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  *
  * Copyright Jonathan Naylor G4KLX (g4klx@g4klx.demon.co.uk)
  * Copyright Darryl Miles G7LED (dlm@g7led.demon.co.uk)
@@ -9,18 +12,20 @@
 #include <linux/socket.h>
 #include <linux/in.h>
 #include <linux/kernel.h>
+#include <linux/sched.h>
 #include <linux/timer.h>
 #include <linux/string.h>
 #include <linux/sockios.h>
 #include <linux/net.h>
-#include <linux/slab.h>
 #include <net/ax25.h>
 #include <linux/inet.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
 #include <net/sock.h>
-#include <net/tcp_states.h>
-#include <linux/uaccess.h>
+#include <net/tcp.h>
+#include <net/ip.h>			/* For ip_rcv */
+#include <asm/uaccess.h>
+#include <asm/system.h>
 #include <linux/fcntl.h>
 #include <linux/mm.h>
 #include <linux/interrupt.h>
@@ -48,12 +53,10 @@ static int nr_queue_rx_frame(struct sock *sk, struct sk_buff *skb, int more)
 		if ((skbn = alloc_skb(nr->fraglen, GFP_ATOMIC)) == NULL)
 			return 1;
 
-		skb_reset_transport_header(skbn);
+		skbn->h.raw = skbn->data;
 
 		while ((skbo = skb_dequeue(&nr->frag_queue)) != NULL) {
-			skb_copy_from_linear_data(skbo,
-						  skb_put(skbn, skbo->len),
-						  skbo->len);
+			memcpy(skb_put(skbn, skbo->len), skbo->data, skbo->len);
 			kfree_skb(skbo);
 		}
 
@@ -96,11 +99,6 @@ static int nr_state1_machine(struct sock *sk, struct sk_buff *skb,
 		nr_disconnect(sk, ECONNREFUSED);
 		break;
 
-	case NR_RESET:
-		if (sysctl_netrom_reset_circuit)
-			nr_disconnect(sk, ECONNRESET);
-		break;
-
 	default:
 		break;
 	}
@@ -122,14 +120,9 @@ static int nr_state2_machine(struct sock *sk, struct sk_buff *skb,
 
 	case NR_DISCREQ:
 		nr_write_internal(sk, NR_DISCACK);
-		fallthrough;
+
 	case NR_DISCACK:
 		nr_disconnect(sk, 0);
-		break;
-
-	case NR_RESET:
-		if (sysctl_netrom_reset_circuit)
-			nr_disconnect(sk, ECONNRESET);
 		break;
 
 	default:
@@ -153,6 +146,7 @@ static int nr_state3_machine(struct sock *sk, struct sk_buff *skb, int frametype
 	int queued = 0;
 
 	nr = skb->data[18];
+	ns = skb->data[17];
 
 	switch (frametype) {
 	case NR_CONNREQ:
@@ -259,11 +253,6 @@ static int nr_state3_machine(struct sock *sk, struct sk_buff *skb, int frametype
 				nr_start_t2timer(sk);
 			}
 		}
-		break;
-
-	case NR_RESET:
-		if (sysctl_netrom_reset_circuit)
-			nr_disconnect(sk, ECONNRESET);
 		break;
 
 	default:

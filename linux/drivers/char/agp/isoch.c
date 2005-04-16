@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Setup routines for AGP 3.5 compliant bridges.
  */
@@ -7,7 +6,6 @@
 #include <linux/pci.h>
 #include <linux/agp_backend.h>
 #include <linux/module.h>
-#include <linux/slab.h>
 
 #include "agp.h"
 
@@ -27,7 +25,7 @@ static void agp_3_5_dev_list_insert(struct list_head *head, struct list_head *ne
 
 	list_for_each(pos, head) {
 		cur = list_entry(pos, struct agp_3_5_dev, list);
-		if (cur->maxbw > n->maxbw)
+		if(cur->maxbw > n->maxbw)
 			break;
 	}
 	list_add_tail(new, pos);
@@ -55,9 +53,9 @@ static void agp_3_5_dev_list_sort(struct agp_3_5_dev *list, unsigned int ndevs)
 	}
 }
 
-/*
- * Initialize all isochronous transfer parameters for an AGP 3.0
- * node (i.e. a host bridge in combination with the adapters
+/* 
+ * Initialize all isochronous transfer parameters for an AGP 3.0 
+ * node (i.e. a host bridge in combination with the adapters 
  * lying behind it...)
  */
 
@@ -84,6 +82,7 @@ static int agp_3_5_isochronous_node_enable(struct agp_bridge_data *bridge,
 	unsigned int cdev = 0;
 	u32 mnistat, tnistat, tstatus, mcmd;
 	u16 tnicmd, mnicmd;
+	u8 mcapndx;
 	u32 tot_bw = 0, tot_n = 0, tot_rq = 0, y_max, rq_isoch, rq_async;
 	u32 step, rem, rem_isoch, rem_async;
 	int ret = 0;
@@ -92,8 +91,7 @@ static int agp_3_5_isochronous_node_enable(struct agp_bridge_data *bridge,
 	 * We'll work with an array of isoch_data's (one for each
 	 * device in dev_list) throughout this function.
 	 */
-	master = kmalloc_array(ndevs, sizeof(*master), GFP_KERNEL);
-	if (master == NULL) {
+	if ((master = kmalloc(ndevs * sizeof(*master), GFP_KERNEL)) == NULL) {
 		ret = -ENOMEM;
 		goto get_out;
 	}
@@ -137,6 +135,8 @@ static int agp_3_5_isochronous_node_enable(struct agp_bridge_data *bridge,
 		cur = list_entry(pos, struct agp_3_5_dev, list);
 		dev = cur->dev;
 
+		mcapndx = cur->capndx;
+
 		pci_read_config_dword(dev, cur->capndx+AGPNISTAT, &mnistat);
 
 		master[cdev].maxbw = (mnistat >> 16) & 0xff;
@@ -152,7 +152,7 @@ static int agp_3_5_isochronous_node_enable(struct agp_bridge_data *bridge,
 
 	/* Check if this configuration has any chance of working */
 	if (tot_bw > target.maxbw) {
-		dev_err(&td->dev, "isochronous bandwidth required "
+		printk(KERN_ERR PFX "isochronous bandwidth required "
 			"by AGP 3.0 devices exceeds that which is supported by "
 			"the AGP 3.0 bridge!\n");
 		ret = -ENODEV;
@@ -187,7 +187,7 @@ static int agp_3_5_isochronous_node_enable(struct agp_bridge_data *bridge,
 	/* Exit if the minimal ISOCH_N allocation among the masters is more
 	 * than the target can handle. */
 	if (tot_n > target.n) {
-		dev_err(&td->dev, "number of isochronous "
+		printk(KERN_ERR PFX "number of isochronous "
 			"transactions per period required by AGP 3.0 devices "
 			"exceeds that which is supported by the AGP 3.0 "
 			"bridge!\n");
@@ -199,7 +199,7 @@ static int agp_3_5_isochronous_node_enable(struct agp_bridge_data *bridge,
 	 * this to the hungriest device (as per the spec) */
 	rem  = target.n - tot_n;
 
-	/*
+	/* 
 	 * Calculate the minimum isochronous RQ depth needed by each master.
 	 * Along the way, distribute the extra ISOCH_N capability calculated
 	 * above.
@@ -213,12 +213,14 @@ static int agp_3_5_isochronous_node_enable(struct agp_bridge_data *bridge,
 		 * many writes on the AGP bus).
 		 */
 		master[cdev].rq = master[cdev].n;
-		if (master[cdev].y > 0x1)
+		if(master[cdev].y > 0x1)
 			master[cdev].rq *= (1 << (master[cdev].y - 1));
 
 		tot_rq += master[cdev].rq;
+
+		if (cdev == ndevs-1)
+			master[cdev].n += rem;
 	}
-	master[ndevs-1].n += rem;
 
 	/* Figure the number of isochronous and asynchronous RQ slots the
 	 * target is providing. */
@@ -228,7 +230,7 @@ static int agp_3_5_isochronous_node_enable(struct agp_bridge_data *bridge,
 	/* Exit if the minimal RQ needs of the masters exceeds what the target
 	 * can provide. */
 	if (tot_rq > rq_isoch) {
-		dev_err(&td->dev, "number of request queue slots "
+		printk(KERN_ERR PFX "number of request queue slots "
 			"required by the isochronous bandwidth requested by "
 			"AGP 3.0 devices exceeds the number provided by the "
 			"AGP 3.0 bridge!\n");
@@ -247,6 +249,8 @@ static int agp_3_5_isochronous_node_enable(struct agp_bridge_data *bridge,
 	for (cdev=0; cdev<ndevs; cdev++) {
 		cur = master[cdev].dev;
 		dev = cur->dev;
+
+		mcapndx = cur->capndx;
 
 		master[cdev].rq += (cdev == ndevs - 1)
 		              ? (rem_async + rem_isoch) : step;
@@ -314,7 +318,7 @@ int agp_3_5_enable(struct agp_bridge_data *bridge)
 {
 	struct pci_dev *td = bridge->dev, *dev = NULL;
 	u8 mcapndx;
-	u32 isoch;
+	u32 isoch, arqsz;
 	u32 tstatus, mstatus, ncapid;
 	u32 mmajor;
 	u16 mpstat;
@@ -329,9 +333,11 @@ int agp_3_5_enable(struct agp_bridge_data *bridge)
 	if (isoch == 0)	/* isoch xfers not available, bail out. */
 		return -ENODEV;
 
-	/*
+	arqsz     = (tstatus >> 13) & 0x7;
+
+	/* 
 	 * Allocate a head for our AGP 3.5 device list
-	 * (multiple AGP v3 devices are allowed behind a single bridge).
+	 * (multiple AGP v3 devices are allowed behind a single bridge). 
 	 */
 	if ((dev_list = kmalloc(sizeof(*dev_list), GFP_KERNEL)) == NULL) {
 		ret = -ENOMEM;
@@ -354,15 +360,14 @@ int agp_3_5_enable(struct agp_bridge_data *bridge)
 			case 0x0001:    /* Unclassified device */
 				/* Don't know what this is, but log it for investigation. */
 				if (mcapndx != 0) {
-					dev_info(&td->dev, "wacky, found unclassified AGP device %s [%04x/%04x]\n",
-						 pci_name(dev),
-						 dev->vendor, dev->device);
+					printk (KERN_INFO PFX "Wacky, found unclassified AGP device. %x:%x\n",
+						dev->vendor, dev->device);
 				}
 				continue;
 
 			case 0x0300:    /* Display controller */
 			case 0x0400:    /* Multimedia controller */
-				if ((cur = kmalloc(sizeof(*cur), GFP_KERNEL)) == NULL) {
+				if((cur = kmalloc(sizeof(*cur), GFP_KERNEL)) == NULL) {
 					ret = -ENOMEM;
 					goto free_and_exit;
 				}
@@ -387,7 +392,7 @@ int agp_3_5_enable(struct agp_bridge_data *bridge)
 	list_for_each(pos, head) {
 		cur = list_entry(pos, struct agp_3_5_dev, list);
 		dev = cur->dev;
-
+		
 		pci_read_config_word(dev, PCI_STATUS, &mpstat);
 		if ((mpstat & PCI_STATUS_CAP_LIST) == 0)
 			continue;
@@ -403,18 +408,17 @@ int agp_3_5_enable(struct agp_bridge_data *bridge)
 		}
 
 		if (mcapndx == 0) {
-			dev_err(&td->dev, "woah!  Non-AGP device %s on "
-				"secondary bus of AGP 3.5 bridge!\n",
-				pci_name(dev));
+			printk(KERN_ERR PFX "woah!  Non-AGP device "
+				"found on the secondary bus of an AGP 3.5 bridge!\n");
 			ret = -ENODEV;
 			goto free_and_exit;
 		}
 
 		mmajor = (ncapid >> AGP_MAJOR_VERSION_SHIFT) & 0xf;
 		if (mmajor < 3) {
-			dev_err(&td->dev, "woah!  AGP 2.0 device %s on "
-				"secondary bus of AGP 3.5 bridge operating "
-				"with AGP 3.0 electricals!\n", pci_name(dev));
+			printk(KERN_ERR PFX "woah!  AGP 2.0 device "
+				"found on the secondary bus of an AGP 3.5 "
+				"bridge operating with AGP 3.0 electricals!\n");
 			ret = -ENODEV;
 			goto free_and_exit;
 		}
@@ -424,10 +428,10 @@ int agp_3_5_enable(struct agp_bridge_data *bridge)
 		pci_read_config_dword(dev, cur->capndx+AGPSTAT, &mstatus);
 
 		if (((mstatus >> 3) & 0x1) == 0) {
-			dev_err(&td->dev, "woah!  AGP 3.x device %s not "
-				"operating in AGP 3.x mode on secondary bus "
-				"of AGP 3.5 bridge operating with AGP 3.0 "
-				"electricals!\n", pci_name(dev));
+			printk(KERN_ERR PFX "woah!  AGP 3.x device "
+				"not operating in AGP 3.x mode found on the "
+				"secondary bus of an AGP 3.5 bridge operating "
+				"with AGP 3.0 electricals!\n");
 			ret = -ENODEV;
 			goto free_and_exit;
 		}
@@ -441,9 +445,9 @@ int agp_3_5_enable(struct agp_bridge_data *bridge)
 	if (isoch) {
 		ret = agp_3_5_isochronous_node_enable(bridge, dev_list, ndevs);
 		if (ret) {
-			dev_info(&td->dev, "something bad happened setting "
-				 "up isochronous xfers; falling back to "
-				 "non-isochronous xfer mode\n");
+			printk(KERN_INFO PFX "Something bad happened setting "
+			       "up isochronous xfers.  Falling back to "
+			       "non-isochronous xfer mode.\n");
 		} else {
 			goto free_and_exit;
 		}
@@ -463,3 +467,4 @@ free_and_exit:
 get_out:
 	return ret;
 }
+

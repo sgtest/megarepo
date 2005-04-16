@@ -6,17 +6,17 @@
  * (c) 1995,1996 Grant R. Guenther, grant@torque.net,
  * under the terms of the GNU General Public License.
  * 
+ * Current Maintainer: David Campbell (Perth, Western Australia, GMT+0800)
+ *                     campbell@torque.net
  */
 
+#include <linux/config.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
-#include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/blkdev.h>
 #include <linux/parport.h>
 #include <linux/workqueue.h>
-#include <linux/delay.h>
-#include <linux/jiffies.h>
 #include <asm/io.h>
 
 #include <scsi/scsi.h>
@@ -32,23 +32,17 @@ typedef struct {
 	int base;		/* Actual port address          */
 	int mode;		/* Transfer mode                */
 	struct scsi_cmnd *cur_cmd;	/* Current queued command       */
-	struct delayed_work ppa_tq;	/* Polling interrupt stuff       */
+	struct work_struct ppa_tq;	/* Polling interrupt stuff       */
 	unsigned long jstart;	/* Jiffies at start             */
 	unsigned long recon_tmo;	/* How many usecs to wait for reconnection (6th bit) */
 	unsigned int failed:1;	/* Failure flag                 */
 	unsigned wanted:1;	/* Parport sharing busy flag    */
-	unsigned int dev_no;	/* Device number		*/
 	wait_queue_head_t *waiting;
 	struct Scsi_Host *host;
 	struct list_head list;
 } ppa_struct;
 
 #include  "ppa.h"
-
-static struct scsi_pointer *ppa_scsi_pointer(struct scsi_cmnd *cmd)
-{
-	return scsi_cmd_priv(cmd);
-}
 
 static inline ppa_struct *ppa_dev(struct Scsi_Host *host)
 {
@@ -61,7 +55,7 @@ static void got_it(ppa_struct *dev)
 {
 	dev->base = dev->dev->port->base;
 	if (dev->cur_cmd)
-		ppa_scsi_pointer(dev->cur_cmd)->phase = 1;
+		dev->cur_cmd->SCp.phase = 1;
 	else
 		wake_up(dev->waiting);
 }
@@ -124,9 +118,8 @@ static inline void ppa_pb_release(ppa_struct *dev)
  * Also gives a method to use a script to obtain optimum timings (TODO)
  */
 
-static inline int ppa_write_info(struct Scsi_Host *host, char *buffer, int length)
+static inline int ppa_proc_write(ppa_struct *dev, char *buffer, int length)
 {
-	ppa_struct *dev = ppa_dev(host);
 	unsigned long x;
 
 	if ((length > 5) && (strncmp(buffer, "mode=", 5) == 0)) {
@@ -137,31 +130,49 @@ static inline int ppa_write_info(struct Scsi_Host *host, char *buffer, int lengt
 	if ((length > 10) && (strncmp(buffer, "recon_tmo=", 10) == 0)) {
 		x = simple_strtoul(buffer + 10, NULL, 0);
 		dev->recon_tmo = x;
-		printk(KERN_INFO "ppa: recon_tmo set to %ld\n", x);
+		printk("ppa: recon_tmo set to %ld\n", x);
 		return length;
 	}
-	printk(KERN_WARNING "ppa /proc: invalid variable\n");
-	return -EINVAL;
+	printk("ppa /proc: invalid variable\n");
+	return (-EINVAL);
 }
 
-static int ppa_show_info(struct seq_file *m, struct Scsi_Host *host)
+static int ppa_proc_info(struct Scsi_Host *host, char *buffer, char **start, off_t offset, int length, int inout)
 {
+	int len = 0;
 	ppa_struct *dev = ppa_dev(host);
 
-	seq_printf(m, "Version : %s\n", PPA_VERSION);
-	seq_printf(m, "Parport : %s\n", dev->dev->port->name);
-	seq_printf(m, "Mode    : %s\n", PPA_MODE_STRING[dev->mode]);
+	if (inout)
+		return ppa_proc_write(dev, buffer, length);
+
+	len += sprintf(buffer + len, "Version : %s\n", PPA_VERSION);
+	len +=
+	    sprintf(buffer + len, "Parport : %s\n",
+		    dev->dev->port->name);
+	len +=
+	    sprintf(buffer + len, "Mode    : %s\n",
+		    PPA_MODE_STRING[dev->mode]);
 #if PPA_DEBUG > 0
-	seq_printf(m, "recon_tmo : %lu\n", dev->recon_tmo);
+	len +=
+	    sprintf(buffer + len, "recon_tmo : %lu\n", dev->recon_tmo);
 #endif
-	return 0;
+
+	/* Request for beyond end of buffer */
+	if (offset > length)
+		return 0;
+
+	*start = buffer + offset;
+	len -= offset;
+	if (len > length)
+		len = length;
+	return len;
 }
 
 static int device_check(ppa_struct *dev);
 
 #if PPA_DEBUG > 0
 #define ppa_fail(x,y) printk("ppa: ppa_fail(%i) from %s at line %d\n",\
-	   y, __func__, __LINE__); ppa_fail_func(x,y);
+	   y, __FUNCTION__, __LINE__); ppa_fail_func(x,y);
 static inline void ppa_fail_func(ppa_struct *dev, int error_code)
 #else
 static inline void ppa_fail(ppa_struct *dev, int error_code)
@@ -206,7 +217,7 @@ static unsigned char ppa_wait(ppa_struct *dev)
 
 	/* Counter expired - Time out occurred */
 	ppa_fail(dev, DID_TIME_OUT);
-	printk(KERN_WARNING "ppa timeout in ppa_wait\n");
+	printk("ppa timeout in ppa_wait\n");
 	return 0;		/* command timed out */
 }
 
@@ -238,7 +249,7 @@ static inline void ecp_sync(ppa_struct *dev)
 				return;
 			udelay(5);
 		}
-		printk(KERN_WARNING "ppa: ECP sync failed as data still present in FIFO.\n");
+		printk("ppa: ECP sync failed as data still present in FIFO.\n");
 	}
 }
 
@@ -318,7 +329,7 @@ static int ppa_out(ppa_struct *dev, char *buffer, int len)
 		break;
 
 	default:
-		printk(KERN_ERR "PPA: bug in ppa_out()\n");
+		printk("PPA: bug in ppa_out()\n");
 		r = 0;
 	}
 	return r;
@@ -371,7 +382,7 @@ static int ppa_in(ppa_struct *dev, char *buffer, int len)
 		break;
 
 	default:
-		printk(KERN_ERR "PPA: bug in ppa_ins()\n");
+		printk("PPA: bug in ppa_ins()\n");
 		r = 0;
 		break;
 	}
@@ -516,14 +527,13 @@ static inline int ppa_send_command(struct scsi_cmnd *cmd)
  * The driver appears to remain stable if we speed up the parallel port
  * i/o in this function, but not elsewhere.
  */
-static int ppa_completion(struct scsi_cmnd *const cmd)
+static int ppa_completion(struct scsi_cmnd *cmd)
 {
 	/* Return codes:
 	 * -1     Error
 	 *  0     Told to schedule
 	 *  1     Finished data transfer
 	 */
-	struct scsi_pointer *scsi_pointer = ppa_scsi_pointer(cmd);
 	ppa_struct *dev = ppa_dev(cmd->device->host);
 	unsigned short ppb = dev->base;
 	unsigned long start_jiffies = jiffies;
@@ -549,7 +559,7 @@ static int ppa_completion(struct scsi_cmnd *const cmd)
 		if (time_after(jiffies, start_jiffies + 1))
 			return 0;
 
-		if (scsi_pointer->this_residual <= 0) {
+		if ((cmd->SCp.this_residual <= 0)) {
 			ppa_fail(dev, DID_ERROR);
 			return -1;	/* ERROR_RETURN */
 		}
@@ -578,30 +588,30 @@ static int ppa_completion(struct scsi_cmnd *const cmd)
 		}
 
 		/* determine if we should use burst I/O */
-		fast = bulk && scsi_pointer->this_residual >= PPA_BURST_SIZE ?
-			PPA_BURST_SIZE : 1;
+		fast = (bulk && (cmd->SCp.this_residual >= PPA_BURST_SIZE))
+		    ? PPA_BURST_SIZE : 1;
 
 		if (r == (unsigned char) 0xc0)
-			status = ppa_out(dev, scsi_pointer->ptr, fast);
+			status = ppa_out(dev, cmd->SCp.ptr, fast);
 		else
-			status = ppa_in(dev, scsi_pointer->ptr, fast);
+			status = ppa_in(dev, cmd->SCp.ptr, fast);
 
-		scsi_pointer->ptr += fast;
-		scsi_pointer->this_residual -= fast;
+		cmd->SCp.ptr += fast;
+		cmd->SCp.this_residual -= fast;
 
 		if (!status) {
 			ppa_fail(dev, DID_BUS_BUSY);
 			return -1;	/* ERROR_RETURN */
 		}
-		if (scsi_pointer->buffer && !scsi_pointer->this_residual) {
+		if (cmd->SCp.buffer && !cmd->SCp.this_residual) {
 			/* if scatter/gather, advance to the next segment */
-			if (scsi_pointer->buffers_residual--) {
-				scsi_pointer->buffer =
-					sg_next(scsi_pointer->buffer);
-				scsi_pointer->this_residual =
-				    scsi_pointer->buffer->length;
-				scsi_pointer->ptr =
-					sg_virt(scsi_pointer->buffer);
+			if (cmd->SCp.buffers_residual--) {
+				cmd->SCp.buffer++;
+				cmd->SCp.this_residual =
+				    cmd->SCp.buffer->length;
+				cmd->SCp.ptr =
+				    page_address(cmd->SCp.buffer->page) +
+				    cmd->SCp.buffer->offset;
 			}
 		}
 		/* Now check to see if the drive is ready to comunicate */
@@ -618,16 +628,17 @@ static int ppa_completion(struct scsi_cmnd *const cmd)
  * the scheduler's task queue to generate a stream of call-backs and
  * complete the request when the drive is ready.
  */
-static void ppa_interrupt(struct work_struct *work)
+static void ppa_interrupt(void *data)
 {
-	ppa_struct *dev = container_of(work, ppa_struct, ppa_tq.work);
+	ppa_struct *dev = (ppa_struct *) data;
 	struct scsi_cmnd *cmd = dev->cur_cmd;
 
 	if (!cmd) {
-		printk(KERN_ERR "PPA: bug in ppa_interrupt\n");
+		printk("PPA: bug in ppa_interrupt\n");
 		return;
 	}
 	if (ppa_engine(dev, cmd)) {
+		dev->ppa_tq.data = (void *) dev;
 		schedule_delayed_work(&dev->ppa_tq, 1);
 		return;
 	}
@@ -637,48 +648,47 @@ static void ppa_interrupt(struct work_struct *work)
 	case DID_OK:
 		break;
 	case DID_NO_CONNECT:
-		printk(KERN_DEBUG "ppa: no device at SCSI ID %i\n", cmd->device->target);
+		printk("ppa: no device at SCSI ID %i\n", cmd->device->target);
 		break;
 	case DID_BUS_BUSY:
-		printk(KERN_DEBUG "ppa: BUS BUSY - EPP timeout detected\n");
+		printk("ppa: BUS BUSY - EPP timeout detected\n");
 		break;
 	case DID_TIME_OUT:
-		printk(KERN_DEBUG "ppa: unknown timeout\n");
+		printk("ppa: unknown timeout\n");
 		break;
 	case DID_ABORT:
-		printk(KERN_DEBUG "ppa: told to abort\n");
+		printk("ppa: told to abort\n");
 		break;
 	case DID_PARITY:
-		printk(KERN_DEBUG "ppa: parity error (???)\n");
+		printk("ppa: parity error (???)\n");
 		break;
 	case DID_ERROR:
-		printk(KERN_DEBUG "ppa: internal driver error\n");
+		printk("ppa: internal driver error\n");
 		break;
 	case DID_RESET:
-		printk(KERN_DEBUG "ppa: told to reset device\n");
+		printk("ppa: told to reset device\n");
 		break;
 	case DID_BAD_INTR:
-		printk(KERN_WARNING "ppa: bad interrupt (???)\n");
+		printk("ppa: bad interrupt (???)\n");
 		break;
 	default:
-		printk(KERN_WARNING "ppa: bad return code (%02x)\n",
+		printk("ppa: bad return code (%02x)\n",
 		       (cmd->result >> 16) & 0xff);
 	}
 #endif
 
-	if (ppa_scsi_pointer(cmd)->phase > 1)
+	if (cmd->SCp.phase > 1)
 		ppa_disconnect(dev);
 
 	ppa_pb_dismiss(dev);
 
 	dev->cur_cmd = NULL;
 
-	scsi_done(cmd);
+	cmd->scsi_done(cmd);
 }
 
 static int ppa_engine(ppa_struct *dev, struct scsi_cmnd *cmd)
 {
-	struct scsi_pointer *scsi_pointer = ppa_scsi_pointer(cmd);
 	unsigned short ppb = dev->base;
 	unsigned char l = 0, h = 0;
 	int retv;
@@ -689,7 +699,7 @@ static int ppa_engine(ppa_struct *dev, struct scsi_cmnd *cmd)
 	if (dev->failed)
 		return 0;
 
-	switch (scsi_pointer->phase) {
+	switch (cmd->SCp.phase) {
 	case 0:		/* Phase 0 - Waiting for parport */
 		if (time_after(jiffies, dev->jstart + HZ)) {
 			/*
@@ -715,8 +725,9 @@ static int ppa_engine(ppa_struct *dev, struct scsi_cmnd *cmd)
 				retv--;
 
 			if (retv) {
-				if (time_after(jiffies, dev->jstart + (1 * HZ))) {
-					printk(KERN_ERR "ppa: Parallel port cable is unplugged.\n");
+				if ((jiffies - dev->jstart) > (1 * HZ)) {
+					printk
+					    ("ppa: Parallel port cable is unplugged!!\n");
 					ppa_fail(dev, DID_BUS_BUSY);
 					return 0;
 				} else {
@@ -724,17 +735,15 @@ static int ppa_engine(ppa_struct *dev, struct scsi_cmnd *cmd)
 					return 1;	/* Try again in a jiffy */
 				}
 			}
-			scsi_pointer->phase++;
+			cmd->SCp.phase++;
 		}
-		fallthrough;
 
 	case 2:		/* Phase 2 - We are now talking to the scsi bus */
-		if (!ppa_select(dev, scmd_id(cmd))) {
+		if (!ppa_select(dev, cmd->device->id)) {
 			ppa_fail(dev, DID_NO_CONNECT);
 			return 0;
 		}
-		scsi_pointer->phase++;
-		fallthrough;
+		cmd->SCp.phase++;
 
 	case 3:		/* Phase 3 - Ready to accept a command */
 		w_ctr(ppb, 0x0c);
@@ -743,23 +752,25 @@ static int ppa_engine(ppa_struct *dev, struct scsi_cmnd *cmd)
 
 		if (!ppa_send_command(cmd))
 			return 0;
-		scsi_pointer->phase++;
-		fallthrough;
+		cmd->SCp.phase++;
 
 	case 4:		/* Phase 4 - Setup scatter/gather buffers */
-		if (scsi_bufflen(cmd)) {
-			scsi_pointer->buffer = scsi_sglist(cmd);
-			scsi_pointer->this_residual =
-				scsi_pointer->buffer->length;
-			scsi_pointer->ptr = sg_virt(scsi_pointer->buffer);
+		if (cmd->use_sg) {
+			/* if many buffers are available, start filling the first */
+			cmd->SCp.buffer =
+			    (struct scatterlist *) cmd->request_buffer;
+			cmd->SCp.this_residual = cmd->SCp.buffer->length;
+			cmd->SCp.ptr =
+			    page_address(cmd->SCp.buffer->page) +
+			    cmd->SCp.buffer->offset;
 		} else {
-			scsi_pointer->buffer = NULL;
-			scsi_pointer->this_residual = 0;
-			scsi_pointer->ptr = NULL;
+			/* else fill the only available buffer */
+			cmd->SCp.buffer = NULL;
+			cmd->SCp.this_residual = cmd->request_bufflen;
+			cmd->SCp.ptr = cmd->request_buffer;
 		}
-		scsi_pointer->buffers_residual = scsi_sg_count(cmd) - 1;
-		scsi_pointer->phase++;
-		fallthrough;
+		cmd->SCp.buffers_residual = cmd->use_sg - 1;
+		cmd->SCp.phase++;
 
 	case 5:		/* Phase 5 - Data transfer stage */
 		w_ctr(ppb, 0x0c);
@@ -771,8 +782,7 @@ static int ppa_engine(ppa_struct *dev, struct scsi_cmnd *cmd)
 			return 0;
 		if (retv == 0)
 			return 1;
-		scsi_pointer->phase++;
-		fallthrough;
+		cmd->SCp.phase++;
 
 	case 6:		/* Phase 6 - Read status/message */
 		cmd->result = DID_OK << 16;
@@ -789,35 +799,37 @@ static int ppa_engine(ppa_struct *dev, struct scsi_cmnd *cmd)
 			    (DID_OK << 16) + (h << 8) + (l & STATUS_MASK);
 		}
 		return 0;	/* Finished */
+		break;
 
 	default:
-		printk(KERN_ERR "ppa: Invalid scsi phase\n");
+		printk("ppa: Invalid scsi phase\n");
 	}
 	return 0;
 }
 
-static int ppa_queuecommand_lck(struct scsi_cmnd *cmd)
+static int ppa_queuecommand(struct scsi_cmnd *cmd,
+		void (*done) (struct scsi_cmnd *))
 {
 	ppa_struct *dev = ppa_dev(cmd->device->host);
 
 	if (dev->cur_cmd) {
-		printk(KERN_ERR "PPA: bug in ppa_queuecommand\n");
+		printk("PPA: bug in ppa_queuecommand\n");
 		return 0;
 	}
 	dev->failed = 0;
 	dev->jstart = jiffies;
 	dev->cur_cmd = cmd;
+	cmd->scsi_done = done;
 	cmd->result = DID_ERROR << 16;	/* default return code */
-	ppa_scsi_pointer(cmd)->phase = 0;	/* bus free */
+	cmd->SCp.phase = 0;	/* bus free */
 
-	schedule_delayed_work(&dev->ppa_tq, 0);
+	dev->ppa_tq.data = dev;
+	schedule_work(&dev->ppa_tq);
 
 	ppa_pb_claim(dev);
 
 	return 0;
 }
-
-static DEF_SCSI_QCMD(ppa_queuecommand)
 
 /*
  * Apparently the disk->capacity attribute is off by 1 sector 
@@ -849,13 +861,15 @@ static int ppa_abort(struct scsi_cmnd *cmd)
 	 * have tied the SCSI_MESSAGE line high in the interface
 	 */
 
-	switch (ppa_scsi_pointer(cmd)->phase) {
+	switch (cmd->SCp.phase) {
 	case 0:		/* Do not have access to parport */
 	case 1:		/* Have not connected to interface */
 		dev->cur_cmd = NULL;	/* Forget the problem */
 		return SUCCESS;
+		break;
 	default:		/* SCSI command sent, can not abort */
 		return FAILED;
+		break;
 	}
 }
 
@@ -871,15 +885,15 @@ static int ppa_reset(struct scsi_cmnd *cmd)
 {
 	ppa_struct *dev = ppa_dev(cmd->device->host);
 
-	if (ppa_scsi_pointer(cmd)->phase)
+	if (cmd->SCp.phase)
 		ppa_disconnect(dev);
 	dev->cur_cmd = NULL;	/* Forget the problem */
 
 	ppa_connect(dev, CONNECT_NORMAL);
 	ppa_reset_pulse(dev->base);
-	mdelay(1);		/* device settle delay */
+	udelay(1000);		/* device settle delay */
 	ppa_disconnect(dev);
-	mdelay(1);		/* device settle delay */
+	udelay(1000);		/* device settle delay */
 	return SUCCESS;
 }
 
@@ -888,7 +902,7 @@ static int device_check(ppa_struct *dev)
 	/* This routine looks for a device and then attempts to use EPP
 	   to send a command. If all goes as planned then EPP is available. */
 
-	static u8 cmd[6] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+	static char cmd[6] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 	int loop, old_mode, status, k, ppb = dev->base;
 	unsigned char l;
 
@@ -898,14 +912,14 @@ static int device_check(ppa_struct *dev)
 		if ((ppb & 0x0007) == 0x0000)
 			dev->mode = PPA_EPP_32;
 
-second_pass:
+	      second_pass:
 		ppa_connect(dev, CONNECT_EPP_MAYBE);
 		/* Select SCSI device */
 		if (!ppa_select(dev, loop)) {
 			ppa_disconnect(dev);
 			continue;
 		}
-		printk(KERN_INFO "ppa: Found device at ID %i, Attempting to use %s\n",
+		printk("ppa: Found device at ID %i, Attempting to use %s\n",
 		       loop, PPA_MODE_STRING[dev->mode]);
 
 		/* Send SCSI command */
@@ -954,7 +968,7 @@ second_pass:
 			return -EIO;
 		}
 		ppa_disconnect(dev);
-		printk(KERN_INFO "ppa: Communication established with ID %i using %s\n",
+		printk("ppa: Communication established with ID %i using %s\n",
 		       loop, PPA_MODE_STRING[dev->mode]);
 		ppa_connect(dev, CONNECT_EPP_MAYBE);
 		ppa_reset_pulse(ppb);
@@ -966,27 +980,21 @@ second_pass:
 	return -ENODEV;
 }
 
-static int ppa_adjust_queue(struct scsi_device *device)
-{
-	blk_queue_bounce_limit(device->request_queue, BLK_BOUNCE_HIGH);
-	return 0;
-}
-
 static struct scsi_host_template ppa_template = {
 	.module			= THIS_MODULE,
 	.proc_name		= "ppa",
-	.show_info		= ppa_show_info,
-	.write_info		= ppa_write_info,
+	.proc_info		= ppa_proc_info,
 	.name			= "Iomega VPI0 (ppa) interface",
 	.queuecommand		= ppa_queuecommand,
 	.eh_abort_handler	= ppa_abort,
+	.eh_bus_reset_handler	= ppa_reset,
 	.eh_host_reset_handler	= ppa_reset,
 	.bios_param		= ppa_biosparam,
 	.this_id		= -1,
 	.sg_tablesize		= SG_ALL,
+	.cmd_per_lun		= 1,
+	.use_clustering		= ENABLE_CLUSTERING,
 	.can_queue		= 1,
-	.slave_alloc		= ppa_adjust_queue,
-	.cmd_size		= sizeof(struct scsi_pointer),
 };
 
 /***************************************************************************
@@ -995,57 +1003,26 @@ static struct scsi_host_template ppa_template = {
 
 static LIST_HEAD(ppa_hosts);
 
-/*
- * Finds the first available device number that can be alloted to the
- * new ppa device and returns the address of the previous node so that
- * we can add to the tail and have a list in the ascending order.
- */
-
-static inline ppa_struct *find_parent(void)
-{
-	ppa_struct *dev, *par = NULL;
-	unsigned int cnt = 0;
-
-	if (list_empty(&ppa_hosts))
-		return NULL;
-
-	list_for_each_entry(dev, &ppa_hosts, list) {
-		if (dev->dev_no != cnt)
-			return par;
-		cnt++;
-		par = dev;
-	}
-
-	return par;
-}
-
 static int __ppa_attach(struct parport *pb)
 {
 	struct Scsi_Host *host;
-	DECLARE_WAIT_QUEUE_HEAD_ONSTACK(waiting);
+	DECLARE_WAIT_QUEUE_HEAD(waiting);
 	DEFINE_WAIT(wait);
-	ppa_struct *dev, *temp;
+	ppa_struct *dev;
 	int ports;
 	int modes, ppb, ppb_hi;
 	int err = -ENOMEM;
-	struct pardev_cb ppa_cb;
 
-	dev = kzalloc(sizeof(ppa_struct), GFP_KERNEL);
+	dev = kmalloc(sizeof(ppa_struct), GFP_KERNEL);
 	if (!dev)
 		return -ENOMEM;
+	memset(dev, 0, sizeof(ppa_struct));
 	dev->base = -1;
 	dev->mode = PPA_AUTODETECT;
 	dev->recon_tmo = PPA_RECON_TMO;
 	init_waitqueue_head(&waiting);
-	temp = find_parent();
-	if (temp)
-		dev->dev_no = temp->dev_no + 1;
-
-	memset(&ppa_cb, 0, sizeof(ppa_cb));
-	ppa_cb.private = dev;
-	ppa_cb.wakeup = ppa_wakeup;
-
-	dev->dev = parport_register_dev_model(pb, "ppa", &ppa_cb, dev->dev_no);
+	dev->dev = parport_register_device(pb, "ppa", NULL, ppa_wakeup,
+					    NULL, 0, dev);
 
 	if (!dev->dev)
 		goto out;
@@ -1103,7 +1080,7 @@ static int __ppa_attach(struct parport *pb)
 	else
 		ports = 8;
 
-	INIT_DELAYED_WORK(&dev->ppa_tq, ppa_interrupt);
+	INIT_WORK(&dev->ppa_tq, ppa_interrupt, dev);
 
 	err = -ENOMEM;
 	host = scsi_host_alloc(&ppa_template, sizeof(ppa_struct *));
@@ -1152,11 +1129,22 @@ static void ppa_detach(struct parport *pb)
 }
 
 static struct parport_driver ppa_driver = {
-	.name		= "ppa",
-	.match_port	= ppa_attach,
-	.detach		= ppa_detach,
-	.devmodel	= true,
+	.name	= "ppa",
+	.attach	= ppa_attach,
+	.detach	= ppa_detach,
 };
-module_parport_driver(ppa_driver);
 
+static int __init ppa_driver_init(void)
+{
+	printk("ppa: Version %s\n", PPA_VERSION);
+	return parport_register_driver(&ppa_driver);
+}
+
+static void __exit ppa_driver_exit(void)
+{
+	parport_unregister_driver(&ppa_driver);
+}
+
+module_init(ppa_driver_init);
+module_exit(ppa_driver_exit);
 MODULE_LICENSE("GPL");

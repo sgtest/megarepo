@@ -1,50 +1,125 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _LINUX__INIT_TASK_H
 #define _LINUX__INIT_TASK_H
 
-#include <linux/rcupdate.h>
-#include <linux/irqflags.h>
-#include <linux/utsname.h>
-#include <linux/lockdep.h>
-#include <linux/ftrace.h>
-#include <linux/ipc.h>
-#include <linux/pid_namespace.h>
-#include <linux/user_namespace.h>
-#include <linux/securebits.h>
-#include <linux/seqlock.h>
-#include <linux/rbtree.h>
-#include <linux/refcount.h>
-#include <linux/sched/autogroup.h>
-#include <net/net_namespace.h>
-#include <linux/sched/rt.h>
-#include <linux/livepatch.h>
-#include <linux/mm_types.h>
+#include <linux/file.h>
 
-#include <asm/thread_info.h>
+#define INIT_FILES \
+{ 							\
+	.count		= ATOMIC_INIT(1), 		\
+	.file_lock	= SPIN_LOCK_UNLOCKED, 		\
+	.max_fds	= NR_OPEN_DEFAULT, 		\
+	.max_fdset	= __FD_SETSIZE, 		\
+	.next_fd	= 0, 				\
+	.fd		= &init_files.fd_array[0], 	\
+	.close_on_exec	= &init_files.close_on_exec_init, \
+	.open_fds	= &init_files.open_fds_init, 	\
+	.close_on_exec_init = { { 0, } }, 		\
+	.open_fds_init	= { { 0, } }, 			\
+	.fd_array	= { NULL, } 			\
+}
 
-extern struct files_struct init_files;
-extern struct fs_struct init_fs;
-extern struct nsproxy init_nsproxy;
-extern struct cred init_cred;
+#define INIT_KIOCTX(name, which_mm) \
+{							\
+	.users		= ATOMIC_INIT(1),		\
+	.dead		= 0,				\
+	.mm		= &which_mm,			\
+	.user_id	= 0,				\
+	.next		= NULL,				\
+	.wait		= __WAIT_QUEUE_HEAD_INITIALIZER(name.wait), \
+	.ctx_lock	= SPIN_LOCK_UNLOCKED,		\
+	.reqs_active	= 0U,				\
+	.max_reqs	= ~0U,				\
+}
 
-#ifndef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
-#define INIT_PREV_CPUTIME(x)	.prev_cputime = {			\
-	.lock = __RAW_SPIN_LOCK_UNLOCKED(x.prev_cputime.lock),		\
-},
-#else
-#define INIT_PREV_CPUTIME(x)
-#endif
+#define INIT_MM(name) \
+{			 					\
+	.mm_rb		= RB_ROOT,				\
+	.pgd		= swapper_pg_dir, 			\
+	.mm_users	= ATOMIC_INIT(2), 			\
+	.mm_count	= ATOMIC_INIT(1), 			\
+	.mmap_sem	= __RWSEM_INITIALIZER(name.mmap_sem),	\
+	.page_table_lock =  SPIN_LOCK_UNLOCKED, 		\
+	.mmlist		= LIST_HEAD_INIT(name.mmlist),		\
+	.cpu_vm_mask	= CPU_MASK_ALL,				\
+	.default_kioctx = INIT_KIOCTX(name.default_kioctx, name),	\
+}
 
-#define INIT_TASK_COMM "swapper"
+#define INIT_SIGNALS(sig) {	\
+	.count		= ATOMIC_INIT(1), 		\
+	.wait_chldexit	= __WAIT_QUEUE_HEAD_INITIALIZER(sig.wait_chldexit),\
+	.shared_pending	= { 				\
+		.list = LIST_HEAD_INIT(sig.shared_pending.list),	\
+		.signal =  {{0}}}, \
+	.posix_timers	 = LIST_HEAD_INIT(sig.posix_timers),		\
+	.cpu_timers	= INIT_CPU_TIMERS(sig.cpu_timers),		\
+	.rlim		= INIT_RLIMITS,					\
+}
 
-/* Attach to the init_task data structure for proper alignment */
-#ifdef CONFIG_ARCH_TASK_STRUCT_ON_STACK
-#define __init_task_data __section(".data..init_task")
-#else
-#define __init_task_data /**/
-#endif
+#define INIT_SIGHAND(sighand) {						\
+	.count		= ATOMIC_INIT(1), 				\
+	.action		= { { { .sa_handler = NULL, } }, },		\
+	.siglock	= SPIN_LOCK_UNLOCKED, 				\
+}
 
-/* Attach to the thread_info data structure for proper alignment */
-#define __init_thread_info __section(".data..init_thread_info")
+extern struct group_info init_groups;
+
+/*
+ *  INIT_TASK is used to set up the first task table, touch at
+ * your own risk!. Base=0, limit=0x1fffff (=2MB)
+ */
+#define INIT_TASK(tsk)	\
+{									\
+	.state		= 0,						\
+	.thread_info	= &init_thread_info,				\
+	.usage		= ATOMIC_INIT(2),				\
+	.flags		= 0,						\
+	.lock_depth	= -1,						\
+	.prio		= MAX_PRIO-20,					\
+	.static_prio	= MAX_PRIO-20,					\
+	.policy		= SCHED_NORMAL,					\
+	.cpus_allowed	= CPU_MASK_ALL,					\
+	.mm		= NULL,						\
+	.active_mm	= &init_mm,					\
+	.run_list	= LIST_HEAD_INIT(tsk.run_list),			\
+	.time_slice	= HZ,						\
+	.tasks		= LIST_HEAD_INIT(tsk.tasks),			\
+	.ptrace_children= LIST_HEAD_INIT(tsk.ptrace_children),		\
+	.ptrace_list	= LIST_HEAD_INIT(tsk.ptrace_list),		\
+	.real_parent	= &tsk,						\
+	.parent		= &tsk,						\
+	.children	= LIST_HEAD_INIT(tsk.children),			\
+	.sibling	= LIST_HEAD_INIT(tsk.sibling),			\
+	.group_leader	= &tsk,						\
+	.group_info	= &init_groups,					\
+	.cap_effective	= CAP_INIT_EFF_SET,				\
+	.cap_inheritable = CAP_INIT_INH_SET,				\
+	.cap_permitted	= CAP_FULL_SET,					\
+	.keep_capabilities = 0,						\
+	.user		= INIT_USER,					\
+	.comm		= "swapper",					\
+	.thread		= INIT_THREAD,					\
+	.fs		= &init_fs,					\
+	.files		= &init_files,					\
+	.signal		= &init_signals,				\
+	.sighand	= &init_sighand,				\
+	.pending	= {						\
+		.list = LIST_HEAD_INIT(tsk.pending.list),		\
+		.signal = {{0}}},					\
+	.blocked	= {{0}},					\
+	.alloc_lock	= SPIN_LOCK_UNLOCKED,				\
+	.proc_lock	= SPIN_LOCK_UNLOCKED,				\
+	.switch_lock	= SPIN_LOCK_UNLOCKED,				\
+	.journal_info	= NULL,						\
+	.cpu_timers	= INIT_CPU_TIMERS(tsk.cpu_timers),		\
+}
+
+
+#define INIT_CPU_TIMERS(cpu_timers)					\
+{									\
+	LIST_HEAD_INIT(cpu_timers[0]),					\
+	LIST_HEAD_INIT(cpu_timers[1]),					\
+	LIST_HEAD_INIT(cpu_timers[2]),					\
+}
+
 
 #endif

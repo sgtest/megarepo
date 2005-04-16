@@ -1,23 +1,34 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef __SOUND_ICE1712_H
 #define __SOUND_ICE1712_H
 
 /*
  *   ALSA driver for ICEnsemble ICE1712 (Envy24)
  *
- *	Copyright (c) 2000 Jaroslav Kysela <perex@perex.cz>
- */
+ *	Copyright (c) 2000 Jaroslav Kysela <perex@suse.cz>
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ *
+ */      
 
-#include <linux/io.h>
 #include <sound/control.h>
 #include <sound/ac97_codec.h>
 #include <sound/rawmidi.h>
 #include <sound/i2c.h>
 #include <sound/ak4xxx-adda.h>
 #include <sound/ak4114.h>
-#include <sound/pt2258.h>
 #include <sound/pcm.h>
-#include <sound/mpu401.h>
 
 
 /*
@@ -27,17 +38,14 @@
 #define ICEREG(ice, x) ((ice)->port + ICE1712_REG_##x)
 
 #define ICE1712_REG_CONTROL		0x00	/* byte */
-#define   ICE1712_RESET			0x80	/* soft reset whole chip */
-#define   ICE1712_SERR_ASSERT_DS_DMA	0x40    /* disabled SERR# assertion for the DS DMA Ch-C irq otherwise enabled */
-#define   ICE1712_DOS_VOL		0x10    /* DOS WT/FM volume control */
-#define   ICE1712_SERR_LEVEL		0x08	/* SERR# level otherwise edge */
-#define   ICE1712_SERR_ASSERT_SB	0x02	/* disabled SERR# assertion for SB irq otherwise enabled */
+#define   ICE1712_RESET			0x80	/* reset whole chip */
+#define   ICE1712_SERR_LEVEL		0x04	/* SERR# level otherwise edge */
 #define   ICE1712_NATIVE		0x01	/* native mode otherwise SB */
 #define ICE1712_REG_IRQMASK		0x01	/* byte */
-#define   ICE1712_IRQ_MPU1		0x80	/* MIDI irq mask */
-#define   ICE1712_IRQ_TIMER		0x40	/* Timer mask */
-#define   ICE1712_IRQ_MPU2		0x20	/* Secondary MIDI irq mask */
-#define   ICE1712_IRQ_PROPCM		0x10	/* professional multi-track */
+#define   ICE1712_IRQ_MPU1		0x80
+#define   ICE1712_IRQ_TIMER		0x40
+#define   ICE1712_IRQ_MPU2		0x20
+#define   ICE1712_IRQ_PROPCM		0x10
 #define   ICE1712_IRQ_FM		0x08	/* FM/MIDI - legacy */
 #define   ICE1712_IRQ_PBKDS		0x04	/* playback DS channels */
 #define   ICE1712_IRQ_CONCAP		0x02	/* consumer capture */
@@ -102,7 +110,7 @@
  */
 
 #define ICEDS(ice, x) ((ice)->dmapath_port + ICE1712_DS_##x)
-
+ 
 #define ICE1712_DS_INTMASK		0x00	/* word - interrupt mask */
 #define ICE1712_DS_INTSTAT		0x02	/* word - interrupt status */
 #define ICE1712_DS_DATA			0x04	/* dword - channel data */
@@ -111,7 +119,7 @@
 /*
  *  Consumer section channel registers
  */
-
+ 
 #define ICE1712_DSC_ADDR0		0x00	/* dword - base address 0 */
 #define ICE1712_DSC_COUNT0		0x01	/* word - count 0 */
 #define ICE1712_DSC_ADDR1		0x02	/* dword - base address 1 */
@@ -128,7 +136,7 @@
 #define ICE1712_DSC_RATE		0x05	/* dword - rate */
 #define ICE1712_DSC_VOLUME		0x06	/* word - volume control */
 
-/*
+/* 
  *  Professional multi-track direct control registers
  */
 
@@ -204,13 +212,12 @@
 
 
 /*
- * I2C EEPROM Address
+ *  
  */
-#define ICE_I2C_EEPROM_ADDR		0xA0
 
-struct snd_ice1712;
+typedef struct _snd_ice1712 ice1712_t;
 
-struct snd_ice1712_eeprom {
+typedef struct {
 	unsigned int subvendor;	/* PCI[2c-2f] */
 	unsigned char size;	/* size of EEPROM image in bytes */
 	unsigned char version;	/* must be 1 (or 2 for vt1724) */
@@ -218,7 +225,7 @@ struct snd_ice1712_eeprom {
 	unsigned int gpiomask;
 	unsigned int gpiostate;
 	unsigned int gpiodir;
-};
+} ice1712_eeprom_t;
 
 enum {
 	ICE_EEP1_CODEC = 0,	/* 06 */
@@ -244,12 +251,12 @@ enum {
 	ICE_EEP1_ADC_ID2,
 	ICE_EEP1_ADC_ID3
 };
-
+	
 #define ice_has_con_ac97(ice)	(!((ice)->eeprom.data[ICE_EEP1_CODEC] & ICE1712_CFG_NO_CON_AC97))
 
 
 struct snd_ak4xxx_private {
-	unsigned int cif:1;		/* CIF mode */
+	unsigned int cif: 1;		/* CIF mode */
 	unsigned char caddr;		/* C0 and C1 bits */
 	unsigned int data_mask;		/* DATA gpio bit */
 	unsigned int clk_mask;		/* CLK gpio bit */
@@ -259,29 +266,28 @@ struct snd_ak4xxx_private {
 	unsigned int add_flags;		/* additional bits at init */
 	unsigned int mask_flags;	/* total mask bits */
 	struct snd_akm4xxx_ops {
-		void (*set_rate_val)(struct snd_akm4xxx *ak, unsigned int rate);
+		void (*set_rate_val)(akm4xxx_t *ak, unsigned int rate);
 	} ops;
 };
 
 struct snd_ice1712_spdif {
 	unsigned char cs8403_bits;
 	unsigned char cs8403_stream_bits;
-	struct snd_kcontrol *stream_ctl;
+	snd_kcontrol_t *stream_ctl;
 
 	struct snd_ice1712_spdif_ops {
-		void (*open)(struct snd_ice1712 *, struct snd_pcm_substream *);
-		void (*setup_rate)(struct snd_ice1712 *, int rate);
-		void (*close)(struct snd_ice1712 *, struct snd_pcm_substream *);
-		void (*default_get)(struct snd_ice1712 *, struct snd_ctl_elem_value *ucontrol);
-		int (*default_put)(struct snd_ice1712 *, struct snd_ctl_elem_value *ucontrol);
-		void (*stream_get)(struct snd_ice1712 *, struct snd_ctl_elem_value *ucontrol);
-		int (*stream_put)(struct snd_ice1712 *, struct snd_ctl_elem_value *ucontrol);
+		void (*open)(ice1712_t *, snd_pcm_substream_t *);
+		void (*setup_rate)(ice1712_t *, int rate);
+		void (*close)(ice1712_t *, snd_pcm_substream_t *);
+		void (*default_get)(ice1712_t *, snd_ctl_elem_value_t * ucontrol);
+		int (*default_put)(ice1712_t *, snd_ctl_elem_value_t * ucontrol);
+		void (*stream_get)(ice1712_t *, snd_ctl_elem_value_t * ucontrol);
+		int (*stream_put)(ice1712_t *, snd_ctl_elem_value_t * ucontrol);
 	} ops;
 };
 
-struct snd_ice1712_card_info;
 
-struct snd_ice1712 {
+struct _snd_ice1712 {
 	unsigned long conp_dma_size;
 	unsigned long conc_dma_size;
 	unsigned long prop_dma_size;
@@ -294,125 +300,113 @@ struct snd_ice1712 {
 	unsigned long profi_port;
 
 	struct pci_dev *pci;
-	struct snd_card *card;
-	struct snd_pcm *pcm;
-	struct snd_pcm *pcm_ds;
-	struct snd_pcm *pcm_pro;
-	struct snd_pcm_substream *playback_con_substream;
-	struct snd_pcm_substream *playback_con_substream_ds[6];
-	struct snd_pcm_substream *capture_con_substream;
-	struct snd_pcm_substream *playback_pro_substream;
-	struct snd_pcm_substream *capture_pro_substream;
+	snd_card_t *card;
+	snd_pcm_t *pcm;
+	snd_pcm_t *pcm_ds;
+	snd_pcm_t *pcm_pro;
+        snd_pcm_substream_t *playback_con_substream;
+        snd_pcm_substream_t *playback_con_substream_ds[6];
+        snd_pcm_substream_t *capture_con_substream;
+        snd_pcm_substream_t *playback_pro_substream;
+        snd_pcm_substream_t *capture_pro_substream;
 	unsigned int playback_pro_size;
 	unsigned int capture_pro_size;
 	unsigned int playback_con_virt_addr[6];
 	unsigned int playback_con_active_buf[6];
 	unsigned int capture_con_virt_addr;
 	unsigned int ac97_ext_id;
-	struct snd_ac97 *ac97;
-	struct snd_rawmidi *rmidi[2];
+	ac97_t *ac97;
+	snd_rawmidi_t *rmidi[2];
 
 	spinlock_t reg_lock;
-	struct snd_info_entry *proc_entry;
+	snd_info_entry_t *proc_entry;
 
-	struct snd_ice1712_eeprom eeprom;
-	const struct snd_ice1712_card_info *card_info;
+	ice1712_eeprom_t eeprom;
 
 	unsigned int pro_volumes[20];
-	unsigned int omni:1;		/* Delta Omni I/O */
-	unsigned int dxr_enable:1;	/* Terratec DXR enable for DMX6FIRE */
-	unsigned int vt1724:1;
-	unsigned int vt1720:1;
-	unsigned int has_spdif:1;	/* VT1720/4 - has SPDIF I/O */
-	unsigned int force_pdma4:1;	/* VT1720/4 - PDMA4 as non-spdif */
-	unsigned int force_rdma1:1;	/* VT1720/4 - RDMA1 as non-spdif */
-	unsigned int midi_output:1;	/* VT1720/4: MIDI output triggered */
-	unsigned int midi_input:1;	/* VT1720/4: MIDI input triggered */
-	unsigned int own_routing:1;	/* VT1720/4: use own routing ctls */
+	unsigned int omni: 1;		/* Delta Omni I/O */
+	unsigned int vt1724: 1;
+	unsigned int vt1720: 1;
+	unsigned int has_spdif: 1;	/* VT1720/4 - has SPDIF I/O */
+	unsigned int force_pdma4: 1;	/* VT1720/4 - PDMA4 as non-spdif */
+	unsigned int force_rdma1: 1;	/* VT1720/4 - RDMA1 as non-spdif */
 	unsigned int num_total_dacs;	/* total DACs */
 	unsigned int num_total_adcs;	/* total ADCs */
 	unsigned int cur_rate;		/* current rate */
 
-	struct mutex open_mutex;
-	struct snd_pcm_substream *pcm_reserved[4];
-	const struct snd_pcm_hw_constraint_list *hw_rates; /* card-specific rate constraints */
+	struct semaphore open_mutex;
+	snd_pcm_substream_t *pcm_reserved[4];
+	snd_pcm_hw_constraint_list_t *hw_rates; /* card-specific rate constraints */
 
 	unsigned int akm_codecs;
-	struct snd_akm4xxx *akm;
+	akm4xxx_t *akm;
 	struct snd_ice1712_spdif spdif;
 
-	struct mutex i2c_mutex;	/* I2C mutex for ICE1724 registers */
-	struct snd_i2c_bus *i2c;		/* I2C bus */
-	struct snd_i2c_device *cs8427;	/* CS8427 I2C device */
+	struct semaphore i2c_mutex;	/* I2C mutex for ICE1724 registers */
+	snd_i2c_bus_t *i2c;		/* I2C bus */
+	snd_i2c_device_t *cs8427;	/* CS8427 I2C device */
 	unsigned int cs8427_timeout;	/* CS8427 reset timeout in HZ/100 */
-
+	
 	struct ice1712_gpio {
 		unsigned int direction;		/* current direction bits */
 		unsigned int write_mask;	/* current mask bits */
 		unsigned int saved[2];		/* for ewx_i2c */
 		/* operators */
-		void (*set_mask)(struct snd_ice1712 *ice, unsigned int data);
-		unsigned int (*get_mask)(struct snd_ice1712 *ice);
-		void (*set_dir)(struct snd_ice1712 *ice, unsigned int data);
-		unsigned int (*get_dir)(struct snd_ice1712 *ice);
-		void (*set_data)(struct snd_ice1712 *ice, unsigned int data);
-		unsigned int (*get_data)(struct snd_ice1712 *ice);
+		void (*set_mask)(ice1712_t *ice, unsigned int data);
+		void (*set_dir)(ice1712_t *ice, unsigned int data);
+		void (*set_data)(ice1712_t *ice, unsigned int data);
+		unsigned int (*get_data)(ice1712_t *ice);
 		/* misc operators - move to another place? */
-		void (*set_pro_rate)(struct snd_ice1712 *ice, unsigned int rate);
-		void (*i2s_mclk_changed)(struct snd_ice1712 *ice);
+		void (*set_pro_rate)(ice1712_t *ice, unsigned int rate);
+		void (*i2s_mclk_changed)(ice1712_t *ice);
 	} gpio;
-	struct mutex gpio_mutex;
+	struct semaphore gpio_mutex;
 
 	/* other board-specific data */
-	void *spec;
+	union {
+		/* additional i2c devices for EWS boards */
+		snd_i2c_device_t *i2cdevs[3];
+		/* AC97 register cache for Aureon */
+		struct aureon_spec {
+			unsigned short stac9744[64];
+			unsigned int cs8415_mux;
+			unsigned short master[2];
+			unsigned short vol[8];
+		} aureon;
+		/* Hoontech-specific setting */
+		struct hoontech_spec {
+			unsigned char boxbits[4];
+			unsigned int config;
+			unsigned short boxconfig[4];
+		} hoontech;
+		struct {
+			ak4114_t *ak4114;
+			unsigned int analog: 1;
+		} juli;
+	} spec;
 
-	/* VT172x specific */
-	int pro_rate_default;
-	int (*is_spdif_master)(struct snd_ice1712 *ice);
-	unsigned int (*get_rate)(struct snd_ice1712 *ice);
-	void (*set_rate)(struct snd_ice1712 *ice, unsigned int rate);
-	unsigned char (*set_mclk)(struct snd_ice1712 *ice, unsigned int rate);
-	int (*set_spdif_clock)(struct snd_ice1712 *ice, int type);
-	int (*get_spdif_master_type)(struct snd_ice1712 *ice);
-	const char * const *ext_clock_names;
-	int ext_clock_count;
-	void (*pro_open)(struct snd_ice1712 *, struct snd_pcm_substream *);
-#ifdef CONFIG_PM_SLEEP
-	int (*pm_suspend)(struct snd_ice1712 *);
-	int (*pm_resume)(struct snd_ice1712 *);
-	unsigned int pm_suspend_enabled:1;
-	unsigned int pm_saved_is_spdif_master:1;
-	unsigned int pm_saved_spdif_ctrl;
-	unsigned char pm_saved_spdif_cfg;
-	unsigned int pm_saved_route;
-#endif
 };
 
 
 /*
  * gpio access functions
  */
-static inline void snd_ice1712_gpio_set_dir(struct snd_ice1712 *ice, unsigned int bits)
+static inline void snd_ice1712_gpio_set_dir(ice1712_t *ice, unsigned int bits)
 {
 	ice->gpio.set_dir(ice, bits);
 }
 
-static inline unsigned int snd_ice1712_gpio_get_dir(struct snd_ice1712 *ice)
-{
-	return ice->gpio.get_dir(ice);
-}
-
-static inline void snd_ice1712_gpio_set_mask(struct snd_ice1712 *ice, unsigned int bits)
+static inline void snd_ice1712_gpio_set_mask(ice1712_t *ice, unsigned int bits)
 {
 	ice->gpio.set_mask(ice, bits);
 }
 
-static inline void snd_ice1712_gpio_write(struct snd_ice1712 *ice, unsigned int val)
+static inline void snd_ice1712_gpio_write(ice1712_t *ice, unsigned int val)
 {
 	ice->gpio.set_data(ice, val);
 }
 
-static inline unsigned int snd_ice1712_gpio_read(struct snd_ice1712 *ice)
+static inline unsigned int snd_ice1712_gpio_read(ice1712_t *ice)
 {
 	return ice->gpio.get_data(ice);
 }
@@ -422,78 +416,58 @@ static inline unsigned int snd_ice1712_gpio_read(struct snd_ice1712 *ice)
  * The access to gpio will be protected by mutex, so don't forget to
  * restore!
  */
-static inline void snd_ice1712_save_gpio_status(struct snd_ice1712 *ice)
+static inline void snd_ice1712_save_gpio_status(ice1712_t *ice)
 {
-	mutex_lock(&ice->gpio_mutex);
+	down(&ice->gpio_mutex);
 	ice->gpio.saved[0] = ice->gpio.direction;
 	ice->gpio.saved[1] = ice->gpio.write_mask;
 }
 
-static inline void snd_ice1712_restore_gpio_status(struct snd_ice1712 *ice)
+static inline void snd_ice1712_restore_gpio_status(ice1712_t *ice)
 {
 	ice->gpio.set_dir(ice, ice->gpio.saved[0]);
 	ice->gpio.set_mask(ice, ice->gpio.saved[1]);
 	ice->gpio.direction = ice->gpio.saved[0];
 	ice->gpio.write_mask = ice->gpio.saved[1];
-	mutex_unlock(&ice->gpio_mutex);
+	up(&ice->gpio_mutex);
 }
 
 /* for bit controls */
 #define ICE1712_GPIO(xiface, xname, xindex, mask, invert, xaccess) \
-{ .iface = xiface, .name = xname, .access = xaccess, .info = snd_ctl_boolean_mono_info, \
+{ .iface = xiface, .name = xname, .access = xaccess, .info = snd_ice1712_gpio_info, \
   .get = snd_ice1712_gpio_get, .put = snd_ice1712_gpio_put, \
   .private_value = mask | (invert << 24) }
 
-int snd_ice1712_gpio_get(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *ucontrol);
-int snd_ice1712_gpio_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *ucontrol);
+int snd_ice1712_gpio_info(snd_kcontrol_t *kcontrol, snd_ctl_elem_info_t * uinfo);
+int snd_ice1712_gpio_get(snd_kcontrol_t * kcontrol, snd_ctl_elem_value_t * ucontrol);
+int snd_ice1712_gpio_put(snd_kcontrol_t * kcontrol, snd_ctl_elem_value_t * ucontrol);
 
 /*
  * set gpio direction, write mask and data
  */
-static inline void snd_ice1712_gpio_write_bits(struct snd_ice1712 *ice,
-					       unsigned int mask, unsigned int bits)
+static inline void snd_ice1712_gpio_write_bits(ice1712_t *ice, unsigned int mask, unsigned int bits)
 {
-	unsigned val;
-
 	ice->gpio.direction |= mask;
 	snd_ice1712_gpio_set_dir(ice, ice->gpio.direction);
-	val = snd_ice1712_gpio_read(ice);
-	val &= ~mask;
-	val |= mask & bits;
-	snd_ice1712_gpio_write(ice, val);
+	snd_ice1712_gpio_set_mask(ice, ~mask);
+	snd_ice1712_gpio_write(ice, mask & bits);
 }
 
-static inline int snd_ice1712_gpio_read_bits(struct snd_ice1712 *ice,
-					      unsigned int mask)
-{
-	ice->gpio.direction &= ~mask;
-	snd_ice1712_gpio_set_dir(ice, ice->gpio.direction);
-	return  snd_ice1712_gpio_read(ice) & mask;
-}
+int snd_ice1712_spdif_build_controls(ice1712_t *ice);
 
-/* route access functions */
-int snd_ice1724_get_route_val(struct snd_ice1712 *ice, int shift);
-int snd_ice1724_put_route_val(struct snd_ice1712 *ice, unsigned int val,
-								int shift);
+int snd_ice1712_akm4xxx_init(akm4xxx_t *ak, const akm4xxx_t *template, const struct snd_ak4xxx_private *priv, ice1712_t *ice);
+void snd_ice1712_akm4xxx_free(ice1712_t *ice);
+int snd_ice1712_akm4xxx_build_controls(ice1712_t *ice);
 
-int snd_ice1712_spdif_build_controls(struct snd_ice1712 *ice);
+int snd_ice1712_init_cs8427(ice1712_t *ice, int addr);
 
-int snd_ice1712_akm4xxx_init(struct snd_akm4xxx *ak,
-			     const struct snd_akm4xxx *template,
-			     const struct snd_ak4xxx_private *priv,
-			     struct snd_ice1712 *ice);
-void snd_ice1712_akm4xxx_free(struct snd_ice1712 *ice);
-int snd_ice1712_akm4xxx_build_controls(struct snd_ice1712 *ice);
-
-int snd_ice1712_init_cs8427(struct snd_ice1712 *ice, int addr);
-
-static inline void snd_ice1712_write(struct snd_ice1712 *ice, u8 addr, u8 data)
+static inline void snd_ice1712_write(ice1712_t * ice, u8 addr, u8 data)
 {
 	outb(addr, ICEREG(ice, INDEX));
 	outb(data, ICEREG(ice, DATA));
 }
 
-static inline u8 snd_ice1712_read(struct snd_ice1712 *ice, u8 addr)
+static inline u8 snd_ice1712_read(ice1712_t * ice, u8 addr)
 {
 	outb(addr, ICEREG(ice, INDEX));
 	return inb(ICEREG(ice, DATA));
@@ -506,19 +480,14 @@ static inline u8 snd_ice1712_read(struct snd_ice1712 *ice, u8 addr)
 
 struct snd_ice1712_card_info {
 	unsigned int subvendor;
-	const char *name;
-	const char *model;
-	const char *driver;
-	int (*chip_init)(struct snd_ice1712 *);
-	void (*chip_exit)(struct snd_ice1712 *);
-	int (*build_controls)(struct snd_ice1712 *);
-	unsigned int no_mpu401:1;
-	unsigned int mpu401_1_info_flags;
-	unsigned int mpu401_2_info_flags;
-	const char *mpu401_1_name;
-	const char *mpu401_2_name;
-	const unsigned int eeprom_size;
-	const unsigned char *eeprom_data;
+	char *name;
+	char *model;
+	char *driver;
+	int (*chip_init)(ice1712_t *);
+	int (*build_controls)(ice1712_t *);
+	unsigned int no_mpu401: 1;
+	unsigned int eeprom_size;
+	unsigned char *eeprom_data;
 };
 
 

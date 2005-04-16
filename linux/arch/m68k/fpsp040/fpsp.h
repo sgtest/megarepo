@@ -5,8 +5,9 @@
 |		Copyright (C) Motorola, Inc. 1990
 |			All Rights Reserved
 |
-|       For details on the license for this file, please see the
-|       file, README, in this same directory.
+|	THIS IS UNPUBLISHED PROPRIETARY SOURCE CODE OF MOTOROLA
+|	The copyright notice above does not evidence any
+|	actual or intended publication of such source code.
 
 |	fpsp.h --- stack frame offsets during FPSP exception handling
 |

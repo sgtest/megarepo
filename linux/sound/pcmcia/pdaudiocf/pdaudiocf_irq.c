@@ -1,23 +1,35 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Driver for Sound Core PDAudioCF soundcard
  *
- * Copyright (c) 2003 by Jaroslav Kysela <perex@perex.cz>
+ * Copyright (c) 2003 by Jaroslav Kysela <perex@suse.cz>
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  */
 
+#include <sound/driver.h>
 #include <sound/core.h>
 #include "pdaudiocf.h"
 #include <sound/initval.h>
-#include <asm/irq_regs.h>
 
 /*
  *
  */
-irqreturn_t pdacf_interrupt(int irq, void *dev)
+irqreturn_t pdacf_interrupt(int irq, void *dev, struct pt_regs *regs)
 {
-	struct snd_pdacf *chip = dev;
+	pdacf_t *chip = dev;
 	unsigned short stat;
-	bool wake_thread = false;
 
 	if ((chip->chip_status & (PDAUDIOCF_STAT_IS_STALE|
 				  PDAUDIOCF_STAT_IS_CONFIGURED|
@@ -29,13 +41,13 @@ irqreturn_t pdacf_interrupt(int irq, void *dev)
 		if (stat & PDAUDIOCF_IRQOVR)	/* should never happen */
 			snd_printk(KERN_ERR "PDAUDIOCF SRAM buffer overrun detected!\n");
 		if (chip->pcm_substream)
-			wake_thread = true;
+			tasklet_hi_schedule(&chip->tq);
 		if (!(stat & PDAUDIOCF_IRQAKM))
 			stat |= PDAUDIOCF_IRQAKM;	/* check rate */
 	}
-	if (get_irq_regs() != NULL)
+	if (regs != NULL)
 		snd_ak4117_check_rate_and_errors(chip->ak4117, 0);
-	return wake_thread ? IRQ_WAKE_THREAD : IRQ_HANDLED;
+	return IRQ_HANDLED;
 }
 
 static inline void pdacf_transfer_mono16(u16 *dst, u16 xor, unsigned int size, unsigned long rdp_port)
@@ -192,7 +204,7 @@ static inline void pdacf_transfer_stereo24be(u8 *dst, u32 xor, unsigned int size
 	}
 }
 
-static void pdacf_transfer(struct snd_pdacf *chip, unsigned int size, unsigned int off)
+static void pdacf_transfer(pdacf_t *chip, unsigned int size, unsigned int off)
 {
 	unsigned long rdp_port = chip->port + PDAUDIOCF_REG_MD;
 	unsigned int xor = chip->pcm_xor;
@@ -244,20 +256,20 @@ static void pdacf_transfer(struct snd_pdacf *chip, unsigned int size, unsigned i
 	}
 }
 
-irqreturn_t pdacf_threaded_irq(int irq, void *dev)
+void pdacf_tasklet(unsigned long private_data)
 {
-	struct snd_pdacf *chip = dev;
+	pdacf_t *chip = (pdacf_t *) private_data;
 	int size, off, cont, rdp, wdp;
 
 	if ((chip->chip_status & (PDAUDIOCF_STAT_IS_STALE|PDAUDIOCF_STAT_IS_CONFIGURED)) != PDAUDIOCF_STAT_IS_CONFIGURED)
-		return IRQ_HANDLED;
+		return;
 	
 	if (chip->pcm_substream == NULL || chip->pcm_substream->runtime == NULL || !snd_pcm_running(chip->pcm_substream))
-		return IRQ_HANDLED;
+		return;
 
 	rdp = inw(chip->port + PDAUDIOCF_REG_RDP);
 	wdp = inw(chip->port + PDAUDIOCF_REG_WDP);
-	/* printk(KERN_DEBUG "TASKLET: rdp = %x, wdp = %x\n", rdp, wdp); */
+	// printk("TASKLET: rdp = %x, wdp = %x\n", rdp, wdp);
 	size = wdp - rdp;
 	if (size < 0)
 		size += 0x10000;
@@ -299,15 +311,15 @@ irqreturn_t pdacf_threaded_irq(int irq, void *dev)
 		size -= cont;
 	}
 #endif
-	mutex_lock(&chip->reg_lock);
+	spin_lock(&chip->reg_lock);
 	while (chip->pcm_tdone >= chip->pcm_period) {
 		chip->pcm_hwptr += chip->pcm_period;
 		chip->pcm_hwptr %= chip->pcm_size;
 		chip->pcm_tdone -= chip->pcm_period;
-		mutex_unlock(&chip->reg_lock);
+		spin_unlock(&chip->reg_lock);
 		snd_pcm_period_elapsed(chip->pcm_substream);
-		mutex_lock(&chip->reg_lock);
+		spin_lock(&chip->reg_lock);
 	}
-	mutex_unlock(&chip->reg_lock);
-	return IRQ_HANDLED;
+	spin_unlock(&chip->reg_lock);
+	// printk("TASKLET: end\n");
 }

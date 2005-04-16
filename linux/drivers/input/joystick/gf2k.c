@@ -1,5 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * $Id: gf2k.c,v 1.19 2002/01/22 20:27:43 vojtech Exp $
+ *
  *  Copyright (c) 1998-2001 Vojtech Pavlik
  */
 
@@ -8,15 +9,32 @@
  */
 
 /*
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ *
+ * Should you need to contact me, the author, you can do so either by
+ * e-mail - mail your message to <vojtech@ucw.cz>, or by paper mail:
+ * Vojtech Pavlik, Simunkova 1594, Prague 8, 182 00 Czech Republic
  */
 
 #include <linux/delay.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/module.h>
+#include <linux/init.h>
 #include <linux/input.h>
 #include <linux/gameport.h>
-#include <linux/jiffies.h>
 
 #define DRIVER_DESC	"Genius Flight 2000 joystick driver"
 
@@ -63,7 +81,7 @@ static short gf2k_seq_digital[] = { 590, 320, 860, 0 };
 
 struct gf2k {
 	struct gameport *gameport;
-	struct input_dev *dev;
+	struct input_dev dev;
 	int reads;
 	int bads;
 	unsigned char id;
@@ -157,7 +175,7 @@ static int gf2k_get_bits(unsigned char *buf, int pos, int num, int shift)
 
 static void gf2k_read(struct gf2k *gf2k, unsigned char *data)
 {
-	struct input_dev *dev = gf2k->dev;
+	struct input_dev *dev = &gf2k->dev;
 	int i, t;
 
 	for (i = 0; i < 4 && i < gf2k_axes[gf2k->id]; i++)
@@ -201,7 +219,7 @@ static void gf2k_poll(struct gameport *gameport)
 
 static int gf2k_open(struct input_dev *dev)
 {
-	struct gf2k *gf2k = input_get_drvdata(dev);
+	struct gf2k *gf2k = dev->private;
 
 	gameport_start_polling(gf2k->gameport);
 	return 0;
@@ -209,7 +227,7 @@ static int gf2k_open(struct input_dev *dev)
 
 static void gf2k_close(struct input_dev *dev)
 {
-	struct gf2k *gf2k = input_get_drvdata(dev);
+	struct gf2k *gf2k = dev->private;
 
 	gameport_stop_polling(gf2k->gameport);
 }
@@ -221,19 +239,13 @@ static void gf2k_close(struct input_dev *dev)
 static int gf2k_connect(struct gameport *gameport, struct gameport_driver *drv)
 {
 	struct gf2k *gf2k;
-	struct input_dev *input_dev;
 	unsigned char data[GF2K_LENGTH];
 	int i, err;
 
-	gf2k = kzalloc(sizeof(struct gf2k), GFP_KERNEL);
-	input_dev = input_allocate_device();
-	if (!gf2k || !input_dev) {
-		err = -ENOMEM;
-		goto fail1;
-	}
+	if (!(gf2k = kcalloc(1, sizeof(struct gf2k), GFP_KERNEL)))
+		return -ENOMEM;
 
 	gf2k->gameport = gameport;
-	gf2k->dev = input_dev;
 
 	gameport_set_drvdata(gameport, gf2k);
 
@@ -260,7 +272,7 @@ static int gf2k_connect(struct gameport *gameport, struct gameport_driver *drv)
 	}
 
 #ifdef RESET_WORKS
-	if ((gf2k->id != (GB(19,2,0) | GB(15,3,2) | GB(12,3,5))) &&
+	if ((gf2k->id != (GB(19,2,0) | GB(15,3,2) | GB(12,3,5))) ||
 	    (gf2k->id != (GB(31,2,0) | GB(27,3,2) | GB(24,3,5)))) {
 		err = -ENODEV;
 		goto fail2;
@@ -279,60 +291,57 @@ static int gf2k_connect(struct gameport *gameport, struct gameport_driver *drv)
 	gameport_set_poll_handler(gameport, gf2k_poll);
 	gameport_set_poll_interval(gameport, 20);
 
-	snprintf(gf2k->phys, sizeof(gf2k->phys), "%s/input0", gameport->phys);
+	sprintf(gf2k->phys, "%s/input0", gameport->phys);
 
 	gf2k->length = gf2k_lens[gf2k->id];
 
-	input_dev->name = gf2k_names[gf2k->id];
-	input_dev->phys = gf2k->phys;
-	input_dev->id.bustype = BUS_GAMEPORT;
-	input_dev->id.vendor = GAMEPORT_ID_VENDOR_GENIUS;
-	input_dev->id.product = gf2k->id;
-	input_dev->id.version = 0x0100;
-	input_dev->dev.parent = &gameport->dev;
+	init_input_dev(&gf2k->dev);
 
-	input_set_drvdata(input_dev, gf2k);
+	gf2k->dev.private = gf2k;
+	gf2k->dev.open = gf2k_open;
+	gf2k->dev.close = gf2k_close;
+	gf2k->dev.evbit[0] = BIT(EV_KEY) | BIT(EV_ABS);
 
-	input_dev->open = gf2k_open;
-	input_dev->close = gf2k_close;
-
-	input_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_ABS);
+	gf2k->dev.name = gf2k_names[gf2k->id];
+	gf2k->dev.phys = gf2k->phys;
+	gf2k->dev.id.bustype = BUS_GAMEPORT;
+	gf2k->dev.id.vendor = GAMEPORT_ID_VENDOR_GENIUS;
+	gf2k->dev.id.product = gf2k->id;
+	gf2k->dev.id.version = 0x0100;
 
 	for (i = 0; i < gf2k_axes[gf2k->id]; i++)
-		set_bit(gf2k_abs[i], input_dev->absbit);
+		set_bit(gf2k_abs[i], gf2k->dev.absbit);
 
-	for (i = 0; i < gf2k_hats[gf2k->id]; i++)
-		input_set_abs_params(input_dev, ABS_HAT0X + i, -1, 1, 0, 0);
+	for (i = 0; i < gf2k_hats[gf2k->id]; i++) {
+		set_bit(ABS_HAT0X + i, gf2k->dev.absbit);
+		gf2k->dev.absmin[ABS_HAT0X + i] = -1;
+		gf2k->dev.absmax[ABS_HAT0X + i] = 1;
+	}
 
 	for (i = 0; i < gf2k_joys[gf2k->id]; i++)
-		set_bit(gf2k_btn_joy[i], input_dev->keybit);
+		set_bit(gf2k_btn_joy[i], gf2k->dev.keybit);
 
 	for (i = 0; i < gf2k_pads[gf2k->id]; i++)
-		set_bit(gf2k_btn_pad[i], input_dev->keybit);
+		set_bit(gf2k_btn_pad[i], gf2k->dev.keybit);
 
 	gf2k_read_packet(gameport, gf2k->length, data);
 	gf2k_read(gf2k, data);
 
 	for (i = 0; i < gf2k_axes[gf2k->id]; i++) {
-		int max = i < 2 ?
-			input_abs_get_val(input_dev, gf2k_abs[i]) * 2 :
-			input_abs_get_val(input_dev, gf2k_abs[0]) +
-				input_abs_get_val(input_dev, gf2k_abs[1]);
-		int flat = i < 2 ? 24 : 0;
-
-		input_set_abs_params(input_dev, gf2k_abs[i],
-				     32, max - 32, 8, flat);
+		gf2k->dev.absmax[gf2k_abs[i]] = (i < 2) ? gf2k->dev.abs[gf2k_abs[i]] * 2 - 32 :
+	      		  gf2k->dev.abs[gf2k_abs[0]] + gf2k->dev.abs[gf2k_abs[1]] - 32;
+		gf2k->dev.absmin[gf2k_abs[i]] = 32;
+		gf2k->dev.absfuzz[gf2k_abs[i]] = 8;
+		gf2k->dev.absflat[gf2k_abs[i]] = (i < 2) ? 24 : 0;
 	}
 
-	err = input_register_device(gf2k->dev);
-	if (err)
-		goto fail2;
+	input_register_device(&gf2k->dev);
+	printk(KERN_INFO "input: %s on %s\n", gf2k_names[gf2k->id], gameport->phys);
 
 	return 0;
 
- fail2:	gameport_close(gameport);
- fail1:	gameport_set_drvdata(gameport, NULL);
-	input_free_device(input_dev);
+fail2:	gameport_close(gameport);
+fail1:	gameport_set_drvdata(gameport, NULL);
 	kfree(gf2k);
 	return err;
 }
@@ -341,7 +350,7 @@ static void gf2k_disconnect(struct gameport *gameport)
 {
 	struct gf2k *gf2k = gameport_get_drvdata(gameport);
 
-	input_unregister_device(gf2k->dev);
+	input_unregister_device(&gf2k->dev);
 	gameport_close(gameport);
 	gameport_set_drvdata(gameport, NULL);
 	kfree(gf2k);
@@ -356,4 +365,16 @@ static struct gameport_driver gf2k_drv = {
 	.disconnect	= gf2k_disconnect,
 };
 
-module_gameport_driver(gf2k_drv);
+static int __init gf2k_init(void)
+{
+	gameport_register_driver(&gf2k_drv);
+	return 0;
+}
+
+static void __exit gf2k_exit(void)
+{
+	gameport_unregister_driver(&gf2k_drv);
+}
+
+module_init(gf2k_init);
+module_exit(gf2k_exit);

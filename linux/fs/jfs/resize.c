@@ -1,12 +1,24 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *   Copyright (C) International Business Machines  Corp., 2000-2004
+ *
+ *   This program is free software;  you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or 
+ *   (at your option) any later version.
+ * 
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY;  without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See
+ *   the GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program;  if not, write to the Free Software 
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 */
 
 #include <linux/fs.h>
 #include <linux/buffer_head.h>
 #include <linux/quotaops.h>
-#include <linux/blkdev.h>
 #include "jfs_incore.h"
 #include "jfs_filsys.h"
 #include "jfs_metapage.h"
@@ -17,17 +29,17 @@
 #include "jfs_txnmgr.h"
 #include "jfs_debug.h"
 
-#define BITSPERPAGE	(PSIZE << 3)
-#define L2MEGABYTE	20
-#define MEGABYTE	(1 << L2MEGABYTE)
-#define MEGABYTE32	(MEGABYTE << 5)
+#define BITSPERPAGE     (PSIZE << 3)
+#define L2MEGABYTE      20
+#define MEGABYTE        (1 << L2MEGABYTE)
+#define MEGABYTE32     (MEGABYTE << 5)
 
 /* convert block number to bmap file page number */
 #define BLKTODMAPN(b)\
-	(((b) >> 13) + ((b) >> 23) + ((b) >> 33) + 3 + 1)
+        (((b) >> 13) + ((b) >> 23) + ((b) >> 33) + 3 + 1)
 
 /*
- *	jfs_extendfs()
+ *      jfs_extendfs()
  *
  * function: extend file system;
  *
@@ -36,16 +48,16 @@
  *                                   workspace  space
  *
  * input:
- *	new LVSize: in LV blocks (required)
- *	new LogSize: in LV blocks (optional)
- *	new FSSize: in LV blocks (optional)
+ *      new LVSize: in LV blocks (required)
+ *      new LogSize: in LV blocks (optional)
+ *      new FSSize: in LV blocks (optional)
  *
  * new configuration:
  * 1. set new LogSize as specified or default from new LVSize;
  * 2. compute new FSCKSize from new LVSize;
  * 3. set new FSSize as MIN(FSSize, LVSize-(LogSize+FSCKSize)) where
  *    assert(new FSSize >= old FSSize),
- *    i.e., file system must not be shrunk;
+ *    i.e., file system must not be shrinked;
  */
 int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 {
@@ -68,8 +80,7 @@ int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 	int log_formatted = 0;
 	struct inode *iplist[1];
 	struct jfs_superblock *j_sb, *j_sb2;
-	s64 old_agsize;
-	int agsizechanged = 0;
+	uint old_agsize;
 	struct buffer_head *bh, *bh2;
 
 	/* If the volume hasn't grown, get out now */
@@ -86,7 +97,8 @@ int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 		goto out;
 	}
 
-	VolumeSize = sb_bdev_nr_blocks(sb);
+	VolumeSize = sb->s_bdev->bd_inode->i_size >> sb->s_blocksize_bits;
+
 	if (VolumeSize) {
 		if (newLVSize > VolumeSize) {
 			printk(KERN_WARNING "jfs_extendfs: invalid size\n");
@@ -113,8 +125,8 @@ int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 	}
 
 	/*
-	 *	reconfigure LV spaces
-	 *	---------------------
+	 *      reconfigure LV spaces
+	 *      ---------------------
 	 *
 	 * validate new size, or, if not specified, determine new size
 	 */
@@ -160,7 +172,7 @@ int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 	 */
 	t64 = ((newLVSize - newLogSize + BPERDMAP - 1) >> L2BPERDMAP)
 	    << L2BPERDMAP;
-	t32 = DIV_ROUND_UP(t64, BITSPERPAGE) + 1 + 50;
+	t32 = ((t64 + (BITSPERPAGE - 1)) / BITSPERPAGE) + 1 + 50;
 	newFSCKSize = t32 << sbi->l2nbperpage;
 	newFSCKAddress = newLogAddress - newFSCKSize;
 
@@ -169,7 +181,7 @@ int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 	 */
 	newFSSize = newLVSize - newLogSize - newFSCKSize;
 
-	/* file system cannot be shrunk */
+	/* file system cannot be shrinked */
 	if (newFSSize < bmp->db_mapsize) {
 		rc = -EINVAL;
 		goto out;
@@ -186,7 +198,7 @@ int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 		log_formatted = 1;
 	}
 	/*
-	 *	quiesce file system
+	 *      quiesce file system
 	 *
 	 * (prepare to move the inline log and to prevent map update)
 	 *
@@ -196,9 +208,6 @@ int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 	 * log is not required for recovery.
 	 */
 	txQuiesce(sb);
-
-	/* Reset size of direct inode */
-	sbi->direct_inode->i_size = bdev_nr_bytes(sb->s_bdev);
 
 	if (sbi->mntflag & JFS_INLINELOG) {
 		/*
@@ -258,8 +267,8 @@ int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 	}
 
 	/*
-	 *	extend block allocation map
-	 *	---------------------------
+	 *      extend block allocation map
+	 *      ---------------------------
 	 *
 	 * extendfs() for new extension, retry after crash recovery;
 	 *
@@ -271,7 +280,7 @@ int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 	 *  s_size: aggregate size in physical blocks;
 	 */
 	/*
-	 *	compute the new block allocation map configuration
+	 *      compute the new block allocation map configuration
 	 *
 	 * map dinode:
 	 *  di_size: map file size in byte;
@@ -289,7 +298,7 @@ int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 	newNpages = BLKTODMAPN(t64) + 1;
 
 	/*
-	 *	extend map from current map (WITHOUT growing mapfile)
+	 *      extend map from current map (WITHOUT growing mapfile)
 	 *
 	 * map new extension with unmapped part of the last partial
 	 * dmap page, if applicable, and extra page(s) allocated
@@ -321,9 +330,6 @@ int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 	 */
 	if ((rc = dbExtendFS(ipbmap, XAddress, nblocks)))
 		goto error_out;
-
-	agsizechanged |= (bmp->db_agsize != old_agsize);
-
 	/*
 	 * the map now has extended to cover additional nblocks:
 	 * dn_mapsize = oldMapsize + nblocks;
@@ -332,8 +338,8 @@ int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 	XSize -= nblocks;
 
 	/*
-	 *	grow map file to cover remaining extension
-	 *	and/or one extra dmap page for next extendfs();
+	 *      grow map file to cover remaining extension
+	 *      and/or one extra dmap page for next extendfs();
 	 *
 	 * allocate new map pages and its backing blocks, and
 	 * update map file xtree
@@ -366,14 +372,9 @@ int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 	 * cached in meta-data cache, and not written out
 	 * by txCommit();
 	 */
-	rc = filemap_fdatawait(ipbmap->i_mapping);
-	if (rc)
-		goto error_out;
-
-	rc = filemap_write_and_wait(ipbmap->i_mapping);
-	if (rc)
-		goto error_out;
-
+	filemap_fdatawait(ipbmap->i_mapping);
+	filemap_fdatawrite(ipbmap->i_mapping);
+	filemap_fdatawait(ipbmap->i_mapping);
 	diWriteSpecial(ipbmap, 0);
 
 	newPage = nPages;	/* first new page number */
@@ -419,8 +420,8 @@ int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 	dbFinalizeBmap(ipbmap);
 
 	/*
-	 *	update inode allocation map
-	 *	---------------------------
+	 *      update inode allocation map
+	 *      ---------------------------
 	 *
 	 * move iag lists from old to new iag;
 	 * agstart field is not updated for logredo() to reconstruct
@@ -429,7 +430,7 @@ int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 	 * will correctly identify the new ag);
 	 */
 	/* if new AG size the same as old AG size, done! */
-	if (agsizechanged) {
+	if (bmp->db_agsize != old_agsize) {
 		if ((rc = diExtendFS(ipimap, ipbmap)))
 			goto error_out;
 
@@ -439,8 +440,8 @@ int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 	}
 
 	/*
-	 *	finalize
-	 *	--------
+	 *      finalize
+	 *      --------
 	 *
 	 * extension is committed when on-disk super block is
 	 * updated with new descriptors: logredo will recover
@@ -477,7 +478,7 @@ int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 	diFreeSpecial(ipbmap2);
 
 	/*
-	 *	update superblock
+	 *      update superblock
 	 */
 	if ((rc = readSuper(sb, &bh)))
 		goto error_out;
@@ -523,11 +524,11 @@ int jfs_extendfs(struct super_block *sb, s64 newLVSize, int newLogSize)
 	goto resume;
 
       error_out:
-	jfs_error(sb, "\n");
+	jfs_error(sb, "jfs_extendfs");
 
       resume:
 	/*
-	 *	resume file system transactions
+	 *      resume file system transactions
 	 */
 	txResume(sb);
 

@@ -1,17 +1,23 @@
-# SPDX-License-Identifier: GPL-2.0
+# $Id: Makefile,v 1.38 2000/12/15 00:41:22 davem Exp $
 # Makefile for the linux Sparc-specific parts of the memory manager.
 #
 
-asflags-y := -ansi
-ccflags-y := -Werror
+EXTRA_AFLAGS := -ansi
 
-obj-$(CONFIG_SPARC64)   += ultra.o tlb.o tsb.o
-obj-y                   += fault_$(BITS).o
-obj-y                   += init_$(BITS).o
-obj-$(CONFIG_SPARC32)   += srmmu.o iommu.o io-unit.o
-obj-$(CONFIG_SPARC32)   += srmmu_access.o
-obj-$(CONFIG_SPARC32)   += hypersparc.o viking.o tsunami.o swift.o
-obj-$(CONFIG_SPARC32)   += leon_mm.o
+obj-y    := fault.o init.o loadmmu.o generic.o extable.o btfixup.o
 
-# Only used by sparc64
-obj-$(CONFIG_HUGETLB_PAGE) += hugetlbpage.o
+ifeq ($(CONFIG_SUN4),y)
+obj-y	 += nosrmmu.o
+else
+obj-y	 += srmmu.o iommu.o io-unit.o hypersparc.o viking.o tsunami.o swift.o
+endif
+
+ifdef CONFIG_HIGHMEM
+obj-y	+= highmem.o
+endif
+
+ifdef CONFIG_SMP
+obj-y   += nosun4c.o
+else
+obj-y   += sun4c.o
+endif

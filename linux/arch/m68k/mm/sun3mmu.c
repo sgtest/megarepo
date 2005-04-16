@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * linux/arch/m68k/mm/sun3mmu.c
  *
@@ -16,11 +15,13 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/init.h>
-#include <linux/memblock.h>
+#include <linux/bootmem.h>
 
 #include <asm/setup.h>
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
 #include <asm/page.h>
+#include <asm/pgtable.h>
+#include <asm/system.h>
 #include <asm/machdep.h>
 #include <asm/io.h>
 
@@ -29,6 +30,10 @@ extern void mmu_emu_init (unsigned long bootmem_end);
 const char bad_pmd_string[] = "Bad pmd in pte_alloc: %08lx\n";
 
 extern unsigned long num_pages;
+
+void free_initmem(void)
+{
+}
 
 /* For the sun3 we try to follow the i386 paging_init() more closely */
 /* start_mem and end_mem have PAGE_OFFSET added already */
@@ -41,13 +46,15 @@ void __init paging_init(void)
 	unsigned long address;
 	unsigned long next_pgtable;
 	unsigned long bootmem_end;
-	unsigned long max_zone_pfn[MAX_NR_ZONES] = { 0, };
+	unsigned long zones_size[3] = {0, 0, 0};
 	unsigned long size;
 
-	empty_zero_page = memblock_alloc(PAGE_SIZE, PAGE_SIZE);
-	if (!empty_zero_page)
-		panic("%s: Failed to allocate %lu bytes align=0x%lx\n",
-		      __func__, PAGE_SIZE, PAGE_SIZE);
+
+#ifdef TEST_VERIFY_AREA
+	wp_works_ok = 0;
+#endif
+	empty_zero_page = alloc_bootmem_pages(PAGE_SIZE);
+	memset(empty_zero_page, 0, PAGE_SIZE);
 
 	address = PAGE_OFFSET;
 	pg_dir = swapper_pg_dir;
@@ -57,10 +64,7 @@ void __init paging_init(void)
 	size = num_pages * sizeof(pte_t);
 	size = (size + PAGE_SIZE) & ~(PAGE_SIZE-1);
 
-	next_pgtable = (unsigned long)memblock_alloc(size, PAGE_SIZE);
-	if (!next_pgtable)
-		panic("%s: Failed to allocate %lu bytes align=0x%lx\n",
-		      __func__, size, PAGE_SIZE);
+	next_pgtable = (unsigned long)alloc_bootmem_pages(size);
 	bootmem_end = (next_pgtable + size + PAGE_SIZE) & PAGE_MASK;
 
 	/* Map whole memory from PAGE_OFFSET (0x0E000000) */
@@ -88,30 +92,11 @@ void __init paging_init(void)
 	current->mm = NULL;
 
 	/* memory sizing is a hack stolen from motorola.c..  hope it works for us */
-	max_zone_pfn[ZONE_DMA] = ((unsigned long)high_memory) >> PAGE_SHIFT;
+	zones_size[0] = ((unsigned long)high_memory - PAGE_OFFSET) >> PAGE_SHIFT;
+	zones_size[1] = 0;
 
-	/* I really wish I knew why the following change made things better...  -- Sam */
-	free_area_init(max_zone_pfn);
-
+	free_area_init(zones_size);
 
 }
 
-static const pgprot_t protection_map[16] = {
-	[VM_NONE]					= PAGE_NONE,
-	[VM_READ]					= PAGE_READONLY,
-	[VM_WRITE]					= PAGE_COPY,
-	[VM_WRITE | VM_READ]				= PAGE_COPY,
-	[VM_EXEC]					= PAGE_READONLY,
-	[VM_EXEC | VM_READ]				= PAGE_READONLY,
-	[VM_EXEC | VM_WRITE]				= PAGE_COPY,
-	[VM_EXEC | VM_WRITE | VM_READ]			= PAGE_COPY,
-	[VM_SHARED]					= PAGE_NONE,
-	[VM_SHARED | VM_READ]				= PAGE_READONLY,
-	[VM_SHARED | VM_WRITE]				= PAGE_SHARED,
-	[VM_SHARED | VM_WRITE | VM_READ]		= PAGE_SHARED,
-	[VM_SHARED | VM_EXEC]				= PAGE_READONLY,
-	[VM_SHARED | VM_EXEC | VM_READ]			= PAGE_READONLY,
-	[VM_SHARED | VM_EXEC | VM_WRITE]		= PAGE_SHARED,
-	[VM_SHARED | VM_EXEC | VM_WRITE | VM_READ]	= PAGE_SHARED
-};
-DECLARE_VM_GET_PAGE_PROT
+

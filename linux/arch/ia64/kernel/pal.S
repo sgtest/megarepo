@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * PAL Firmware support
  * IA-64 Processor Programmers Reference Vol 2
@@ -15,7 +14,6 @@
 
 #include <asm/asmmacro.h>
 #include <asm/processor.h>
-#include <asm/export.h>
 
 	.data
 pal_entry_point:
@@ -23,12 +21,11 @@ pal_entry_point:
 	.text
 
 /*
- * Set the PAL entry point address.  This could be written in C code, but we
- * do it here to keep it all in one module (besides, it's so trivial that it's
+ * Set the PAL entry point address.  This could be written in C code, but we do it here
+ * to keep it all in one module (besides, it's so trivial that it's
  * not a big deal).
  *
- * in0		Address of the PAL entry point (text address, NOT a function
- *		descriptor).
+ * in0		Address of the PAL entry point (text address, NOT a function descriptor).
  */
 GLOBAL_ENTRY(ia64_pal_handler_init)
 	alloc r3=ar.pfs,1,0,0,0
@@ -39,9 +36,9 @@ GLOBAL_ENTRY(ia64_pal_handler_init)
 END(ia64_pal_handler_init)
 
 /*
- * Default PAL call handler.  This needs to be coded in assembly because it
- * uses the static calling convention, i.e., the RSE may not be used and
- * calls are done via "br.cond" (not "br.call").
+ * Default PAL call handler.  This needs to be coded in assembly because it uses
+ * the static calling convention, i.e., the RSE may not be used and calls are
+ * done via "br.cond" (not "br.call").
  */
 GLOBAL_ENTRY(ia64_pal_default_handler)
 	mov r8=-1
@@ -53,10 +50,12 @@ END(ia64_pal_default_handler)
  *
  * in0         Index of PAL service
  * in1 - in3   Remaining PAL arguments
+ * in4	       1 ==> clear psr.ic,  0 ==> don't clear psr.ic
+ *
  */
 GLOBAL_ENTRY(ia64_pal_call_static)
-	.prologue ASM_UNW_PRLG_RP|ASM_UNW_PRLG_PFS, ASM_UNW_PRLG_GRSAVE(4)
-	alloc loc1 = ar.pfs,4,5,0,0
+	.prologue ASM_UNW_PRLG_RP|ASM_UNW_PRLG_PFS, ASM_UNW_PRLG_GRSAVE(5)
+	alloc loc1 = ar.pfs,5,5,0,0
 	movl loc2 = pal_entry_point
 1:	{
 	  mov r28 = in0
@@ -65,6 +64,7 @@ GLOBAL_ENTRY(ia64_pal_call_static)
 	}
 	;;
 	ld8 loc2 = [loc2]		// loc2 <- entry point
+	tbit.nz p6,p7 = in4, 0
 	adds r8 = 1f-1b,r8
 	mov loc4=ar.rsc			// save RSE configuration
 	;;
@@ -74,11 +74,13 @@ GLOBAL_ENTRY(ia64_pal_call_static)
 	.body
 	mov r30 = in2
 
+(p6)	rsm psr.i | psr.ic
 	mov r31 = in3
 	mov b7 = loc2
 
-	rsm psr.i
+(p7)	rsm psr.i
 	;;
+(p6)	srlz.i
 	mov rp = r8
 	br.cond.sptk.many b7
 1:	mov psr.l = loc3
@@ -86,17 +88,16 @@ GLOBAL_ENTRY(ia64_pal_call_static)
 	mov ar.pfs = loc1
 	mov rp = loc0
 	;;
-	srlz.d				// serialize restoration of psr.l
+	srlz.d				// seralize restoration of psr.l
 	br.ret.sptk.many b0
 END(ia64_pal_call_static)
-EXPORT_SYMBOL(ia64_pal_call_static)
 
 /*
  * Make a PAL call using the stacked registers calling convention.
  *
  * Inputs:
- *	in0         Index of PAL service
- *	in2 - in3   Remaining PAL arguments
+ * 	in0         Index of PAL service
+ * 	in2 - in3   Remaning PAL arguments
  */
 GLOBAL_ENTRY(ia64_pal_call_stacked)
 	.prologue ASM_UNW_PRLG_RP|ASM_UNW_PRLG_PFS, ASM_UNW_PRLG_GRSAVE(4)
@@ -125,24 +126,23 @@ GLOBAL_ENTRY(ia64_pal_call_stacked)
 	srlz.d				// serialize restoration of psr.l
 	br.ret.sptk.many b0
 END(ia64_pal_call_stacked)
-EXPORT_SYMBOL(ia64_pal_call_stacked)
 
 /*
  * Make a physical mode PAL call using the static registers calling convention.
  *
  * Inputs:
- *	in0         Index of PAL service
- *	in2 - in3   Remaining PAL arguments
+ * 	in0         Index of PAL service
+ * 	in2 - in3   Remaning PAL arguments
  *
  * PSR_LP, PSR_TB, PSR_ID, PSR_DA are never set by the kernel.
  * So we don't need to clear them.
  */
-#define PAL_PSR_BITS_TO_CLEAR						      \
-	(IA64_PSR_I | IA64_PSR_IT | IA64_PSR_DT  | IA64_PSR_DB | IA64_PSR_RT |\
-	 IA64_PSR_DD | IA64_PSR_SS | IA64_PSR_RI | IA64_PSR_ED |	      \
+#define PAL_PSR_BITS_TO_CLEAR							\
+	(IA64_PSR_I | IA64_PSR_IT | IA64_PSR_DT  | IA64_PSR_DB | IA64_PSR_RT |	\
+	 IA64_PSR_DD | IA64_PSR_SS | IA64_PSR_RI | IA64_PSR_ED |		\
 	 IA64_PSR_DFL | IA64_PSR_DFH)
 
-#define PAL_PSR_BITS_TO_SET						      \
+#define PAL_PSR_BITS_TO_SET							\
 	(IA64_PSR_BN)
 
 
@@ -178,7 +178,7 @@ GLOBAL_ENTRY(ia64_pal_call_phys_static)
 	;;
 	andcm r16=loc3,r16		// removes bits to clear from psr
 	br.call.sptk.many rp=ia64_switch_mode_phys
-	mov rp = r8			// install return address (physical)
+.ret1:	mov rp = r8			// install return address (physical)
 	mov loc5 = r19
 	mov loc6 = r20
 	br.cond.sptk.many b7
@@ -188,23 +188,23 @@ GLOBAL_ENTRY(ia64_pal_call_phys_static)
 	mov r19=loc5
 	mov r20=loc6
 	br.call.sptk.many rp=ia64_switch_mode_virt // return to virtual mode
+.ret2:
 	mov psr.l = loc3		// restore init PSR
 
 	mov ar.pfs = loc1
 	mov rp = loc0
 	;;
 	mov ar.rsc=loc4			// restore RSE configuration
-	srlz.d				// serialize restoration of psr.l
+	srlz.d				// seralize restoration of psr.l
 	br.ret.sptk.many b0
 END(ia64_pal_call_phys_static)
-EXPORT_SYMBOL(ia64_pal_call_phys_static)
 
 /*
  * Make a PAL call using the stacked registers in physical mode.
  *
  * Inputs:
- *	in0         Index of PAL service
- *	in2 - in3   Remaining PAL arguments
+ * 	in0         Index of PAL service
+ * 	in2 - in3   Remaning PAL arguments
  */
 GLOBAL_ENTRY(ia64_pal_call_phys_stacked)
 	.prologue ASM_UNW_PRLG_RP|ASM_UNW_PRLG_PFS, ASM_UNW_PRLG_GRSAVE(5)
@@ -212,12 +212,17 @@ GLOBAL_ENTRY(ia64_pal_call_phys_stacked)
 	movl	loc2 = pal_entry_point
 1:	{
 	  mov r28  = in0		// copy procedure index
-	  mov loc0 = rp			// save rp
+	  mov loc0 = rp		// save rp
 	}
 	.body
 	;;
 	ld8 loc2 = [loc2]		// loc2 <- entry point
-	mov loc3 = psr			// save psr
+	mov out0 = in0		// first argument
+	mov out1 = in1		// copy arg2
+	mov out2 = in2		// copy arg3
+	mov out3 = in3		// copy arg3
+	;;
+	mov loc3 = psr		// save psr
 	;;
 	mov loc4=ar.rsc			// save RSE configuration
 	dep.z loc2=loc2,0,61		// convert pal entry point to physical
@@ -231,38 +236,31 @@ GLOBAL_ENTRY(ia64_pal_call_phys_stacked)
 	;;
 	andcm r16=loc3,r16		// removes bits to clear from psr
 	br.call.sptk.many rp=ia64_switch_mode_phys
-
-	mov out0 = in0			// first argument
-	mov out1 = in1			// copy arg2
-	mov out2 = in2			// copy arg3
-	mov out3 = in3			// copy arg3
+.ret6:
 	mov loc5 = r19
 	mov loc6 = r20
-
 	br.call.sptk.many rp=b7		// now make the call
-
+.ret7:
 	mov ar.rsc=0			// put RSE in enforced lazy, LE mode
 	mov r16=loc3			// r16= original psr
 	mov r19=loc5
 	mov r20=loc6
-	br.call.sptk.many rp=ia64_switch_mode_virt // return to virtual mode
+	br.call.sptk.many rp=ia64_switch_mode_virt	// return to virtual mode
 
-	mov psr.l  = loc3		// restore init PSR
+.ret8:	mov psr.l  = loc3		// restore init PSR
 	mov ar.pfs = loc1
 	mov rp = loc0
 	;;
 	mov ar.rsc=loc4			// restore RSE configuration
-	srlz.d				// serialize restoration of psr.l
+	srlz.d				// seralize restoration of psr.l
 	br.ret.sptk.many b0
 END(ia64_pal_call_phys_stacked)
-EXPORT_SYMBOL(ia64_pal_call_phys_stacked)
 
 /*
- * Save scratch fp scratch regs which aren't saved in pt_regs already
- * (fp10-fp15).
+ * Save scratch fp scratch regs which aren't saved in pt_regs already (fp10-fp15).
  *
- * NOTE: We need to do this since firmware (SAL and PAL) may use any of the
- * scratch regs fp-low partition.
+ * NOTE: We need to do this since firmware (SAL and PAL) may use any of the scratch
+ * regs fp-low partition.
  *
  * Inputs:
  *      in0	Address of stack storage for fp regs
@@ -281,7 +279,6 @@ GLOBAL_ENTRY(ia64_save_scratch_fpregs)
 	stf.spill [r2]  = f15,32
 	br.ret.sptk.many rp
 END(ia64_save_scratch_fpregs)
-EXPORT_SYMBOL(ia64_save_scratch_fpregs)
 
 /*
  * Load scratch fp scratch regs (fp10-fp15)
@@ -303,4 +300,3 @@ GLOBAL_ENTRY(ia64_load_scratch_fpregs)
 	ldf.fill  f15 = [r2],32
 	br.ret.sptk.many rp
 END(ia64_load_scratch_fpregs)
-EXPORT_SYMBOL(ia64_load_scratch_fpregs)

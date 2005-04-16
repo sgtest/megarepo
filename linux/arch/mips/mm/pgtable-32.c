@@ -5,13 +5,12 @@
  *
  * Copyright (C) 2003 by Ralf Baechle
  */
+#include <linux/config.h>
 #include <linux/init.h>
 #include <linux/mm.h>
-#include <linux/memblock.h>
+#include <linux/bootmem.h>
 #include <linux/highmem.h>
-#include <asm/fixmap.h>
-#include <asm/pgalloc.h>
-#include <asm/tlbflush.h>
+#include <asm/pgtable.h>
 
 void pgd_init(unsigned long page)
 {
@@ -30,32 +29,42 @@ void pgd_init(unsigned long page)
 	}
 }
 
-#if defined(CONFIG_TRANSPARENT_HUGEPAGE)
-pmd_t mk_pmd(struct page *page, pgprot_t prot)
+#ifdef CONFIG_HIGHMEM
+static void __init fixrange_init (unsigned long start, unsigned long end,
+	pgd_t *pgd_base)
 {
-	pmd_t pmd;
+	pgd_t *pgd;
+	pmd_t *pmd;
+	pte_t *pte;
+	int i, j;
+	unsigned long vaddr;
 
-	pmd_val(pmd) = (page_to_pfn(page) << _PFN_SHIFT) | pgprot_val(prot);
+	vaddr = start;
+	i = __pgd_offset(vaddr);
+	j = __pmd_offset(vaddr);
+	pgd = pgd_base + i;
 
-	return pmd;
+	for ( ; (i < PTRS_PER_PGD) && (vaddr != end); pgd++, i++) {
+		pmd = (pmd_t *)pgd;
+		for (; (j < PTRS_PER_PMD) && (vaddr != end); pmd++, j++) {
+			if (pmd_none(*pmd)) {
+				pte = (pte_t *) alloc_bootmem_low_pages(PAGE_SIZE);
+				set_pmd(pmd, __pmd((unsigned long)pte));
+				if (pte != pte_offset_kernel(pmd, 0))
+					BUG();
+			}
+			vaddr += PMD_SIZE;
+		}
+		j = 0;
+	}
 }
-
-
-void set_pmd_at(struct mm_struct *mm, unsigned long addr,
-		pmd_t *pmdp, pmd_t pmd)
-{
-	*pmdp = pmd;
-}
-#endif /* defined(CONFIG_TRANSPARENT_HUGEPAGE) */
+#endif
 
 void __init pagetable_init(void)
 {
-	unsigned long vaddr;
-	pgd_t *pgd_base;
 #ifdef CONFIG_HIGHMEM
-	pgd_t *pgd;
-	p4d_t *p4d;
-	pud_t *pud;
+	unsigned long vaddr;
+	pgd_t *pgd, *pgd_base;
 	pmd_t *pmd;
 	pte_t *pte;
 #endif
@@ -65,25 +74,23 @@ void __init pagetable_init(void)
 	pgd_init((unsigned long)swapper_pg_dir
 		 + sizeof(pgd_t) * USER_PTRS_PER_PGD);
 
+#ifdef CONFIG_HIGHMEM
 	pgd_base = swapper_pg_dir;
 
 	/*
 	 * Fixed mappings:
 	 */
-	vaddr = __fix_to_virt(__end_of_fixed_addresses - 1);
-	fixrange_init(vaddr & PMD_MASK, vaddr + FIXADDR_SIZE, pgd_base);
+	vaddr = __fix_to_virt(__end_of_fixed_addresses - 1) & PMD_MASK;
+	fixrange_init(vaddr, 0, pgd_base);
 
-#ifdef CONFIG_HIGHMEM
 	/*
 	 * Permanent kmaps:
 	 */
 	vaddr = PKMAP_BASE;
-	fixrange_init(vaddr & PMD_MASK, vaddr + PAGE_SIZE*LAST_PKMAP, pgd_base);
+	fixrange_init(vaddr, vaddr + PAGE_SIZE*LAST_PKMAP, pgd_base);
 
-	pgd = swapper_pg_dir + pgd_index(vaddr);
-	p4d = p4d_offset(pgd, vaddr);
-	pud = pud_offset(p4d, vaddr);
-	pmd = pmd_offset(pud, vaddr);
+	pgd = swapper_pg_dir + __pgd_offset(vaddr);
+	pmd = pmd_offset(pgd, vaddr);
 	pte = pte_offset_kernel(pmd, vaddr);
 	pkmap_page_table = pte;
 #endif

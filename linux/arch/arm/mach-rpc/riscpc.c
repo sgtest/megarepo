@@ -1,8 +1,11 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  *  linux/arch/arm/mach-rpc/riscpc.c
  *
  *  Copyright (C) 1998-2001 Russell King
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
  *
  *  Architecture specific fixups.
  */
@@ -14,19 +17,14 @@
 #include <linux/sched.h>
 #include <linux/device.h>
 #include <linux/serial_8250.h>
-#include <linux/ata_platform.h>
-#include <linux/io.h>
-#include <linux/i2c.h>
-#include <linux/reboot.h>
 
 #include <asm/elf.h>
+#include <asm/io.h>
 #include <asm/mach-types.h>
-#include <mach/hardware.h>
-#include <asm/hardware/iomd.h>
+#include <asm/hardware.h>
 #include <asm/page.h>
 #include <asm/domain.h>
 #include <asm/setup.h>
-#include <asm/system_misc.h>
 
 #include <asm/mach/map.h>
 #include <asm/mach/arch.h>
@@ -34,7 +32,10 @@
 
 extern void rpc_init_irq(void);
 
-unsigned int vram_size;
+extern unsigned int vram_size;
+
+#if 0
+
 unsigned int memc_ctrl_reg;
 unsigned int number_mfm_drives;
 
@@ -46,10 +47,8 @@ static int __init parse_tag_acorn(const struct tag *tag)
 	switch (tag->u.acorn.vram_pages) {
 	case 512:
 		vram_size += PAGE_SIZE * 256;
-		fallthrough;	/* ??? */
 	case 256:
 		vram_size += PAGE_SIZE * 256;
-		break;
 	default:
 		break;
 	}
@@ -64,23 +63,12 @@ static int __init parse_tag_acorn(const struct tag *tag)
 
 __tagtable(ATAG_ACORN, parse_tag_acorn);
 
+#endif
+
 static struct map_desc rpc_io_desc[] __initdata = {
- 	{	/* VRAM		*/
-		.virtual	=  SCREEN_BASE,
-		.pfn		= __phys_to_pfn(SCREEN_START),
-		.length		= 	2*1048576,
-		.type		= MT_DEVICE
-	}, {	/* IO space	*/
-		.virtual	=  (u32)IO_BASE,
-		.pfn		= __phys_to_pfn(IO_START),
-		.length		= 	IO_SIZE	 ,
-		.type		= MT_DEVICE
-	}, {	/* EASI space	*/
-		.virtual	= (unsigned long)EASI_BASE,
-		.pfn		= __phys_to_pfn(EASI_START),
-		.length		= EASI_SIZE,
-		.type		= MT_DEVICE
-	}
+ { SCREEN_BASE,	SCREEN_START,	2*1048576, MT_DEVICE }, /* VRAM		*/
+ { (u32)IO_BASE, IO_START,	IO_SIZE	 , MT_DEVICE }, /* IO space	*/
+ { EASI_BASE,	EASI_START,	EASI_SIZE, MT_DEVICE }  /* EASI space	*/
 };
 
 static void __init rpc_map_io(void)
@@ -90,7 +78,7 @@ static void __init rpc_map_io(void)
 	/*
 	 * Turn off floppy.
 	 */
-	writeb(0xc, PCIO_BASE + (0x3f2 << 2));
+	outb(0xc, 0x3f2);
 
 	/*
 	 * RiscPC can't handle half-word loads and stores
@@ -99,9 +87,15 @@ static void __init rpc_map_io(void)
 }
 
 static struct resource acornfb_resources[] = {
-	/* VIDC */
-	DEFINE_RES_MEM(0x03400000, 0x00200000),
-	DEFINE_RES_IRQ(IRQ_VSYNCPULSE),
+	{	/* VIDC */
+		.start		= 0x03400000,
+		.end		= 0x035fffff,
+		.flags		= IORESOURCE_MEM,
+	}, {
+		.start		= IRQ_VSYNCPULSE,
+		.end		= IRQ_VSYNCPULSE,
+		.flags		= IORESOURCE_IRQ,
+	},
 };
 
 static struct platform_device acornfb_device = {
@@ -115,7 +109,11 @@ static struct platform_device acornfb_device = {
 };
 
 static struct resource iomd_resources[] = {
-	DEFINE_RES_MEM(0x03200000, 0x10000),
+	{
+		.start		= 0x03200000,
+		.end		= 0x0320ffff,
+		.flags		= IORESOURCE_MEM,
+	},
 };
 
 static struct platform_device iomd_device = {
@@ -125,25 +123,18 @@ static struct platform_device iomd_device = {
 	.resource		= iomd_resources,
 };
 
-static struct resource iomd_kart_resources[] = {
-	DEFINE_RES_IRQ(IRQ_KEYBOARDRX),
-	DEFINE_RES_IRQ(IRQ_KEYBOARDTX),
-};
-
 static struct platform_device kbd_device = {
 	.name			= "kart",
 	.id			= -1,
 	.dev			= {
 		.parent 	= &iomd_device.dev,
 	},
-	.num_resources		= ARRAY_SIZE(iomd_kart_resources),
-	.resource		= iomd_kart_resources,
 };
 
 static struct plat_serial8250_port serial_platform_data[] = {
 	{
 		.mapbase	= 0x03010fe0,
-		.irq		= IRQ_SERIALPORT,
+		.irq		= 10,
 		.uartclk	= 1843200,
 		.regshift	= 2,
 		.iotype		= UPIO_MEM,
@@ -154,30 +145,9 @@ static struct plat_serial8250_port serial_platform_data[] = {
 
 static struct platform_device serial_device = {
 	.name			= "serial8250",
-	.id			= PLAT8250_DEV_PLATFORM,
+	.id			= 0,
 	.dev			= {
 		.platform_data	= serial_platform_data,
-	},
-};
-
-static struct pata_platform_info pata_platform_data = {
-	.ioport_shift		= 2,
-};
-
-static struct resource pata_resources[] = {
-	DEFINE_RES_MEM(0x030107c0, 0x20),
-	DEFINE_RES_MEM(0x03010fd8, 0x04),
-	DEFINE_RES_IRQ(IRQ_HARDDISK),
-};
-
-static struct platform_device pata_device = {
-	.name			= "pata_platform",
-	.id			= -1,
-	.num_resources		= ARRAY_SIZE(pata_resources),
-	.resource		= pata_resources,
-	.dev			= {
-		.platform_data	= &pata_platform_data,
-		.coherent_dma_mask = ~0,	/* grumble */
 	},
 };
 
@@ -186,40 +156,24 @@ static struct platform_device *devs[] __initdata = {
 	&kbd_device,
 	&serial_device,
 	&acornfb_device,
-	&pata_device,
-};
-
-static struct i2c_board_info i2c_rtc = {
-	I2C_BOARD_INFO("pcf8583", 0x50)
 };
 
 static int __init rpc_init(void)
 {
-	i2c_register_board_info(0, &i2c_rtc, 1);
 	return platform_add_devices(devs, ARRAY_SIZE(devs));
 }
 
 arch_initcall(rpc_init);
 
-static void rpc_restart(enum reboot_mode mode, const char *cmd)
-{
-	iomd_writeb(0, IOMD_ROMCR0);
-
-	/*
-	 * Jump into the ROM
-	 */
-	soft_restart(0);
-}
-
-void ioc_timer_init(void);
+extern struct sys_timer ioc_timer;
 
 MACHINE_START(RISCPC, "Acorn-RiscPC")
-	/* Maintainer: Russell King */
-	.atag_offset	= 0x100,
-	.reserve_lp0	= 1,
-	.reserve_lp1	= 1,
-	.map_io		= rpc_map_io,
-	.init_irq	= rpc_init_irq,
-	.init_time	= ioc_timer_init,
-	.restart	= rpc_restart,
+	MAINTAINER("Russell King")
+	BOOT_MEM(0x10000000, 0x03000000, 0xe0000000)
+	BOOT_PARAMS(0x10000100)
+	DISABLE_PARPORT(0)
+	DISABLE_PARPORT(1)
+	MAPIO(rpc_map_io)
+	INITIRQ(rpc_init_irq)
+	.timer		= &ioc_timer,
 MACHINE_END

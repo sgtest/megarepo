@@ -1,16 +1,41 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+/* 
+   BlueCore Serial Protocol (BCSP) for Linux Bluetooth stack (BlueZ).
+   Copyright 2002 by Fabrizio Gennari <fabrizio.gennari@philips.com>
+
+   Based on
+       hci_h4.c  by Maxim Krasnyansky <maxk@qualcomm.com>
+       ABCSP     by Carl Orsborn <cjo@csr.com>
+
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License version 2 as
+   published by the Free Software Foundation;
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF THIRD PARTY RIGHTS.
+   IN NO EVENT SHALL THE COPYRIGHT HOLDER(S) AND AUTHOR(S) BE LIABLE FOR ANY
+   CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES, OR ANY DAMAGES 
+   WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN 
+   ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF 
+   OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+   ALL LIABILITY, INCLUDING LIABILITY FOR INFRINGEMENT OF ANY PATENTS, 
+   COPYRIGHTS, TRADEMARKS OR OTHER RIGHTS, RELATING TO USE OF THIS 
+   SOFTWARE IS DISCLAIMED.
+*/
+
 /*
- *
- *  Bluetooth HCI UART driver
- *
- *  Copyright (C) 2002-2003  Fabrizio Gennari <fabrizio.gennari@philips.com>
- *  Copyright (C) 2004-2005  Marcel Holtmann <marcel@holtmann.org>
+ * $Id: hci_bcsp.c,v 1.2 2002/09/26 05:05:14 maxk Exp $
  */
 
+#define VERSION "0.2"
+
+#include <linux/config.h>
 #include <linux/module.h>
 
 #include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/sched.h>
 #include <linux/types.h>
 #include <linux/fcntl.h>
 #include <linux/interrupt.h>
@@ -24,60 +49,25 @@
 #include <linux/signal.h>
 #include <linux/ioctl.h>
 #include <linux/skbuff.h>
-#include <linux/bitrev.h>
-#include <asm/unaligned.h>
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
-
 #include "hci_uart.h"
+#include "hci_bcsp.h"
 
-static bool txcrc = true;
-static bool hciextn = true;
+#ifndef CONFIG_BT_HCIUART_DEBUG
+#undef  BT_DBG
+#define BT_DBG( A... )
+#undef  BT_DMP
+#define BT_DMP( A... )
+#endif
 
-#define BCSP_TXWINSIZE	4
-
-#define BCSP_ACK_PKT	0x05
-#define BCSP_LE_PKT	0x06
-
-struct bcsp_struct {
-	struct sk_buff_head unack;	/* Unack'ed packets queue */
-	struct sk_buff_head rel;	/* Reliable packets queue */
-	struct sk_buff_head unrel;	/* Unreliable packets queue */
-
-	unsigned long rx_count;
-	struct	sk_buff *rx_skb;
-	u8	rxseq_txack;		/* rxseq == txack. */
-	u8	rxack;			/* Last packet sent by us that the peer ack'ed */
-	struct	timer_list tbcsp;
-	struct	hci_uart *hu;
-
-	enum {
-		BCSP_W4_PKT_DELIMITER,
-		BCSP_W4_PKT_START,
-		BCSP_W4_BCSP_HDR,
-		BCSP_W4_DATA,
-		BCSP_W4_CRC
-	} rx_state;
-
-	enum {
-		BCSP_ESCSTATE_NOESC,
-		BCSP_ESCSTATE_ESC
-	} rx_esc_state;
-
-	u8	use_crc;
-	u16	message_crc;
-	u8	txack_req;		/* Do we need to send ack's to the peer? */
-
-	/* Reliable packet sequence number - used to assign seq to each rel pkt. */
-	u8	msgq_txseq;
-};
+static int hciextn = 1;
 
 /* ---- BCSP CRC calculation ---- */
 
 /* Table for calculating CRC for polynomial 0x1021, LSB processed first,
- * initial value 0xffff, bits shifted in reverse order.
- */
+initial value 0xffff, bits shifted in reverse order. */
 
 static const u16 crc_table[] = {
 	0x0000, 0x1081, 0x2102, 0x3183,
@@ -89,12 +79,13 @@ static const u16 crc_table[] = {
 /* Initialise the crc calculator */
 #define BCSP_CRC_INIT(x) x = 0xffff
 
-/* Update crc with next data byte
- *
- * Implementation note
- *     The data byte is treated as two nibbles.  The crc is generated
- *     in reverse, i.e., bits are fed into the register from the top.
- */
+/*
+   Update crc with next data byte
+
+   Implementation note
+        The data byte is treated as two nibbles.  The crc is generated
+        in reverse, i.e., bits are fed into the register from the top.
+*/
 static void bcsp_crc_update(u16 *crc, u8 d)
 {
 	u16 reg = *crc;
@@ -105,13 +96,32 @@ static void bcsp_crc_update(u16 *crc, u8 d)
 	*crc = reg;
 }
 
+/*
+   Get reverse of generated crc
+
+   Implementation note
+        The crc generator (bcsp_crc_init() and bcsp_crc_update())
+        creates a reversed crc, so it needs to be swapped back before
+        being passed on.
+*/
+static u16 bcsp_crc_reverse(u16 crc)
+{
+	u16 b, rev;
+
+	for (b = 0, rev = 0; b < 16; b++) {
+		rev = rev << 1;
+		rev |= (crc & 1);
+		crc = crc >> 1;
+	}
+	return (rev);
+}
+
 /* ---- BCSP core ---- */
 
 static void bcsp_slip_msgdelim(struct sk_buff *skb)
 {
 	const char pkt_delim = 0xc0;
-
-	skb_put_data(skb, &pkt_delim, 1);
+	memcpy(skb_put(skb, 1), &pkt_delim, 1);
 }
 
 static void bcsp_slip_one_byte(struct sk_buff *skb, u8 c)
@@ -121,13 +131,13 @@ static void bcsp_slip_one_byte(struct sk_buff *skb, u8 c)
 
 	switch (c) {
 	case 0xc0:
-		skb_put_data(skb, &esc_c0, 2);
+		memcpy(skb_put(skb, 2), &esc_c0, 2);
 		break;
 	case 0xdb:
-		skb_put_data(skb, &esc_db, 2);
+		memcpy(skb_put(skb, 2), &esc_db, 2);
 		break;
 	default:
-		skb_put_data(skb, &c, 1);
+		memcpy(skb_put(skb, 1), &c, 1);
 	}
 }
 
@@ -141,7 +151,7 @@ static int bcsp_enqueue(struct hci_uart *hu, struct sk_buff *skb)
 		return 0;
 	}
 
-	switch (hci_skb_pkt_type(skb)) {
+	switch (skb->pkt_type) {
 	case HCI_ACLDATA_PKT:
 	case HCI_COMMAND_PKT:
 		skb_queue_tail(&bcsp->rel, skb);
@@ -161,12 +171,15 @@ static int bcsp_enqueue(struct hci_uart *hu, struct sk_buff *skb)
 }
 
 static struct sk_buff *bcsp_prepare_pkt(struct bcsp_struct *bcsp, u8 *data,
-					int len, int pkt_type)
+		int len, int pkt_type)
 {
 	struct sk_buff *nskb;
 	u8 hdr[4], chan;
-	u16 BCSP_CRC_INIT(bcsp_txmsg_crc);
 	int rel, i;
+
+#ifdef CONFIG_BT_HCIUART_BCSP_TXCRC
+	u16 BCSP_CRC_INIT(bcsp_txmsg_crc);
+#endif
 
 	switch (pkt_type) {
 	case HCI_ACLDATA_PKT:
@@ -195,12 +208,10 @@ static struct sk_buff *bcsp_prepare_pkt(struct bcsp_struct *bcsp, u8 *data,
 	}
 
 	if (hciextn && chan == 5) {
-		__le16 opcode = ((struct hci_command_hdr *)data)->opcode;
+		struct hci_command_hdr *hdr = (struct hci_command_hdr *) data;
 
-		/* Vendor specific commands */
-		if (hci_opcode_ogf(__le16_to_cpu(opcode)) == 0x3f) {
+		if (hci_opcode_ogf(__le16_to_cpu(hdr->opcode)) == OGF_VENDOR_CMD) {
 			u8 desc = *(data + HCI_COMMAND_HDR_SIZE);
-
 			if ((desc & 0xf0) == 0xc0) {
 				data += HCI_COMMAND_HDR_SIZE + 1;
 				len  -= HCI_COMMAND_HDR_SIZE + 1;
@@ -210,16 +221,15 @@ static struct sk_buff *bcsp_prepare_pkt(struct bcsp_struct *bcsp, u8 *data,
 	}
 
 	/* Max len of packet: (original len +4(bcsp hdr) +2(crc))*2
-	 * (because bytes 0xc0 and 0xdb are escaped, worst case is
-	 * when the packet is all made of 0xc0 and 0xdb :) )
-	 * + 2 (0xc0 delimiters at start and end).
-	 */
+	   (because bytes 0xc0 and 0xdb are escaped, worst case is
+	   when the packet is all made of 0xc0 and 0xdb :) )
+	   + 2 (0xc0 delimiters at start and end). */
 
 	nskb = alloc_skb((len + 6) * 2 + 2, GFP_ATOMIC);
 	if (!nskb)
 		return NULL;
 
-	hci_skb_pkt_type(nskb) = pkt_type;
+	nskb->pkt_type = pkt_type;
 
 	bcsp_slip_msgdelim(nskb);
 
@@ -230,11 +240,11 @@ static struct sk_buff *bcsp_prepare_pkt(struct bcsp_struct *bcsp, u8 *data,
 	if (rel) {
 		hdr[0] |= 0x80 + bcsp->msgq_txseq;
 		BT_DBG("Sending packet with seqno %u", bcsp->msgq_txseq);
-		bcsp->msgq_txseq = (bcsp->msgq_txseq + 1) & 0x07;
+		bcsp->msgq_txseq = ++(bcsp->msgq_txseq) & 0x07;
 	}
-
-	if (bcsp->use_crc)
-		hdr[0] |= 0x40;
+#ifdef CONFIG_BT_HCIUART_BCSP_TXCRC
+	hdr[0] |= 0x40;
+#endif
 
 	hdr[1] = ((len << 4) & 0xff) | chan;
 	hdr[2] = len >> 4;
@@ -243,25 +253,25 @@ static struct sk_buff *bcsp_prepare_pkt(struct bcsp_struct *bcsp, u8 *data,
 	/* Put BCSP header */
 	for (i = 0; i < 4; i++) {
 		bcsp_slip_one_byte(nskb, hdr[i]);
-
-		if (bcsp->use_crc)
-			bcsp_crc_update(&bcsp_txmsg_crc, hdr[i]);
+#ifdef CONFIG_BT_HCIUART_BCSP_TXCRC
+		bcsp_crc_update(&bcsp_txmsg_crc, hdr[i]);
+#endif
 	}
 
 	/* Put payload */
 	for (i = 0; i < len; i++) {
 		bcsp_slip_one_byte(nskb, data[i]);
-
-		if (bcsp->use_crc)
-			bcsp_crc_update(&bcsp_txmsg_crc, data[i]);
+#ifdef CONFIG_BT_HCIUART_BCSP_TXCRC
+		bcsp_crc_update(&bcsp_txmsg_crc, data[i]);
+#endif
 	}
 
+#ifdef CONFIG_BT_HCIUART_BCSP_TXCRC
 	/* Put CRC */
-	if (bcsp->use_crc) {
-		bcsp_txmsg_crc = bitrev16(bcsp_txmsg_crc);
-		bcsp_slip_one_byte(nskb, (u8)((bcsp_txmsg_crc >> 8) & 0x00ff));
-		bcsp_slip_one_byte(nskb, (u8)(bcsp_txmsg_crc & 0x00ff));
-	}
+	bcsp_txmsg_crc = bcsp_crc_reverse(bcsp_txmsg_crc);
+	bcsp_slip_one_byte(nskb, (u8) ((bcsp_txmsg_crc >> 8) & 0x00ff));
+	bcsp_slip_one_byte(nskb, (u8) (bcsp_txmsg_crc & 0x00ff));
+#endif
 
 	bcsp_slip_msgdelim(nskb);
 	return nskb;
@@ -273,17 +283,12 @@ static struct sk_buff *bcsp_dequeue(struct hci_uart *hu)
 	struct bcsp_struct *bcsp = hu->priv;
 	unsigned long flags;
 	struct sk_buff *skb;
-
+	
 	/* First of all, check for unreliable messages in the queue,
-	 * since they have priority
-	 */
+	   since they have priority */
 
-	skb = skb_dequeue(&bcsp->unrel);
-	if (skb != NULL) {
-		struct sk_buff *nskb;
-
-		nskb = bcsp_prepare_pkt(bcsp, skb->data, skb->len,
-					hci_skb_pkt_type(skb));
+	if ((skb = skb_dequeue(&bcsp->unrel)) != NULL) {
+		struct sk_buff *nskb = bcsp_prepare_pkt(bcsp, skb->data, skb->len, skb->pkt_type);
 		if (nskb) {
 			kfree_skb(skb);
 			return nskb;
@@ -294,42 +299,34 @@ static struct sk_buff *bcsp_dequeue(struct hci_uart *hu)
 	}
 
 	/* Now, try to send a reliable pkt. We can only send a
-	 * reliable packet if the number of packets sent but not yet ack'ed
-	 * is < than the winsize
-	 */
+	   reliable packet if the number of packets sent but not yet ack'ed
+	   is < than the winsize */
 
-	spin_lock_irqsave_nested(&bcsp->unack.lock, flags, SINGLE_DEPTH_NESTING);
+	spin_lock_irqsave(&bcsp->unack.lock, flags);
 
-	if (bcsp->unack.qlen < BCSP_TXWINSIZE) {
-		skb = skb_dequeue(&bcsp->rel);
-		if (skb != NULL) {
-			struct sk_buff *nskb;
-
-			nskb = bcsp_prepare_pkt(bcsp, skb->data, skb->len,
-						hci_skb_pkt_type(skb));
-			if (nskb) {
-				__skb_queue_tail(&bcsp->unack, skb);
-				mod_timer(&bcsp->tbcsp, jiffies + HZ / 4);
-				spin_unlock_irqrestore(&bcsp->unack.lock, flags);
-				return nskb;
-			} else {
-				skb_queue_head(&bcsp->rel, skb);
-				BT_ERR("Could not dequeue pkt because alloc_skb failed");
-			}
+	if (bcsp->unack.qlen < BCSP_TXWINSIZE && (skb = skb_dequeue(&bcsp->rel)) != NULL) {
+		struct sk_buff *nskb = bcsp_prepare_pkt(bcsp, skb->data, skb->len, skb->pkt_type);
+		if (nskb) {
+			__skb_queue_tail(&bcsp->unack, skb);
+			mod_timer(&bcsp->tbcsp, jiffies + HZ / 4);
+			spin_unlock_irqrestore(&bcsp->unack.lock, flags);
+			return nskb;
+		} else {
+			skb_queue_head(&bcsp->rel, skb);
+			BT_ERR("Could not dequeue pkt because alloc_skb failed");
 		}
 	}
 
 	spin_unlock_irqrestore(&bcsp->unack.lock, flags);
 
+
 	/* We could not send a reliable packet, either because there are
-	 * none or because there are too many unack'ed pkts. Did we receive
-	 * any packets we have not acknowledged yet ?
-	 */
+	   none or because there are too many unack'ed pkts. Did we receive
+	   any packets we have not acknowledged yet ? */
 
 	if (bcsp->txack_req) {
 		/* if so, craft an empty ACK pkt and send it on BCSP unreliable
-		 * channel 0
-		 */
+		   channel 0 */
 		struct sk_buff *nskb = bcsp_prepare_pkt(bcsp, NULL, 0, BCSP_ACK_PKT);
 		return nskb;
 	}
@@ -347,14 +344,14 @@ static int bcsp_flush(struct hci_uart *hu)
 /* Remove ack'ed packets */
 static void bcsp_pkt_cull(struct bcsp_struct *bcsp)
 {
-	struct sk_buff *skb, *tmp;
 	unsigned long flags;
+	struct sk_buff *skb;
 	int i, pkts_to_be_removed;
 	u8 seqno;
 
 	spin_lock_irqsave(&bcsp->unack.lock, flags);
 
-	pkts_to_be_removed = skb_queue_len(&bcsp->unack);
+	pkts_to_be_removed = bcsp->unack.qlen;
 	seqno = bcsp->msgq_txseq;
 
 	while (pkts_to_be_removed) {
@@ -368,22 +365,19 @@ static void bcsp_pkt_cull(struct bcsp_struct *bcsp)
 		BT_ERR("Peer acked invalid packet");
 
 	BT_DBG("Removing %u pkts out of %u, up to seqno %u",
-	       pkts_to_be_removed, skb_queue_len(&bcsp->unack),
-	       (seqno - 1) & 0x07);
+	       pkts_to_be_removed, bcsp->unack.qlen, (seqno - 1) & 0x07);
 
-	i = 0;
-	skb_queue_walk_safe(&bcsp->unack, skb, tmp) {
-		if (i >= pkts_to_be_removed)
-			break;
-		i++;
+	for (i = 0, skb = ((struct sk_buff *) &bcsp->unack)->next; i < pkts_to_be_removed
+			&& skb != (struct sk_buff *) &bcsp->unack; i++) {
+		struct sk_buff *nskb;
 
+		nskb = skb->next;
 		__skb_unlink(skb, &bcsp->unack);
 		kfree_skb(skb);
+		skb = nskb;
 	}
-
-	if (skb_queue_empty(&bcsp->unack))
+	if (bcsp->unack.qlen == 0)
 		del_timer(&bcsp->tbcsp);
-
 	spin_unlock_irqrestore(&bcsp->unack.lock, flags);
 
 	if (i != pkts_to_be_removed)
@@ -391,9 +385,8 @@ static void bcsp_pkt_cull(struct bcsp_struct *bcsp)
 }
 
 /* Handle BCSP link-establishment packets. When we
- * detect a "sync" packet, symptom that the BT module has reset,
- * we do nothing :) (yet)
- */
+   detect a "sync" packet, symptom that the BT module has reset,
+   we do nothing :) (yet) */
 static void bcsp_handle_le_pkt(struct hci_uart *hu)
 {
 	struct bcsp_struct *bcsp = hu->priv;
@@ -403,21 +396,21 @@ static void bcsp_handle_le_pkt(struct hci_uart *hu)
 
 	/* spot "conf" pkts and reply with a "conf rsp" pkt */
 	if (bcsp->rx_skb->data[1] >> 4 == 4 && bcsp->rx_skb->data[2] == 0 &&
-	    !memcmp(&bcsp->rx_skb->data[4], conf_pkt, 4)) {
+			!memcmp(&bcsp->rx_skb->data[4], conf_pkt, 4)) {
 		struct sk_buff *nskb = alloc_skb(4, GFP_ATOMIC);
 
 		BT_DBG("Found a LE conf pkt");
 		if (!nskb)
 			return;
-		skb_put_data(nskb, conf_rsp_pkt, 4);
-		hci_skb_pkt_type(nskb) = BCSP_LE_PKT;
+		memcpy(skb_put(nskb, 4), conf_rsp_pkt, 4);
+		nskb->pkt_type = BCSP_LE_PKT;
 
 		skb_queue_head(&bcsp->unrel, nskb);
 		hci_uart_tx_wakeup(hu);
 	}
 	/* Spot "sync" pkts. If we find one...disaster! */
 	else if (bcsp->rx_skb->data[1] >> 4 == 4 && bcsp->rx_skb->data[2] == 0 &&
-		 !memcmp(&bcsp->rx_skb->data[4], sync_pkt, 4)) {
+			!memcmp(&bcsp->rx_skb->data[4], sync_pkt, 4)) {
 		BT_ERR("Found a LE sync pkt, card has reset");
 	}
 }
@@ -433,9 +426,9 @@ static inline void bcsp_unslip_one_byte(struct bcsp_struct *bcsp, unsigned char 
 			bcsp->rx_esc_state = BCSP_ESCSTATE_ESC;
 			break;
 		default:
-			skb_put_data(bcsp->rx_skb, &byte, 1);
-			if ((bcsp->rx_skb->data[0] & 0x40) != 0 &&
-			    bcsp->rx_state != BCSP_W4_CRC)
+			memcpy(skb_put(bcsp->rx_skb, 1), &byte, 1);
+			if ((bcsp->rx_skb-> data[0] & 0x40) != 0 && 
+					bcsp->rx_state != BCSP_W4_CRC)
 				bcsp_crc_update(&bcsp->message_crc, byte);
 			bcsp->rx_count--;
 		}
@@ -444,25 +437,25 @@ static inline void bcsp_unslip_one_byte(struct bcsp_struct *bcsp, unsigned char 
 	case BCSP_ESCSTATE_ESC:
 		switch (byte) {
 		case 0xdc:
-			skb_put_data(bcsp->rx_skb, &c0, 1);
-			if ((bcsp->rx_skb->data[0] & 0x40) != 0 &&
-			    bcsp->rx_state != BCSP_W4_CRC)
-				bcsp_crc_update(&bcsp->message_crc, 0xc0);
+			memcpy(skb_put(bcsp->rx_skb, 1), &c0, 1);
+			if ((bcsp->rx_skb-> data[0] & 0x40) != 0 && 
+					bcsp->rx_state != BCSP_W4_CRC)
+				bcsp_crc_update(&bcsp-> message_crc, 0xc0);
 			bcsp->rx_esc_state = BCSP_ESCSTATE_NOESC;
 			bcsp->rx_count--;
 			break;
 
 		case 0xdd:
-			skb_put_data(bcsp->rx_skb, &db, 1);
-			if ((bcsp->rx_skb->data[0] & 0x40) != 0 &&
-			    bcsp->rx_state != BCSP_W4_CRC)
-				bcsp_crc_update(&bcsp->message_crc, 0xdb);
+			memcpy(skb_put(bcsp->rx_skb, 1), &db, 1);
+			if ((bcsp->rx_skb-> data[0] & 0x40) != 0 && 
+					bcsp->rx_state != BCSP_W4_CRC) 
+				bcsp_crc_update(&bcsp-> message_crc, 0xdb);
 			bcsp->rx_esc_state = BCSP_ESCSTATE_NOESC;
 			bcsp->rx_count--;
 			break;
 
 		default:
-			BT_ERR("Invalid byte %02x after esc byte", byte);
+			BT_ERR ("Invalid byte %02x after esc byte", byte);
 			kfree_skb(bcsp->rx_skb);
 			bcsp->rx_skb = NULL;
 			bcsp->rx_state = BCSP_W4_PKT_DELIMITER;
@@ -471,31 +464,16 @@ static inline void bcsp_unslip_one_byte(struct bcsp_struct *bcsp, unsigned char 
 	}
 }
 
-static void bcsp_complete_rx_pkt(struct hci_uart *hu)
+static inline void bcsp_complete_rx_pkt(struct hci_uart *hu)
 {
 	struct bcsp_struct *bcsp = hu->priv;
-	int pass_up = 0;
+	int pass_up;
 
 	if (bcsp->rx_skb->data[0] & 0x80) {	/* reliable pkt */
 		BT_DBG("Received seqno %u from card", bcsp->rxseq_txack);
-
-		/* check the rx sequence number is as expected */
-		if ((bcsp->rx_skb->data[0] & 0x07) == bcsp->rxseq_txack) {
-			bcsp->rxseq_txack++;
-			bcsp->rxseq_txack %= 0x8;
-		} else {
-			/* handle re-transmitted packet or
-			 * when packet was missed
-			 */
-			BT_ERR("Out-of-order packet arrived, got %u expected %u",
-			       bcsp->rx_skb->data[0] & 0x07, bcsp->rxseq_txack);
-
-			/* do not process out-of-order packet payload */
-			pass_up = 2;
-		}
-
-		/* send current txack value to all received reliable packets */
-		bcsp->txack_req = 1;
+		bcsp->rxseq_txack++;
+		bcsp->rxseq_txack %= 0x8;
+		bcsp->txack_req    = 1;
 
 		/* If needed, transmit an ack pkt */
 		hci_uart_tx_wakeup(hu);
@@ -504,33 +482,26 @@ static void bcsp_complete_rx_pkt(struct hci_uart *hu)
 	bcsp->rxack = (bcsp->rx_skb->data[0] >> 3) & 0x07;
 	BT_DBG("Request for pkt %u from card", bcsp->rxack);
 
-	/* handle received ACK indications,
-	 * including those from out-of-order packets
-	 */
 	bcsp_pkt_cull(bcsp);
+	if ((bcsp->rx_skb->data[1] & 0x0f) == 6 &&
+			bcsp->rx_skb->data[0] & 0x80) {
+		bcsp->rx_skb->pkt_type = HCI_ACLDATA_PKT;
+		pass_up = 1;
+	} else if ((bcsp->rx_skb->data[1] & 0x0f) == 5 &&
+			bcsp->rx_skb->data[0] & 0x80) {
+		bcsp->rx_skb->pkt_type = HCI_EVENT_PKT;
+		pass_up = 1;
+	} else if ((bcsp->rx_skb->data[1] & 0x0f) == 7) {
+		bcsp->rx_skb->pkt_type = HCI_SCODATA_PKT;
+		pass_up = 1;
+	} else if ((bcsp->rx_skb->data[1] & 0x0f) == 1 &&
+			!(bcsp->rx_skb->data[0] & 0x80)) {
+		bcsp_handle_le_pkt(hu);
+		pass_up = 0;
+	} else
+		pass_up = 0;
 
-	if (pass_up != 2) {
-		if ((bcsp->rx_skb->data[1] & 0x0f) == 6 &&
-		    (bcsp->rx_skb->data[0] & 0x80)) {
-			hci_skb_pkt_type(bcsp->rx_skb) = HCI_ACLDATA_PKT;
-			pass_up = 1;
-		} else if ((bcsp->rx_skb->data[1] & 0x0f) == 5 &&
-			   (bcsp->rx_skb->data[0] & 0x80)) {
-			hci_skb_pkt_type(bcsp->rx_skb) = HCI_EVENT_PKT;
-			pass_up = 1;
-		} else if ((bcsp->rx_skb->data[1] & 0x0f) == 7) {
-			hci_skb_pkt_type(bcsp->rx_skb) = HCI_SCODATA_PKT;
-			pass_up = 1;
-		} else if ((bcsp->rx_skb->data[1] & 0x0f) == 1 &&
-			   !(bcsp->rx_skb->data[0] & 0x80)) {
-			bcsp_handle_le_pkt(hu);
-			pass_up = 0;
-		} else {
-			pass_up = 0;
-		}
-	}
-
-	if (pass_up == 0) {
+	if (!pass_up) {
 		struct hci_event_hdr hdr;
 		u8 desc = (bcsp->rx_skb->data[1] & 0x0f);
 
@@ -543,47 +514,36 @@ static void bcsp_complete_rx_pkt(struct hci_uart *hu)
 				hdr.evt = 0xff;
 				hdr.plen = bcsp->rx_skb->len;
 				memcpy(skb_push(bcsp->rx_skb, HCI_EVENT_HDR_SIZE), &hdr, HCI_EVENT_HDR_SIZE);
-				hci_skb_pkt_type(bcsp->rx_skb) = HCI_EVENT_PKT;
+				bcsp->rx_skb->pkt_type = HCI_EVENT_PKT;
 
-				hci_recv_frame(hu->hdev, bcsp->rx_skb);
+				hci_recv_frame(bcsp->rx_skb);
 			} else {
-				BT_ERR("Packet for unknown channel (%u %s)",
-				       bcsp->rx_skb->data[1] & 0x0f,
-				       bcsp->rx_skb->data[0] & 0x80 ?
-				       "reliable" : "unreliable");
+				BT_ERR ("Packet for unknown channel (%u %s)",
+					bcsp->rx_skb->data[1] & 0x0f,
+					bcsp->rx_skb->data[0] & 0x80 ? 
+					"reliable" : "unreliable");
 				kfree_skb(bcsp->rx_skb);
 			}
 		} else
 			kfree_skb(bcsp->rx_skb);
-	} else if (pass_up == 1) {
+	} else {
 		/* Pull out BCSP hdr */
 		skb_pull(bcsp->rx_skb, 4);
 
-		hci_recv_frame(hu->hdev, bcsp->rx_skb);
-	} else {
-		/* ignore packet payload of already ACKed re-transmitted
-		 * packets or when a packet was missed in the BCSP window
-		 */
-		kfree_skb(bcsp->rx_skb);
+		hci_recv_frame(bcsp->rx_skb);
 	}
-
 	bcsp->rx_state = BCSP_W4_PKT_DELIMITER;
 	bcsp->rx_skb = NULL;
 }
 
-static u16 bscp_get_crc(struct bcsp_struct *bcsp)
-{
-	return get_unaligned_be16(&bcsp->rx_skb->data[bcsp->rx_skb->len - 2]);
-}
-
 /* Recv data */
-static int bcsp_recv(struct hci_uart *hu, const void *data, int count)
+static int bcsp_recv(struct hci_uart *hu, void *data, int count)
 {
 	struct bcsp_struct *bcsp = hu->priv;
-	const unsigned char *ptr;
+	register unsigned char *ptr;
 
-	BT_DBG("hu %p count %d rx_state %d rx_count %ld",
-	       hu, count, bcsp->rx_state, bcsp->rx_count);
+	BT_DBG("hu %p count %d rx_state %d rx_count %ld", 
+		hu, count, bcsp->rx_state, bcsp->rx_count);
 
 	ptr = data;
 	while (count) {
@@ -591,7 +551,6 @@ static int bcsp_recv(struct hci_uart *hu, const void *data, int count)
 			if (*ptr == 0xc0) {
 				BT_ERR("Short BCSP packet");
 				kfree_skb(bcsp->rx_skb);
-				bcsp->rx_skb = NULL;
 				bcsp->rx_state = BCSP_W4_PKT_START;
 				bcsp->rx_count = 0;
 			} else
@@ -603,17 +562,26 @@ static int bcsp_recv(struct hci_uart *hu, const void *data, int count)
 
 		switch (bcsp->rx_state) {
 		case BCSP_W4_BCSP_HDR:
-			if ((0xff & (u8)~(bcsp->rx_skb->data[0] + bcsp->rx_skb->data[1] +
-			    bcsp->rx_skb->data[2])) != bcsp->rx_skb->data[3]) {
+			if ((0xff & (u8) ~ (bcsp->rx_skb->data[0] + bcsp->rx_skb->data[1] +
+					bcsp->rx_skb->data[2])) != bcsp->rx_skb->data[3]) {
 				BT_ERR("Error in BCSP hdr checksum");
 				kfree_skb(bcsp->rx_skb);
-				bcsp->rx_skb = NULL;
+				bcsp->rx_state = BCSP_W4_PKT_DELIMITER;
+				bcsp->rx_count = 0;
+				continue;
+			}
+			if (bcsp->rx_skb->data[0] & 0x80	/* reliable pkt */
+			    		&& (bcsp->rx_skb->data[0] & 0x07) != bcsp->rxseq_txack) {
+				BT_ERR ("Out-of-order packet arrived, got %u expected %u",
+					bcsp->rx_skb->data[0] & 0x07, bcsp->rxseq_txack);
+
+				kfree_skb(bcsp->rx_skb);
 				bcsp->rx_state = BCSP_W4_PKT_DELIMITER;
 				bcsp->rx_count = 0;
 				continue;
 			}
 			bcsp->rx_state = BCSP_W4_DATA;
-			bcsp->rx_count = (bcsp->rx_skb->data[1] >> 4) +
+			bcsp->rx_count = (bcsp->rx_skb->data[1] >> 4) + 
 					(bcsp->rx_skb->data[2] << 4);	/* May be 0 */
 			continue;
 
@@ -626,13 +594,16 @@ static int bcsp_recv(struct hci_uart *hu, const void *data, int count)
 			continue;
 
 		case BCSP_W4_CRC:
-			if (bitrev16(bcsp->message_crc) != bscp_get_crc(bcsp)) {
-				BT_ERR("Checksum failed: computed %04x received %04x",
-				       bitrev16(bcsp->message_crc),
-				       bscp_get_crc(bcsp));
+			if (bcsp_crc_reverse(bcsp->message_crc) !=
+					(bcsp->rx_skb->data[bcsp->rx_skb->len - 2] << 8) +
+					bcsp->rx_skb->data[bcsp->rx_skb->len - 1]) {
+
+				BT_ERR ("Checksum failed: computed %04x received %04x",
+					bcsp_crc_reverse(bcsp->message_crc),
+				     	(bcsp->rx_skb-> data[bcsp->rx_skb->len - 2] << 8) +
+				     	bcsp->rx_skb->data[bcsp->rx_skb->len - 1]);
 
 				kfree_skb(bcsp->rx_skb);
-				bcsp->rx_skb = NULL;
 				bcsp->rx_state = BCSP_W4_PKT_DELIMITER;
 				bcsp->rx_count = 0;
 				continue;
@@ -664,11 +635,10 @@ static int bcsp_recv(struct hci_uart *hu, const void *data, int count)
 				bcsp->rx_count = 4;
 				bcsp->rx_esc_state = BCSP_ESCSTATE_NOESC;
 				BCSP_CRC_INIT(bcsp->message_crc);
-
+				
 				/* Do not increment ptr or decrement count
-				 * Allocate packet. Max len of a BCSP pkt=
-				 * 0xFFF (payload) +4 (header) +2 (crc)
-				 */
+				 * Allocate packet. Max len of a BCSP pkt= 
+				 * 0xFFF (payload) +4 (header) +2 (crc) */
 
 				bcsp->rx_skb = bt_skb_alloc(0x1005, GFP_ATOMIC);
 				if (!bcsp->rx_skb) {
@@ -677,6 +647,7 @@ static int bcsp_recv(struct hci_uart *hu, const void *data, int count)
 					bcsp->rx_count = 0;
 					return 0;
 				}
+				bcsp->rx_skb->dev = (void *) hu->hdev;
 				break;
 			}
 			break;
@@ -686,16 +657,16 @@ static int bcsp_recv(struct hci_uart *hu, const void *data, int count)
 }
 
 	/* Arrange to retransmit all messages in the relq. */
-static void bcsp_timed_event(struct timer_list *t)
+static void bcsp_timed_event(unsigned long arg)
 {
-	struct bcsp_struct *bcsp = from_timer(bcsp, t, tbcsp);
-	struct hci_uart *hu = bcsp->hu;
+	struct hci_uart *hu = (struct hci_uart *) arg;
+	struct bcsp_struct *bcsp = hu->priv;
 	struct sk_buff *skb;
 	unsigned long flags;
 
 	BT_DBG("hu %p retransmitting %u pkts", hu, bcsp->unack.qlen);
 
-	spin_lock_irqsave_nested(&bcsp->unack.lock, flags, SINGLE_DEPTH_NESTING);
+	spin_lock_irqsave(&bcsp->unack.lock, flags);
 
 	while ((skb = __skb_dequeue_tail(&bcsp->unack)) != NULL) {
 		bcsp->msgq_txseq = (bcsp->msgq_txseq - 1) & 0x07;
@@ -713,22 +684,21 @@ static int bcsp_open(struct hci_uart *hu)
 
 	BT_DBG("hu %p", hu);
 
-	bcsp = kzalloc(sizeof(*bcsp), GFP_KERNEL);
+	bcsp = kmalloc(sizeof(*bcsp), GFP_ATOMIC);
 	if (!bcsp)
 		return -ENOMEM;
+	memset(bcsp, 0, sizeof(*bcsp));
 
 	hu->priv = bcsp;
-	bcsp->hu = hu;
 	skb_queue_head_init(&bcsp->unack);
 	skb_queue_head_init(&bcsp->rel);
 	skb_queue_head_init(&bcsp->unrel);
 
-	timer_setup(&bcsp->tbcsp, bcsp_timed_event, 0);
+	init_timer(&bcsp->tbcsp);
+	bcsp->tbcsp.function = bcsp_timed_event;
+	bcsp->tbcsp.data     = (u_long) hu;
 
 	bcsp->rx_state = BCSP_W4_PKT_DELIMITER;
-
-	if (txcrc)
-		bcsp->use_crc = 1;
 
 	return 0;
 }
@@ -736,9 +706,6 @@ static int bcsp_open(struct hci_uart *hu)
 static int bcsp_close(struct hci_uart *hu)
 {
 	struct bcsp_struct *bcsp = hu->priv;
-
-	del_timer_sync(&bcsp->tbcsp);
-
 	hu->priv = NULL;
 
 	BT_DBG("hu %p", hu);
@@ -746,39 +713,37 @@ static int bcsp_close(struct hci_uart *hu)
 	skb_queue_purge(&bcsp->unack);
 	skb_queue_purge(&bcsp->rel);
 	skb_queue_purge(&bcsp->unrel);
-
-	if (bcsp->rx_skb) {
-		kfree_skb(bcsp->rx_skb);
-		bcsp->rx_skb = NULL;
-	}
+	del_timer(&bcsp->tbcsp);
 
 	kfree(bcsp);
 	return 0;
 }
 
-static const struct hci_uart_proto bcsp = {
-	.id		= HCI_UART_BCSP,
-	.name		= "BCSP",
-	.open		= bcsp_open,
-	.close		= bcsp_close,
-	.enqueue	= bcsp_enqueue,
-	.dequeue	= bcsp_dequeue,
-	.recv		= bcsp_recv,
-	.flush		= bcsp_flush
+static struct hci_uart_proto bcsp = {
+	.id      = HCI_UART_BCSP,
+	.open    = bcsp_open,
+	.close   = bcsp_close,
+	.enqueue = bcsp_enqueue,
+	.dequeue = bcsp_dequeue,
+	.recv    = bcsp_recv,
+	.flush   = bcsp_flush
 };
 
-int __init bcsp_init(void)
+int bcsp_init(void)
 {
-	return hci_uart_register_proto(&bcsp);
+	int err = hci_uart_register_proto(&bcsp);
+	if (!err)
+		BT_INFO("HCI BCSP protocol initialized");
+	else
+		BT_ERR("HCI BCSP protocol registration failed");
+
+	return err;
 }
 
-int __exit bcsp_deinit(void)
+int bcsp_deinit(void)
 {
 	return hci_uart_unregister_proto(&bcsp);
 }
-
-module_param(txcrc, bool, 0644);
-MODULE_PARM_DESC(txcrc, "Transmit CRC with every BCSP packet");
 
 module_param(hciextn, bool, 0644);
 MODULE_PARM_DESC(hciextn, "Convert HCI Extensions into BCSP packets");

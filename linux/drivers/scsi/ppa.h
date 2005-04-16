@@ -1,9 +1,8 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*  Driver for the PPA3 parallel port SCSI HBA embedded in 
  * the Iomega ZIP drive
  * 
  * (c) 1996     Grant R. Guenther  grant@torque.net
- *              David Campbell
+ *              David Campbell     campbell@torque.net
  *
  *      All comments to David.
  */
@@ -74,6 +73,7 @@
  */
 /* ------ END OF USER CONFIGURABLE PARAMETERS ----- */
 
+#include  <linux/config.h>
 #include  <linux/stddef.h>
 #include  <linux/module.h>
 #include  <linux/kernel.h>

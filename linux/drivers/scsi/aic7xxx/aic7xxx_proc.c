@@ -43,75 +43,81 @@
 #include "aic7xxx_inline.h"
 #include "aic7xxx_93cx6.h"
 
+static void	copy_mem_info(struct info_str *info, char *data, int len);
+static int	copy_info(struct info_str *info, char *fmt, ...);
 static void	ahc_dump_target_state(struct ahc_softc *ahc,
-				      struct seq_file *m,
+				      struct info_str *info,
 				      u_int our_id, char channel,
 				      u_int target_id, u_int target_offset);
-static void	ahc_dump_device_state(struct seq_file *m,
-				      struct scsi_device *dev);
-
-/*
- * Table of syncrates that don't follow the "divisible by 4"
- * rule. This table will be expanded in future SCSI specs.
- */
-static const struct {
-	u_int period_factor;
-	u_int period;	/* in 100ths of ns */
-} scsi_syncrates[] = {
-	{ 0x08, 625 },	/* FAST-160 */
-	{ 0x09, 1250 },	/* FAST-80 */
-	{ 0x0a, 2500 },	/* FAST-40 40MHz */
-	{ 0x0b, 3030 },	/* FAST-40 33MHz */
-	{ 0x0c, 5000 }	/* FAST-20 */
-};
-
-/*
- * Return the frequency in kHz corresponding to the given
- * sync period factor.
- */
-static u_int
-ahc_calc_syncsrate(u_int period_factor)
-{
-	int i;
-
-	/* See if the period is in the "exception" table */
-	for (i = 0; i < ARRAY_SIZE(scsi_syncrates); i++) {
-
-		if (period_factor == scsi_syncrates[i].period_factor) {
-			/* Period in kHz */
-			return (100000000 / scsi_syncrates[i].period);
-		}
-	}
-
-	/*
-	 * Wasn't in the table, so use the standard
-	 * 4 times conversion.
-	 */
-	return (10000000 / (period_factor * 4 * 10));
-}
+static void	ahc_dump_device_state(struct info_str *info,
+				      struct ahc_linux_device *dev);
+static int	ahc_proc_write_seeprom(struct ahc_softc *ahc,
+				       char *buffer, int length);
 
 static void
-ahc_format_transinfo(struct seq_file *m, struct ahc_transinfo *tinfo)
+copy_mem_info(struct info_str *info, char *data, int len)
+{
+	if (info->pos + len > info->offset + info->length)
+		len = info->offset + info->length - info->pos;
+
+	if (info->pos + len < info->offset) {
+		info->pos += len;
+		return;
+	}
+
+	if (info->pos < info->offset) {
+		off_t partial;
+
+		partial = info->offset - info->pos;
+		data += partial;
+		info->pos += partial;
+		len  -= partial;
+	}
+
+	if (len > 0) {
+		memcpy(info->buffer, data, len);
+		info->pos += len;
+		info->buffer += len;
+	}
+}
+
+static int
+copy_info(struct info_str *info, char *fmt, ...)
+{
+	va_list args;
+	char buf[256];
+	int len;
+
+	va_start(args, fmt);
+	len = vsprintf(buf, fmt, args);
+	va_end(args);
+
+	copy_mem_info(info, buf, len);
+	return (len);
+}
+
+void
+ahc_format_transinfo(struct info_str *info, struct ahc_transinfo *tinfo)
 {
 	u_int speed;
 	u_int freq;
 	u_int mb;
 
-	speed = 3300;
-	freq = 0;
+        speed = 3300;
+        freq = 0;
 	if (tinfo->offset != 0) {
-		freq = ahc_calc_syncsrate(tinfo->period);
+		freq = aic_calc_syncsrate(tinfo->period);
 		speed = freq;
 	}
 	speed *= (0x01 << tinfo->width);
-	mb = speed / 1000;
-	if (mb > 0)
-		seq_printf(m, "%d.%03dMB/s transfers", mb, speed % 1000);
-	else
-		seq_printf(m, "%dKB/s transfers", speed);
+        mb = speed / 1000;
+        if (mb > 0)
+		copy_info(info, "%d.%03dMB/s transfers", mb, speed % 1000);
+        else
+		copy_info(info, "%dKB/s transfers", speed);
 
 	if (freq != 0) {
-		seq_printf(m, " (%d.%03dMHz%s, offset %d",
+		copy_info(info, " (%d.%03dMHz%s, offset %d",
 			 freq / 1000, freq % 1000,
 			 (tinfo->ppr_options & MSG_EXT_PPR_DT_REQ) != 0
 			 ? " DT" : "", tinfo->offset);
@@ -119,23 +125,23 @@ ahc_format_transinfo(struct seq_file *m, struct ahc_transinfo *tinfo)
 
 	if (tinfo->width > 0) {
 		if (freq != 0) {
-			seq_puts(m, ", ");
+			copy_info(info, ", ");
 		} else {
-			seq_puts(m, " (");
+			copy_info(info, " (");
 		}
-		seq_printf(m, "%dbit)", 8 * (0x01 << tinfo->width));
+		copy_info(info, "%dbit)", 8 * (0x01 << tinfo->width));
 	} else if (freq != 0) {
-		seq_putc(m, ')');
+		copy_info(info, ")");
 	}
-	seq_putc(m, '\n');
+	copy_info(info, "\n");
 }
 
 static void
-ahc_dump_target_state(struct ahc_softc *ahc, struct seq_file *m,
+ahc_dump_target_state(struct ahc_softc *ahc, struct info_str *info,
 		      u_int our_id, char channel, u_int target_id,
 		      u_int target_offset)
 {
-	struct	scsi_target *starget;
+	struct	ahc_linux_target *targ;
 	struct	ahc_initiator_tinfo *tinfo;
 	struct	ahc_tmode_tstate *tstate;
 	int	lun;
@@ -143,51 +149,47 @@ ahc_dump_target_state(struct ahc_softc *ahc, struct seq_file *m,
 	tinfo = ahc_fetch_transinfo(ahc, channel, our_id,
 				    target_id, &tstate);
 	if ((ahc->features & AHC_TWIN) != 0)
-		seq_printf(m, "Channel %c ", channel);
-	seq_printf(m, "Target %d Negotiation Settings\n", target_id);
-	seq_puts(m, "\tUser: ");
-	ahc_format_transinfo(m, &tinfo->user);
-	starget = ahc->platform_data->starget[target_offset];
-	if (!starget)
+		copy_info(info, "Channel %c ", channel);
+	copy_info(info, "Target %d Negotiation Settings\n", target_id);
+	copy_info(info, "\tUser: ");
+	ahc_format_transinfo(info, &tinfo->user);
+	targ = ahc->platform_data->targets[target_offset];
+	if (targ == NULL)
 		return;
 
-	seq_puts(m, "\tGoal: ");
-	ahc_format_transinfo(m, &tinfo->goal);
-	seq_puts(m, "\tCurr: ");
-	ahc_format_transinfo(m, &tinfo->curr);
+	copy_info(info, "\tGoal: ");
+	ahc_format_transinfo(info, &tinfo->goal);
+	copy_info(info, "\tCurr: ");
+	ahc_format_transinfo(info, &tinfo->curr);
 
 	for (lun = 0; lun < AHC_NUM_LUNS; lun++) {
-		struct scsi_device *sdev;
+		struct ahc_linux_device *dev;
 
-		sdev = scsi_device_lookup_by_target(starget, lun);
+		dev = targ->devices[lun];
 
-		if (sdev == NULL)
+		if (dev == NULL)
 			continue;
 
-		ahc_dump_device_state(m, sdev);
+		ahc_dump_device_state(info, dev);
 	}
 }
 
 static void
-ahc_dump_device_state(struct seq_file *m, struct scsi_device *sdev)
+ahc_dump_device_state(struct info_str *info, struct ahc_linux_device *dev)
 {
-	struct ahc_linux_device *dev = scsi_transport_device_data(sdev);
+	copy_info(info, "\tChannel %c Target %d Lun %d Settings\n",
+		  dev->target->channel + 'A', dev->target->target, dev->lun);
 
-	seq_printf(m, "\tChannel %c Target %d Lun %d Settings\n",
-		  sdev->sdev_target->channel + 'A',
-		   sdev->sdev_target->id, (u8)sdev->lun);
-
-	seq_printf(m, "\t\tCommands Queued %ld\n", dev->commands_issued);
-	seq_printf(m, "\t\tCommands Active %d\n", dev->active);
-	seq_printf(m, "\t\tCommand Openings %d\n", dev->openings);
-	seq_printf(m, "\t\tMax Tagged Openings %d\n", dev->maxtags);
-	seq_printf(m, "\t\tDevice Queue Frozen Count %d\n", dev->qfrozen);
+	copy_info(info, "\t\tCommands Queued %ld\n", dev->commands_issued);
+	copy_info(info, "\t\tCommands Active %d\n", dev->active);
+	copy_info(info, "\t\tCommand Openings %d\n", dev->openings);
+	copy_info(info, "\t\tMax Tagged Openings %d\n", dev->maxtags);
+	copy_info(info, "\t\tDevice Queue Frozen Count %d\n", dev->qfrozen);
 }
 
-int
-ahc_proc_write_seeprom(struct Scsi_Host *shost, char *buffer, int length)
+static int
+ahc_proc_write_seeprom(struct ahc_softc *ahc, char *buffer, int length)
 {
-	struct	ahc_softc *ahc = *(struct ahc_softc **)shost->hostdata;
 	struct seeprom_descriptor sd;
 	int have_seeprom;
 	u_long s;
@@ -202,13 +204,13 @@ ahc_proc_write_seeprom(struct Scsi_Host *shost, char *buffer, int length)
 		ahc_pause(ahc);
 
 	if (length != sizeof(struct seeprom_config)) {
-		printk("ahc_proc_write_seeprom: incorrect buffer size\n");
+		printf("ahc_proc_write_seeprom: incorrect buffer size\n");
 		goto done;
 	}
 
 	have_seeprom = ahc_verify_cksum((struct seeprom_config*)buffer);
 	if (have_seeprom == 0) {
-		printk("ahc_proc_write_seeprom: cksum verification failed\n");
+		printf("ahc_proc_write_seeprom: cksum verification failed\n");
 		goto done;
 	}
 
@@ -234,7 +236,7 @@ ahc_proc_write_seeprom(struct Scsi_Host *shost, char *buffer, int length)
 	if ((ahc->chip & AHC_VL) != 0) {
 		sd.sd_control_offset = SEECTL_2840;
 		sd.sd_status_offset = STATUS_2840;
-		sd.sd_dataout_offset = STATUS_2840;
+		sd.sd_dataout_offset = STATUS_2840;		
 		sd.sd_chip = C46;
 		sd.sd_MS = 0;
 		sd.sd_RDY = EEPROM_TF;
@@ -244,26 +246,26 @@ ahc_proc_write_seeprom(struct Scsi_Host *shost, char *buffer, int length)
 		sd.sd_DI = DI_2840;
 		have_seeprom = TRUE;
 	} else {
-		printk("ahc_proc_write_seeprom: unsupported adapter type\n");
+		printf("ahc_proc_write_seeprom: unsupported adapter type\n");
 		goto done;
 	}
 
 	if (!have_seeprom) {
-		printk("ahc_proc_write_seeprom: No Serial EEPROM\n");
+		printf("ahc_proc_write_seeprom: No Serial EEPROM\n");
 		goto done;
 	} else {
 		u_int start_addr;
 
 		if (ahc->seep_config == NULL) {
-			ahc->seep_config = kmalloc(sizeof(*ahc->seep_config),
-						   GFP_ATOMIC);
+			ahc->seep_config = malloc(sizeof(*ahc->seep_config),
+						  M_DEVBUF, M_NOWAIT);
 			if (ahc->seep_config == NULL) {
-				printk("aic7xxx: Unable to allocate serial "
+				printf("aic7xxx: Unable to allocate serial "
 				       "eeprom buffer.  Write failing\n");
 				goto done;
 			}
 		}
-		printk("aic7xxx: Writing Serial EEPROM\n");
+		printf("aic7xxx: Writing Serial EEPROM\n");
 		start_addr = 32 * (ahc->channel - 'A');
 		ahc_write_seeprom(&sd, (u_int16_t *)buffer, start_addr,
 				  sizeof(struct seeprom_config)/2);
@@ -287,42 +289,79 @@ done:
  * Return information to handle /proc support for the driver.
  */
 int
-ahc_linux_show_info(struct seq_file *m, struct Scsi_Host *shost)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,5,0)
+ahc_linux_proc_info(char *buffer, char **start, off_t offset,
+		    int length, int hostno, int inout)
+#else
+ahc_linux_proc_info(struct Scsi_Host *shost, char *buffer, char **start,
+		    off_t offset, int length, int inout)
+#endif
 {
-	struct	ahc_softc *ahc = *(struct ahc_softc **)shost->hostdata;
+	struct	ahc_softc *ahc;
+	struct	info_str info;
 	char	ahc_info[256];
+	u_long	s;
 	u_int	max_targ;
 	u_int	i;
+	int	retval;
 
-	seq_printf(m, "Adaptec AIC7xxx driver version: %s\n",
+	retval = -EINVAL;
+	ahc_list_lock(&s);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,5,0)
+	TAILQ_FOREACH(ahc, &ahc_tailq, links) {
+		if (ahc->platform_data->host->host_no == hostno)
+			break;
+	}
+#else
+	ahc = ahc_find_softc(*(struct ahc_softc **)shost->hostdata);
+#endif
+
+	if (ahc == NULL)
+		goto done;
+
+	 /* Has data been written to the file? */ 
+	if (inout == TRUE) {
+		retval = ahc_proc_write_seeprom(ahc, buffer, length);
+		goto done;
+	}
+
+	if (start)
+		*start = buffer;
+
+	info.buffer	= buffer;
+	info.length	= length;
+	info.offset	= offset;
+	info.pos	= 0;
+
+	copy_info(&info, "Adaptec AIC7xxx driver version: %s\n",
 		  AIC7XXX_DRIVER_VERSION);
-	seq_printf(m, "%s\n", ahc->description);
+	copy_info(&info, "%s\n", ahc->description);
 	ahc_controller_info(ahc, ahc_info);
-	seq_printf(m, "%s\n", ahc_info);
-	seq_printf(m, "Allocated SCBs: %d, SG List Length: %d\n\n",
+	copy_info(&info, "%s\n", ahc_info);
+	copy_info(&info, "Allocated SCBs: %d, SG List Length: %d\n\n",
 		  ahc->scb_data->numscbs, AHC_NSEG);
 
 
 	if (ahc->seep_config == NULL)
-		seq_puts(m, "No Serial EEPROM\n");
+		copy_info(&info, "No Serial EEPROM\n");
 	else {
-		seq_puts(m, "Serial EEPROM:\n");
+		copy_info(&info, "Serial EEPROM:\n");
 		for (i = 0; i < sizeof(*ahc->seep_config)/2; i++) {
 			if (((i % 8) == 0) && (i != 0)) {
-				seq_putc(m, '\n');
+				copy_info(&info, "\n");
 			}
-			seq_printf(m, "0x%.4x ",
+			copy_info(&info, "0x%.4x ",
 				  ((uint16_t*)ahc->seep_config)[i]);
 		}
-		seq_putc(m, '\n');
+		copy_info(&info, "\n");
 	}
-	seq_putc(m, '\n');
+	copy_info(&info, "\n");
 
-	max_targ = 16;
+	max_targ = 15;
 	if ((ahc->features & (AHC_WIDE|AHC_TWIN)) == 0)
-		max_targ = 8;
+		max_targ = 7;
 
-	for (i = 0; i < max_targ; i++) {
+	for (i = 0; i <= max_targ; i++) {
 		u_int our_id;
 		u_int target_id;
 		char channel;
@@ -336,8 +375,11 @@ ahc_linux_show_info(struct seq_file *m, struct Scsi_Host *shost)
 			target_id = i % 8;
 		}
 
-		ahc_dump_target_state(ahc, m, our_id,
+		ahc_dump_target_state(ahc, &info, our_id,
 				      channel, target_id, i);
 	}
-	return 0;
+	retval = info.pos > info.offset ? info.pos - info.offset : 0;
+done:
+	ahc_list_unlock(&s);
+	return (retval);
 }

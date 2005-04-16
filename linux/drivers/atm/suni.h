@@ -1,16 +1,14 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-/*
- * drivers/atm/suni.h - S/UNI PHY driver
- */
+/* drivers/atm/suni.h - PMC PM5346 SUNI (PHY) declarations */
  
 /* Written 1995-2000 by Werner Almesberger, EPFL LRC/ICA */
+ 
 
 #ifndef DRIVER_ATM_SUNI_H
 #define DRIVER_ATM_SUNI_H
 
 #include <linux/atmdev.h>
 #include <linux/atmioc.h>
-#include <linux/sonet.h>
+
 
 /* SUNI registers */
 
@@ -41,8 +39,7 @@
 #define SUNI_RLOP_LFM		0x1F	/* RLOP Line FEBE MSB */
 #define SUNI_TLOP_CTRL		0x20	/* TLOP Control */
 #define SUNI_TLOP_DIAG		0x21	/* TLOP Diagnostic */
-			     /* 0x22-0x27 reserved */
-#define SUNI_SSTB_CTRL		0x28
+			     /* 0x22-0x2F reserved */
 #define SUNI_RPOP_SC		0x30	/* RPOP Status/Control */
 #define SUNI_RPOP_IS		0x31	/* RPOP Interrupt Status */
 			     /* 0x32 reserved */
@@ -55,7 +52,6 @@
 #define SUNI_RPOP_PFM		0x3B	/* RPOP Path FEBE MSB */
 			     /* 0x3C reserved */
 #define SUNI_RPOP_PBC		0x3D	/* RPOP Path BIP-8 Configuration */
-#define SUNI_RPOP_RC		0x3D	/* RPOP Ring Control (PM5355) */
 			     /* 0x3E-0x3F reserved */
 #define SUNI_TPOP_CD		0x40	/* TPOP Control/Diagnostic */
 #define SUNI_TPOP_PC		0x41	/* TPOP Pointer Control */
@@ -86,8 +82,7 @@
 #define SUNI_TACP_TCC		0x65	/* TACP Transmit Cell Counter */
 #define SUNI_TACP_TCCM		0x66	/* TACP Transmit Cell Counter MSB */
 #define SUNI_TACP_CFG		0x67	/* TACP Configuration */
-#define SUNI_SPTB_CTRL		0x68	/* SPTB Control */
-			     /* 0x69-0x7F reserved */
+			     /* 0x68-0x7F reserved */
 #define	SUNI_MT			0x80	/* Master Test */
 			     /* 0x81-0xFF reserved */
 
@@ -99,18 +94,9 @@
 #define SUNI_MRI_ID_SHIFT 	0
 #define SUNI_MRI_TYPE		0x70	/* R, SUNI type (lite is 011) */
 #define SUNI_MRI_TYPE_SHIFT 	4
-#define SUNI_MRI_TYPE_PM5346	0x3	/* S/UNI 155 LITE */
-#define SUNI_MRI_TYPE_PM5347	0x4	/* S/UNI 155 PLUS */
-#define SUNI_MRI_TYPE_PM5350	0x7	/* S/UNI 155 ULTRA */
-#define SUNI_MRI_TYPE_PM5355	0x1	/* S/UNI 622 */
 #define SUNI_MRI_RESET		0x80	/* RW, reset & power down chip
 					   0: normal operation
 					   1: reset & low power */
-
-/* MCM is reg 0x4 */
-#define SUNI_MCM_LLE		0x20	/* line loopback (PM5355) */
-#define SUNI_MCM_DLE		0x10	/* diagnostic loopback (PM5355) */
-
 /* MCT is reg 5 */
 #define SUNI_MCT_LOOPT		0x01	/* RW, timing source, 0: from
 					   TRCLK+/- */
@@ -157,12 +143,6 @@
 
 /* TLOP_DIAG is reg 0x21 */
 #define SUNI_TLOP_DIAG_DBIP	0x01	/* insert line BIP err (continuously) */
-
-/* SSTB_CTRL is reg 0x28 */
-#define SUNI_SSTB_CTRL_LEN16	0x01	/* path trace message length bit */
-
-/* RPOP_RC is reg 0x3D (PM5355) */
-#define SUNI_RPOP_RC_ENSS	0x40	/* enable size bit */
 
 /* TPOP_DIAG is reg 0x40 */
 #define SUNI_TPOP_DIAG_PAIS	0x01	/* insert STS path alarm ind (cont) */
@@ -211,9 +191,6 @@
 					   pattern */
 #define SUNI_TACP_IUCHP_GFC_SHIFT 4
 
-/* SPTB_CTRL is reg 0x68 */
-#define SUNI_SPTB_CTRL_LEN16	0x01	/* path trace message length */
-
 /* MT is reg 0x80 */
 #define SUNI_MT_HIZIO		0x01	/* RW, all but data bus & MP interface
 					   tri-state */
@@ -228,14 +205,6 @@
 
 
 #ifdef __KERNEL__
-struct suni_priv {
-	struct k_sonet_stats sonet_stats;	/* link diagnostics */
-	int loop_mode;				/* loopback mode */
-	int type;				/* phy type */
-	struct atm_dev *dev;			/* device back-pointer */
-	struct suni_priv *next;			/* next SUNI */
-};
-
 int suni_init(struct atm_dev *dev);
 #endif
 

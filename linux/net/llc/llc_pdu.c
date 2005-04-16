@@ -24,8 +24,8 @@ void llc_pdu_set_cmd_rsp(struct sk_buff *skb, u8 pdu_type)
 }
 
 /**
- *	llc_pdu_set_pf_bit - sets poll/final bit in LLC header
- *	@skb: Frame to set bit in
+ *	pdu_set_pf_bit - sets poll/final bit in LLC header
+ *	@pdu_frame: input frame that p/f bit must be set into it.
  *	@bit_value: poll/final bit (0 or 1).
  *
  *	This function sets poll/final bit in LLC header (based on type of PDU).
@@ -39,7 +39,7 @@ void llc_pdu_set_pf_bit(struct sk_buff *skb, u8 bit_value)
 
 	llc_pdu_decode_pdu_type(skb, &pdu_type);
 	pdu = llc_pdu_sn_hdr(skb);
-
+	
 	switch (pdu_type) {
 	case LLC_PDU_TYPE_I:
 	case LLC_PDU_TYPE_S:
@@ -241,7 +241,7 @@ void llc_pdu_init_as_frmr_rsp(struct sk_buff *skb, struct llc_pdu_sn *prev_pdu,
 	FRMR_INFO_SET_PDU_INFO_2LONG_IND(frmr_info, vzyxw);
 	FRMR_INFO_SET_PDU_INVALID_Nr_IND(frmr_info, vzyxw);
 	FRMR_INFO_SET_PDU_INVALID_Ns_IND(frmr_info, vzyxw);
-	skb_put(skb, sizeof(struct llc_frmr_info));
+	skb_put(skb, 5);
 }
 
 /**

@@ -1,30 +1,49 @@
-# SPDX-License-Identifier: GPL-2.0
 
-hostprogs-always-y	+= genksyms
+hostprogs-y	:= genksyms
+always		:= $(hostprogs-y)
 
-genksyms-objs	:= genksyms.o parse.tab.o lex.lex.o
+genksyms-objs	:= genksyms.o parse.o lex.o
 
-# FIXME: fix the ambiguous grammar in parse.y and delete this hack
-#
-# Suppress shift/reduce, reduce/reduce conflicts warnings
-# unless W=1 is specified.
-#
-# Just in case, run "$(YACC) --version" without suppressing stderr
-# so that 'bison: not found' will be displayed if it is missing.
-ifeq ($(findstring 1,$(KBUILD_EXTRA_WARN)),)
+# -I needed for generated C source (shipped source)
+HOSTCFLAGS_parse.o := -Wno-uninitialized -I$(src)
 
-quiet_cmd_bison_no_warn = $(quiet_cmd_bison)
-      cmd_bison_no_warn = $(YACC) --version >/dev/null; \
-			  $(cmd_bison) 2>/dev/null
+# dependencies on generated files need to be listed explicitly
+$(obj)/lex.o: $(obj)/parse.h $(obj)/keywords.c
 
-$(obj)/pars%.tab.c $(obj)/pars%.tab.h: $(src)/pars%.y FORCE
-	$(call if_changed,bison_no_warn)
+# -I needed for generated C source (shipped source)
+HOSTCFLAGS_lex.o := -I$(src)
+
+ifdef GENERATE_PARSER
+
+# gperf
+
+quiet_cmd_keywords.c = GPERF   $@
+      cmd_keywords.c = gperf -L ANSI-C -a -C -E -g -H is_reserved_hash	\
+		       -k 1,3,$$ -N is_reserved_word -p -t $< > $@
+
+$(obj)/keywords.c: $(obj)/keywords.gperf FORCE
+	$(call if_changed,keywords.c)
+
+# flex
+
+quiet_cmd_lex.c = FLEX    $@
+      cmd_lex.c = flex -o$@ -d $(filter-out FORCE,$^)
+
+$(obj)/lex.c: $(obj)/lex.l $(obj)/parse.h FORCE
+	$(call if_changed,lex.c)
+
+# bison
+
+quiet_cmd_parse.c = BISON   $@
+      cmd_parse.c = bison -o$@ -dtv $(filter-out FORCE,$^)
+
+$(obj)/parse.c: $(obj)/parse.y FORCE
+	$(call if_changed,parse.c)
+
+$(obj)/parse.h: $(obj)/parse.c ;
+
+clean-files	+= parse.output
 
 endif
 
-# -I needed for generated C source to include headers in source tree
-HOSTCFLAGS_parse.tab.o := -I $(srctree)/$(src)
-HOSTCFLAGS_lex.lex.o := -I $(srctree)/$(src)
-
-# dependencies on generated files need to be listed explicitly
-$(obj)/lex.lex.o: $(obj)/parse.tab.h
+targets += keywords.c lex.c parse.c parse.h

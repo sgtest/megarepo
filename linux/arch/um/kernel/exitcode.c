@@ -1,79 +1,73 @@
-// SPDX-License-Identifier: GPL-2.0
-/*
- * Copyright (C) 2002 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
+/* 
+ * Copyright (C) 2002 Jeff Dike (jdike@karaya.com)
+ * Licensed under the GPL
  */
 
-#include <linux/ctype.h>
-#include <linux/init.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/proc_fs.h>
-#include <linux/seq_file.h>
-#include <linux/types.h>
-#include <linux/uaccess.h>
+#include "linux/init.h"
+#include "linux/ctype.h"
+#include "linux/proc_fs.h"
+#include "asm/uaccess.h"
 
-/*
- * If read and write race, the read will still atomically read a valid
+/* If read and write race, the read will still atomically read a valid
  * value.
  */
 int uml_exitcode = 0;
 
-static int exitcode_proc_show(struct seq_file *m, void *v)
+static int read_proc_exitcode(char *page, char **start, off_t off,
+			      int count, int *eof, void *data)
 {
-	int val;
+	int len;
 
-	/*
-	 * Save uml_exitcode in a local so that we don't need to guarantee
-	 * that sprintf accesses it atomically.
-	 */
-	val = uml_exitcode;
-	seq_printf(m, "%d\n", val);
-	return 0;
+	len = sprintf(page, "%d\n", uml_exitcode);
+	len -= off;
+	if(len <= off+count) *eof = 1;
+	*start = page + off;
+	if(len > count) len = count;
+	if(len < 0) len = 0;
+	return(len);
 }
 
-static int exitcode_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, exitcode_proc_show, NULL);
-}
-
-static ssize_t exitcode_proc_write(struct file *file,
-		const char __user *buffer, size_t count, loff_t *pos)
+static int write_proc_exitcode(struct file *file, const char __user *buffer,
+			       unsigned long count, void *data)
 {
 	char *end, buf[sizeof("nnnnn\0")];
-	size_t size;
 	int tmp;
 
-	size = min(count, sizeof(buf));
-	if (copy_from_user(buf, buffer, size))
-		return -EFAULT;
-
+	if(copy_from_user(buf, buffer, count))
+		return(-EFAULT);
 	tmp = simple_strtol(buf, &end, 0);
-	if ((*end != '\0') && !isspace(*end))
-		return -EINVAL;
-
+	if((*end != '\0') && !isspace(*end))
+		return(-EINVAL);
 	uml_exitcode = tmp;
-	return count;
+	return(count);
 }
-
-static const struct proc_ops exitcode_proc_ops = {
-	.proc_open	= exitcode_proc_open,
-	.proc_read	= seq_read,
-	.proc_lseek	= seq_lseek,
-	.proc_release	= single_release,
-	.proc_write	= exitcode_proc_write,
-};
 
 static int make_proc_exitcode(void)
 {
 	struct proc_dir_entry *ent;
 
-	ent = proc_create("exitcode", 0600, NULL, &exitcode_proc_ops);
-	if (ent == NULL) {
-		printk(KERN_WARNING "make_proc_exitcode : Failed to register "
+	ent = create_proc_entry("exitcode", 0600, &proc_root);
+	if(ent == NULL){
+		printk("make_proc_exitcode : Failed to register "
 		       "/proc/exitcode\n");
-		return 0;
+		return(0);
 	}
-	return 0;
+
+	ent->read_proc = read_proc_exitcode;
+	ent->write_proc = write_proc_exitcode;
+	
+	return(0);
 }
 
 __initcall(make_proc_exitcode);
+
+/*
+ * Overrides for Emacs so that we follow Linus's tabbing style.
+ * Emacs will notice this stuff at the end of the file and automatically
+ * adjust the settings for this buffer only.  This must remain at the end
+ * of the file.
+ * ---------------------------------------------------------------------------
+ * Local variables:
+ * c-file-style: "linux"
+ * End:
+ */

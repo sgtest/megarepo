@@ -1,14 +1,7 @@
-// SPDX-License-Identifier: GPL-2.0-only
-/*
- * drivers/atm/suni.c - S/UNI PHY driver
- *
- * Supports the following:
- * 	PMC PM5346 S/UNI LITE
- * 	PMC PM5350 S/UNI 155 ULTRA
- * 	PMC PM5355 S/UNI 622
- */
+/* drivers/atm/suni.c - PMC PM5346 SUNI (PHY) driver */
  
 /* Written 1995-2000 by Werner Almesberger, EPFL LRC/ICA */
+
 
 #include <linux/module.h>
 #include <linux/jiffies.h>
@@ -21,10 +14,11 @@
 #include <linux/timer.h>
 #include <linux/init.h>
 #include <linux/capability.h>
-#include <linux/slab.h>
+#include <linux/atm_suni.h>
+#include <asm/system.h>
 #include <asm/param.h>
-#include <linux/uaccess.h>
-#include <linux/atomic.h>
+#include <asm/uaccess.h>
+#include <asm/atomic.h>
 
 #include "suni.h"
 
@@ -34,6 +28,15 @@
 #else
 #define DPRINTK(format,args...)
 #endif
+
+
+struct suni_priv {
+	struct k_sonet_stats sonet_stats; /* link diagnostics */
+	int loop_mode;			/* loopback mode */
+	struct atm_dev *dev;		/* device back-pointer */
+	struct suni_priv *next;		/* next SUNI */
+};
+
 
 #define PRIV(dev) ((struct suni_priv *) dev->phy_data)
 
@@ -53,7 +56,7 @@ static DEFINE_SPINLOCK(sunis_lock);
     if (atomic_read(&stats->s) < 0) atomic_set(&stats->s,INT_MAX);
 
 
-static void suni_hz(struct timer_list *timer)
+static void suni_hz(unsigned long from_timer)
 {
 	struct suni_priv *walk;
 	struct atm_dev *dev;
@@ -85,7 +88,7 @@ static void suni_hz(struct timer_list *timer)
 		    ((GET(TACP_TCC) & 0xff) << 8) |
 		    ((GET(TACP_TCCM) & 7) << 16));
 	}
-	if (timer) mod_timer(&poll_timer,jiffies+HZ);
+	if (from_timer) mod_timer(&poll_timer,jiffies+HZ);
 }
 
 
@@ -152,103 +155,23 @@ static int get_diag(struct atm_dev *dev,void __user *arg)
 static int set_loopback(struct atm_dev *dev,int mode)
 {
 	unsigned char control;
-	int reg, dle, lle;
 
-	if (PRIV(dev)->type == SUNI_MRI_TYPE_PM5355) {
-		reg = SUNI_MCM;
-		dle = SUNI_MCM_DLE;
-		lle = SUNI_MCM_LLE;
-	} else {
-		reg = SUNI_MCT;
-		dle = SUNI_MCT_DLE;
-		lle = SUNI_MCT_LLE;
-	}
-
-	control = dev->ops->phy_get(dev, reg) & ~(dle | lle);
+	control = GET(MCT) & ~(SUNI_MCT_DLE | SUNI_MCT_LLE);
 	switch (mode) {
 		case ATM_LM_NONE:
 			break;
 		case ATM_LM_LOC_PHY:
-			control |= dle;
+			control |= SUNI_MCT_DLE;
 			break;
 		case ATM_LM_RMT_PHY:
-			control |= lle;
+			control |= SUNI_MCT_LLE;
 			break;
 		default:
 			return -EINVAL;
 	}
-	dev->ops->phy_put(dev, control, reg);
+	PUT(control,MCT);
 	PRIV(dev)->loop_mode = mode;
 	return 0;
-}
-
-/*
- * SONET vs. SDH Configuration
- *
- * Z0INS (register 0x06): 0 for SONET, 1 for SDH
- * ENSS (register 0x3D): 0 for SONET, 1 for SDH
- * LEN16 (register 0x28): 0 for SONET, 1 for SDH (n/a for S/UNI 155 QUAD)
- * LEN16 (register 0x50): 0 for SONET, 1 for SDH (n/a for S/UNI 155 QUAD)
- * S[1:0] (register 0x46): 00 for SONET, 10 for SDH
- */
-
-static int set_sonet(struct atm_dev *dev)
-{
-	if (PRIV(dev)->type == SUNI_MRI_TYPE_PM5355) {
-		PUT(GET(RPOP_RC) & ~SUNI_RPOP_RC_ENSS, RPOP_RC);
-		PUT(GET(SSTB_CTRL) & ~SUNI_SSTB_CTRL_LEN16, SSTB_CTRL);
-		PUT(GET(SPTB_CTRL) & ~SUNI_SPTB_CTRL_LEN16, SPTB_CTRL);
-	}
-
-	REG_CHANGE(SUNI_TPOP_APM_S, SUNI_TPOP_APM_S_SHIFT,
-		   SUNI_TPOP_S_SONET, TPOP_APM);
-
-	return 0;
-}
-
-static int set_sdh(struct atm_dev *dev)
-{
-	if (PRIV(dev)->type == SUNI_MRI_TYPE_PM5355) {
-		PUT(GET(RPOP_RC) | SUNI_RPOP_RC_ENSS, RPOP_RC);
-		PUT(GET(SSTB_CTRL) | SUNI_SSTB_CTRL_LEN16, SSTB_CTRL);
-		PUT(GET(SPTB_CTRL) | SUNI_SPTB_CTRL_LEN16, SPTB_CTRL);
-	}
-
-	REG_CHANGE(SUNI_TPOP_APM_S, SUNI_TPOP_APM_S_SHIFT,
-		   SUNI_TPOP_S_SDH, TPOP_APM);
-
-	return 0;
-}
-
-
-static int get_framing(struct atm_dev *dev, void __user *arg)
-{
-	int framing;
-	unsigned char s;
-
-
-	s = (GET(TPOP_APM) & SUNI_TPOP_APM_S) >> SUNI_TPOP_APM_S_SHIFT;
-	if (s == SUNI_TPOP_S_SONET)
-		framing = SONET_FRAME_SONET;
-	else
-		framing = SONET_FRAME_SDH;
-
-	return put_user(framing, (int __user *) arg) ? -EFAULT : 0;
-}
-
-static int set_framing(struct atm_dev *dev, void __user *arg)
-{
-	int mode;
-
-	if (get_user(mode, (int __user *) arg))
-		return -EFAULT;
-
-	if (mode == SONET_FRAME_SONET)
-		return set_sonet(dev);
-	else if (mode == SONET_FRAME_SDH)
-		return set_sdh(dev);
-
-	return -EINVAL;
 }
 
 
@@ -265,16 +188,14 @@ static int suni_ioctl(struct atm_dev *dev,unsigned int cmd,void __user *arg)
 		case SONET_GETDIAG:
 			return get_diag(dev,arg);
 		case SONET_SETFRAMING:
-			if (!capable(CAP_NET_ADMIN))
-				return -EPERM;
-			return set_framing(dev, arg);
+			if (arg != SONET_FRAME_SONET) return -EINVAL;
+			return 0;
 		case SONET_GETFRAMING:
-			return get_framing(dev, arg);
+			return put_user(SONET_FRAME_SONET,(int __user *)arg) ?
+			    -EFAULT : 0;
 		case SONET_GETFRSENSE:
 			return -EINVAL;
 		case ATM_SETLOOP:
-			if (!capable(CAP_NET_ADMIN))
-				return -EPERM;
 			return set_loopback(dev,(int)(unsigned long)arg);
 		case ATM_GETLOOP:
 			return put_user(PRIV(dev)->loop_mode,(int __user *)arg) ?
@@ -290,9 +211,8 @@ static int suni_ioctl(struct atm_dev *dev,unsigned int cmd,void __user *arg)
 
 static void poll_los(struct atm_dev *dev)
 {
-	atm_dev_signal_change(dev,
-		GET(RSOP_SIS) & SUNI_RSOP_SIS_LOSV ?
-		ATM_PHY_SIG_LOST : ATM_PHY_SIG_FOUND);
+	dev->signal = GET(RSOP_SIS) & SUNI_RSOP_SIS_LOSV ? ATM_PHY_SIG_LOST :
+	  ATM_PHY_SIG_FOUND;
 }
 
 
@@ -309,6 +229,10 @@ static int suni_start(struct atm_dev *dev)
 	unsigned long flags;
 	int first;
 
+	if (!(dev->phy_data = kmalloc(sizeof(struct suni_priv),GFP_KERNEL)))
+		return -ENOMEM;
+
+	PRIV(dev)->dev = dev;
 	spin_lock_irqsave(&sunis_lock,flags);
 	first = !sunis;
 	PRIV(dev)->next = sunis;
@@ -322,11 +246,13 @@ static int suni_start(struct atm_dev *dev)
 		printk(KERN_WARNING "%s(itf %d): no signal\n",dev->type,
 		    dev->number);
 	PRIV(dev)->loop_mode = ATM_LM_NONE;
-	suni_hz(NULL); /* clear SUNI counters */
+	suni_hz(0); /* clear SUNI counters */
 	(void) fetch_stats(dev,NULL,1); /* clear kernel counters */
 	if (first) {
-		timer_setup(&poll_timer, suni_hz, 0);
+		init_timer(&poll_timer);
 		poll_timer.expires = jiffies+HZ;
+		poll_timer.function = suni_hz;
+		poll_timer.data = 1;
 #if 0
 printk(KERN_DEBUG "[u] p=0x%lx,n=0x%lx\n",(unsigned long) poll_timer.list.prev,
     (unsigned long) poll_timer.list.next);
@@ -367,21 +293,16 @@ int suni_init(struct atm_dev *dev)
 {
 	unsigned char mri;
 
-	if (!(dev->phy_data = kmalloc(sizeof(struct suni_priv),GFP_KERNEL)))
-		return -ENOMEM;
-	PRIV(dev)->dev = dev;
-
 	mri = GET(MRI); /* reset SUNI */
-	PRIV(dev)->type = (mri & SUNI_MRI_TYPE) >> SUNI_MRI_TYPE_SHIFT;
 	PUT(mri | SUNI_MRI_RESET,MRI);
 	PUT(mri,MRI);
 	PUT((GET(MT) & SUNI_MT_DS27_53),MT); /* disable all tests */
-        set_sonet(dev);
+	REG_CHANGE(SUNI_TPOP_APM_S,SUNI_TPOP_APM_S_SHIFT,SUNI_TPOP_S_SONET,
+	    TPOP_APM); /* use SONET */
 	REG_CHANGE(SUNI_TACP_IUCHP_CLP,0,SUNI_TACP_IUCHP_CLP,
 	    TACP_IUCHP); /* idle cells */
 	PUT(SUNI_IDLE_PATTERN,TACP_IUCPOP);
 	dev->phy = &suni_ops;
-
 	return 0;
 }
 

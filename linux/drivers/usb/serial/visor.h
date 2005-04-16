@@ -1,13 +1,16 @@
-/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * USB HandSpring Visor driver
  *
  *	Copyright (C) 1999 - 2003
  *	    Greg Kroah-Hartman (greg@kroah.com)
  *
- * See Documentation/usb/usb-serial.rst for more information on using this
- * driver.
+ *	This program is free software; you can redistribute it and/or modify
+ *	it under the terms of the GNU General Public License as published by
+ *	the Free Software Foundation; either version 2 of the License, or
+ *	(at your option) any later version.
  *
+ * See Documentation/usb/usb-serial.txt for more information on using this driver
+ * 
  */
 
 #ifndef __LINUX_USB_SERIAL_VISOR_H
@@ -27,13 +30,10 @@
 #define PALM_M125_ID			0x0040
 #define PALM_M130_ID			0x0050
 #define PALM_TUNGSTEN_T_ID		0x0060
-#define PALM_TREO_650			0x0061
 #define PALM_TUNGSTEN_Z_ID		0x0031
+#define PALM_ZIRE31_ID			0x0061
 #define PALM_ZIRE_ID			0x0070
 #define PALM_M100_ID			0x0080
-
-#define GSPDA_VENDOR_ID		0x115e
-#define GSPDA_XPLORE_M68_ID		0xf100
 
 #define SONY_VENDOR_ID			0x054C
 #define SONY_CLIE_3_5_ID		0x0038
@@ -45,15 +45,9 @@
 #define SONY_CLIE_UX50_ID		0x0144
 #define SONY_CLIE_TJ25_ID		0x0169
 
-#define ACER_VENDOR_ID			0x0502
-#define ACER_S10_ID			0x0001
-
 #define SAMSUNG_VENDOR_ID		0x04E8
 #define SAMSUNG_SCH_I330_ID		0x8001
 #define SAMSUNG_SPH_I500_ID		0x6601
-
-#define TAPWAVE_VENDOR_ID		0x12EF
-#define TAPWAVE_ZODIAC_ID		0x0100
 
 #define GARMIN_VENDOR_ID		0x091E
 #define GARMIN_IQUE_3600_ID		0x0004
@@ -62,7 +56,7 @@
 #define ACEECA_MEZ1000_ID		0x0001
 
 #define KYOCERA_VENDOR_ID		0x0C88
-#define KYOCERA_7135_ID			0x0021
+#define KYOCERA_7135_ID			0x0021 
 
 #define FOSSIL_VENDOR_ID		0x0E67
 #define FOSSIL_ABACUS_ID		0x0002
@@ -132,7 +126,7 @@ struct visor_connection_info {
  *	connections.end_point_info is non-zero.  If value is 0, then
  *	connections.port contains the endpoint number, which is the same for in
  *	and out.
- * @port_function_id: contains the creator id of the application that opened
+ * @port_function_id: contains the creator id of the applicaton that opened
  *	this connection.
  * @port: contains the in/out endpoint number.  Is 0 if in and out endpoint
  *	numbers are different.
@@ -142,7 +136,7 @@ struct visor_connection_info {
  * The maximum number of connections currently supported is 2
  */
 struct palm_ext_connection_info {
-	__u8 num_ports;
+	__u8 num_ports;		
 	__u8 endpoint_numbers_different;
 	__le16 reserved1;
 	struct {

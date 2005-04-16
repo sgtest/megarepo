@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * ip22-berr.c: Bus error handling.
  *
@@ -7,12 +6,12 @@
 
 #include <linux/init.h>
 #include <linux/kernel.h>
-#include <linux/sched/signal.h>
+#include <linux/sched.h>
 
 #include <asm/addrspace.h>
+#include <asm/system.h>
 #include <asm/traps.h>
 #include <asm/branch.h>
-#include <asm/irq_regs.h>
 #include <asm/sgi/mc.h>
 #include <asm/sgi/hpc3.h>
 #include <asm/sgi/ioc.h>
@@ -86,10 +85,9 @@ static void print_buserr(void)
  * and then clear the interrupt when this happens.
  */
 
-void ip22_be_interrupt(int irq)
+void ip22_be_interrupt(int irq, struct pt_regs *regs)
 {
 	const int field = 2 * sizeof(unsigned long);
-	struct pt_regs *regs = get_irq_regs();
 
 	save_and_clear_buserr();
 	print_buserr();
@@ -98,7 +96,7 @@ void ip22_be_interrupt(int irq)
 	       field, regs->cp0_epc, field, regs->regs[31]);
 	/* Assume it would be too dangerous to continue ... */
 	die_if_kernel("Oops", regs);
-	force_sig(SIGBUS);
+	force_sig(SIGBUS, current);
 }
 
 static int ip22_be_handler(struct pt_regs *regs, int is_fixup)
@@ -112,5 +110,5 @@ static int ip22_be_handler(struct pt_regs *regs, int is_fixup)
 
 void __init ip22_be_init(void)
 {
-	mips_set_be_handler(ip22_be_handler);
+	board_be_handler = ip22_be_handler;
 }

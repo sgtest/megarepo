@@ -1,12 +1,17 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *	X.25 Packet Layer release 002
  *
  *	This is ALPHA test software. This code may break your machine,
  *	randomly fail to work with new releases, misbehave and/or generally
- *	screw up. It might even work.
+ *	screw up. It might even work. 
  *
  *	This code REQUIRES 2.1.15 or higher
+ *
+ *	This module:
+ *		This module is free software; you can redistribute it and/or
+ *		modify it under the terms of the GNU General Public License
+ *		as published by the Free Software Foundation; either version
+ *		2 of the License, or (at your option) any later version.
  *
  *	History
  *	X.25 001	Jonathan Naylor	Started coding.
@@ -18,20 +23,23 @@
 #include <linux/jiffies.h>
 #include <linux/timer.h>
 #include <net/sock.h>
-#include <net/tcp_states.h>
+#include <net/tcp.h>
 #include <net/x25.h>
 
-static void x25_heartbeat_expiry(struct timer_list *t);
-static void x25_timer_expiry(struct timer_list *t);
+static void x25_heartbeat_expiry(unsigned long);
+static void x25_timer_expiry(unsigned long);
 
 void x25_init_timers(struct sock *sk)
 {
 	struct x25_sock *x25 = x25_sk(sk);
 
-	timer_setup(&x25->timer, x25_timer_expiry, 0);
+	init_timer(&x25->timer);
+	x25->timer.data     = (unsigned long)sk;
+	x25->timer.function = &x25_timer_expiry;
 
 	/* initialized by sock_init_data */
-	sk->sk_timer.function = x25_heartbeat_expiry;
+	sk->sk_timer.data     = (unsigned long)sk;
+	sk->sk_timer.function = &x25_heartbeat_expiry;
 }
 
 void x25_start_heartbeat(struct sock *sk)
@@ -87,12 +95,12 @@ unsigned long x25_display_timer(struct sock *sk)
 	return x25->timer.expires - jiffies;
 }
 
-static void x25_heartbeat_expiry(struct timer_list *t)
+static void x25_heartbeat_expiry(unsigned long param)
 {
-	struct sock *sk = from_timer(sk, t, sk_timer);
+	struct sock *sk = (struct sock *)param;
 
-	bh_lock_sock(sk);
-	if (sock_owned_by_user(sk)) /* can currently only occur in state 3 */
+        bh_lock_sock(sk);
+        if (sock_owned_by_user(sk)) /* can currently only occur in state 3 */ 
 		goto restart_heartbeat;
 
 	switch (x25_sk(sk)->state) {
@@ -106,9 +114,8 @@ static void x25_heartbeat_expiry(struct timer_list *t)
 			if (sock_flag(sk, SOCK_DESTROY) ||
 			    (sk->sk_state == TCP_LISTEN &&
 			     sock_flag(sk, SOCK_DEAD))) {
-				bh_unlock_sock(sk);
-				x25_destroy_socket_from_timer(sk);
-				return;
+				x25_destroy_socket(sk);
+				goto unlock;
 			}
 			break;
 
@@ -121,6 +128,7 @@ static void x25_heartbeat_expiry(struct timer_list *t)
 	}
 restart_heartbeat:
 	x25_start_heartbeat(sk);
+unlock:
 	bh_unlock_sock(sk);
 }
 
@@ -154,10 +162,9 @@ static inline void x25_do_timer_expiry(struct sock * sk)
 	}
 }
 
-static void x25_timer_expiry(struct timer_list *t)
+static void x25_timer_expiry(unsigned long param)
 {
-	struct x25_sock *x25 = from_timer(x25, t, timer);
-	struct sock *sk = &x25->sk;
+	struct sock *sk = (struct sock *)param;
 
 	bh_lock_sock(sk);
 	if (sock_owned_by_user(sk)) { /* can currently only occur in state 3 */

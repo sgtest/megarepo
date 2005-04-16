@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
     NetWinder Floating Point Emulator
     (c) Rebel.COM, 1998,1999
@@ -6,21 +5,34 @@
 
     Direct questions, comments to Scott Bambrough <scottb@netwinder.org>
 
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 */
 
+#include <linux/config.h>
 #include "fpa11.h"
 #include "fpopcode.h"
 
-unsigned int SingleCPDO(struct roundingData *roundData, const unsigned int opcode, FPREG * rFd);
-unsigned int DoubleCPDO(struct roundingData *roundData, const unsigned int opcode, FPREG * rFd);
-unsigned int ExtendedCPDO(struct roundingData *roundData, const unsigned int opcode, FPREG * rFd);
+unsigned int SingleCPDO(const unsigned int opcode, FPREG * rFd);
+unsigned int DoubleCPDO(const unsigned int opcode, FPREG * rFd);
+unsigned int ExtendedCPDO(const unsigned int opcode, FPREG * rFd);
 
 unsigned int EmulateCPDO(const unsigned int opcode)
 {
 	FPA11 *fpa11 = GET_FPA11();
 	FPREG *rFd;
 	unsigned int nType, nDest, nRc;
-	struct roundingData roundData;
 
 	/* Get the destination size.  If not valid let Linux perform
 	   an invalid instruction trap. */
@@ -28,9 +40,7 @@ unsigned int EmulateCPDO(const unsigned int opcode)
 	if (typeNone == nDest)
 		return 0;
 
-	roundData.mode = SetRoundingMode(opcode);
-	roundData.precision = SetRoundingPrecision(opcode);
-	roundData.exception = 0;
+	SetRoundingMode(opcode);
 
 	/* Compare the size of the operands in Fn and Fm.
 	   Choose the largest size and perform operations in that size,
@@ -53,14 +63,14 @@ unsigned int EmulateCPDO(const unsigned int opcode)
 
 	switch (nType) {
 	case typeSingle:
-		nRc = SingleCPDO(&roundData, opcode, rFd);
+		nRc = SingleCPDO(opcode, rFd);
 		break;
 	case typeDouble:
-		nRc = DoubleCPDO(&roundData, opcode, rFd);
+		nRc = DoubleCPDO(opcode, rFd);
 		break;
 #ifdef CONFIG_FPE_NWFPE_XP
 	case typeExtended:
-		nRc = ExtendedCPDO(&roundData, opcode, rFd);
+		nRc = ExtendedCPDO(opcode, rFd);
 		break;
 #endif
 	default:
@@ -83,9 +93,9 @@ unsigned int EmulateCPDO(const unsigned int opcode)
 			case typeSingle:
 				{
 					if (typeDouble == nType)
-						rFd->fSingle = float64_to_float32(&roundData, rFd->fDouble);
+						rFd->fSingle = float64_to_float32(rFd->fDouble);
 					else
-						rFd->fSingle = floatx80_to_float32(&roundData, rFd->fExtended);
+						rFd->fSingle = floatx80_to_float32(rFd->fExtended);
 				}
 				break;
 
@@ -94,7 +104,7 @@ unsigned int EmulateCPDO(const unsigned int opcode)
 					if (typeSingle == nType)
 						rFd->fDouble = float32_to_float64(rFd->fSingle);
 					else
-						rFd->fDouble = floatx80_to_float64(&roundData, rFd->fExtended);
+						rFd->fDouble = floatx80_to_float64(rFd->fExtended);
 				}
 				break;
 
@@ -111,15 +121,12 @@ unsigned int EmulateCPDO(const unsigned int opcode)
 #else
 		if (nDest != nType) {
 			if (nDest == typeSingle)
-				rFd->fSingle = float64_to_float32(&roundData, rFd->fDouble);
+				rFd->fSingle = float64_to_float32(rFd->fDouble);
 			else
 				rFd->fDouble = float32_to_float64(rFd->fSingle);
 		}
 #endif
 	}
-
-	if (roundData.exception)
-		float_raise(roundData.exception);
 
 	return nRc;
 }

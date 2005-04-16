@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _LINUX_UTS_H
 #define _LINUX_UTS_H
 
@@ -10,7 +9,7 @@
 #endif
 
 #ifndef UTS_NODENAME
-#define UTS_NODENAME CONFIG_DEFAULT_HOSTNAME /* set by sethostname() */
+#define UTS_NODENAME "(none)"	/* set by sethostname() */
 #endif
 
 #ifndef UTS_DOMAINNAME

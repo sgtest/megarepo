@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef FWH_LOCK_H
 #define FWH_LOCK_H
 
@@ -26,7 +25,7 @@ struct fwh_xxlock_thunk {
  * so this code has not been tested with interleaved chips,
  * and will likely fail in that context.
  */
-static int fwh_xxlock_oneblock(struct map_info *map, struct flchip *chip,
+static int fwh_xxlock_oneblock(struct map_info *map, struct flchip *chip, 
 	unsigned long adr, int len, void *thunk)
 {
 	struct cfi_private *cfi = map->fldrv_priv;
@@ -35,7 +34,8 @@ static int fwh_xxlock_oneblock(struct map_info *map, struct flchip *chip,
 
 	/* Refuse the operation if the we cannot look behind the chip */
 	if (chip->start < 0x400000) {
-		pr_debug( "MTD %s(): chip->start: %lx wanted >= 0x400000\n",
+		DEBUG( MTD_DEBUG_LEVEL3,
+			"MTD %s(): chip->start: %lx wanted >= 0x400000\n",
 			__func__, chip->start );
 		return -EIO;
 	}
@@ -44,7 +44,7 @@ static int fwh_xxlock_oneblock(struct map_info *map, struct flchip *chip,
 	 * - on 64k boundariesand
 	 * - bit 1 set high
 	 * - block lock registers are 4MiB lower - overflow subtract (danger)
-	 *
+	 * 
 	 * The address manipulation is first done on the logical address
 	 * which is 0 at the start of the chip, and then the offset of
 	 * the individual chip is addted to it.  Any other order a weird
@@ -58,26 +58,25 @@ static int fwh_xxlock_oneblock(struct map_info *map, struct flchip *chip,
 	 * to flash memory - that means that we don't have to check status
 	 * and timeout.
 	 */
-	mutex_lock(&chip->mutex);
+	cfi_spin_lock(chip->mutex);
 	ret = get_chip(map, chip, adr, FL_LOCKING);
 	if (ret) {
-		mutex_unlock(&chip->mutex);
+		cfi_spin_unlock(chip->mutex);
 		return ret;
 	}
 
-	chip->oldstate = chip->state;
 	chip->state = xxlt->state;
 	map_write(map, CMD(xxlt->val), adr);
 
 	/* Done and happy. */
-	chip->state = chip->oldstate;
+	chip->state = FL_READY;
 	put_chip(map, chip, adr);
-	mutex_unlock(&chip->mutex);
+	cfi_spin_unlock(chip->mutex);
 	return 0;
 }
 
 
-static int fwh_lock_varsize(struct mtd_info *mtd, loff_t ofs, uint64_t len)
+static int fwh_lock_varsize(struct mtd_info *mtd, loff_t ofs, size_t len)
 {
 	int ret;
 
@@ -88,21 +87,21 @@ static int fwh_lock_varsize(struct mtd_info *mtd, loff_t ofs, uint64_t len)
 }
 
 
-static int fwh_unlock_varsize(struct mtd_info *mtd, loff_t ofs, uint64_t len)
+static int fwh_unlock_varsize(struct mtd_info *mtd, loff_t ofs, size_t len)
 {
 	int ret;
 
 	ret = cfi_varsize_frob(mtd, fwh_xxlock_oneblock, ofs, len,
 		(void *)&FWH_XXLOCK_ONEBLOCK_UNLOCK);
-
+	
 	return ret;
 }
 
-static void fixup_use_fwh_lock(struct mtd_info *mtd)
+static void fixup_use_fwh_lock(struct mtd_info *mtd, void *param)
 {
 	printk(KERN_NOTICE "using fwh lock/unlock method\n");
 	/* Setup for the chips with the fwh lock method */
-	mtd->_lock   = fwh_lock_varsize;
-	mtd->_unlock = fwh_unlock_varsize;
+	mtd->lock   = fwh_lock_varsize;
+	mtd->unlock = fwh_unlock_varsize;
 }
 #endif /* FWH_LOCK_H */

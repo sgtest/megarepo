@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  *  linux/arch/arm/lib/div64.S
  *
@@ -7,11 +6,13 @@
  *  Author:	Nicolas Pitre
  *  Created:	Oct 5, 2003
  *  Copyright:	Monta Vista Software, Inc.
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License version 2 as
+ *  published by the Free Software Foundation.
  */
 
 #include <linux/linkage.h>
-#include <asm/assembler.h>
-#include <asm/unwind.h>
 
 #ifdef __ARMEB__
 #define xh r0
@@ -43,7 +44,6 @@
  */
 
 ENTRY(__do_div64)
-UNWIND(.fnstart)
 
 	@ Test for easy paths first.
 	subs	ip, r4, #1
@@ -85,8 +85,8 @@ UNWIND(.fnstart)
  	@ Break out early if dividend reaches 0.
 2:	cmp	xh, yl
 	orrcs	yh, yh, ip
-	subscs	xh, xh, yl
-	movsne	ip, ip, lsr #1
+	subcss	xh, xh, yl
+	movnes	ip, ip, lsr #1
 	mov	yl, yl, lsr #1
 	bne	2b
 
@@ -95,7 +95,7 @@ UNWIND(.fnstart)
 	mov	yl, #0
 	cmpeq	xl, r4
 	movlo	xh, xl
-	retlo	lr
+	movlo	pc, lr
 
 	@ The division loop for lower bit positions.
 	@ Here we shift remainer bits leftwards rather than moving the
@@ -109,14 +109,14 @@ UNWIND(.fnstart)
 	subcs	xh, xh, r4
 	movs	ip, ip, lsr #1
 	bne	4b
-	ret	lr
+	mov	pc, lr
 
 	@ The top part of remainder became zero.  If carry is set
 	@ (the 33th bit) this is a false positive so resume the loop.
 	@ Otherwise, if lower part is also null then we are done.
 6:	bcs	5b
 	cmp	xl, #0
-	reteq	lr
+	moveq	pc, lr
 
 	@ We still have remainer bits in the low part.  Bring them up.
 
@@ -142,7 +142,7 @@ UNWIND(.fnstart)
 	movs	ip, ip, lsr #1
 	mov	xh, #1
 	bne	4b
-	ret	lr
+	mov	pc, lr
 
 8:	@ Division by a power of 2: determine what that divisor order is
 	@ then simply shift values around
@@ -177,33 +177,24 @@ UNWIND(.fnstart)
 	mov	yh, xh, lsr ip
 	mov	yl, xl, lsr ip
 	rsb	ip, ip, #32
- ARM(	orr	yl, yl, xh, lsl ip	)
- THUMB(	lsl	xh, xh, ip		)
- THUMB(	orr	yl, yl, xh		)
+	orr	yl, yl, xh, lsl ip
 	mov	xh, xl, lsl ip
 	mov	xh, xh, lsr ip
-	ret	lr
+	mov	pc, lr
 
 	@ eq -> division by 1: obvious enough...
 9:	moveq	yl, xl
 	moveq	yh, xh
 	moveq	xh, #0
-	reteq	lr
-UNWIND(.fnend)
+	moveq	pc, lr
 
-UNWIND(.fnstart)
-UNWIND(.pad #4)
-UNWIND(.save {lr})
-Ldiv0_64:
 	@ Division by 0:
-	str	lr, [sp, #-8]!
+	str	lr, [sp, #-4]!
 	bl	__div0
 
 	@ as wrong as it could be...
 	mov	yl, #0
 	mov	yh, #0
 	mov	xh, #0
-	ldr	pc, [sp], #8
+	ldr	pc, [sp], #4
 
-UNWIND(.fnend)
-ENDPROC(__do_div64)

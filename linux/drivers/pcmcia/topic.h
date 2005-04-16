@@ -101,11 +101,6 @@
 #define  TOPIC97_AVS_AUDIO_CONTROL	0x02
 #define  TOPIC97_AVS_VIDEO_CONTROL	0x01
 
-#define TOPIC_EXCA_IF_CONTROL		0x3e	/* 8 bit */
-#define TOPIC_EXCA_IFC_33V_ENA		0x01
-
-#define TOPIC_PCI_CFG_PPBCN		0x3e	/* 16-bit */
-#define TOPIC_PCI_CFG_PPBCN_WBEN	0x0400
 
 static void topic97_zoom_video(struct pcmcia_socket *sock, int onoff)
 {
@@ -117,51 +112,28 @@ static void topic97_zoom_video(struct pcmcia_socket *sock, int onoff)
 		reg_zv |= TOPIC97_ZV_CONTROL_ENABLE;
 		config_writeb(socket, TOPIC97_ZOOM_VIDEO_CONTROL, reg_zv);
 
+		reg = config_readb(socket, TOPIC97_MISC2);
+		reg |= TOPIC97_MISC2_ZV_ENABLE;
+		config_writeb(socket, TOPIC97_MISC2, reg);
+
+		/* not sure this is needed, doc is unclear */
+#if 0
 		reg = config_readb(socket, TOPIC97_AUDIO_VIDEO_SWITCH);
 		reg |= TOPIC97_AVS_AUDIO_CONTROL | TOPIC97_AVS_VIDEO_CONTROL;
 		config_writeb(socket, TOPIC97_AUDIO_VIDEO_SWITCH, reg);
-	} else {
+#endif
+	}
+	else {
 		reg_zv &= ~TOPIC97_ZV_CONTROL_ENABLE;
 		config_writeb(socket, TOPIC97_ZOOM_VIDEO_CONTROL, reg_zv);
-
-		reg = config_readb(socket, TOPIC97_AUDIO_VIDEO_SWITCH);
-		reg &= ~(TOPIC97_AVS_AUDIO_CONTROL | TOPIC97_AVS_VIDEO_CONTROL);
-		config_writeb(socket, TOPIC97_AUDIO_VIDEO_SWITCH, reg);
 	}
+
 }
 
 static int topic97_override(struct yenta_socket *socket)
 {
 	/* ToPIC97/100 support ZV */
 	socket->socket.zoom_video = topic97_zoom_video;
-	return 0;
-}
-
-
-static int topic95_override(struct yenta_socket *socket)
-{
-	u8 fctrl;
-	u16 ppbcn;
-
-	/* enable 3.3V support for 16bit cards */
-	fctrl = exca_readb(socket, TOPIC_EXCA_IF_CONTROL);
-	exca_writeb(socket, TOPIC_EXCA_IF_CONTROL, fctrl | TOPIC_EXCA_IFC_33V_ENA);
-
-	/* tell yenta to use exca registers to power 16bit cards */
-	socket->flags |= YENTA_16BIT_POWER_EXCA | YENTA_16BIT_POWER_DF;
-
-	/* Disable write buffers to prevent lockups under load with numerous
-	   Cardbus cards, observed on Tecra 500CDT and reported elsewhere on the
-	   net.  This is not a power-on default according to the datasheet
-	   but some BIOSes seem to set it. */
-	if (pci_read_config_word(socket->dev, TOPIC_PCI_CFG_PPBCN, &ppbcn) == 0
-	    && socket->dev->revision <= 7
-	    && (ppbcn & TOPIC_PCI_CFG_PPBCN_WBEN)) {
-		ppbcn &= ~TOPIC_PCI_CFG_PPBCN_WBEN;
-		pci_write_config_word(socket->dev, TOPIC_PCI_CFG_PPBCN, ppbcn);
-		dev_info(&socket->dev->dev, "Disabled ToPIC95 Cardbus write buffers.\n");
-	}
-
 	return 0;
 }
 

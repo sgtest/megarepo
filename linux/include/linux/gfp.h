@@ -1,161 +1,64 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __LINUX_GFP_H
 #define __LINUX_GFP_H
 
-#include <linux/gfp_types.h>
-
 #include <linux/mmzone.h>
-#include <linux/topology.h>
+#include <linux/stddef.h>
+#include <linux/linkage.h>
+#include <linux/config.h>
 
 struct vm_area_struct;
 
-/* Convert GFP flags to their corresponding migrate type */
-#define GFP_MOVABLE_MASK (__GFP_RECLAIMABLE|__GFP_MOVABLE)
-#define GFP_MOVABLE_SHIFT 3
-
-static inline int gfp_migratetype(const gfp_t gfp_flags)
-{
-	VM_WARN_ON((gfp_flags & GFP_MOVABLE_MASK) == GFP_MOVABLE_MASK);
-	BUILD_BUG_ON((1UL << GFP_MOVABLE_SHIFT) != ___GFP_MOVABLE);
-	BUILD_BUG_ON((___GFP_MOVABLE >> GFP_MOVABLE_SHIFT) != MIGRATE_MOVABLE);
-
-	if (unlikely(page_group_by_mobility_disabled))
-		return MIGRATE_UNMOVABLE;
-
-	/* Group based on mobility */
-	return (__force unsigned long)(gfp_flags & GFP_MOVABLE_MASK) >> GFP_MOVABLE_SHIFT;
-}
-#undef GFP_MOVABLE_MASK
-#undef GFP_MOVABLE_SHIFT
-
-static inline bool gfpflags_allow_blocking(const gfp_t gfp_flags)
-{
-	return !!(gfp_flags & __GFP_DIRECT_RECLAIM);
-}
-
-/**
- * gfpflags_normal_context - is gfp_flags a normal sleepable context?
- * @gfp_flags: gfp_flags to test
- *
- * Test whether @gfp_flags indicates that the allocation is from the
- * %current context and allowed to sleep.
- *
- * An allocation being allowed to block doesn't mean it owns the %current
- * context.  When direct reclaim path tries to allocate memory, the
- * allocation context is nested inside whatever %current was doing at the
- * time of the original allocation.  The nested allocation may be allowed
- * to block but modifying anything %current owns can corrupt the outer
- * context's expectations.
- *
- * %true result from this function indicates that the allocation context
- * can sleep and use anything that's associated with %current.
+/*
+ * GFP bitmasks..
  */
-static inline bool gfpflags_normal_context(const gfp_t gfp_flags)
-{
-	return (gfp_flags & (__GFP_DIRECT_RECLAIM | __GFP_MEMALLOC)) ==
-		__GFP_DIRECT_RECLAIM;
-}
-
-#ifdef CONFIG_HIGHMEM
-#define OPT_ZONE_HIGHMEM ZONE_HIGHMEM
-#else
-#define OPT_ZONE_HIGHMEM ZONE_NORMAL
-#endif
-
-#ifdef CONFIG_ZONE_DMA
-#define OPT_ZONE_DMA ZONE_DMA
-#else
-#define OPT_ZONE_DMA ZONE_NORMAL
-#endif
-
-#ifdef CONFIG_ZONE_DMA32
-#define OPT_ZONE_DMA32 ZONE_DMA32
-#else
-#define OPT_ZONE_DMA32 ZONE_NORMAL
-#endif
+/* Zone modifiers in GFP_ZONEMASK (see linux/mmzone.h - low two bits) */
+#define __GFP_DMA	0x01
+#define __GFP_HIGHMEM	0x02
 
 /*
- * GFP_ZONE_TABLE is a word size bitstring that is used for looking up the
- * zone to use given the lowest 4 bits of gfp_t. Entries are GFP_ZONES_SHIFT
- * bits long and there are 16 of them to cover all possible combinations of
- * __GFP_DMA, __GFP_DMA32, __GFP_MOVABLE and __GFP_HIGHMEM.
+ * Action modifiers - doesn't change the zoning
  *
- * The zone fallback order is MOVABLE=>HIGHMEM=>NORMAL=>DMA32=>DMA.
- * But GFP_MOVABLE is not only a zone specifier but also an allocation
- * policy. Therefore __GFP_MOVABLE plus another zone selector is valid.
- * Only 1 bit of the lowest 3 bits (DMA,DMA32,HIGHMEM) can be set to "1".
+ * __GFP_REPEAT: Try hard to allocate the memory, but the allocation attempt
+ * _might_ fail.  This depends upon the particular VM implementation.
  *
- *       bit       result
- *       =================
- *       0x0    => NORMAL
- *       0x1    => DMA or NORMAL
- *       0x2    => HIGHMEM or NORMAL
- *       0x3    => BAD (DMA+HIGHMEM)
- *       0x4    => DMA32 or NORMAL
- *       0x5    => BAD (DMA+DMA32)
- *       0x6    => BAD (HIGHMEM+DMA32)
- *       0x7    => BAD (HIGHMEM+DMA32+DMA)
- *       0x8    => NORMAL (MOVABLE+0)
- *       0x9    => DMA or NORMAL (MOVABLE+DMA)
- *       0xa    => MOVABLE (Movable is valid only if HIGHMEM is set too)
- *       0xb    => BAD (MOVABLE+HIGHMEM+DMA)
- *       0xc    => DMA32 or NORMAL (MOVABLE+DMA32)
- *       0xd    => BAD (MOVABLE+DMA32+DMA)
- *       0xe    => BAD (MOVABLE+DMA32+HIGHMEM)
- *       0xf    => BAD (MOVABLE+DMA32+HIGHMEM+DMA)
+ * __GFP_NOFAIL: The VM implementation _must_ retry infinitely: the caller
+ * cannot handle allocation failures.
  *
- * GFP_ZONES_SHIFT must be <= 2 on 32 bit platforms.
+ * __GFP_NORETRY: The VM implementation must not retry indefinitely.
  */
+#define __GFP_WAIT	0x10u	/* Can wait and reschedule? */
+#define __GFP_HIGH	0x20u	/* Should access emergency pools? */
+#define __GFP_IO	0x40u	/* Can start physical IO? */
+#define __GFP_FS	0x80u	/* Can call down to low-level FS? */
+#define __GFP_COLD	0x100u	/* Cache-cold page required */
+#define __GFP_NOWARN	0x200u	/* Suppress page allocation failure warning */
+#define __GFP_REPEAT	0x400u	/* Retry the allocation.  Might fail */
+#define __GFP_NOFAIL	0x800u	/* Retry for ever.  Cannot fail */
+#define __GFP_NORETRY	0x1000u	/* Do not retry.  Might fail */
+#define __GFP_NO_GROW	0x2000u	/* Slab internal usage */
+#define __GFP_COMP	0x4000u	/* Add compound page metadata */
+#define __GFP_ZERO	0x8000u	/* Return zeroed page on success */
 
-#if defined(CONFIG_ZONE_DEVICE) && (MAX_NR_ZONES-1) <= 4
-/* ZONE_DEVICE is not a valid GFP zone specifier */
-#define GFP_ZONES_SHIFT 2
-#else
-#define GFP_ZONES_SHIFT ZONES_SHIFT
-#endif
+#define __GFP_BITS_SHIFT 16	/* Room for 16 __GFP_FOO bits */
+#define __GFP_BITS_MASK ((1 << __GFP_BITS_SHIFT) - 1)
 
-#if 16 * GFP_ZONES_SHIFT > BITS_PER_LONG
-#error GFP_ZONES_SHIFT too large to create GFP_ZONE_TABLE integer
-#endif
+/* if you forget to add the bitmask here kernel will crash, period */
+#define GFP_LEVEL_MASK (__GFP_WAIT|__GFP_HIGH|__GFP_IO|__GFP_FS| \
+			__GFP_COLD|__GFP_NOWARN|__GFP_REPEAT| \
+			__GFP_NOFAIL|__GFP_NORETRY|__GFP_NO_GROW|__GFP_COMP)
 
-#define GFP_ZONE_TABLE ( \
-	(ZONE_NORMAL << 0 * GFP_ZONES_SHIFT)				       \
-	| (OPT_ZONE_DMA << ___GFP_DMA * GFP_ZONES_SHIFT)		       \
-	| (OPT_ZONE_HIGHMEM << ___GFP_HIGHMEM * GFP_ZONES_SHIFT)	       \
-	| (OPT_ZONE_DMA32 << ___GFP_DMA32 * GFP_ZONES_SHIFT)		       \
-	| (ZONE_NORMAL << ___GFP_MOVABLE * GFP_ZONES_SHIFT)		       \
-	| (OPT_ZONE_DMA << (___GFP_MOVABLE | ___GFP_DMA) * GFP_ZONES_SHIFT)    \
-	| (ZONE_MOVABLE << (___GFP_MOVABLE | ___GFP_HIGHMEM) * GFP_ZONES_SHIFT)\
-	| (OPT_ZONE_DMA32 << (___GFP_MOVABLE | ___GFP_DMA32) * GFP_ZONES_SHIFT)\
-)
+#define GFP_ATOMIC	(__GFP_HIGH)
+#define GFP_NOIO	(__GFP_WAIT)
+#define GFP_NOFS	(__GFP_WAIT | __GFP_IO)
+#define GFP_KERNEL	(__GFP_WAIT | __GFP_IO | __GFP_FS)
+#define GFP_USER	(__GFP_WAIT | __GFP_IO | __GFP_FS)
+#define GFP_HIGHUSER	(__GFP_WAIT | __GFP_IO | __GFP_FS | __GFP_HIGHMEM)
 
-/*
- * GFP_ZONE_BAD is a bitmap for all combinations of __GFP_DMA, __GFP_DMA32
- * __GFP_HIGHMEM and __GFP_MOVABLE that are not permitted. One flag per
- * entry starting with bit 0. Bit is set if the combination is not
- * allowed.
- */
-#define GFP_ZONE_BAD ( \
-	1 << (___GFP_DMA | ___GFP_HIGHMEM)				      \
-	| 1 << (___GFP_DMA | ___GFP_DMA32)				      \
-	| 1 << (___GFP_DMA32 | ___GFP_HIGHMEM)				      \
-	| 1 << (___GFP_DMA | ___GFP_DMA32 | ___GFP_HIGHMEM)		      \
-	| 1 << (___GFP_MOVABLE | ___GFP_HIGHMEM | ___GFP_DMA)		      \
-	| 1 << (___GFP_MOVABLE | ___GFP_DMA32 | ___GFP_DMA)		      \
-	| 1 << (___GFP_MOVABLE | ___GFP_DMA32 | ___GFP_HIGHMEM)		      \
-	| 1 << (___GFP_MOVABLE | ___GFP_DMA32 | ___GFP_DMA | ___GFP_HIGHMEM)  \
-)
+/* Flag - indicates that the buffer will be suitable for DMA.  Ignored on some
+   platforms, used as appropriate on others */
 
-static inline enum zone_type gfp_zone(gfp_t flags)
-{
-	enum zone_type z;
-	int bit = (__force int) (flags & GFP_ZONEMASK);
+#define GFP_DMA		__GFP_DMA
 
-	z = (GFP_ZONE_TABLE >> (bit * GFP_ZONES_SHIFT)) &
-					 ((1 << GFP_ZONES_SHIFT) - 1);
-	VM_BUG_ON((GFP_ZONE_BAD >> bit) & 1);
-	return z;
-}
 
 /*
  * There is only one page-allocator function, and two main namespaces to
@@ -164,212 +67,68 @@ static inline enum zone_type gfp_zone(gfp_t flags)
  * virtual kernel addresses to the allocated page(s).
  */
 
-static inline int gfp_zonelist(gfp_t flags)
-{
-#ifdef CONFIG_NUMA
-	if (unlikely(flags & __GFP_THISNODE))
-		return ZONELIST_NOFALLBACK;
-#endif
-	return ZONELIST_FALLBACK;
-}
-
 /*
  * We get the zone list from the current node and the gfp_mask.
- * This zone list contains a maximum of MAX_NUMNODES*MAX_NR_ZONES zones.
- * There are two zonelists per node, one for all zones with memory and
- * one containing just zones from the node the zonelist belongs to.
+ * This zone list contains a maximum of MAXNODES*MAX_NR_ZONES zones.
  *
- * For the case of non-NUMA systems the NODE_DATA() gets optimized to
- * &contig_page_data at compile-time.
+ * For the normal case of non-DISCONTIGMEM systems the NODE_DATA() gets
+ * optimized to &contig_page_data at compile-time.
  */
-static inline struct zonelist *node_zonelist(int nid, gfp_t flags)
-{
-	return NODE_DATA(nid)->node_zonelists + gfp_zonelist(flags);
-}
 
 #ifndef HAVE_ARCH_FREE_PAGE
 static inline void arch_free_page(struct page *page, int order) { }
 #endif
-#ifndef HAVE_ARCH_ALLOC_PAGE
-static inline void arch_alloc_page(struct page *page, int order) { }
-#endif
 
-struct page *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid,
-		nodemask_t *nodemask);
-struct folio *__folio_alloc(gfp_t gfp, unsigned int order, int preferred_nid,
-		nodemask_t *nodemask);
+extern struct page *
+FASTCALL(__alloc_pages(unsigned int, unsigned int, struct zonelist *));
 
-unsigned long __alloc_pages_bulk(gfp_t gfp, int preferred_nid,
-				nodemask_t *nodemask, int nr_pages,
-				struct list_head *page_list,
-				struct page **page_array);
-
-unsigned long alloc_pages_bulk_array_mempolicy(gfp_t gfp,
-				unsigned long nr_pages,
-				struct page **page_array);
-
-/* Bulk allocate order-0 pages */
-static inline unsigned long
-alloc_pages_bulk_list(gfp_t gfp, unsigned long nr_pages, struct list_head *list)
-{
-	return __alloc_pages_bulk(gfp, numa_mem_id(), NULL, nr_pages, list, NULL);
-}
-
-static inline unsigned long
-alloc_pages_bulk_array(gfp_t gfp, unsigned long nr_pages, struct page **page_array)
-{
-	return __alloc_pages_bulk(gfp, numa_mem_id(), NULL, nr_pages, NULL, page_array);
-}
-
-static inline unsigned long
-alloc_pages_bulk_array_node(gfp_t gfp, int nid, unsigned long nr_pages, struct page **page_array)
-{
-	if (nid == NUMA_NO_NODE)
-		nid = numa_mem_id();
-
-	return __alloc_pages_bulk(gfp, nid, NULL, nr_pages, NULL, page_array);
-}
-
-/*
- * Allocate pages, preferring the node given as nid. The node must be valid and
- * online. For more general interface, see alloc_pages_node().
- */
-static inline struct page *
-__alloc_pages_node(int nid, gfp_t gfp_mask, unsigned int order)
-{
-	VM_BUG_ON(nid < 0 || nid >= MAX_NUMNODES);
-	VM_WARN_ON((gfp_mask & __GFP_THISNODE) && !node_online(nid));
-
-	return __alloc_pages(gfp_mask, order, nid, NULL);
-}
-
-static inline
-struct folio *__folio_alloc_node(gfp_t gfp, unsigned int order, int nid)
-{
-	VM_BUG_ON(nid < 0 || nid >= MAX_NUMNODES);
-	VM_WARN_ON((gfp & __GFP_THISNODE) && !node_online(nid));
-
-	return __folio_alloc(gfp, order, nid, NULL);
-}
-
-/*
- * Allocate pages, preferring the node given as nid. When nid == NUMA_NO_NODE,
- * prefer the current CPU's closest node. Otherwise node must be valid and
- * online.
- */
-static inline struct page *alloc_pages_node(int nid, gfp_t gfp_mask,
+static inline struct page *alloc_pages_node(int nid, unsigned int __nocast gfp_mask,
 						unsigned int order)
 {
-	if (nid == NUMA_NO_NODE)
-		nid = numa_mem_id();
+	if (unlikely(order >= MAX_ORDER))
+		return NULL;
 
-	return __alloc_pages_node(nid, gfp_mask, order);
+	return __alloc_pages(gfp_mask, order,
+		NODE_DATA(nid)->node_zonelists + (gfp_mask & GFP_ZONEMASK));
 }
 
 #ifdef CONFIG_NUMA
-struct page *alloc_pages(gfp_t gfp, unsigned int order);
-struct folio *folio_alloc(gfp_t gfp, unsigned order);
-struct folio *vma_alloc_folio(gfp_t gfp, int order, struct vm_area_struct *vma,
-		unsigned long addr, bool hugepage);
+extern struct page *alloc_pages_current(unsigned int __nocast gfp_mask, unsigned order);
+
+static inline struct page *
+alloc_pages(unsigned int __nocast gfp_mask, unsigned int order)
+{
+	if (unlikely(order >= MAX_ORDER))
+		return NULL;
+
+	return alloc_pages_current(gfp_mask, order);
+}
+extern struct page *alloc_page_vma(unsigned __nocast gfp_mask,
+			struct vm_area_struct *vma, unsigned long addr);
 #else
-static inline struct page *alloc_pages(gfp_t gfp_mask, unsigned int order)
-{
-	return alloc_pages_node(numa_node_id(), gfp_mask, order);
-}
-static inline struct folio *folio_alloc(gfp_t gfp, unsigned int order)
-{
-	return __folio_alloc_node(gfp, order, numa_node_id());
-}
-#define vma_alloc_folio(gfp, order, vma, addr, hugepage)		\
-	folio_alloc(gfp, order)
+#define alloc_pages(gfp_mask, order) \
+		alloc_pages_node(numa_node_id(), gfp_mask, order)
+#define alloc_page_vma(gfp_mask, vma, addr) alloc_pages(gfp_mask, 0)
 #endif
 #define alloc_page(gfp_mask) alloc_pages(gfp_mask, 0)
-static inline struct page *alloc_page_vma(gfp_t gfp,
-		struct vm_area_struct *vma, unsigned long addr)
-{
-	struct folio *folio = vma_alloc_folio(gfp, 0, vma, addr, false);
 
-	return &folio->page;
-}
-
-extern unsigned long __get_free_pages(gfp_t gfp_mask, unsigned int order);
-extern unsigned long get_zeroed_page(gfp_t gfp_mask);
-
-void *alloc_pages_exact(size_t size, gfp_t gfp_mask) __alloc_size(1);
-void free_pages_exact(void *virt, size_t size);
-__meminit void *alloc_pages_exact_nid(int nid, size_t size, gfp_t gfp_mask) __alloc_size(2);
+extern unsigned long FASTCALL(__get_free_pages(unsigned int __nocast gfp_mask, unsigned int order));
+extern unsigned long FASTCALL(get_zeroed_page(unsigned int __nocast gfp_mask));
 
 #define __get_free_page(gfp_mask) \
-		__get_free_pages((gfp_mask), 0)
+		__get_free_pages((gfp_mask),0)
 
 #define __get_dma_pages(gfp_mask, order) \
-		__get_free_pages((gfp_mask) | GFP_DMA, (order))
+		__get_free_pages((gfp_mask) | GFP_DMA,(order))
 
-extern void __free_pages(struct page *page, unsigned int order);
-extern void free_pages(unsigned long addr, unsigned int order);
-
-struct page_frag_cache;
-extern void __page_frag_cache_drain(struct page *page, unsigned int count);
-extern void *page_frag_alloc_align(struct page_frag_cache *nc,
-				   unsigned int fragsz, gfp_t gfp_mask,
-				   unsigned int align_mask);
-
-static inline void *page_frag_alloc(struct page_frag_cache *nc,
-			     unsigned int fragsz, gfp_t gfp_mask)
-{
-	return page_frag_alloc_align(nc, fragsz, gfp_mask, ~0u);
-}
-
-extern void page_frag_free(void *addr);
+extern void FASTCALL(__free_pages(struct page *page, unsigned int order));
+extern void FASTCALL(free_pages(unsigned long addr, unsigned int order));
+extern void FASTCALL(free_hot_page(struct page *page));
+extern void FASTCALL(free_cold_page(struct page *page));
 
 #define __free_page(page) __free_pages((page), 0)
-#define free_page(addr) free_pages((addr), 0)
+#define free_page(addr) free_pages((addr),0)
 
 void page_alloc_init(void);
-void drain_zone_pages(struct zone *zone, struct per_cpu_pages *pcp);
-void drain_all_pages(struct zone *zone);
-void drain_local_pages(struct zone *zone);
-
-void page_alloc_init_late(void);
-
-/*
- * gfp_allowed_mask is set to GFP_BOOT_MASK during early boot to restrict what
- * GFP flags are used before interrupts are enabled. Once interrupts are
- * enabled, it is set to __GFP_BITS_MASK while the system is running. During
- * hibernation, it is used by PM to avoid I/O during memory allocation while
- * devices are suspended.
- */
-extern gfp_t gfp_allowed_mask;
-
-/* Returns true if the gfp_mask allows use of ALLOC_NO_WATERMARK */
-bool gfp_pfmemalloc_allowed(gfp_t gfp_mask);
-
-extern void pm_restrict_gfp_mask(void);
-extern void pm_restore_gfp_mask(void);
-
-extern gfp_t vma_thp_gfp_mask(struct vm_area_struct *vma);
-
-#ifdef CONFIG_PM_SLEEP
-extern bool pm_suspended_storage(void);
-#else
-static inline bool pm_suspended_storage(void)
-{
-	return false;
-}
-#endif /* CONFIG_PM_SLEEP */
-
-#ifdef CONFIG_CONTIG_ALLOC
-/* The below functions must be run on a range from a single zone. */
-extern int alloc_contig_range(unsigned long start, unsigned long end,
-			      unsigned migratetype, gfp_t gfp_mask);
-extern struct page *alloc_contig_pages(unsigned long nr_pages, gfp_t gfp_mask,
-				       int nid, nodemask_t *nodemask);
-#endif
-void free_contig_range(unsigned long pfn, unsigned long nr_pages);
-
-#ifdef CONFIG_CMA
-/* CMA stuff */
-extern void init_cma_reserved_pageblock(struct page *page);
-#endif
 
 #endif /* __LINUX_GFP_H */

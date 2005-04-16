@@ -1,35 +1,28 @@
-// SPDX-License-Identifier: GPL-2.0-only
-/* radio-trust.c - Trust FM Radio card driver for Linux 2.2
+/* radio-trust.c - Trust FM Radio card driver for Linux 2.2 
  * by Eric Lammerts <eric@scintilla.utwente.nl>
  *
  * Based on radio-aztech.c. Original notes:
  *
- * Adapted to support the Video for Linux API by
+ * Adapted to support the Video for Linux API by 
  * Russell Kroll <rkroll@exploits.org>.  Based on original tuner code by:
  *
  * Quay Ly
  * Donald Song
- * Jason Lewis      (jlewis@twilight.vtc.vsc.edu)
+ * Jason Lewis      (jlewis@twilight.vtc.vsc.edu) 
  * Scott McGrath    (smcgrath@twilight.vtc.vsc.edu)
  * William McGrath  (wmcgrath@twilight.vtc.vsc.edu)
  *
- * Converted to V4L2 API by Mauro Carvalho Chehab <mchehab@kernel.org>
+ * The basis for this code may be found at http://bigbang.vtc.vsc.edu/fmradio/
  */
 
+#include <stdarg.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/ioport.h>
-#include <linux/videodev2.h>
-#include <linux/io.h>
-#include <linux/slab.h>
-#include <media/v4l2-device.h>
-#include <media/v4l2-ioctl.h>
-#include "radio-isa.h"
-
-MODULE_AUTHOR("Eric Lammerts, Russell Kroll, Quay Lu, Donald Song, Jason Lewis, Scott McGrath, William McGrath");
-MODULE_DESCRIPTION("A driver for the Trust FM Radio card.");
-MODULE_LICENSE("GPL");
-MODULE_VERSION("0.1.99");
+#include <asm/io.h>
+#include <asm/uaccess.h>
+#include <linux/videodev.h>
+#include <linux/config.h>	/* CONFIG_RADIO_TRUST_PORT 	*/
 
 /* acceptable ports: 0x350 (JP3 shorted), 0x358 (JP3 open) */
 
@@ -37,40 +30,27 @@ MODULE_VERSION("0.1.99");
 #define CONFIG_RADIO_TRUST_PORT -1
 #endif
 
-#define TRUST_MAX 2
-
-static int io[TRUST_MAX] = { [0] = CONFIG_RADIO_TRUST_PORT,
-			      [1 ... (TRUST_MAX - 1)] = -1 };
-static int radio_nr[TRUST_MAX] = { [0 ... (TRUST_MAX - 1)] = -1 };
-
-module_param_array(io, int, NULL, 0444);
-MODULE_PARM_DESC(io, "I/O addresses of the Trust FM Radio card (0x350 or 0x358)");
-module_param_array(radio_nr, int, NULL, 0444);
-MODULE_PARM_DESC(radio_nr, "Radio device numbers");
-
-struct trust {
-	struct radio_isa_card isa;
-	int ioval;
-};
-
-static struct radio_isa_card *trust_alloc(void)
-{
-	struct trust *tr = kzalloc(sizeof(*tr), GFP_KERNEL);
-
-	return tr ? &tr->isa : NULL;
-}
+static int io = CONFIG_RADIO_TRUST_PORT; 
+static int radio_nr = -1;
+static int ioval = 0xf;
+static __u16 curvol;
+static __u16 curbass;
+static __u16 curtreble;
+static unsigned long curfreq;
+static int curstereo;
+static int curmute;
 
 /* i2c addresses */
 #define TDA7318_ADDR 0x88
 #define TSA6060T_ADDR 0xc4
 
-#define TR_DELAY do { inb(tr->isa.io); inb(tr->isa.io); inb(tr->isa.io); } while (0)
-#define TR_SET_SCL outb(tr->ioval |= 2, tr->isa.io)
-#define TR_CLR_SCL outb(tr->ioval &= 0xfd, tr->isa.io)
-#define TR_SET_SDA outb(tr->ioval |= 1, tr->isa.io)
-#define TR_CLR_SDA outb(tr->ioval &= 0xfe, tr->isa.io)
+#define TR_DELAY do { inb(io); inb(io); inb(io); } while(0)
+#define TR_SET_SCL outb(ioval |= 2, io)
+#define TR_CLR_SCL outb(ioval &= 0xfd, io)
+#define TR_SET_SDA outb(ioval |= 1, io)
+#define TR_CLR_SDA outb(ioval &= 0xfe, io)
 
-static void write_i2c(struct trust *tr, int n, ...)
+static void write_i2c(int n, ...)
 {
 	unsigned char val, mask;
 	va_list args;
@@ -85,10 +65,10 @@ static void write_i2c(struct trust *tr, int n, ...)
 	TR_CLR_SCL;
 	TR_DELAY;
 
-	for (; n; n--) {
+	for(; n; n--) {
 		val = va_arg(args, unsigned);
-		for (mask = 0x80; mask; mask >>= 1) {
-			if (val & mask)
+		for(mask = 0x80; mask; mask >>= 1) {
+			if(val & mask)
 				TR_SET_SDA;
 			else
 				TR_CLR_SDA;
@@ -116,128 +96,225 @@ static void write_i2c(struct trust *tr, int n, ...)
 	va_end(args);
 }
 
-static int trust_s_mute_volume(struct radio_isa_card *isa, bool mute, int vol)
+static void tr_setvol(__u16 vol)
 {
-	struct trust *tr = container_of(isa, struct trust, isa);
-
-	tr->ioval = (tr->ioval & 0xf7) | (mute << 3);
-	outb(tr->ioval, isa->io);
-	write_i2c(tr, 2, TDA7318_ADDR, vol ^ 0x1f);
-	return 0;
-}
-
-static int trust_s_stereo(struct radio_isa_card *isa, bool stereo)
-{
-	struct trust *tr = container_of(isa, struct trust, isa);
-
-	tr->ioval = (tr->ioval & 0xfb) | (!stereo << 2);
-	outb(tr->ioval, isa->io);
-	return 0;
-}
-
-static u32 trust_g_signal(struct radio_isa_card *isa)
-{
-	int i, v;
-
-	for (i = 0, v = 0; i < 100; i++)
-		v |= inb(isa->io);
-	return (v & 1) ? 0 : 0xffff;
-}
-
-static int trust_s_frequency(struct radio_isa_card *isa, u32 freq)
-{
-	struct trust *tr = container_of(isa, struct trust, isa);
-
-	freq /= 160;	/* Convert to 10 kHz units	*/
-	freq += 1070;	/* Add 10.7 MHz IF		*/
-	write_i2c(tr, 5, TSA6060T_ADDR, (freq << 1) | 1,
-			freq >> 7, 0x60 | ((freq >> 15) & 1), 0);
-	return 0;
+	curvol = vol / 2048;
+	write_i2c(2, TDA7318_ADDR, curvol ^ 0x1f);
 }
 
 static int basstreble2chip[15] = {
 	0, 1, 2, 3, 4, 5, 6, 7, 14, 13, 12, 11, 10, 9, 8
 };
 
-static int trust_s_ctrl(struct v4l2_ctrl *ctrl)
+static void tr_setbass(__u16 bass)
 {
-	struct radio_isa_card *isa =
-		container_of(ctrl->handler, struct radio_isa_card, hdl);
-	struct trust *tr = container_of(isa, struct trust, isa);
+	curbass = bass / 4370;
+	write_i2c(2, TDA7318_ADDR, 0x60 | basstreble2chip[curbass]);
+}
 
-	switch (ctrl->id) {
-	case V4L2_CID_AUDIO_BASS:
-		write_i2c(tr, 2, TDA7318_ADDR, 0x60 | basstreble2chip[ctrl->val]);
-		return 0;
-	case V4L2_CID_AUDIO_TREBLE:
-		write_i2c(tr, 2, TDA7318_ADDR, 0x70 | basstreble2chip[ctrl->val]);
-		return 0;
+static void tr_settreble(__u16 treble)
+{
+	curtreble = treble / 4370;
+	write_i2c(2, TDA7318_ADDR, 0x70 | basstreble2chip[curtreble]);
+}
+
+static void tr_setstereo(int stereo)
+{
+	curstereo = !!stereo;
+	ioval = (ioval & 0xfb) | (!curstereo << 2);
+	outb(ioval, io);
+}
+
+static void tr_setmute(int mute)
+{
+	curmute = !!mute;
+	ioval = (ioval & 0xf7) | (curmute << 3);
+	outb(ioval, io);
+}
+
+static int tr_getsigstr(void)
+{
+	int i, v;
+	
+	for(i = 0, v = 0; i < 100; i++) v |= inb(io);
+	return (v & 1)? 0 : 0xffff;
+}
+
+static int tr_getstereo(void)
+{
+	/* don't know how to determine it, just return the setting */
+	return curstereo;
+}
+
+static void tr_setfreq(unsigned long f)
+{
+	f /= 160;	/* Convert to 10 kHz units	*/
+	f += 1070;	/* Add 10.7 MHz IF			*/
+
+	write_i2c(5, TSA6060T_ADDR, (f << 1) | 1, f >> 7, 0x60 | ((f >> 15) & 1), 0);
+}
+
+static int tr_do_ioctl(struct inode *inode, struct file *file,
+		       unsigned int cmd, void *arg)
+{
+	switch(cmd)
+	{
+		case VIDIOCGCAP:
+		{
+			struct video_capability *v = arg;
+
+			memset(v,0,sizeof(*v));
+			v->type=VID_TYPE_TUNER;
+			v->channels=1;
+			v->audios=1;
+			strcpy(v->name, "Trust FM Radio");
+
+			return 0;
+		}
+		case VIDIOCGTUNER:
+		{
+			struct video_tuner *v = arg;
+
+			if(v->tuner)	/* Only 1 tuner */ 
+				return -EINVAL;
+
+			v->rangelow = 87500 * 16;
+			v->rangehigh = 108000 * 16;
+			v->flags = VIDEO_TUNER_LOW;
+			v->mode = VIDEO_MODE_AUTO;
+
+			v->signal = tr_getsigstr();
+			if(tr_getstereo())
+				v->flags |= VIDEO_TUNER_STEREO_ON;
+
+			strcpy(v->name, "FM");
+
+			return 0;
+		}
+		case VIDIOCSTUNER:
+		{
+			struct video_tuner *v = arg;
+			if(v->tuner != 0)
+				return -EINVAL;
+			return 0;
+		}
+		case VIDIOCGFREQ:
+		{
+			unsigned long *freq = arg;
+			*freq = curfreq;
+			return 0;
+		}
+		case VIDIOCSFREQ:
+		{
+			unsigned long *freq = arg;
+			tr_setfreq(*freq);
+			return 0;
+		}
+		case VIDIOCGAUDIO:
+		{	
+			struct video_audio *v = arg;
+
+			memset(v,0, sizeof(*v));
+			v->flags = VIDEO_AUDIO_MUTABLE | VIDEO_AUDIO_VOLUME |
+			          VIDEO_AUDIO_BASS | VIDEO_AUDIO_TREBLE;
+			v->mode = curstereo? VIDEO_SOUND_STEREO : VIDEO_SOUND_MONO;
+			v->volume = curvol * 2048;
+			v->step = 2048;
+			v->bass = curbass * 4370;
+			v->treble = curtreble * 4370;
+			
+			strcpy(v->name, "Trust FM Radio");
+			return 0;			
+		}
+		case VIDIOCSAUDIO:
+		{
+			struct video_audio *v = arg;
+
+			if(v->audio) 
+				return -EINVAL;
+			tr_setvol(v->volume);					
+			tr_setbass(v->bass);
+			tr_settreble(v->treble);
+			tr_setstereo(v->mode & VIDEO_SOUND_STEREO);
+			tr_setmute(v->flags & VIDEO_AUDIO_MUTE);
+			return 0;
+		}
+		default:
+			return -ENOIOCTLCMD;
 	}
-	return -EINVAL;
 }
 
-static const struct v4l2_ctrl_ops trust_ctrl_ops = {
-	.s_ctrl = trust_s_ctrl,
-};
-
-static int trust_initialize(struct radio_isa_card *isa)
+static int tr_ioctl(struct inode *inode, struct file *file,
+		    unsigned int cmd, unsigned long arg)
 {
-	struct trust *tr = container_of(isa, struct trust, isa);
-
-	tr->ioval = 0xf;
-	write_i2c(tr, 2, TDA7318_ADDR, 0x80);	/* speaker att. LF = 0 dB */
-	write_i2c(tr, 2, TDA7318_ADDR, 0xa0);	/* speaker att. RF = 0 dB */
-	write_i2c(tr, 2, TDA7318_ADDR, 0xc0);	/* speaker att. LR = 0 dB */
-	write_i2c(tr, 2, TDA7318_ADDR, 0xe0);	/* speaker att. RR = 0 dB */
-	write_i2c(tr, 2, TDA7318_ADDR, 0x40);	/* stereo 1 input, gain = 18.75 dB */
-
-	v4l2_ctrl_new_std(&isa->hdl, &trust_ctrl_ops,
-				V4L2_CID_AUDIO_BASS, 0, 15, 1, 8);
-	v4l2_ctrl_new_std(&isa->hdl, &trust_ctrl_ops,
-				V4L2_CID_AUDIO_TREBLE, 0, 15, 1, 8);
-	return isa->hdl.error;
+	return video_usercopy(inode, file, cmd, arg, tr_do_ioctl);
 }
 
-static const struct radio_isa_ops trust_ops = {
-	.init = trust_initialize,
-	.alloc = trust_alloc,
-	.s_mute_volume = trust_s_mute_volume,
-	.s_frequency = trust_s_frequency,
-	.s_stereo = trust_s_stereo,
-	.g_signal = trust_g_signal,
+static struct file_operations trust_fops = {
+	.owner		= THIS_MODULE,
+	.open           = video_exclusive_open,
+	.release        = video_exclusive_release,
+	.ioctl		= tr_ioctl,
+	.llseek         = no_llseek,
 };
 
-static const int trust_ioports[] = { 0x350, 0x358 };
-
-static struct radio_isa_driver trust_driver = {
-	.driver = {
-		.match		= radio_isa_match,
-		.probe		= radio_isa_probe,
-		.remove		= radio_isa_remove,
-		.driver		= {
-			.name	= "radio-trust",
-		},
-	},
-	.io_params = io,
-	.radio_nr_params = radio_nr,
-	.io_ports = trust_ioports,
-	.num_of_io_ports = ARRAY_SIZE(trust_ioports),
-	.region_size = 2,
-	.card = "Trust FM Radio",
-	.ops = &trust_ops,
-	.has_stereo = true,
-	.max_volume = 31,
+static struct video_device trust_radio=
+{
+	.owner		= THIS_MODULE,
+	.name		= "Trust FM Radio",
+	.type		= VID_TYPE_TUNER,
+	.hardware	= VID_HARDWARE_TRUST,
+	.fops           = &trust_fops,
 };
 
 static int __init trust_init(void)
 {
-	return isa_register_driver(&trust_driver.driver, TRUST_MAX);
+	if(io == -1) {
+		printk(KERN_ERR "You must set an I/O address with io=0x???\n");
+		return -EINVAL;
+	}
+	if(!request_region(io, 2, "Trust FM Radio")) {
+		printk(KERN_ERR "trust: port 0x%x already in use\n", io);
+		return -EBUSY;
+	}
+	if(video_register_device(&trust_radio, VFL_TYPE_RADIO, radio_nr)==-1)
+	{
+		release_region(io, 2);
+		return -EINVAL;
+	}
+
+	printk(KERN_INFO "Trust FM Radio card driver v1.0.\n");
+
+	write_i2c(2, TDA7318_ADDR, 0x80);	/* speaker att. LF = 0 dB */
+	write_i2c(2, TDA7318_ADDR, 0xa0);	/* speaker att. RF = 0 dB */
+	write_i2c(2, TDA7318_ADDR, 0xc0);	/* speaker att. LR = 0 dB */
+	write_i2c(2, TDA7318_ADDR, 0xe0);	/* speaker att. RR = 0 dB */
+	write_i2c(2, TDA7318_ADDR, 0x40);	/* stereo 1 input, gain = 18.75 dB */
+
+	tr_setvol(0x8000);					
+	tr_setbass(0x8000);
+	tr_settreble(0x8000);
+	tr_setstereo(1);
+
+	/* mute card - prevents noisy bootups */
+	tr_setmute(1);
+
+	return 0;
 }
 
-static void __exit trust_exit(void)
+MODULE_AUTHOR("Eric Lammerts, Russell Kroll, Quay Lu, Donald Song, Jason Lewis, Scott McGrath, William McGrath");
+MODULE_DESCRIPTION("A driver for the Trust FM Radio card.");
+MODULE_LICENSE("GPL");
+
+module_param(io, int, 0);
+MODULE_PARM_DESC(io, "I/O address of the Trust FM Radio card (0x350 or 0x358)");
+module_param(radio_nr, int, 0);
+
+static void __exit cleanup_trust_module(void)
 {
-	isa_unregister_driver(&trust_driver.driver);
+	video_unregister_device(&trust_radio);
+	release_region(io, 2);
 }
 
 module_init(trust_init);
-module_exit(trust_exit);
+module_exit(cleanup_trust_module);

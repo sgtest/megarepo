@@ -7,17 +7,15 @@
  * Ralf Baechle or David S. Miller (sorry guys, i'm really not sure)
  *
  * Copyright (C) 2001 by Ladislav Michl
- * Copyright (C) 2003, 06 Ralf Baechle (ralf@linux-mips.org)
+ * Copyright (C) 2003 Ralf Baechle (ralf@linux-mips.org)
  */
 #include <linux/bcd.h>
-#include <linux/i8253.h>
+#include <linux/ds1286.h>
 #include <linux/init.h>
-#include <linux/irq.h>
 #include <linux/kernel.h>
 #include <linux/interrupt.h>
 #include <linux/kernel_stat.h>
 #include <linux/time.h>
-#include <linux/ftrace.h>
 
 #include <asm/cpu.h>
 #include <asm/mipsregs.h>
@@ -29,10 +27,67 @@
 #include <asm/sgi/hpc3.h>
 #include <asm/sgi/ip22.h>
 
+/*
+ * note that mktime uses month from 1 to 12 while to_tm
+ * uses 0 to 11.
+ */
+static unsigned long indy_rtc_get_time(void)
+{
+	unsigned int yrs, mon, day, hrs, min, sec;
+	unsigned int save_control;
+
+	save_control = hpc3c0->rtcregs[RTC_CMD] & 0xff;
+	hpc3c0->rtcregs[RTC_CMD] = save_control | RTC_TE;
+
+	sec = BCD2BIN(hpc3c0->rtcregs[RTC_SECONDS] & 0xff);
+	min = BCD2BIN(hpc3c0->rtcregs[RTC_MINUTES] & 0xff);
+	hrs = BCD2BIN(hpc3c0->rtcregs[RTC_HOURS] & 0x3f);
+	day = BCD2BIN(hpc3c0->rtcregs[RTC_DATE] & 0xff);
+	mon = BCD2BIN(hpc3c0->rtcregs[RTC_MONTH] & 0x1f);
+	yrs = BCD2BIN(hpc3c0->rtcregs[RTC_YEAR] & 0xff);
+
+	hpc3c0->rtcregs[RTC_CMD] = save_control;
+
+	if (yrs < 45)
+		yrs += 30;
+	if ((yrs += 40) < 70)
+		yrs += 100;
+
+	return mktime(yrs + 1900, mon, day, hrs, min, sec);
+}
+
+static int indy_rtc_set_time(unsigned long tim)
+{
+	struct rtc_time tm;
+	unsigned int save_control;
+
+	to_tm(tim, &tm);
+
+	tm.tm_mon += 1;		/* tm_mon starts at zero */
+	tm.tm_year -= 1940;
+	if (tm.tm_year >= 100)
+		tm.tm_year -= 100;
+
+	save_control = hpc3c0->rtcregs[RTC_CMD] & 0xff;
+	hpc3c0->rtcregs[RTC_CMD] = save_control | RTC_TE;
+
+	hpc3c0->rtcregs[RTC_YEAR] = BIN2BCD(tm.tm_sec);
+	hpc3c0->rtcregs[RTC_MONTH] = BIN2BCD(tm.tm_mon);
+	hpc3c0->rtcregs[RTC_DATE] = BIN2BCD(tm.tm_mday);
+	hpc3c0->rtcregs[RTC_HOURS] = BIN2BCD(tm.tm_hour);
+	hpc3c0->rtcregs[RTC_MINUTES] = BIN2BCD(tm.tm_min);
+	hpc3c0->rtcregs[RTC_SECONDS] = BIN2BCD(tm.tm_sec);
+	hpc3c0->rtcregs[RTC_HUNDREDTH_SECOND] = 0;
+
+	hpc3c0->rtcregs[RTC_CMD] = save_control;
+
+	return 0;
+}
+
 static unsigned long dosample(void)
 {
 	u32 ct0, ct1;
-	u8 msb;
+	volatile u8 msb, lsb;
 
 	/* Start the counter. */
 	sgint->tcword = (SGINT_TCWORD_CNT2 | SGINT_TCWORD_CALL |
@@ -45,33 +100,33 @@ static unsigned long dosample(void)
 
 	/* Latch and spin until top byte of counter2 is zero */
 	do {
-		writeb(SGINT_TCWORD_CNT2 | SGINT_TCWORD_CLAT, &sgint->tcword);
-		(void) readb(&sgint->tcnt2);
-		msb = readb(&sgint->tcnt2);
+		sgint->tcword = SGINT_TCWORD_CNT2 | SGINT_TCWORD_CLAT;
+		lsb = sgint->tcnt2;
+		msb = sgint->tcnt2;
 		ct1 = read_c0_count();
 	} while (msb);
 
 	/* Stop the counter. */
-	writeb(SGINT_TCWORD_CNT2 | SGINT_TCWORD_CALL | SGINT_TCWORD_MSWST,
-	       &sgint->tcword);
+	sgint->tcword = (SGINT_TCWORD_CNT2 | SGINT_TCWORD_CALL |
+			 SGINT_TCWORD_MSWST);
 	/*
 	 * Return the difference, this is how far the r4k counter increments
 	 * for every 1/HZ seconds. We round off the nearest 1 MHz of master
 	 * clock (= 1000000 / HZ / 2).
 	 */
-
+	/*return (ct1 - ct0 + (500000/HZ/2)) / (500000/HZ) * (500000/HZ);*/
 	return (ct1 - ct0) / (500000/HZ) * (500000/HZ);
 }
 
 /*
  * Here we need to calibrate the cycle counter to at least be close.
  */
-__init void plat_time_init(void)
+static __init void indy_time_init(void)
 {
 	unsigned long r4k_ticks[3];
 	unsigned long r4k_tick;
 
-	/*
+	/* 
 	 * Figure out the r4k offset, the algorithm is very simple and works in
 	 * _all_ cases as long as the 8254 counter register itself works ok (as
 	 * an interrupt driving timer it does not because of bug, this is why
@@ -110,22 +165,50 @@ __init void plat_time_init(void)
 		(int) (r4k_tick % (500000 / HZ)));
 
 	mips_hpt_frequency = r4k_tick * HZ;
-
-	if (ip22_is_fullhouse())
-		setup_pit_timer();
 }
 
 /* Generic SGI handler for (spurious) 8254 interrupts */
-void __irq_entry indy_8254timer_irq(void)
+void indy_8254timer_irq(struct pt_regs *regs)
 {
 	int irq = SGI_8254_0_IRQ;
 	ULONG cnt;
 	char c;
 
 	irq_enter();
-	kstat_incr_irq_this_cpu(irq);
+	kstat_this_cpu.irqs[irq]++;
 	printk(KERN_ALERT "Oops, got 8254 interrupt.\n");
 	ArcRead(0, &c, 1, &cnt);
 	ArcEnterInteractiveMode();
 	irq_exit();
+}
+
+void indy_r4k_timer_interrupt(struct pt_regs *regs)
+{
+	int irq = SGI_TIMER_IRQ;
+
+	irq_enter();
+	kstat_this_cpu.irqs[irq]++;
+	timer_interrupt(irq, NULL, regs);
+	irq_exit();
+}
+
+extern int setup_irq(unsigned int irq, struct irqaction *irqaction);
+
+static void indy_timer_setup(struct irqaction *irq)
+{
+	/* over-write the handler, we use our own way */
+	irq->handler = no_action;
+
+	/* setup irqaction */
+	setup_irq(SGI_TIMER_IRQ, irq);
+}
+
+void __init ip22_time_init(void)
+{
+	/* setup hookup functions */
+	rtc_get_time = indy_rtc_get_time;
+	rtc_set_time = indy_rtc_set_time;
+
+	board_time_init = indy_time_init;
+	board_timer_setup = indy_timer_setup;
 }

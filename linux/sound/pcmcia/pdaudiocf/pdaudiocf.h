@@ -1,16 +1,31 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Driver for Sound Cors PDAudioCF soundcard
  *
- * Copyright (c) 2003 by Jaroslav Kysela <perex@perex.cz>
+ * Copyright (c) 2003 by Jaroslav Kysela <perex@suse.cz>
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  */
 
 #ifndef __PDAUDIOCF_H
 #define __PDAUDIOCF_H
 
 #include <sound/pcm.h>
-#include <linux/io.h>
+#include <asm/io.h>
 #include <linux/interrupt.h>
+#include <pcmcia/cs_types.h>
+#include <pcmcia/cs.h>
 #include <pcmcia/cistpl.h>
 #include <pcmcia/ds.h>
 
@@ -68,24 +83,25 @@
 #define PDAUDIOCF_STAT_IS_CONFIGURED (1<<1)
 #define PDAUDIOCF_STAT_IS_SUSPENDED (1<<2)
 
-struct snd_pdacf {
-	struct snd_card *card;
+typedef struct {
+	snd_card_t *card;
 	int index;
 
 	unsigned long port;
 	int irq;
 
-	struct mutex reg_lock;
+	spinlock_t reg_lock;
 	unsigned short regmap[8];
 	unsigned short suspend_reg_scr;
+	struct tasklet_struct tq;
 
 	spinlock_t ak4117_lock;
-	struct ak4117 *ak4117;
+	ak4117_t *ak4117;
 
 	unsigned int chip_status;
 
-	struct snd_pcm *pcm;
-	struct snd_pcm_substream *pcm_substream;
+	snd_pcm_t *pcm;
+	snd_pcm_substream_t *pcm_substream;
 	unsigned int pcm_running: 1;
 	unsigned int pcm_channels;
 	unsigned int pcm_swab;
@@ -100,29 +116,30 @@ struct snd_pdacf {
 	void *pcm_area;
 	
 	/* pcmcia stuff */
-	struct pcmcia_device	*p_dev;
-};
+	dev_link_t link;
+	dev_node_t node;
+} pdacf_t;
 
-static inline void pdacf_reg_write(struct snd_pdacf *chip, unsigned char reg, unsigned short val)
+static inline void pdacf_reg_write(pdacf_t *chip, unsigned char reg, unsigned short val)
 {
 	outw(chip->regmap[reg>>1] = val, chip->port + reg);
 }
 
-static inline unsigned short pdacf_reg_read(struct snd_pdacf *chip, unsigned char reg)
+static inline unsigned short pdacf_reg_read(pdacf_t *chip, unsigned char reg)
 {
 	return inw(chip->port + reg);
 }
 
-struct snd_pdacf *snd_pdacf_create(struct snd_card *card);
-int snd_pdacf_ak4117_create(struct snd_pdacf *pdacf);
-void snd_pdacf_powerdown(struct snd_pdacf *chip);
+pdacf_t *snd_pdacf_create(snd_card_t *card);
+int snd_pdacf_ak4117_create(pdacf_t *pdacf);
+void snd_pdacf_powerdown(pdacf_t *chip);
 #ifdef CONFIG_PM
-int snd_pdacf_suspend(struct snd_pdacf *chip);
-int snd_pdacf_resume(struct snd_pdacf *chip);
+int snd_pdacf_suspend(snd_card_t *card, pm_message_t state);
+int snd_pdacf_resume(snd_card_t *card);
 #endif
-int snd_pdacf_pcm_new(struct snd_pdacf *chip);
-irqreturn_t pdacf_interrupt(int irq, void *dev);
-irqreturn_t pdacf_threaded_irq(int irq, void *dev);
-void pdacf_reinit(struct snd_pdacf *chip, int resume);
+int snd_pdacf_pcm_new(pdacf_t *chip);
+irqreturn_t pdacf_interrupt(int irq, void *dev, struct pt_regs *regs);
+void pdacf_tasklet(unsigned long private_data);
+void pdacf_reinit(pdacf_t *chip, int resume);
 
 #endif /* __PDAUDIOCF_H */

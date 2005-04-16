@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /* net/atm/resources.h - ATM-related resources */
 
 /* Written 1995-1998 by Werner Almesberger, EPFL LRC/ICA */
@@ -7,16 +6,16 @@
 #ifndef NET_ATM_RESOURCES_H
 #define NET_ATM_RESOURCES_H
 
+#include <linux/config.h>
 #include <linux/atmdev.h>
-#include <linux/mutex.h>
 
 
 extern struct list_head atm_devs;
-extern struct mutex atm_dev_mutex;
+extern spinlock_t atm_dev_lock;
 
-int atm_getnames(void __user *buf, int __user *iobuf_len);
-int atm_dev_ioctl(unsigned int cmd, void __user *buf, int __user *sioc_len,
-		  int number, int compat);
+
+int atm_dev_ioctl(unsigned int cmd, void __user *arg);
+
 
 #ifdef CONFIG_PROC_FS
 
@@ -44,6 +43,4 @@ static inline void atm_proc_dev_deregister(struct atm_dev *dev)
 
 #endif /* CONFIG_PROC_FS */
 
-int atm_register_sysfs(struct atm_dev *adev, struct device *parent);
-void atm_unregister_sysfs(struct atm_dev *adev);
 #endif

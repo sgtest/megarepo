@@ -61,7 +61,7 @@
                         the slower the port i/o.  In some cases, setting
                         this to zero will speed up the device. (default -1)
 
-	    major	You may use this parameter to override the
+	    major	You may use this parameter to overide the
 			default major number (96) that this driver
 			will use.  Be sure to change the device
 			name as well.
@@ -109,8 +109,6 @@
 #define PT_NAME		"pt"
 #define PT_UNITS	4
 
-#include <linux/types.h>
-
 /* Here are things one can override from the insmod command.
    Most are autoprobed by paride unless set here.  Verbose is on
    by default.
@@ -143,16 +141,15 @@ static int (*drives[4])[6] = {&drive0, &drive1, &drive2, &drive3};
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/fs.h>
+#include <linux/devfs_fs_kernel.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/mtio.h>
 #include <linux/device.h>
-#include <linux/sched.h>	/* current, TASK_*, schedule_timeout() */
-#include <linux/mutex.h>
 
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
 
-module_param(verbose, int, 0);
+module_param(verbose, bool, 0);
 module_param(major, int, 0);
 module_param(name, charp, 0);
 module_param_array(drive0, int, NULL, 0);
@@ -191,9 +188,9 @@ module_param_array(drive3, int, NULL, 0);
 #define ATAPI_MODE_SENSE	0x1a
 #define ATAPI_LOG_SENSE		0x4d
 
-static DEFINE_MUTEX(pt_mutex);
 static int pt_open(struct inode *inode, struct file *file);
-static long pt_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+static int pt_ioctl(struct inode *inode, struct file *file,
+		    unsigned int cmd, unsigned long arg);
 static int pt_release(struct inode *inode, struct file *file);
 static ssize_t pt_read(struct file *filp, char __user *buf,
 		       size_t count, loff_t * ppos);
@@ -232,22 +229,20 @@ static int pt_identify(struct pt_unit *tape);
 static struct pt_unit pt[PT_UNITS];
 
 static char pt_scratch[512];	/* scratch block buffer */
-static void *par_drv;		/* reference of parport driver */
 
 /* kernel glue structures */
 
-static const struct file_operations pt_fops = {
+static struct file_operations pt_fops = {
 	.owner = THIS_MODULE,
 	.read = pt_read,
 	.write = pt_write,
-	.unlocked_ioctl = pt_ioctl,
+	.ioctl = pt_ioctl,
 	.open = pt_open,
 	.release = pt_release,
-	.llseek = noop_llseek,
 };
 
 /* sysfs class support */
-static struct class *pt_class;
+static struct class_simple *pt_class;
 
 static inline int status_reg(struct pi_adapter *pi)
 {
@@ -279,11 +274,11 @@ static int pt_wait(struct pt_unit *tape, int go, int stop, char *fun, char *msg)
 	       && (j++ < PT_SPIN))
 		udelay(PT_SPIN_DEL);
 
-	if ((r & (STAT_ERR & stop)) || (j > PT_SPIN)) {
+	if ((r & (STAT_ERR & stop)) || (j >= PT_SPIN)) {
 		s = read_reg(pi, 7);
 		e = read_reg(pi, 1);
 		p = read_reg(pi, 2);
-		if (j > PT_SPIN)
+		if (j >= PT_SPIN)
 			e |= 0x100;
 		if (fun)
 			printk("%s: %s %s: alt=0x%x stat=0x%x err=0x%x"
@@ -388,7 +383,8 @@ static int pt_atapi(struct pt_unit *tape, char *cmd, int dlen, char *buf, char *
 
 static void pt_sleep(int cs)
 {
-	schedule_timeout_interruptible(cs);
+	current->state = TASK_INTERRUPTIBLE;
+	schedule_timeout(cs);
 }
 
 static int pt_poll_dsc(struct pt_unit *tape, int pause, int tmo, char *msg)
@@ -606,12 +602,6 @@ static int pt_detect(void)
 
 	printk("%s: %s version %s, major %d\n", name, name, PT_VERSION, major);
 
-	par_drv = pi_register_driver(name);
-	if (!par_drv) {
-		pr_err("failed to register %s driver\n", name);
-		return -1;
-	}
-
 	specified = 0;
 	for (unit = 0; unit < PT_UNITS; unit++) {
 		struct pt_unit *tape = &pt[unit];
@@ -651,7 +641,6 @@ static int pt_detect(void)
 	if (found)
 		return 0;
 
-	pi_unregister_driver(par_drv);
 	printk("%s: No ATAPI tape drive detected\n", name);
 	return -1;
 }
@@ -662,11 +651,8 @@ static int pt_open(struct inode *inode, struct file *file)
 	struct pt_unit *tape = pt + unit;
 	int err;
 
-	mutex_lock(&pt_mutex);
-	if (unit >= PT_UNITS || (!tape->present)) {
-		mutex_unlock(&pt_mutex);
+	if (unit >= PT_UNITS || (!tape->present))
 		return -ENODEV;
-	}
 
 	err = -EBUSY;
 	if (!atomic_dec_and_test(&tape->available))
@@ -675,11 +661,11 @@ static int pt_open(struct inode *inode, struct file *file)
 	pt_identify(tape);
 
 	err = -ENODEV;
-	if (!(tape->flags & PT_MEDIA))
+	if (!tape->flags & PT_MEDIA)
 		goto out;
 
 	err = -EROFS;
-	if ((!(tape->flags & PT_WRITE_OK)) && (file->f_mode & FMODE_WRITE))
+	if ((!tape->flags & PT_WRITE_OK) && (file->f_mode & 2))
 		goto out;
 
 	if (!(iminor(inode) & 128))
@@ -693,16 +679,15 @@ static int pt_open(struct inode *inode, struct file *file)
 	}
 
 	file->private_data = tape;
-	mutex_unlock(&pt_mutex);
 	return 0;
 
 out:
 	atomic_inc(&tape->available);
-	mutex_unlock(&pt_mutex);
 	return err;
 }
 
-static long pt_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+static int pt_ioctl(struct inode *inode, struct file *file,
+	 unsigned int cmd, unsigned long arg)
 {
 	struct pt_unit *tape = file->private_data;
 	struct mtop __user *p = (void __user *)arg;
@@ -716,26 +701,23 @@ static long pt_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		switch (mtop.mt_op) {
 
 		case MTREW:
-			mutex_lock(&pt_mutex);
 			pt_rewind(tape);
-			mutex_unlock(&pt_mutex);
 			return 0;
 
 		case MTWEOF:
-			mutex_lock(&pt_mutex);
 			pt_write_fm(tape);
-			mutex_unlock(&pt_mutex);
 			return 0;
 
 		default:
-			/* FIXME: rate limit ?? */
-			printk(KERN_DEBUG "%s: Unimplemented mt_op %d\n", tape->name,
+			printk("%s: Unimplemented mt_op %d\n", tape->name,
 			       mtop.mt_op);
 			return -EINVAL;
 		}
 
 	default:
-		return -ENOTTY;
+		printk("%s: Unimplemented ioctl 0x%x\n", tape->name, cmd);
+		return -EINVAL;
+
 	}
 }
 
@@ -961,43 +943,58 @@ static ssize_t pt_write(struct file *filp, const char __user *buf, size_t count,
 
 static int __init pt_init(void)
 {
-	int unit;
-	int err;
+	int unit, err = 0;
 
 	if (disable) {
-		err = -EINVAL;
+		err = -1;
 		goto out;
 	}
 
 	if (pt_detect()) {
-		err = -ENODEV;
+		err = -1;
 		goto out;
 	}
 
-	err = register_chrdev(major, name, &pt_fops);
-	if (err < 0) {
+	if (register_chrdev(major, name, &pt_fops)) {
 		printk("pt_init: unable to get major number %d\n", major);
 		for (unit = 0; unit < PT_UNITS; unit++)
 			if (pt[unit].present)
 				pi_release(pt[unit].pi);
+		err = -1;
 		goto out;
 	}
-	major = err;
-	pt_class = class_create(THIS_MODULE, "pt");
+	pt_class = class_simple_create(THIS_MODULE, "pt");
 	if (IS_ERR(pt_class)) {
 		err = PTR_ERR(pt_class);
 		goto out_chrdev;
 	}
 
+	devfs_mk_dir("pt");
 	for (unit = 0; unit < PT_UNITS; unit++)
 		if (pt[unit].present) {
-			device_create(pt_class, NULL, MKDEV(major, unit), NULL,
-				      "pt%d", unit);
-			device_create(pt_class, NULL, MKDEV(major, unit + 128),
-				      NULL, "pt%dn", unit);
+			class_simple_device_add(pt_class, MKDEV(major, unit), 
+					NULL, "pt%d", unit);
+			err = devfs_mk_cdev(MKDEV(major, unit),
+				      S_IFCHR | S_IRUSR | S_IWUSR,
+				      "pt/%d", unit);
+			if (err) {
+				class_simple_device_remove(MKDEV(major, unit));
+				goto out_class;
+			}
+			class_simple_device_add(pt_class, MKDEV(major, unit + 128),
+					NULL, "pt%dn", unit);
+			err = devfs_mk_cdev(MKDEV(major, unit + 128),
+				      S_IFCHR | S_IRUSR | S_IWUSR,
+				      "pt/%dn", unit);
+			if (err) {
+				class_simple_device_remove(MKDEV(major, unit + 128));
+				goto out_class;
+			}
 		}
 	goto out;
 
+out_class:
+	class_simple_destroy(pt_class);
 out_chrdev:
 	unregister_chrdev(major, "pt");
 out:
@@ -1009,10 +1006,13 @@ static void __exit pt_exit(void)
 	int unit;
 	for (unit = 0; unit < PT_UNITS; unit++)
 		if (pt[unit].present) {
-			device_destroy(pt_class, MKDEV(major, unit));
-			device_destroy(pt_class, MKDEV(major, unit + 128));
+			class_simple_device_remove(MKDEV(major, unit));
+			devfs_remove("pt/%d", unit);
+			class_simple_device_remove(MKDEV(major, unit + 128));
+			devfs_remove("pt/%dn", unit);
 		}
-	class_destroy(pt_class);
+	class_simple_destroy(pt_class);
+	devfs_remove("pt");
 	unregister_chrdev(major, name);
 	for (unit = 0; unit < PT_UNITS; unit++)
 		if (pt[unit].present)

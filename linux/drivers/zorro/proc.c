@@ -1,5 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
+ *	$Id: proc.c,v 1.1.2.1 1998/06/07 23:21:01 geert Exp $
+ *
  *	Procfs interface for the Zorro bus.
  *
  *	Copyright (C) 1998-2003 Geert Uytterhoeven
@@ -12,25 +13,43 @@
 #include <linux/types.h>
 #include <linux/zorro.h>
 #include <linux/proc_fs.h>
-#include <linux/seq_file.h>
 #include <linux/init.h>
-#include <linux/export.h>
-
-#include <asm/byteorder.h>
-#include <linux/uaccess.h>
+#include <linux/smp_lock.h>
+#include <asm/uaccess.h>
 #include <asm/amigahw.h>
 #include <asm/setup.h>
 
 static loff_t
 proc_bus_zorro_lseek(struct file *file, loff_t off, int whence)
 {
-	return fixed_size_llseek(file, off, whence, sizeof(struct ConfigDev));
+	loff_t new = -1;
+
+	lock_kernel();
+	switch (whence) {
+	case 0:
+		new = off;
+		break;
+	case 1:
+		new = file->f_pos + off;
+		break;
+	case 2:
+		new = sizeof(struct ConfigDev) + off;
+		break;
+	}
+	if (new < 0 || new > sizeof(struct ConfigDev)) {
+		unlock_kernel();
+		return -EINVAL;
+	}
+	unlock_kernel();
+	return (file->f_pos = new);
 }
 
 static ssize_t
-proc_bus_zorro_read(struct file *file, char __user *buf, size_t nbytes, loff_t *ppos)
+proc_bus_zorro_read(struct file *file, char *buf, size_t nbytes, loff_t *ppos)
 {
-	struct zorro_dev *z = pde_data(file_inode(file));
+	struct inode *ino = file->f_dentry->d_inode;
+	struct proc_dir_entry *dp = PDE(ino);
+	struct zorro_dev *z = dp->data;
 	struct ConfigDev cd;
 	loff_t pos = *ppos;
 
@@ -44,86 +63,77 @@ proc_bus_zorro_read(struct file *file, char __user *buf, size_t nbytes, loff_t *
 	/* Construct a ConfigDev */
 	memset(&cd, 0, sizeof(cd));
 	cd.cd_Rom = z->rom;
-	cd.cd_SlotAddr = cpu_to_be16(z->slotaddr);
-	cd.cd_SlotSize = cpu_to_be16(z->slotsize);
-	cd.cd_BoardAddr = cpu_to_be32(zorro_resource_start(z));
-	cd.cd_BoardSize = cpu_to_be32(zorro_resource_len(z));
+	cd.cd_SlotAddr = z->slotaddr;
+	cd.cd_SlotSize = z->slotsize;
+	cd.cd_BoardAddr = (void *)zorro_resource_start(z);
+	cd.cd_BoardSize = zorro_resource_len(z);
 
-	if (copy_to_user(buf, (void *)&cd + pos, nbytes))
+	if (copy_to_user(buf, &cd, nbytes))
 		return -EFAULT;
 	*ppos += nbytes;
 
 	return nbytes;
 }
 
-static const struct proc_ops bus_zorro_proc_ops = {
-	.proc_lseek	= proc_bus_zorro_lseek,
-	.proc_read	= proc_bus_zorro_read,
+static struct file_operations proc_bus_zorro_operations = {
+	.llseek		= proc_bus_zorro_lseek,
+	.read		= proc_bus_zorro_read,
 };
 
-static void * zorro_seq_start(struct seq_file *m, loff_t *pos)
+static int
+get_zorro_dev_info(char *buf, char **start, off_t pos, int count)
 {
-	return (*pos < zorro_num_autocon) ? pos : NULL;
+	u_int slot;
+	off_t at = 0;
+	int len, cnt;
+
+	for (slot = cnt = 0; slot < zorro_num_autocon && count > cnt; slot++) {
+		struct zorro_dev *z = &zorro_autocon[slot];
+		len = sprintf(buf, "%02x\t%08x\t%08lx\t%08lx\t%02x\n", slot,
+			      z->id, zorro_resource_start(z),
+			      zorro_resource_len(z), z->rom.er_Type);
+		at += len;
+		if (at >= pos) {
+			if (!*start) {
+				*start = buf + (pos - (at - len));
+				cnt = at - pos;
+			} else
+				cnt += len;
+			buf += len;
+		}
+	}
+	return (count > cnt) ? cnt : count;
 }
-
-static void * zorro_seq_next(struct seq_file *m, void *v, loff_t *pos)
-{
-	(*pos)++;
-	return (*pos < zorro_num_autocon) ? pos : NULL;
-}
-
-static void zorro_seq_stop(struct seq_file *m, void *v)
-{
-}
-
-static int zorro_seq_show(struct seq_file *m, void *v)
-{
-	unsigned int slot = *(loff_t *)v;
-	struct zorro_dev *z = &zorro_autocon[slot];
-
-	seq_printf(m, "%02x\t%08x\t%08lx\t%08lx\t%02x\n", slot, z->id,
-		   (unsigned long)zorro_resource_start(z),
-		   (unsigned long)zorro_resource_len(z),
-		   z->rom.er_Type);
-	return 0;
-}
-
-static const struct seq_operations zorro_devices_seq_ops = {
-	.start = zorro_seq_start,
-	.next  = zorro_seq_next,
-	.stop  = zorro_seq_stop,
-	.show  = zorro_seq_show,
-};
 
 static struct proc_dir_entry *proc_bus_zorro_dir;
 
-static int __init zorro_proc_attach_device(unsigned int slot)
+static int __init zorro_proc_attach_device(u_int slot)
 {
 	struct proc_dir_entry *entry;
 	char name[4];
 
 	sprintf(name, "%02x", slot);
-	entry = proc_create_data(name, 0, proc_bus_zorro_dir,
-				 &bus_zorro_proc_ops,
-				 &zorro_autocon[slot]);
+	entry = create_proc_entry(name, 0, proc_bus_zorro_dir);
 	if (!entry)
 		return -ENOMEM;
-	proc_set_size(entry, sizeof(struct zorro_dev));
+	entry->proc_fops = &proc_bus_zorro_operations;
+	entry->data = &zorro_autocon[slot];
+	entry->size = sizeof(struct zorro_dev);
 	return 0;
 }
 
 static int __init zorro_proc_init(void)
 {
-	unsigned int slot;
+	u_int slot;
 
 	if (MACH_IS_AMIGA && AMIGAHW_PRESENT(ZORRO)) {
-		proc_bus_zorro_dir = proc_mkdir("bus/zorro", NULL);
-		proc_create_seq("devices", 0, proc_bus_zorro_dir,
-			    &zorro_devices_seq_ops);
+		proc_bus_zorro_dir = proc_mkdir("zorro", proc_bus);
+		create_proc_info_entry("devices", 0, proc_bus_zorro_dir,
+				       get_zorro_dev_info);
 		for (slot = 0; slot < zorro_num_autocon; slot++)
 			zorro_proc_attach_device(slot);
 	}
 	return 0;
 }
 
-device_initcall(zorro_proc_init);
+__initcall(zorro_proc_init);

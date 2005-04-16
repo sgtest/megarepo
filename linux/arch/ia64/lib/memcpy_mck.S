@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Itanium 2-optimized version of memcpy and copy_user function
  *
@@ -7,16 +6,14 @@
  *	in1:	source address
  *	in2:	number of bytes to copy
  * Output:
- *	for memcpy:    return dest
- * 	for copy_user: return 0 if success,
- *		       or number of byte NOT copied if error occurred.
+ * 	0 if success, or number of byte NOT copied if error occurred.
  *
  * Copyright (C) 2002 Intel Corp.
  * Copyright (C) 2002 Ken Chen <kenneth.w.chen@intel.com>
  */
+#include <linux/config.h>
 #include <asm/asmmacro.h>
 #include <asm/page.h>
-#include <asm/export.h>
 
 #define EK(y...) EX(y)
 
@@ -76,11 +73,8 @@ GLOBAL_ENTRY(memcpy)
 	and	r28=0x7,in0
 	and	r29=0x7,in1
 	mov	f6=f0
-	mov	retval=in0
 	br.cond.sptk .common_code
 	;;
-END(memcpy)
-EXPORT_SYMBOL(memcpy)
 GLOBAL_ENTRY(__copy_user)
 	.prologue
 // check dest alignment
@@ -89,7 +83,7 @@ GLOBAL_ENTRY(__copy_user)
 	mov	f6=f1
 	mov	saved_in0=in0	// save dest pointer
 	mov	saved_in1=in1	// save src pointer
-	mov	retval=r0	// initialize return value
+	mov	saved_in2=in2	// save len
 	;;
 .common_code:
 	cmp.gt	p15,p0=8,in2	// check for small size
@@ -97,7 +91,7 @@ GLOBAL_ENTRY(__copy_user)
 	cmp.ne	p14,p0=0,r29	// check src alignment
 	add	src0=0,in1
 	sub	r30=8,r28	// for .align_dest
-	mov	saved_in2=in2	// save len
+	mov	retval=r0	// initialize return value
 	;;
 	add	dst0=0,in0
 	add	dst1=1,in0	// dest odd index
@@ -306,7 +300,7 @@ EK(.ex_handler,	(p[D])	st8 [dst1] = t15, 4*8)
 	add	src_pre_mem=0,src0	// prefetch src pointer
 	add	dst_pre_mem=0,dst0	// prefetch dest pointer
 	and	src0=-8,src0		// 1st src pointer
-(p7)	mov	ar.lc = cnt
+(p7)	mov	ar.lc = r21
 (p8)	mov	ar.lc = r0
 	;;
 	TEXT_ALIGN(32)
@@ -530,6 +524,7 @@ EK(.ex_handler,  (p17)	st8	[dst1]=r39,8);						\
 #undef B
 #undef C
 #undef D
+END(memcpy)
 
 /*
  * Due to lack of local tag support in gcc 2.x assembler, it is not clear which
@@ -556,6 +551,9 @@ EK(.ex_handler,  (p17)	st8	[dst1]=r39,8);						\
 #define C	r21
 #define D	r22
 #define F	r28
+
+#define memset_arg0	r32
+#define memset_arg2	r33
 
 #define saved_retval	loc0
 #define saved_rtlink	loc1
@@ -620,22 +618,22 @@ EK(.ex_handler,  (p17)	st8	[dst1]=r39,8);						\
  * 	(faulting_addr - orig_dst)	-> len to faulting st address
  * B =	(cur_dst - orig_dst)		-> len copied so far
  * C =	A - B				-> len need to be copied
- * D =	orig_len - A			-> len need to be left along
+ * D =	orig_len - A			-> len need to be zeroed
  */
 (p6)	sub	A = F, saved_in0
 (p7)	sub	A = F, saved_in1
 	clrrrb
 	;;
 	alloc	saved_pfs_stack=ar.pfs,3,3,3,0
-	cmp.lt	p8,p0=A,r0
 	sub	B = dst0, saved_in0	// how many byte copied so far
-	;;
-(p8)	mov	A = 0;			// A shouldn't be negative, cap it
 	;;
 	sub	C = A, B
 	sub	D = saved_in2, A
 	;;
 	cmp.gt	p8,p0=C,r0		// more than 1 byte?
+	add	memset_arg0=saved_in0, A
+(p6)	mov	memset_arg2=0		// copy_to_user should not call memset
+(p7)	mov	memset_arg2=D		// copy_from_user need to have kbuf zeroed
 	mov	r8=0
 	mov	saved_retval = D
 	mov	saved_rtlink = b0
@@ -647,6 +645,11 @@ EK(.ex_handler,  (p17)	st8	[dst1]=r39,8);						\
 	;;
 
 	add	saved_retval=saved_retval,r8	// above might return non-zero value
+	cmp.gt	p8,p0=memset_arg2,r0	// more than 1 byte?
+	mov	out0=memset_arg0	// *s
+	mov	out1=r0			// c
+	mov	out2=memset_arg2	// n
+(p8)	br.call.sptk.few b0=memset
 	;;
 
 	mov	retval=saved_retval
@@ -656,4 +659,3 @@ EK(.ex_handler,  (p17)	st8	[dst1]=r39,8);						\
 
 /* end of McKinley specific optimization */
 END(__copy_user)
-EXPORT_SYMBOL(__copy_user)

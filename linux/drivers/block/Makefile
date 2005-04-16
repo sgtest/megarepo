@@ -1,42 +1,47 @@
-# SPDX-License-Identifier: GPL-2.0
 #
 # Makefile for the kernel block device drivers.
 #
 # 12 June 2000, Christoph Hellwig <hch@infradead.org>
 # Rewritten to use lists instead of if-statements.
 # 
+# Note : at this point, these files are compiled on all systems.
+# In the future, some of these should be built conditionally.
+#
 
-# needed for trace events
-ccflags-y				+= -I$(src)
+#
+# NOTE that ll_rw_blk.c must come early in linkage order - it starts the
+# kblockd threads
+#
 
+obj-y	:= elevator.o ll_rw_blk.o ioctl.o genhd.o scsi_ioctl.o
+
+obj-$(CONFIG_IOSCHED_NOOP)	+= noop-iosched.o
+obj-$(CONFIG_IOSCHED_AS)	+= as-iosched.o
+obj-$(CONFIG_IOSCHED_DEADLINE)	+= deadline-iosched.o
+obj-$(CONFIG_IOSCHED_CFQ)	+= cfq-iosched.o
 obj-$(CONFIG_MAC_FLOPPY)	+= swim3.o
-obj-$(CONFIG_BLK_DEV_SWIM)	+= swim_mod.o
 obj-$(CONFIG_BLK_DEV_FD)	+= floppy.o
+obj-$(CONFIG_BLK_DEV_FD98)	+= floppy98.o
 obj-$(CONFIG_AMIGA_FLOPPY)	+= amiflop.o
-obj-$(CONFIG_PS3_DISK)		+= ps3disk.o
-obj-$(CONFIG_PS3_VRAM)		+= ps3vram.o
 obj-$(CONFIG_ATARI_FLOPPY)	+= ataflop.o
+obj-$(CONFIG_BLK_DEV_SWIM_IOP)	+= swim_iop.o
+obj-$(CONFIG_ATARI_ACSI)	+= acsi.o
+obj-$(CONFIG_ATARI_SLM)		+= acsi_slm.o
 obj-$(CONFIG_AMIGA_Z2RAM)	+= z2ram.o
-obj-$(CONFIG_N64CART)		+= n64cart.o
-obj-$(CONFIG_BLK_DEV_RAM)	+= brd.o
+obj-$(CONFIG_BLK_DEV_RAM)	+= rd.o
 obj-$(CONFIG_BLK_DEV_LOOP)	+= loop.o
+obj-$(CONFIG_BLK_DEV_PS2)	+= ps2esdi.o
+obj-$(CONFIG_BLK_DEV_XD)	+= xd.o
+obj-$(CONFIG_BLK_CPQ_DA)	+= cpqarray.o
+obj-$(CONFIG_BLK_CPQ_CISS_DA)  += cciss.o
+obj-$(CONFIG_BLK_DEV_DAC960)	+= DAC960.o
 obj-$(CONFIG_CDROM_PKTCDVD)	+= pktcdvd.o
-obj-$(CONFIG_SUNVDC)		+= sunvdc.o
 
+obj-$(CONFIG_BLK_DEV_UMEM)	+= umem.o
 obj-$(CONFIG_BLK_DEV_NBD)	+= nbd.o
-obj-$(CONFIG_VIRTIO_BLK)	+= virtio_blk.o
+obj-$(CONFIG_BLK_DEV_CRYPTOLOOP) += cryptoloop.o
 
-obj-$(CONFIG_XEN_BLKDEV_FRONTEND)	+= xen-blkfront.o
-obj-$(CONFIG_XEN_BLKDEV_BACKEND)	+= xen-blkback/
-obj-$(CONFIG_BLK_DEV_DRBD)     += drbd/
-obj-$(CONFIG_BLK_DEV_RBD)     += rbd.o
-obj-$(CONFIG_BLK_DEV_PCIESSD_MTIP32XX)	+= mtip32xx/
+obj-$(CONFIG_VIODASD)		+= viodasd.o
+obj-$(CONFIG_BLK_DEV_SX8)	+= sx8.o
+obj-$(CONFIG_BLK_DEV_UB)	+= ub.o
 
-obj-$(CONFIG_ZRAM) += zram/
-obj-$(CONFIG_BLK_DEV_RNBD)	+= rnbd/
-
-obj-$(CONFIG_BLK_DEV_NULL_BLK)	+= null_blk/
-
-obj-$(CONFIG_BLK_DEV_UBLK)			+= ublk_drv.o
-
-swim_mod-y	:= swim.o swim_asm.o

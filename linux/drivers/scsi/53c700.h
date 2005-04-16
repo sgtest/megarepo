@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0 */
+/* -*- mode: c; c-basic-offset: 8 -*- */
 
 /* Driver for 53c700 and 53c700-66 chips from NCR and Symbios
  *
@@ -12,7 +12,11 @@
 #include <asm/io.h>
 
 #include <scsi/scsi_device.h>
-#include <scsi/scsi_cmnd.h>
+
+
+#if defined(CONFIG_53C700_MEM_MAPPED) && defined(CONFIG_53C700_IO_MAPPED)
+#define CONFIG_53C700_BOTH_MAPPED
+#endif
 
 /* Turn on for general debugging---too verbose for normal use */
 #undef	NCR_700_DEBUG
@@ -22,14 +26,8 @@
 
 #ifdef NCR_700_DEBUG
 #define DEBUG(x)	printk x
-#define DDEBUG(prefix, sdev, fmt, a...) \
-	sdev_printk(prefix, sdev, fmt, ##a)
-#define CDEBUG(prefix, scmd, fmt, a...) \
-	scmd_printk(prefix, scmd, fmt, ##a)
 #else
-#define DEBUG(x)	do {} while (0)
-#define DDEBUG(prefix, scmd, fmt, a...) do {} while (0)
-#define CDEBUG(prefix, scmd, fmt, a...) do {} while (0)
+#define DEBUG(x)
 #endif
 
 /* The number of available command slots */
@@ -51,13 +49,20 @@
 /* magic byte identifying an internally generated REQUEST_SENSE command */
 #define NCR_700_INTERNAL_SENSE_MAGIC	0x42
 
+/* WARNING: Leave this in for now: the dependency preprocessor doesn't
+ * pick up file specific flags, so must define here if they are not
+ * set */
+#if !defined(CONFIG_53C700_IO_MAPPED) && !defined(CONFIG_53C700_MEM_MAPPED)
+#error "Config.in must define either CONFIG_53C700_IO_MAPPED or CONFIG_53C700_MEM_MAPPED to use this scsi core."
+#endif
+
 struct NCR_700_Host_Parameters;
 
 /* These are the externally used routines */
 struct Scsi_Host *NCR_700_detect(struct scsi_host_template *,
 		struct NCR_700_Host_Parameters *, struct device *);
 int NCR_700_release(struct Scsi_Host *host);
-irqreturn_t NCR_700_intr(int, void *);
+irqreturn_t NCR_700_intr(int, void *, struct pt_regs *);
 
 
 enum NCR_700_Host_State {
@@ -76,20 +81,14 @@ struct NCR_700_SG_List {
 	#define	SCRIPT_RETURN			0x90080000
 };
 
-struct NCR_700_Device_Parameters {
-	/* space for creating a request sense command. Really, except
-	 * for the annoying SCSI-2 requirement for LUN information in
-	 * cmnd[1], this could be in static storage */
-	unsigned char cmnd[MAX_COMMAND_SIZE];
-	__u8	depth;
-	struct scsi_cmnd *current_cmnd;	/* currently active command */
-};
-
-
-/* The SYNC negotiation sequence looks like:
+/* We use device->hostdata to store negotiated parameters.  This is
+ * supposed to be a pointer to a device private area, but we cannot
+ * really use it as such since it will never be freed, so just use the
+ * 32 bits to cram the information.  The SYNC negotiation sequence looks
+ * like:
  * 
  * If DEV_NEGOTIATED_SYNC not set, tack and SDTR message on to the
- * initial identify for the device and set DEV_BEGIN_SYNC_NEGOTIATION
+ * initial identify for the device and set DEV_BEGIN_SYNC_NEGOTATION
  * If we get an SDTR reply, work out the SXFER parameters, squirrel
  * them away here, clear DEV_BEGIN_SYNC_NEGOTIATION and set
  * DEV_NEGOTIATED_SYNC.  If we get a REJECT msg, squirrel
@@ -104,26 +103,19 @@ struct NCR_700_Device_Parameters {
 #define NCR_700_DEV_BEGIN_SYNC_NEGOTIATION	(1<<17)
 #define NCR_700_DEV_PRINT_SYNC_NEGOTIATION (1<<19)
 
-static inline char *NCR_700_get_sense_cmnd(struct scsi_device *SDp)
-{
-	struct NCR_700_Device_Parameters *hostdata = SDp->hostdata;
-
-	return hostdata->cmnd;
-}
-
 static inline void
 NCR_700_set_depth(struct scsi_device *SDp, __u8 depth)
 {
-	struct NCR_700_Device_Parameters *hostdata = SDp->hostdata;
+	long l = (long)SDp->hostdata;
 
-	hostdata->depth = depth;
+	l &= 0xffff00ff;
+	l |= 0xff00 & (depth << 8);
+	SDp->hostdata = (void *)l;
 }
 static inline __u8
 NCR_700_get_depth(struct scsi_device *SDp)
 {
-	struct NCR_700_Device_Parameters *hostdata = SDp->hostdata;
-
-	return hostdata->depth;
+	return ((((unsigned long)SDp->hostdata) & 0xff00)>>8);
 }
 static inline int
 NCR_700_is_flag_set(struct scsi_device *SDp, __u32 flag)
@@ -176,9 +168,6 @@ struct NCR_700_command_slot {
 	#define NCR_700_SLOT_BUSY (1|NCR_700_SLOT_MAGIC) /* slot has command active on HA */
 	#define NCR_700_SLOT_QUEUED (2|NCR_700_SLOT_MAGIC) /* slot has command to be made active on HA */
 	__u8	state;
-	#define NCR_700_FLAG_AUTOSENSE	0x01
-	__u8	flags;
-	__u8	pad1[2];	/* Needed for m68k where min alignment is 2 bytes */
 	int	tag;
 	__u32	resume_offset;
 	struct scsi_cmnd *cmnd;
@@ -195,11 +184,9 @@ struct NCR_700_command_slot {
 struct NCR_700_Host_Parameters {
 	/* These must be filled in by the calling driver */
 	int	clock;			/* board clock speed in MHz */
-	void __iomem	*base;		/* the base for the port (copied to host) */
+	unsigned long	base;		/* the base for the port (copied to host) */
 	struct device	*dev;
 	__u32	dmode_extra;	/* adjustable bus settings */
-	__u32	dcntl_extra;	/* adjustable bus settings */
-	__u32	ctest7_extra;	/* adjustable bus settings */
 	__u32	differential:1;	/* if we are differential */
 #ifdef CONFIG_53C700_LE_ON_BE
 	/* This option is for HP only.  Set it if your chip is wired for
@@ -207,12 +194,14 @@ struct NCR_700_Host_Parameters {
 	__u32	force_le_on_be:1;
 #endif
 	__u32	chip710:1;	/* set if really a 710 not 700 */
-	__u32	burst_length:4;	/* set to 0 to disable 710 bursting */
-	__u32	noncoherent:1;	/* needs to use non-coherent DMA */
+	__u32	burst_disable:1;	/* set to 1 to disable 710 bursting */
 
 	/* NOTHING BELOW HERE NEEDS ALTERING */
 	__u32	fast:1;		/* if we can alter the SCSI bus clock
                                    speed (so can negiotiate sync) */
+#ifdef CONFIG_53C700_BOTH_MAPPED
+	__u32	mem_mapped;	/* set if memory mapped */
+#endif
 	int	sync_clock;	/* The speed of the SYNC core */
 
 	__u32	*script;		/* pointer to script location */
@@ -257,7 +246,6 @@ struct NCR_700_Host_Parameters {
 #ifdef CONFIG_53C700_LE_ON_BE
 #define bE	(hostdata->force_le_on_be ? 0 : 3)
 #define	bSWAP	(hostdata->force_le_on_be)
-#define bEBus	(!hostdata->force_le_on_be)
 #elif defined(__BIG_ENDIAN)
 #define bE	3
 #define bSWAP	0
@@ -266,13 +254,6 @@ struct NCR_700_Host_Parameters {
 #define bSWAP	0
 #else
 #error "__BIG_ENDIAN or __LITTLE_ENDIAN must be defined, did you include byteorder.h?"
-#endif
-#ifndef bEBus
-#ifdef CONFIG_53C700_BE_BUS
-#define bEBus	1
-#else
-#define bEBus	0
-#endif
 #endif
 #define bS_to_cpu(x)	(bSWAP ? le32_to_cpu(x) : (x))
 #define bS_to_host(x)	(bSWAP ? cpu_to_le32(x) : (x))
@@ -357,7 +338,6 @@ struct NCR_700_Host_Parameters {
 #define		SEL_TIMEOUT_DISABLE	0x10 /* 710 only */
 #define         DFP                     0x08
 #define         EVP                     0x04
-#define         CTEST7_TT1              0x02
 #define		DIFF			0x01
 #define CTEST6_REG                      0x1A
 #define	TEMP_REG			0x1C
@@ -391,7 +371,6 @@ struct NCR_700_Host_Parameters {
 #define		SOFTWARE_RESET		0x01
 #define		COMPAT_700_MODE		0x01
 #define 	SCRPTS_16BITS		0x20
-#define		EA_710			0x20
 #define		ASYNC_DIV_2_0		0x00
 #define		ASYNC_DIV_1_5		0x40
 #define		ASYNC_DIV_1_0		0x80
@@ -422,33 +401,31 @@ struct NCR_700_Host_Parameters {
 #define NCR_710_MIN_XFERP	0
 #define NCR_700_MIN_PERIOD	25 /* for SDTR message, 100ns */
 
-#define script_patch_32(h, script, symbol, value) \
+#define script_patch_32(script, symbol, value) \
 { \
 	int i; \
-	dma_addr_t da = value; \
 	for(i=0; i< (sizeof(A_##symbol##_used) / sizeof(__u32)); i++) { \
-		__u32 val = bS_to_cpu((script)[A_##symbol##_used[i]]) + da; \
+		__u32 val = bS_to_cpu((script)[A_##symbol##_used[i]]) + value; \
 		(script)[A_##symbol##_used[i]] = bS_to_host(val); \
-		dma_sync_to_dev((h), &(script)[A_##symbol##_used[i]], 4); \
-		DEBUG((" script, patching %s at %d to %pad\n", \
-		       #symbol, A_##symbol##_used[i], &da)); \
+		dma_cache_sync(&(script)[A_##symbol##_used[i]], 4, DMA_TO_DEVICE); \
+		DEBUG((" script, patching %s at %d to 0x%lx\n", \
+		       #symbol, A_##symbol##_used[i], (value))); \
 	} \
 }
 
-#define script_patch_32_abs(h, script, symbol, value) \
+#define script_patch_32_abs(script, symbol, value) \
 { \
 	int i; \
-	dma_addr_t da = value; \
 	for(i=0; i< (sizeof(A_##symbol##_used) / sizeof(__u32)); i++) { \
-		(script)[A_##symbol##_used[i]] = bS_to_host(da); \
-		dma_sync_to_dev((h), &(script)[A_##symbol##_used[i]], 4); \
-		DEBUG((" script, patching %s at %d to %pad\n", \
-		       #symbol, A_##symbol##_used[i], &da)); \
+		(script)[A_##symbol##_used[i]] = bS_to_host(value); \
+		dma_cache_sync(&(script)[A_##symbol##_used[i]], 4, DMA_TO_DEVICE); \
+		DEBUG((" script, patching %s at %d to 0x%lx\n", \
+		       #symbol, A_##symbol##_used[i], (value))); \
 	} \
 }
 
 /* Used for patching the SCSI ID in the SELECT instruction */
-#define script_patch_ID(h, script, symbol, value) \
+#define script_patch_ID(script, symbol, value) \
 { \
 	int i; \
 	for(i=0; i< (sizeof(A_##symbol##_used) / sizeof(__u32)); i++) { \
@@ -456,13 +433,13 @@ struct NCR_700_Host_Parameters {
 		val &= 0xff00ffff; \
 		val |= ((value) & 0xff) << 16; \
 		(script)[A_##symbol##_used[i]] = bS_to_host(val); \
-		dma_sync_to_dev((h), &(script)[A_##symbol##_used[i]], 4); \
+		dma_cache_sync(&(script)[A_##symbol##_used[i]], 4, DMA_TO_DEVICE); \
 		DEBUG((" script, patching ID field %s at %d to 0x%x\n", \
 		       #symbol, A_##symbol##_used[i], val)); \
 	} \
 }
 
-#define script_patch_16(h, script, symbol, value) \
+#define script_patch_16(script, symbol, value) \
 { \
 	int i; \
 	for(i=0; i< (sizeof(A_##symbol##_used) / sizeof(__u32)); i++) { \
@@ -470,7 +447,7 @@ struct NCR_700_Host_Parameters {
 		val &= 0xffff0000; \
 		val |= ((value) & 0xffff); \
 		(script)[A_##symbol##_used[i]] = bS_to_host(val); \
-		dma_sync_to_dev((h), &(script)[A_##symbol##_used[i]], 4); \
+		dma_cache_sync(&(script)[A_##symbol##_used[i]], 4, DMA_TO_DEVICE); \
 		DEBUG((" script, patching short field %s at %d to 0x%x\n", \
 		       #symbol, A_##symbol##_used[i], val)); \
 	} \
@@ -478,51 +455,195 @@ struct NCR_700_Host_Parameters {
 
 
 static inline __u8
-NCR_700_readb(struct Scsi_Host *host, __u32 reg)
+NCR_700_mem_readb(struct Scsi_Host *host, __u32 reg)
 {
-	const struct NCR_700_Host_Parameters *hostdata
+	const struct NCR_700_Host_Parameters *hostdata __attribute__((unused))
 		= (struct NCR_700_Host_Parameters *)host->hostdata[0];
 
-	return ioread8(hostdata->base + (reg^bE));
+	return readb(host->base + (reg^bE));
+}
+
+static inline __u32
+NCR_700_mem_readl(struct Scsi_Host *host, __u32 reg)
+{
+	__u32 value = __raw_readl(host->base + reg);
+	const struct NCR_700_Host_Parameters *hostdata __attribute__((unused))
+		= (struct NCR_700_Host_Parameters *)host->hostdata[0];
+#if 1
+	/* sanity check the register */
+	if((reg & 0x3) != 0)
+		BUG();
+#endif
+
+	return bS_to_cpu(value);
+}
+
+static inline void
+NCR_700_mem_writeb(__u8 value, struct Scsi_Host *host, __u32 reg)
+{
+	const struct NCR_700_Host_Parameters *hostdata __attribute__((unused))
+		= (struct NCR_700_Host_Parameters *)host->hostdata[0];
+
+	writeb(value, host->base + (reg^bE));
+}
+
+static inline void
+NCR_700_mem_writel(__u32 value, struct Scsi_Host *host, __u32 reg)
+{
+	const struct NCR_700_Host_Parameters *hostdata __attribute__((unused))
+		= (struct NCR_700_Host_Parameters *)host->hostdata[0];
+
+#if 1
+	/* sanity check the register */
+	if((reg & 0x3) != 0)
+		BUG();
+#endif
+
+	__raw_writel(bS_to_host(value), host->base + reg);
+}
+
+static inline __u8
+NCR_700_io_readb(struct Scsi_Host *host, __u32 reg)
+{
+	const struct NCR_700_Host_Parameters *hostdata __attribute__((unused))
+		= (struct NCR_700_Host_Parameters *)host->hostdata[0];
+
+	return inb(host->base + (reg^bE));
+}
+
+static inline __u32
+NCR_700_io_readl(struct Scsi_Host *host, __u32 reg)
+{
+	__u32 value = inl(host->base + reg);
+	const struct NCR_700_Host_Parameters *hostdata __attribute__((unused))
+		= (struct NCR_700_Host_Parameters *)host->hostdata[0];
+
+#if 1
+	/* sanity check the register */
+	if((reg & 0x3) != 0)
+		BUG();
+#endif
+
+	return bS_to_cpu(value);
+}
+
+static inline void
+NCR_700_io_writeb(__u8 value, struct Scsi_Host *host, __u32 reg)
+{
+	const struct NCR_700_Host_Parameters *hostdata __attribute__((unused))
+		= (struct NCR_700_Host_Parameters *)host->hostdata[0];
+
+	outb(value, host->base + (reg^bE));
+}
+
+static inline void
+NCR_700_io_writel(__u32 value, struct Scsi_Host *host, __u32 reg)
+{
+	const struct NCR_700_Host_Parameters *hostdata __attribute__((unused))
+		= (struct NCR_700_Host_Parameters *)host->hostdata[0];
+
+#if 1
+	/* sanity check the register */
+	if((reg & 0x3) != 0)
+		BUG();
+#endif
+
+	outl(bS_to_host(value), host->base + reg);
+}
+
+#ifdef CONFIG_53C700_BOTH_MAPPED
+
+static inline __u8
+NCR_700_readb(struct Scsi_Host *host, __u32 reg)
+{
+	__u8 val;
+
+	const struct NCR_700_Host_Parameters *hostdata __attribute__((unused))
+		= (struct NCR_700_Host_Parameters *)host->hostdata[0];
+
+	if(hostdata->mem_mapped)
+		val = NCR_700_mem_readb(host, reg);
+	else
+		val = NCR_700_io_readb(host, reg);
+
+	return val;
 }
 
 static inline __u32
 NCR_700_readl(struct Scsi_Host *host, __u32 reg)
 {
-	const struct NCR_700_Host_Parameters *hostdata
-		= (struct NCR_700_Host_Parameters *)host->hostdata[0];
-	__u32 value = bEBus ? ioread32be(hostdata->base + reg) :
-		ioread32(hostdata->base + reg);
-#if 1
-	/* sanity check the register */
-	BUG_ON((reg & 0x3) != 0);
-#endif
+	__u32 val;
 
-	return value;
+	const struct NCR_700_Host_Parameters *hostdata __attribute__((unused))
+		= (struct NCR_700_Host_Parameters *)host->hostdata[0];
+
+	if(hostdata->mem_mapped)
+		val = NCR_700_mem_readl(host, reg);
+	else
+		val = NCR_700_io_readl(host, reg);
+
+	return val;
 }
 
 static inline void
 NCR_700_writeb(__u8 value, struct Scsi_Host *host, __u32 reg)
 {
-	const struct NCR_700_Host_Parameters *hostdata
+	const struct NCR_700_Host_Parameters *hostdata __attribute__((unused))
 		= (struct NCR_700_Host_Parameters *)host->hostdata[0];
 
-	iowrite8(value, hostdata->base + (reg^bE));
+	if(hostdata->mem_mapped)
+		NCR_700_mem_writeb(value, host, reg);
+	else
+		NCR_700_io_writeb(value, host, reg);
 }
 
 static inline void
 NCR_700_writel(__u32 value, struct Scsi_Host *host, __u32 reg)
 {
-	const struct NCR_700_Host_Parameters *hostdata
+	const struct NCR_700_Host_Parameters *hostdata __attribute__((unused))
 		= (struct NCR_700_Host_Parameters *)host->hostdata[0];
 
-#if 1
-	/* sanity check the register */
-	BUG_ON((reg & 0x3) != 0);
-#endif
-
-	bEBus ? iowrite32be(value, hostdata->base + reg): 
-		iowrite32(value, hostdata->base + reg);
+	if(hostdata->mem_mapped)
+		NCR_700_mem_writel(value, host, reg);
+	else
+		NCR_700_io_writel(value, host, reg);
 }
+
+static inline void
+NCR_700_set_mem_mapped(struct NCR_700_Host_Parameters *hostdata)
+{
+	hostdata->mem_mapped = 1;
+}
+
+static inline void
+NCR_700_set_io_mapped(struct NCR_700_Host_Parameters *hostdata)
+{
+	hostdata->mem_mapped = 0;
+}
+
+
+#elif defined(CONFIG_53C700_IO_MAPPED)
+
+#define NCR_700_readb NCR_700_io_readb
+#define NCR_700_readl NCR_700_io_readl
+#define NCR_700_writeb NCR_700_io_writeb
+#define NCR_700_writel NCR_700_io_writel
+
+#define NCR_700_set_io_mapped(x)
+#define NCR_700_set_mem_mapped(x)	error I/O mapped only
+
+#elif defined(CONFIG_53C700_MEM_MAPPED)
+
+#define NCR_700_readb NCR_700_mem_readb
+#define NCR_700_readl NCR_700_mem_readl
+#define NCR_700_writeb NCR_700_mem_writeb
+#define NCR_700_writel NCR_700_mem_writel
+
+#define NCR_700_set_io_mapped(x)	error MEM mapped only
+#define NCR_700_set_mem_mapped(x)
+
+#else
+#error neither CONFIG_53C700_MEM_MAPPED nor CONFIG_53C700_IO_MAPPED is set
+#endif
 
 #endif

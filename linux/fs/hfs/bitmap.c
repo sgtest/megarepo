@@ -145,7 +145,7 @@ u32 hfs_vbm_search_free(struct super_block *sb, u32 goal, u32 *num_bits)
 	if (!*num_bits)
 		return 0;
 
-	mutex_lock(&HFS_SB(sb)->bitmap_lock);
+	down(&HFS_SB(sb)->bitmap_lock);
 	bitmap = HFS_SB(sb)->bitmap;
 
 	pos = hfs_find_set_zero_bits(bitmap, HFS_SB(sb)->fs_ablocks, goal, num_bits);
@@ -158,11 +158,11 @@ u32 hfs_vbm_search_free(struct super_block *sb, u32 goal, u32 *num_bits)
 		}
 	}
 
-	hfs_dbg(BITMAP, "alloc_bits: %u,%u\n", pos, *num_bits);
+	dprint(DBG_BITMAP, "alloc_bits: %u,%u\n", pos, *num_bits);
 	HFS_SB(sb)->free_ablocks -= *num_bits;
 	hfs_bitmap_dirty(sb);
 out:
-	mutex_unlock(&HFS_SB(sb)->bitmap_lock);
+	up(&HFS_SB(sb)->bitmap_lock);
 	return pos;
 }
 
@@ -200,12 +200,12 @@ int hfs_clear_vbm_bits(struct super_block *sb, u16 start, u16 count)
 	if (!count)
 		return 0;
 
-	hfs_dbg(BITMAP, "clear_bits: %u,%u\n", start, count);
+	dprint(DBG_BITMAP, "clear_bits: %u,%u\n", start, count);
 	/* are all of the bits in range? */
 	if ((start + count) > HFS_SB(sb)->fs_ablocks)
 		return -2;
 
-	mutex_lock(&HFS_SB(sb)->bitmap_lock);
+	down(&HFS_SB(sb)->bitmap_lock);
 	/* bitmap is always on a 32-bit boundary */
 	curr = HFS_SB(sb)->bitmap + (start / 32);
 	len = count;
@@ -236,7 +236,7 @@ int hfs_clear_vbm_bits(struct super_block *sb, u16 start, u16 count)
 	}
 out:
 	HFS_SB(sb)->free_ablocks += len;
-	mutex_unlock(&HFS_SB(sb)->bitmap_lock);
+	up(&HFS_SB(sb)->bitmap_lock);
 	hfs_bitmap_dirty(sb);
 
 	return 0;

@@ -17,7 +17,7 @@
 
 /* show configuration fields */
 
-static ssize_t dio_show_id(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t dio_show_id(struct device *dev, char *buf)
 {
 	struct dio_dev *d;
 
@@ -26,7 +26,7 @@ static ssize_t dio_show_id(struct device *dev, struct device_attribute *attr, ch
 }
 static DEVICE_ATTR(id, S_IRUGO, dio_show_id, NULL);
 
-static ssize_t dio_show_ipl(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t dio_show_ipl(struct device *dev, char *buf)
 {
 	struct dio_dev *d;
 
@@ -35,7 +35,7 @@ static ssize_t dio_show_ipl(struct device *dev, struct device_attribute *attr, c
 }
 static DEVICE_ATTR(ipl, S_IRUGO, dio_show_ipl, NULL);
 
-static ssize_t dio_show_secid(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t dio_show_secid(struct device *dev, char *buf)
 {
 	struct dio_dev *d;
 
@@ -44,7 +44,7 @@ static ssize_t dio_show_secid(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR(secid, S_IRUGO, dio_show_secid, NULL);
 
-static ssize_t dio_show_name(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t dio_show_name(struct device *dev, char *buf)
 {
 	struct dio_dev *d;
 
@@ -53,30 +53,25 @@ static ssize_t dio_show_name(struct device *dev, struct device_attribute *attr, 
 }
 static DEVICE_ATTR(name, S_IRUGO, dio_show_name, NULL);
 
-static ssize_t dio_show_resource(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t dio_show_resource(struct device *dev, char *buf)
 {
 	struct dio_dev *d = to_dio_dev(dev);
 
 	return sprintf(buf, "0x%08lx 0x%08lx 0x%08lx\n",
-		       (unsigned long)dio_resource_start(d),
-		       (unsigned long)dio_resource_end(d),
+		       dio_resource_start(d), dio_resource_end(d),
 		       dio_resource_flags(d));
 }
 static DEVICE_ATTR(resource, S_IRUGO, dio_show_resource, NULL);
 
-int dio_create_sysfs_dev_files(struct dio_dev *d)
+void dio_create_sysfs_dev_files(struct dio_dev *d)
 {
 	struct device *dev = &d->dev;
-	int error;
 
 	/* current configuration's attributes */
-	if ((error = device_create_file(dev, &dev_attr_id)) ||
-	    (error = device_create_file(dev, &dev_attr_ipl)) ||
-	    (error = device_create_file(dev, &dev_attr_secid)) ||
-	    (error = device_create_file(dev, &dev_attr_name)) ||
-	    (error = device_create_file(dev, &dev_attr_resource)))
-		return error;
-
-	return 0;
+	device_create_file(dev, &dev_attr_id);
+	device_create_file(dev, &dev_attr_ipl);
+	device_create_file(dev, &dev_attr_secid);
+	device_create_file(dev, &dev_attr_name);
+	device_create_file(dev, &dev_attr_resource);
 }
 

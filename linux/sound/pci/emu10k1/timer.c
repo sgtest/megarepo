@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *  Copyright (c) by Lee Revell <rlrevell@joe-job.com>
  *                   Clemens Ladisch <clemens@ladisch.de>
@@ -9,15 +8,31 @@
  *
  *  TODO:
  *    --
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ *
  */
 
+#include <sound/driver.h>
 #include <linux/time.h>
 #include <sound/core.h>
 #include <sound/emu10k1.h>
 
-static int snd_emu10k1_timer_start(struct snd_timer *timer)
+static int snd_emu10k1_timer_start(snd_timer_t *timer)
 {
-	struct snd_emu10k1 *emu;
+	emu10k1_t *emu;
 	unsigned long flags;
 	unsigned int delay;
 
@@ -32,9 +47,9 @@ static int snd_emu10k1_timer_start(struct snd_timer *timer)
 	return 0;
 }
 
-static int snd_emu10k1_timer_stop(struct snd_timer *timer)
+static int snd_emu10k1_timer_stop(snd_timer_t *timer)
 {
-	struct snd_emu10k1 *emu;
+	emu10k1_t *emu;
 	unsigned long flags;
 
 	emu = snd_timer_chip(timer);
@@ -44,7 +59,7 @@ static int snd_emu10k1_timer_stop(struct snd_timer *timer)
 	return 0;
 }
 
-static int snd_emu10k1_timer_precise_resolution(struct snd_timer *timer,
+static int snd_emu10k1_timer_precise_resolution(snd_timer_t *timer,
 					       unsigned long *num, unsigned long *den)
 {
 	*num = 1;
@@ -52,7 +67,7 @@ static int snd_emu10k1_timer_precise_resolution(struct snd_timer *timer,
 	return 0;
 }
 
-static const struct snd_timer_hardware snd_emu10k1_timer_hw = {
+static struct _snd_timer_hardware snd_emu10k1_timer_hw = {
 	.flags = SNDRV_TIMER_HW_AUTO,
 	.resolution = 20833, /* 1 sample @ 48KHZ = 20.833...us */
 	.ticks = 1024,
@@ -61,10 +76,10 @@ static const struct snd_timer_hardware snd_emu10k1_timer_hw = {
 	.precise_resolution = snd_emu10k1_timer_precise_resolution,
 };
 
-int snd_emu10k1_timer(struct snd_emu10k1 *emu, int device)
+int __devinit snd_emu10k1_timer(emu10k1_t *emu, int device)
 {
-	struct snd_timer *timer = NULL;
-	struct snd_timer_id tid;
+	snd_timer_t *timer = NULL;
+	snd_timer_id_t tid;
 	int err;
 
 	tid.dev_class = SNDRV_TIMER_CLASS_CARD;
@@ -72,8 +87,7 @@ int snd_emu10k1_timer(struct snd_emu10k1 *emu, int device)
 	tid.card = emu->card->number;
 	tid.device = device;
 	tid.subdevice = 0;
-	err = snd_timer_new(emu->card, "EMU10K1", &tid, &timer);
-	if (err >= 0) {
+	if ((err = snd_timer_new(emu->card, "EMU10K1", &tid, &timer)) >= 0) {
 		strcpy(timer->name, "EMU10K1 timer");
 		timer->private_data = emu;
 		timer->hw = snd_emu10k1_timer_hw;

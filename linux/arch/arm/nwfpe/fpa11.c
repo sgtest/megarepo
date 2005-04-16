@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
     NetWinder Floating Point Emulator
     (c) Rebel.COM, 1998,1999
@@ -6,6 +5,19 @@
 
     Direct questions, comments to Scott Bambrough <scottb@netwinder.org>
 
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 */
 
 #include "fpa11.h"
@@ -14,8 +26,15 @@
 #include "fpmodule.h"
 #include "fpmodule.inl"
 
+#include <linux/config.h>
 #include <linux/compiler.h>
 #include <linux/string.h>
+#include <asm/system.h>
+
+/* forward declarations */
+unsigned int EmulateCPDO(const unsigned int);
+unsigned int EmulateCPDT(const unsigned int);
+unsigned int EmulateCPRT(const unsigned int);
 
 /* Reset the FPA11 chip.  Called to initialize and reset the emulator. */
 static void resetFPA11(void)
@@ -32,42 +51,48 @@ static void resetFPA11(void)
 	fpa11->fpsr = FP_EMULATOR | BIT_AC;
 }
 
-int8 SetRoundingMode(const unsigned int opcode)
+void SetRoundingMode(const unsigned int opcode)
 {
 	switch (opcode & MASK_ROUNDING_MODE) {
 	default:
 	case ROUND_TO_NEAREST:
-		return float_round_nearest_even;
+		float_rounding_mode = float_round_nearest_even;
+		break;
 
 	case ROUND_TO_PLUS_INFINITY:
-		return float_round_up;
+		float_rounding_mode = float_round_up;
+		break;
 
 	case ROUND_TO_MINUS_INFINITY:
-		return float_round_down;
+		float_rounding_mode = float_round_down;
+		break;
 
 	case ROUND_TO_ZERO:
-		return float_round_to_zero;
+		float_rounding_mode = float_round_to_zero;
+		break;
 	}
 }
 
-int8 SetRoundingPrecision(const unsigned int opcode)
+void SetRoundingPrecision(const unsigned int opcode)
 {
 #ifdef CONFIG_FPE_NWFPE_XP
 	switch (opcode & MASK_ROUNDING_PRECISION) {
 	case ROUND_SINGLE:
-		return 32;
+		floatx80_rounding_precision = 32;
+		break;
 
 	case ROUND_DOUBLE:
-		return 64;
+		floatx80_rounding_precision = 64;
+		break;
 
 	case ROUND_EXTENDED:
-		return 80;
+		floatx80_rounding_precision = 80;
+		break;
 
 	default:
-		return 80;
+		floatx80_rounding_precision = 80;
 	}
 #endif
-	return 80;
 }
 
 void nwfpe_init_fpa(union fp_state *fp)
@@ -78,6 +103,8 @@ void nwfpe_init_fpa(union fp_state *fp)
 #endif
  	memset(fpa11, 0, sizeof(FPA11));
 	resetFPA11();
+	SetRoundingMode(ROUND_TO_NEAREST);
+	SetRoundingPrecision(ROUND_EXTENDED);
 	fpa11->initflag = 1;
 }
 

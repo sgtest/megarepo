@@ -1,12 +1,25 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * Driver for Sound Core PDAudioCF soundcard
  *
- * Copyright (c) 2003 by Jaroslav Kysela <perex@perex.cz>
+ * Copyright (c) 2003 by Jaroslav Kysela <perex@suse.cz>
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  */
 
+#include <sound/driver.h>
 #include <linux/delay.h>
-#include <linux/slab.h>
 #include <sound/core.h>
 #include <sound/info.h>
 #include "pdaudiocf.h"
@@ -17,7 +30,7 @@
  */
 static unsigned char pdacf_ak4117_read(void *private_data, unsigned char reg)
 {
-	struct snd_pdacf *chip = private_data;
+	pdacf_t *chip = private_data;
 	unsigned long timeout;
 	unsigned long flags;
 	unsigned char res;
@@ -49,7 +62,7 @@ static unsigned char pdacf_ak4117_read(void *private_data, unsigned char reg)
 
 static void pdacf_ak4117_write(void *private_data, unsigned char reg, unsigned char val)
 {
-	struct snd_pdacf *chip = private_data;
+	pdacf_t *chip = private_data;
 	unsigned long timeout;
 	unsigned long flags;
 
@@ -68,27 +81,20 @@ static void pdacf_ak4117_write(void *private_data, unsigned char reg, unsigned c
 }
 
 #if 0
-void pdacf_dump(struct snd_pdacf *chip)
+void pdacf_dump(pdacf_t *chip)
 {
-	printk(KERN_DEBUG "PDAUDIOCF DUMP (0x%lx):\n", chip->port);
-	printk(KERN_DEBUG "WPD         : 0x%x\n",
-	       inw(chip->port + PDAUDIOCF_REG_WDP));
-	printk(KERN_DEBUG "RDP         : 0x%x\n",
-	       inw(chip->port + PDAUDIOCF_REG_RDP));
-	printk(KERN_DEBUG "TCR         : 0x%x\n",
-	       inw(chip->port + PDAUDIOCF_REG_TCR));
-	printk(KERN_DEBUG "SCR         : 0x%x\n",
-	       inw(chip->port + PDAUDIOCF_REG_SCR));
-	printk(KERN_DEBUG "ISR         : 0x%x\n",
-	       inw(chip->port + PDAUDIOCF_REG_ISR));
-	printk(KERN_DEBUG "IER         : 0x%x\n",
-	       inw(chip->port + PDAUDIOCF_REG_IER));
-	printk(KERN_DEBUG "AK_IFR      : 0x%x\n",
-	       inw(chip->port + PDAUDIOCF_REG_AK_IFR));
+	printk("PDAUDIOCF DUMP (0x%lx):\n", chip->port);
+	printk("WPD         : 0x%x\n", inw(chip->port + PDAUDIOCF_REG_WDP));
+	printk("RDP         : 0x%x\n", inw(chip->port + PDAUDIOCF_REG_RDP));
+	printk("TCR         : 0x%x\n", inw(chip->port + PDAUDIOCF_REG_TCR));
+	printk("SCR         : 0x%x\n", inw(chip->port + PDAUDIOCF_REG_SCR));
+	printk("ISR         : 0x%x\n", inw(chip->port + PDAUDIOCF_REG_ISR));
+	printk("IER         : 0x%x\n", inw(chip->port + PDAUDIOCF_REG_IER));
+	printk("AK_IFR      : 0x%x\n", inw(chip->port + PDAUDIOCF_REG_AK_IFR));
 }
 #endif
 
-static int pdacf_reset(struct snd_pdacf *chip, int powerdown)
+static int pdacf_reset(pdacf_t *chip, int powerdown)
 {
 	u16 val;
 	
@@ -111,7 +117,7 @@ static int pdacf_reset(struct snd_pdacf *chip, int powerdown)
 	return 0;
 }
 
-void pdacf_reinit(struct snd_pdacf *chip, int resume)
+void pdacf_reinit(pdacf_t *chip, int resume)
 {
 	pdacf_reset(chip, 0);
 	if (resume)
@@ -121,10 +127,10 @@ void pdacf_reinit(struct snd_pdacf *chip, int resume)
 	pdacf_reg_write(chip, PDAUDIOCF_REG_IER, chip->regmap[PDAUDIOCF_REG_IER>>1]);
 }
 
-static void pdacf_proc_read(struct snd_info_entry * entry,
-                            struct snd_info_buffer *buffer)
+static void pdacf_proc_read(snd_info_entry_t * entry,
+                            snd_info_buffer_t * buffer)
 {
-	struct snd_pdacf *chip = entry->private_data;
+	pdacf_t *chip = entry->private_data;
 	u16 tmp;
 
 	snd_iprintf(buffer, "PDAudioCF\n\n");
@@ -133,45 +139,50 @@ static void pdacf_proc_read(struct snd_info_entry * entry,
 	                                   
 }
 
-static void pdacf_proc_init(struct snd_pdacf *chip)
+static void pdacf_proc_init(pdacf_t *chip)
 {
-	snd_card_ro_proc_new(chip->card, "pdaudiocf", chip, pdacf_proc_read);
+	snd_info_entry_t *entry;
+
+	if (! snd_card_proc_new(chip->card, "pdaudiocf", &entry))
+		snd_info_set_text_ops(entry, chip, 1024, pdacf_proc_read);
 }
 
-struct snd_pdacf *snd_pdacf_create(struct snd_card *card)
+pdacf_t *snd_pdacf_create(snd_card_t *card)
 {
-	struct snd_pdacf *chip;
+	pdacf_t *chip;
 
-	chip = kzalloc(sizeof(*chip), GFP_KERNEL);
+	chip = kcalloc(1, sizeof(*chip), GFP_KERNEL);
 	if (chip == NULL)
 		return NULL;
 	chip->card = card;
-	mutex_init(&chip->reg_lock);
+	spin_lock_init(&chip->reg_lock);
 	spin_lock_init(&chip->ak4117_lock);
+	tasklet_init(&chip->tq, pdacf_tasklet, (unsigned long)chip);
 	card->private_data = chip;
 
 	pdacf_proc_init(chip);
 	return chip;
 }
 
-static void snd_pdacf_ak4117_change(struct ak4117 *ak4117, unsigned char c0, unsigned char c1)
+static void snd_pdacf_ak4117_change(ak4117_t *ak4117, unsigned char c0, unsigned char c1)
 {
-	struct snd_pdacf *chip = ak4117->change_callback_private;
+	pdacf_t *chip = ak4117->change_callback_private;
+	unsigned long flags;
 	u16 val;
 
 	if (!(c0 & AK4117_UNLCK))
 		return;
-	mutex_lock(&chip->reg_lock);
+	spin_lock_irqsave(&chip->reg_lock, flags);
 	val = chip->regmap[PDAUDIOCF_REG_SCR>>1];
 	if (ak4117->rcs0 & AK4117_UNLCK)
 		val |= PDAUDIOCF_BLUE_LED_OFF;
 	else
 		val &= ~PDAUDIOCF_BLUE_LED_OFF;
 	pdacf_reg_write(chip, PDAUDIOCF_REG_SCR, val);
-	mutex_unlock(&chip->reg_lock);
+	spin_unlock_irqrestore(&chip->reg_lock, flags);
 }
 
-int snd_pdacf_ak4117_create(struct snd_pdacf *chip)
+int snd_pdacf_ak4117_create(pdacf_t *chip)
 {
 	int err;
 	u16 val;
@@ -179,7 +190,7 @@ int snd_pdacf_ak4117_create(struct snd_pdacf *chip)
 	/* from AK4117 then INT1 pin from AK4117 will be high all time, because PCMCIA interrupts are */
 	/* egde based and FPGA does logical OR for all interrupt sources, we cannot use these */
 	/* high-rate sources */
-	static const unsigned char pgm[5] = {
+	static unsigned char pgm[5] = {
 		AK4117_XTL_24_576M | AK4117_EXCT,				/* AK4117_REG_PWRDN */
 		AK4117_CM_PLL_XTAL | AK4117_PKCS_128fs | AK4117_XCKS_128fs,	/* AK4117_REQ_CLOCK */
 		AK4117_EFH_1024LRCLK | AK4117_DIF_24R | AK4117_IPS,		/* AK4117_REG_IO */
@@ -227,7 +238,7 @@ int snd_pdacf_ak4117_create(struct snd_pdacf *chip)
 	return 0;
 }
 
-void snd_pdacf_powerdown(struct snd_pdacf *chip)
+void snd_pdacf_powerdown(pdacf_t *chip)
 {
 	u16 val;
 
@@ -244,11 +255,12 @@ void snd_pdacf_powerdown(struct snd_pdacf *chip)
 
 #ifdef CONFIG_PM
 
-int snd_pdacf_suspend(struct snd_pdacf *chip)
+int snd_pdacf_suspend(snd_card_t *card, pm_message_t state)
 {
+	pdacf_t *chip = card->pm_private_data;
 	u16 val;
 	
-	snd_power_change_state(chip->card, SNDRV_CTL_POWER_D3hot);
+	snd_pcm_suspend_all(chip->pcm);
 	/* disable interrupts, but use direct write to preserve old register value in chip->regmap */
 	val = inw(chip->port + PDAUDIOCF_REG_IER);
 	val &= ~(PDAUDIOCF_IRQOVREN|PDAUDIOCF_IRQAKMEN|PDAUDIOCF_IRQLVLEN0|PDAUDIOCF_IRQLVLEN1);
@@ -258,13 +270,14 @@ int snd_pdacf_suspend(struct snd_pdacf *chip)
 	return 0;
 }
 
-static inline int check_signal(struct snd_pdacf *chip)
+static inline int check_signal(pdacf_t *chip)
 {
 	return (chip->ak4117->rcs0 & AK4117_UNLCK) == 0;
 }
 
-int snd_pdacf_resume(struct snd_pdacf *chip)
+int snd_pdacf_resume(snd_card_t *card)
 {
+	pdacf_t *chip = card->pm_private_data;
 	int timeout = 40;
 
 	pdacf_reinit(chip, 1);
@@ -273,7 +286,6 @@ int snd_pdacf_resume(struct snd_pdacf *chip)
 	       (snd_ak4117_external_rate(chip->ak4117) <= 0 || !check_signal(chip)))
 		mdelay(1);
 	chip->chip_status &= ~PDAUDIOCF_STAT_IS_SUSPENDED;
-	snd_power_change_state(chip->card, SNDRV_CTL_POWER_D0);
 	return 0;
 }
 #endif

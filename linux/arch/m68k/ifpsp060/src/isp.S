@@ -4,7 +4,7 @@ M68000 Hi-Performance Microprocessor Division
 M68060 Software Package
 Production Release P1.00 -- October 10, 1994
 
-M68060 Software Package Copyright Â© 1993, 1994 Motorola Inc.  All rights reserved.
+M68060 Software Package Copyright © 1993, 1994 Motorola Inc.  All rights reserved.
 
 THE SOFTWARE is provided on an "AS IS" basis and without warranty.
 To the maximum extent permitted by applicable law,
@@ -1876,7 +1876,7 @@ movp_read_err:
 # word, or longword sized operands. Then, in the interest of		#
 # simplicity, all operands are converted to longword size whether the	#
 # operation is byte, word, or long. The bounds are sign extended	#
-# accordingly. If Rn is a data register, Rn is also sign extended. If	#
+# accordingly. If Rn is a data regsiter, Rn is also sign extended. If	#
 # Rn is an address register, it need not be sign extended since the	#
 # full register is always used.						#
 #	The comparisons are made and the condition codes calculated.	#
@@ -3814,7 +3814,7 @@ CAS2W2_FILLER:
 #	(3) Save current DFC/SFC (ASSUMED TO BE EQUAL!!!); Then set	#
 #	    SFC/DFC according to whether exception occurred in user or	#
 #	    supervisor mode.						#
-#	(4) Use "plpaw" instruction to pre-load ATC with effective	#
+#	(4) Use "plpaw" instruction to pre-load ATC with efective	#
 #	    address page(s). THIS SHOULD NOT FAULT!!! The relevant	#
 #	    page(s) should have been made resident prior to entering	#
 #	    this routine.						#

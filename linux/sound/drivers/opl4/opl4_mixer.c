@@ -1,13 +1,26 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * OPL4 mixer functions
  * Copyright (c) 2003 by Clemens Ladisch <clemens@ladisch.de>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  */
 
 #include "opl4_local.h"
 #include <sound/control.h>
 
-static int snd_opl4_ctl_info(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_info *uinfo)
+static int snd_opl4_ctl_info(snd_kcontrol_t *kcontrol, snd_ctl_elem_info_t *uinfo)
 {
 	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
 	uinfo->count = 2;
@@ -16,9 +29,9 @@ static int snd_opl4_ctl_info(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_
 	return 0;
 }
 
-static int snd_opl4_ctl_get(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *ucontrol)
+static int snd_opl4_ctl_get(snd_kcontrol_t *kcontrol, snd_ctl_elem_value_t *ucontrol)
 {
-	struct snd_opl4 *opl4 = snd_kcontrol_chip(kcontrol);
+	opl4_t *opl4 = snd_kcontrol_chip(kcontrol);
 	unsigned long flags;
 	u8 reg = kcontrol->private_value;
 	u8 value;
@@ -31,9 +44,9 @@ static int snd_opl4_ctl_get(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 	return 0;
 }
 
-static int snd_opl4_ctl_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *ucontrol)
+static int snd_opl4_ctl_put(snd_kcontrol_t *kcontrol, snd_ctl_elem_value_t *ucontrol)
 {
-	struct snd_opl4 *opl4 = snd_kcontrol_chip(kcontrol);
+	opl4_t *opl4 = snd_kcontrol_chip(kcontrol);
 	unsigned long flags;
 	u8 reg = kcontrol->private_value;
 	u8 value, old_value;
@@ -47,7 +60,7 @@ static int snd_opl4_ctl_put(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_v
 	return value != old_value;
 }
 
-static const struct snd_kcontrol_new snd_opl4_controls[] = {
+static snd_kcontrol_new_t snd_opl4_controls[] = {
 	{
 		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 		.name = "FM Playback Volume",
@@ -66,9 +79,9 @@ static const struct snd_kcontrol_new snd_opl4_controls[] = {
 	}
 };
 
-int snd_opl4_create_mixer(struct snd_opl4 *opl4)
+int snd_opl4_create_mixer(opl4_t *opl4)
 {
-	struct snd_card *card = opl4->card;
+	snd_card_t *card = opl4->card;
 	int i, err;
 
 	strcat(card->mixername, ",OPL4");

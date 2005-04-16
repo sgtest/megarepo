@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __YENTA_H
 #define __YENTA_H
 
@@ -96,12 +95,6 @@
  */
 #define CB_MEM_PAGE(map)	(0x40 + (map))
 
-
-/* control how 16bit cards are powered */
-#define YENTA_16BIT_POWER_EXCA	0x00000001
-#define YENTA_16BIT_POWER_DF	0x00000002
-
-
 struct yenta_socket;
 
 struct cardbus_type {
@@ -119,8 +112,6 @@ struct yenta_socket {
 
 	struct pcmcia_socket socket;
 	struct cardbus_type *type;
-
-	u32 flags;
 
 	/* for PCI interrupt probing */
 	unsigned int probe_status;

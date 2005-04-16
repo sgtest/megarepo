@@ -1,8 +1,8 @@
 /*
- * linux/drivers/parisc/power.c
+ * linux/arch/parisc/kernel/power.c
  * HP PARISC soft power switch support driver
  *
- * Copyright (c) 2001-2007 Helge Deller <deller@gmx.de>
+ * Copyright (c) 2001-2002 Helge Deller <deller@gmx.de>
  * All rights reserved.
  *
  *
@@ -29,38 +29,44 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  *
  *
+ * 
  *  HINT:
  *  Support of the soft power switch button may be enabled or disabled at
  *  runtime through the "/proc/sys/kernel/power" procfs entry.
  */ 
 
+#include <linux/config.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/string.h>
 #include <linux/notifier.h>
-#include <linux/panic_notifier.h>
 #include <linux/reboot.h>
-#include <linux/sched/signal.h>
-#include <linux/kthread.h>
-#include <linux/pm.h>
+#include <linux/sched.h>
+#include <linux/interrupt.h>
+#include <linux/workqueue.h>
 
 #include <asm/pdc.h>
 #include <asm/io.h>
 #include <asm/led.h>
+#include <asm/uaccess.h>
 
-#define DRIVER_NAME  "powersw"
-#define KTHREAD_NAME "kpowerswd"
 
-/* how often should the power button be polled ? */
-#define POWERSWITCH_POLL_PER_SEC 2
+#ifdef DEBUG
+# define DPRINTK(x...) printk(x)
+#else
+# define DPRINTK(x...)
+#endif
 
-/* how long does the power button needs to be down until we react ? */
-#define POWERSWITCH_DOWN_SEC 2
 
-/* assembly code to access special registers */
-/* taken from PCXL ERS page 82 */
+/* filename in /proc which can be used to enable/disable the power switch */
+#define SYSCTL_FILENAME		"sys/kernel/power"
+
+
 #define DIAG_CODE(code)		(0x14000000 + ((code)<<5))
 
+/* this will go to processor.h or any other place... */
+/* taken from PCXL ERS page 82 */
 #define MFCPU_X(rDiagReg, t_ch, t_th, code) \
 	(DIAG_CODE(code) + ((rDiagReg)<<21) + ((t_ch)<<16) + ((t_th)<<0) )
 	
@@ -71,93 +77,112 @@
 #define __getDIAG(dr) ( { 			\
         register unsigned long __res asm("r28");\
 	 __asm__ __volatile__ (			\
-		".word %1" : "=&r" (__res) : "i" (MFCPU_T(dr,28) ) \
+		".word %1\n nop\n" : "=&r" (__res) : "i" (MFCPU_T(dr,28)) \
 	);					\
 	__res;					\
 } )
 
-/* local shutdown counter */
-static int shutdown_timer __read_mostly;
+
+static void deferred_poweroff(void *dummy)
+{
+	extern int cad_pid;	/* from kernel/sys.c */
+	if (kill_proc(cad_pid, SIGINT, 1)) {
+		/* just in case killing init process failed */
+		machine_power_off();
+	}
+}
+
+/*
+ * This function gets called from interrupt context.
+ * As it's called within an interrupt, it wouldn't sync if we don't
+ * use schedule_work().
+ */
+
+static DECLARE_WORK(poweroff_work, deferred_poweroff, NULL);
+
+static void poweroff(void)
+{
+	static int powering_off;
+
+	if (powering_off)
+		return;
+
+	powering_off++;
+	schedule_work(&poweroff_work);
+}
+
+
+/* local time-counter for shutdown */
+static int shutdown_timer;
 
 /* check, give feedback and start shutdown after one second */
 static void process_shutdown(void)
 {
 	if (shutdown_timer == 0)
-		printk(KERN_ALERT KTHREAD_NAME ": Shutdown requested...\n");
+		DPRINTK(KERN_INFO "Shutdown requested...\n");
 
 	shutdown_timer++;
 	
 	/* wait until the button was pressed for 1 second */
-	if (shutdown_timer == (POWERSWITCH_DOWN_SEC*POWERSWITCH_POLL_PER_SEC)) {
-		static const char msg[] = "Shutting down...";
-		printk(KERN_INFO KTHREAD_NAME ": %s\n", msg);
+	if (shutdown_timer == HZ) {
+#if defined (DEBUG) || defined(CONFIG_CHASSIS_LCD_LED)
+		static char msg[] = "Shutting down...";
+#endif
+		DPRINTK(KERN_INFO "%s\n", msg);
 		lcd_print(msg);
-
-		/* send kill signal */
-		if (kill_cad_pid(SIGINT, 1)) {
-			/* just in case killing init process failed */
-			machine_power_off();
-		}
+		poweroff();
 	}
 }
 
 
-/* main power switch task struct */
-static struct task_struct *power_task;
-
-/* filename in /proc which can be used to enable/disable the power switch */
-#define SYSCTL_FILENAME	"sys/kernel/power"
+/* main power switch tasklet struct (scheduled from time.c) */
+DECLARE_TASKLET_DISABLED(power_tasklet, NULL, 0);
 
 /* soft power switch enabled/disabled */
-int pwrsw_enabled __read_mostly = 1;
+int pwrsw_enabled = 1;
 
-/* main kernel thread worker. It polls the button state */
-static int kpowerswd(void *param)
+/*
+ * On gecko style machines (e.g. 712/xx and 715/xx) 
+ * the power switch status is stored in Bit 0 ("the highest bit")
+ * of CPU diagnose register 25.
+ * 
+ */
+static void gecko_tasklet_func(unsigned long unused)
 {
-	__set_current_state(TASK_RUNNING);
+	if (!pwrsw_enabled)
+		return;
 
-	do {
-		int button_not_pressed;
-		unsigned long soft_power_reg = (unsigned long) param;
-
-		schedule_timeout_interruptible(pwrsw_enabled ? HZ : HZ/POWERSWITCH_POLL_PER_SEC);
-
-		if (unlikely(!pwrsw_enabled))
-			continue;
-
-		if (soft_power_reg) {
-			/*
-			 * Non-Gecko-style machines:
-			 * Check the power switch status which is read from the
-			 * real I/O location at soft_power_reg.
-			 * Bit 31 ("the lowest bit) is the status of the power switch.
-			 * This bit is "1" if the button is NOT pressed.
-			 */
-			button_not_pressed = (gsc_readl(soft_power_reg) & 0x1);
-		} else {
-			/*
-			 * On gecko style machines (e.g. 712/xx and 715/xx) 
-			 * the power switch status is stored in Bit 0 ("the highest bit")
-			 * of CPU diagnose register 25.
-			 * Warning: Some machines never reset the DIAG flag, even if
-			 * the button has been released again.
-			 */
-			button_not_pressed = (__getDIAG(25) & 0x80000000);
-		}
-
-		if (likely(button_not_pressed)) {
-			if (unlikely(shutdown_timer && /* avoid writing if not necessary */
-				shutdown_timer < (POWERSWITCH_DOWN_SEC*POWERSWITCH_POLL_PER_SEC))) {
-				shutdown_timer = 0;
-				printk(KERN_INFO KTHREAD_NAME ": Shutdown request aborted.\n");
-			}
-		} else
-			process_shutdown();
+	if (__getDIAG(25) & 0x80000000) {
+		/* power switch button not pressed or released again */
+		/* Warning: Some machines do never reset this DIAG flag! */
+		shutdown_timer = 0;
+	} else {
+		process_shutdown();
+	}
+}
 
 
-	} while (!kthread_should_stop());
 
-	return 0;
+/*
+ * Check the power switch status which is read from the
+ * real I/O location at soft_power_reg.
+ * Bit 31 ("the lowest bit) is the status of the power switch.
+ */
+
+static void polling_tasklet_func(unsigned long soft_power_reg)
+{
+        unsigned long current_status;
+	
+	if (!pwrsw_enabled)
+		return;
+
+	current_status = gsc_readl(soft_power_reg);
+	if (current_status & 0x1) {
+		/* power switch button not pressed */
+		shutdown_timer = 0;
+	} else {
+		process_shutdown();
+	}
 }
 
 
@@ -165,7 +190,7 @@ static int kpowerswd(void *param)
  * powerfail interruption handler (irq IRQ_FROM_REGION(CPU_IRQ_REGION)+2) 
  */
 #if 0
-static void powerfail_interrupt(int code, void *x)
+static void powerfail_interrupt(int code, void *x, struct pt_regs *regs)
 {
 	printk(KERN_CRIT "POWERFAIL INTERRUPTION !\n");
 	poweroff();
@@ -197,7 +222,7 @@ static struct notifier_block parisc_panic_block = {
 static int __init power_init(void)
 {
 	unsigned long ret;
-	unsigned long soft_power_reg;
+	unsigned long soft_power_reg = 0;
 
 #if 0
 	request_irq( IRQ_FROM_REGION(CPU_IRQ_REGION)+2, &powerfail_interrupt,
@@ -212,44 +237,42 @@ static int __init power_init(void)
 		soft_power_reg = -1UL;
 	
 	switch (soft_power_reg) {
-	case 0:		printk(KERN_INFO DRIVER_NAME ": Gecko-style soft power switch enabled.\n");
+	case 0:		printk(KERN_INFO "Gecko-style soft power switch enabled.\n");
+			power_tasklet.func = gecko_tasklet_func;
 			break;
 			
-	case -1UL:	printk(KERN_INFO DRIVER_NAME ": Soft power switch support not available.\n");
+	case -1UL:	printk(KERN_INFO "Soft power switch support not available.\n");
 			return -ENODEV;
 	
-	default:	printk(KERN_INFO DRIVER_NAME ": Soft power switch at 0x%08lx enabled.\n",
+	default:	printk(KERN_INFO "Soft power switch enabled, polling @ 0x%08lx.\n",
 				soft_power_reg);
-	}
-
-	power_task = kthread_run(kpowerswd, (void*)soft_power_reg, KTHREAD_NAME);
-	if (IS_ERR(power_task)) {
-		printk(KERN_ERR DRIVER_NAME ": thread creation failed.  Driver not loaded.\n");
-		pdc_soft_power_button(0);
-		return -EIO;
+			power_tasklet.data = soft_power_reg;
+			power_tasklet.func = polling_tasklet_func;
 	}
 
 	/* Register a call for panic conditions. */
-	atomic_notifier_chain_register(&panic_notifier_list,
-			&parisc_panic_block);
+	notifier_chain_register(&panic_notifier_list, &parisc_panic_block);
+
+	tasklet_enable(&power_tasklet);
 
 	return 0;
 }
 
 static void __exit power_exit(void)
 {
-	kthread_stop(power_task);
+	if (!power_tasklet.func)
+		return;
 
-	atomic_notifier_chain_unregister(&panic_notifier_list,
-			&parisc_panic_block);
-
+	tasklet_disable(&power_tasklet);
+	notifier_chain_unregister(&panic_notifier_list, &parisc_panic_block);
+	power_tasklet.func = NULL;
 	pdc_soft_power_button(0);
 }
 
-arch_initcall(power_init);
+module_init(power_init);
 module_exit(power_exit);
 
 
-MODULE_AUTHOR("Helge Deller <deller@gmx.de>");
+MODULE_AUTHOR("Helge Deller");
 MODULE_DESCRIPTION("Soft power switch driver");
 MODULE_LICENSE("Dual BSD/GPL");

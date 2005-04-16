@@ -1,7 +1,22 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  *  ALSA sequencer Timer
  *  Copyright (c) 1998-1999 by Frank van de Pol <fvdpol@coil.demon.nl>
+ *
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ *
  */
 #ifndef __SND_SEQ_TIMER_H
 #define __SND_SEQ_TIMER_H
@@ -9,13 +24,13 @@
 #include <sound/timer.h>
 #include <sound/seq_kernel.h>
 
-struct snd_seq_timer_tick {
+typedef struct {
 	snd_seq_tick_time_t	cur_tick;	/* current tick */
 	unsigned long		resolution;	/* time per tick in nsec */
 	unsigned long		fraction;	/* current time per tick in nsec */
-};
+} seq_timer_tick_t;
 
-struct snd_seq_timer {
+typedef struct {
 	/* ... tempo / offset / running state */
 
 	unsigned int		running:1,	/* running state of queue */	
@@ -25,33 +40,34 @@ struct snd_seq_timer {
 	int			ppq;		/* time resolution, ticks/quarter */
 
 	snd_seq_real_time_t	cur_time;	/* current time */
-	struct snd_seq_timer_tick	tick;	/* current tick */
+	seq_timer_tick_t	tick;		/* current tick */
 	int tick_updated;
 	
 	int			type;		/* timer type */
-	struct snd_timer_id	alsa_id;	/* ALSA's timer ID */
-	struct snd_timer_instance	*timeri;	/* timer instance */
+	snd_timer_id_t		alsa_id;	/* ALSA's timer ID */
+	snd_timer_instance_t	*timeri;	/* timer instance */
 	unsigned int		ticks;
 	unsigned long		preferred_resolution; /* timer resolution, ticks/sec */
 
 	unsigned int skew;
 	unsigned int skew_base;
 
-	struct timespec64	last_update;	 /* time of last clock update, used for interpolation */
+	struct timeval 		last_update;	 /* time of last clock update, used for interpolation */
 
 	spinlock_t lock;
-};
+} seq_timer_t;
 
 
 /* create new timer (constructor) */
-struct snd_seq_timer *snd_seq_timer_new(void);
+extern seq_timer_t *snd_seq_timer_new(void);
 
 /* delete timer (destructor) */
-void snd_seq_timer_delete(struct snd_seq_timer **tmr);
+extern void snd_seq_timer_delete(seq_timer_t **tmr);
+
+void snd_seq_timer_set_tick_resolution(seq_timer_tick_t *tick, int tempo, int ppq, int nticks);
 
 /* */
-static inline void snd_seq_timer_update_tick(struct snd_seq_timer_tick *tick,
-					     unsigned long resolution)
+static inline void snd_seq_timer_update_tick(seq_timer_tick_t *tick, unsigned long resolution)
 {
 	if (tick->resolution > 0) {
 		tick->fraction += resolution;
@@ -105,30 +121,21 @@ static inline void snd_seq_inc_time_nsec(snd_seq_real_time_t *tm, unsigned long 
 }
 
 /* called by timer isr */
-struct snd_seq_queue;
-int snd_seq_timer_open(struct snd_seq_queue *q);
-int snd_seq_timer_close(struct snd_seq_queue *q);
-int snd_seq_timer_midi_open(struct snd_seq_queue *q);
-int snd_seq_timer_midi_close(struct snd_seq_queue *q);
-void snd_seq_timer_defaults(struct snd_seq_timer *tmr);
-void snd_seq_timer_reset(struct snd_seq_timer *tmr);
-int snd_seq_timer_stop(struct snd_seq_timer *tmr);
-int snd_seq_timer_start(struct snd_seq_timer *tmr);
-int snd_seq_timer_continue(struct snd_seq_timer *tmr);
-int snd_seq_timer_set_tempo(struct snd_seq_timer *tmr, int tempo);
-int snd_seq_timer_set_tempo_ppq(struct snd_seq_timer *tmr, int tempo, int ppq);
-int snd_seq_timer_set_position_tick(struct snd_seq_timer *tmr, snd_seq_tick_time_t position);
-int snd_seq_timer_set_position_time(struct snd_seq_timer *tmr, snd_seq_real_time_t position);
-int snd_seq_timer_set_skew(struct snd_seq_timer *tmr, unsigned int skew, unsigned int base);
-snd_seq_real_time_t snd_seq_timer_get_cur_time(struct snd_seq_timer *tmr,
-					       bool adjust_ktime);
-snd_seq_tick_time_t snd_seq_timer_get_cur_tick(struct snd_seq_timer *tmr);
-
-extern int seq_default_timer_class;
-extern int seq_default_timer_sclass;
-extern int seq_default_timer_card;
-extern int seq_default_timer_device;
-extern int seq_default_timer_subdevice;
-extern int seq_default_timer_resolution;
+int snd_seq_timer_open(queue_t *q);
+int snd_seq_timer_close(queue_t *q);
+int snd_seq_timer_midi_open(queue_t *q);
+int snd_seq_timer_midi_close(queue_t *q);
+void snd_seq_timer_defaults(seq_timer_t *tmr);
+void snd_seq_timer_reset(seq_timer_t *tmr);
+int snd_seq_timer_stop(seq_timer_t *tmr);
+int snd_seq_timer_start(seq_timer_t *tmr);
+int snd_seq_timer_continue(seq_timer_t *tmr);
+int snd_seq_timer_set_tempo(seq_timer_t *tmr, int tempo);
+int snd_seq_timer_set_ppq(seq_timer_t *tmr, int ppq);
+int snd_seq_timer_set_position_tick(seq_timer_t *tmr, snd_seq_tick_time_t position);
+int snd_seq_timer_set_position_time(seq_timer_t *tmr, snd_seq_real_time_t position);
+int snd_seq_timer_set_skew(seq_timer_t *tmr, unsigned int skew, unsigned int base);
+snd_seq_real_time_t snd_seq_timer_get_cur_time(seq_timer_t *tmr);
+snd_seq_tick_time_t snd_seq_timer_get_cur_tick(seq_timer_t *tmr);
 
 #endif

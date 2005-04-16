@@ -68,7 +68,7 @@ typedef struct {
 	unsigned char ClockControl:1;	/* RW: Clock control: 0=normal, 1=stop 3780i clocks */
 	unsigned char SoftReset:1;	/* RW: Soft reset 0=normal, 1=soft reset active */
 	unsigned char ConfigMode:1;	/* RW: Configuration mode, 0=normal, 1=config mode */
-	unsigned short Reserved:13;	/* 0: Reserved */
+	unsigned char Reserved:5;	/* 0: Reserved */
 } DSP_ISA_SLAVE_CONTROL;
 
 
@@ -101,7 +101,7 @@ typedef struct {
 } DSP_UART_CFG_1;
 
 typedef struct {
-	unsigned char Enable:1;	/* RW: Enable I/O and IRQ: 0=false, 1=true */
+	unsigned char Enable:1;	/* RW: Enable I/O and IRQ: 0=FALSE, 1=TRUE */
 	unsigned char Reserved:7;	/* 0: Reserved */
 } DSP_UART_CFG_2;
 
@@ -114,7 +114,7 @@ typedef struct {
 } DSP_HBRIDGE_CFG_1;
 
 typedef struct {
-	unsigned char Enable:1;	/* RW: enable I/O and IRQ: 0=false, 1=true */
+	unsigned char Enable:1;	/* RW: enable I/O and IRQ: 0=FALSE, 1=TRUE */
 	unsigned char Reserved:7;	/* 0: Reserved */
 } DSP_HBRIDGE_CFG_2;
 
@@ -122,7 +122,7 @@ typedef struct {
 typedef struct {
 	unsigned char Dma:3;	/* RW: DMA channel selection */
 	unsigned char NumTransfers:2;	/* RW: Maximum # of transfers once being granted the ISA bus */
-	unsigned char ReRequest:2;	/* RW: Minimum delay between releasing the ISA bus and requesting it again */
+	unsigned char ReRequest:2;	/* RW: Minumum delay between releasing the ISA bus and requesting it again */
 	unsigned char MEMCS16:1;	/* RW: ISA signal MEMCS16: 0=disabled, 1=enabled */
 } DSP_BUSMASTER_CFG_1;
 
@@ -133,12 +133,12 @@ typedef struct {
 
 
 typedef struct {
-	unsigned char GateIOCHRDY:1;	/* RW: Enable IOCHRDY gating: 0=false, 1=true */
+	unsigned char GateIOCHRDY:1;	/* RW: Enable IOCHRDY gating: 0=FALSE, 1=TRUE */
 	unsigned char Reserved:7;	/* 0: Reserved */
 } DSP_ISA_PROT_CFG;
 
 typedef struct {
-	unsigned char Enable:1;	/* RW: Enable low power suspend/resume 0=false, 1=true */
+	unsigned char Enable:1;	/* RW: Enable low power suspend/resume 0=FALSE, 1=TRUE */
 	unsigned char Reserved:7;	/* 0: Reserved */
 } DSP_POWER_MGMT_CFG;
 
@@ -338,6 +338,10 @@ unsigned short dsp3780I_ReadMsaCfg(unsigned short usDspBaseIO,
                                    unsigned long ulMsaAddr);
 void dsp3780I_WriteMsaCfg(unsigned short usDspBaseIO,
                           unsigned long ulMsaAddr, unsigned short usValue);
+void dsp3780I_WriteGenCfg(unsigned short usDspBaseIO, unsigned uIndex,
+                          unsigned char ucValue);
+unsigned char dsp3780I_ReadGenCfg(unsigned short usDspBaseIO,
+                                  unsigned uIndex);
 int dsp3780I_GetIPCSource(unsigned short usDspBaseIO,
                           unsigned short *pusIPCSource);
 

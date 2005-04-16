@@ -1,6 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * MTD map driver for BIOS Flash on Intel SCB2 boards
+ * $Id: scb2_flash.c,v 1.11 2004/11/28 09:40:40 dwmw2 Exp $
  * Copyright (C) 2002 Sun Microsystems, Inc.
  * Tim Hockin <thockin@sun.com>
  *
@@ -48,10 +48,12 @@
 #include <linux/module.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
+#include <linux/init.h>
 #include <asm/io.h>
 #include <linux/mtd/mtd.h>
 #include <linux/mtd/map.h>
 #include <linux/mtd/cfi.h>
+#include <linux/config.h>
 #include <linux/pci.h>
 #include <linux/pci_ids.h>
 
@@ -69,7 +71,8 @@ static struct map_info scb2_map = {
 };
 static int region_fail;
 
-static int scb2_fixup_mtd(struct mtd_info *mtd)
+static int __devinit
+scb2_fixup_mtd(struct mtd_info *mtd)
 {
 	int i;
 	int done = 0;
@@ -77,7 +80,7 @@ static int scb2_fixup_mtd(struct mtd_info *mtd)
 	struct cfi_private *cfi = map->fldrv_priv;
 
 	/* barf if this doesn't look right */
-	if (cfi->cfiq->InterfaceDesc != CFI_INTERFACE_X16_ASYNC) {
+	if (cfi->cfiq->InterfaceDesc != 1) {
 		printk(KERN_ERR MODNAME ": unsupported InterfaceDesc: %#x\n",
 		    cfi->cfiq->InterfaceDesc);
 		return -1;
@@ -117,8 +120,7 @@ static int scb2_fixup_mtd(struct mtd_info *mtd)
 		struct mtd_erase_region_info *region = &mtd->eraseregions[i];
 
 		if (region->numblocks * region->erasesize > mtd->size) {
-			region->numblocks = ((unsigned long)mtd->size /
-						region->erasesize);
+			region->numblocks = (mtd->size / region->erasesize);
 			done = 1;
 		} else {
 			region->numblocks = 0;
@@ -132,8 +134,8 @@ static int scb2_fixup_mtd(struct mtd_info *mtd)
 /* CSB5's 'Function Control Register' has bits for decoding @ >= 0xffc00000 */
 #define CSB5_FCR	0x41
 #define CSB5_FCR_DECODE_ALL 0x0e
-static int scb2_flash_probe(struct pci_dev *dev,
-			    const struct pci_device_id *ent)
+static int __devinit
+scb2_flash_probe(struct pci_dev *dev, const struct pci_device_id *ent)
 {
 	u8 reg;
 
@@ -152,7 +154,7 @@ static int scb2_flash_probe(struct pci_dev *dev,
 	}
 
 	/* remap the IO window (w/o caching) */
-	scb2_ioaddr = ioremap(SCB2_ADDR, SCB2_WINDOW);
+	scb2_ioaddr = ioremap_nocache(SCB2_ADDR, SCB2_WINDOW);
 	if (!scb2_ioaddr) {
 		printk(KERN_ERR MODNAME ": Failed to ioremap window!\n");
 		if (!region_fail)
@@ -179,7 +181,7 @@ static int scb2_flash_probe(struct pci_dev *dev,
 
 	scb2_mtd->owner = THIS_MODULE;
 	if (scb2_fixup_mtd(scb2_mtd) < 0) {
-		mtd_device_unregister(scb2_mtd);
+		del_mtd_device(scb2_mtd);
 		map_destroy(scb2_mtd);
 		iounmap(scb2_ioaddr);
 		if (!region_fail)
@@ -187,24 +189,25 @@ static int scb2_flash_probe(struct pci_dev *dev,
 		return -ENODEV;
 	}
 
-	printk(KERN_NOTICE MODNAME ": chip size 0x%llx at offset 0x%llx\n",
-	       (unsigned long long)scb2_mtd->size,
-	       (unsigned long long)(SCB2_WINDOW - scb2_mtd->size));
+	printk(KERN_NOTICE MODNAME ": chip size 0x%x at offset 0x%x\n",
+	       scb2_mtd->size, SCB2_WINDOW - scb2_mtd->size);
 
-	mtd_device_register(scb2_mtd, NULL, 0);
+	add_mtd_device(scb2_mtd);
 
 	return 0;
 }
 
-static void scb2_flash_remove(struct pci_dev *dev)
+static void __devexit
+scb2_flash_remove(struct pci_dev *dev)
 {
 	if (!scb2_mtd)
 		return;
 
 	/* disable flash writes */
-	mtd_lock(scb2_mtd, 0, scb2_mtd->size);
+	if (scb2_mtd->lock)
+		scb2_mtd->lock(scb2_mtd, 0, scb2_mtd->size);
 
-	mtd_device_unregister(scb2_mtd);
+	del_mtd_device(scb2_mtd);
 	map_destroy(scb2_mtd);
 
 	iounmap(scb2_ioaddr);
@@ -212,6 +215,7 @@ static void scb2_flash_remove(struct pci_dev *dev)
 
 	if (!region_fail)
 		release_mem_region(SCB2_ADDR, SCB2_WINDOW);
+	pci_set_drvdata(dev, NULL);
 }
 
 static struct pci_device_id scb2_flash_pci_ids[] = {
@@ -228,10 +232,23 @@ static struct pci_driver scb2_flash_driver = {
 	.name =     "Intel SCB2 BIOS Flash",
 	.id_table = scb2_flash_pci_ids,
 	.probe =    scb2_flash_probe,
-	.remove =   scb2_flash_remove,
+	.remove =   __devexit_p(scb2_flash_remove),
 };
 
-module_pci_driver(scb2_flash_driver);
+static int __init
+scb2_flash_init(void)
+{
+	return pci_module_init(&scb2_flash_driver);
+}
+
+static void __exit
+scb2_flash_exit(void)
+{
+	pci_unregister_driver(&scb2_flash_driver);
+}
+
+module_init(scb2_flash_init);
+module_exit(scb2_flash_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Tim Hockin <thockin@sun.com>");

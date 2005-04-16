@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  *  ebt_limit
  *
@@ -11,13 +10,13 @@
  *  September, 2003
  *
  */
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
-#include <linux/module.h>
-#include <linux/netdevice.h>
-#include <linux/spinlock.h>
-#include <linux/netfilter/x_tables.h>
+
 #include <linux/netfilter_bridge/ebtables.h>
 #include <linux/netfilter_bridge/ebt_limit.h>
+#include <linux/module.h>
+
+#include <linux/netdevice.h>
+#include <linux/spinlock.h>
 
 static DEFINE_SPINLOCK(limit_lock);
 
@@ -32,10 +31,11 @@ static DEFINE_SPINLOCK(limit_lock);
 
 #define CREDITS_PER_JIFFY POW2_BELOW32(MAX_CPJ)
 
-static bool
-ebt_limit_mt(const struct sk_buff *skb, struct xt_action_param *par)
+static int ebt_limit_match(const struct sk_buff *skb,
+   const struct net_device *in, const struct net_device *out,
+   const void *data, unsigned int datalen)
 {
-	struct ebt_limit_info *info = (void *)par->matchinfo;
+	struct ebt_limit_info *info = (struct ebt_limit_info *)data;
 	unsigned long now = jiffies;
 
 	spin_lock_bh(&limit_lock);
@@ -47,11 +47,11 @@ ebt_limit_mt(const struct sk_buff *skb, struct xt_action_param *par)
 		/* We're not limited. */
 		info->credit -= info->cost;
 		spin_unlock_bh(&limit_lock);
-		return true;
+		return EBT_MATCH;
 	}
 
 	spin_unlock_bh(&limit_lock);
-	return false;
+	return EBT_NOMATCH;
 }
 
 /* Precision saver. */
@@ -66,15 +66,19 @@ user2credits(u_int32_t user)
 	return (user * HZ * CREDITS_PER_JIFFY) / EBT_LIMIT_SCALE;
 }
 
-static int ebt_limit_mt_check(const struct xt_mtchk_param *par)
+static int ebt_limit_check(const char *tablename, unsigned int hookmask,
+   const struct ebt_entry *e, void *data, unsigned int datalen)
 {
-	struct ebt_limit_info *info = par->matchinfo;
+	struct ebt_limit_info *info = (struct ebt_limit_info *)data;
+
+	if (datalen != EBT_ALIGN(sizeof(struct ebt_limit_info)))
+		return -EINVAL;
 
 	/* Check for overflow. */
 	if (info->burst == 0 ||
 	    user2credits(info->avg * info->burst) < user2credits(info->avg)) {
-		pr_info_ratelimited("overflow, try lower: %u/%u\n",
-				    info->avg, info->burst);
+		printk("Overflow in ebt_limit, try lower: %u/%u\n",
+			info->avg, info->burst);
 		return -EINVAL;
 	}
 
@@ -86,44 +90,24 @@ static int ebt_limit_mt_check(const struct xt_mtchk_param *par)
 	return 0;
 }
 
-
-#ifdef CONFIG_NETFILTER_XTABLES_COMPAT
-/*
- * no conversion function needed --
- * only avg/burst have meaningful values in userspace.
- */
-struct ebt_compat_limit_info {
-	compat_uint_t avg, burst;
-	compat_ulong_t prev;
-	compat_uint_t credit, credit_cap, cost;
-};
-#endif
-
-static struct xt_match ebt_limit_mt_reg __read_mostly = {
-	.name		= "limit",
-	.revision	= 0,
-	.family		= NFPROTO_BRIDGE,
-	.match		= ebt_limit_mt,
-	.checkentry	= ebt_limit_mt_check,
-	.matchsize	= sizeof(struct ebt_limit_info),
-	.usersize	= offsetof(struct ebt_limit_info, prev),
-#ifdef CONFIG_NETFILTER_XTABLES_COMPAT
-	.compatsize	= sizeof(struct ebt_compat_limit_info),
-#endif
+static struct ebt_match ebt_limit_reg =
+{
+	.name		= EBT_LIMIT_MATCH,
+	.match		= ebt_limit_match,
+	.check		= ebt_limit_check,
 	.me		= THIS_MODULE,
 };
 
-static int __init ebt_limit_init(void)
+static int __init init(void)
 {
-	return xt_register_match(&ebt_limit_mt_reg);
+	return ebt_register_match(&ebt_limit_reg);
 }
 
-static void __exit ebt_limit_fini(void)
+static void __exit fini(void)
 {
-	xt_unregister_match(&ebt_limit_mt_reg);
+	ebt_unregister_match(&ebt_limit_reg);
 }
 
-module_init(ebt_limit_init);
-module_exit(ebt_limit_fini);
-MODULE_DESCRIPTION("Ebtables: Rate-limit match");
+module_init(init);
+module_exit(fini);
 MODULE_LICENSE("GPL");

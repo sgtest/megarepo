@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *   US-X2Y AUDIO
  *   Copyright (c) 2002-2004 by Karsten Wiese
@@ -11,16 +10,30 @@
  *
  *   Copyright (c) 2002 by Takashi Iwai <tiwai@suse.de>
  *
- *   Many codes borrowed from audio.c by
+ *   Many codes borrowed from audio.c by 
  *	    Alan Cox (alan@lxorguk.ukuu.org.uk)
  *	    Thomas Sailer (sailer@ife.ee.ethz.ch)
+ *
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  */
 
 
+#include <sound/driver.h>
 #include <linux/interrupt.h>
-#include <linux/slab.h>
 #include <linux/usb.h>
-#include <linux/moduleparam.h>
 #include <sound/core.h>
 #include <sound/info.h>
 #include <sound/pcm.h>
@@ -28,69 +41,63 @@
 #include "usx2y.h"
 #include "usbusx2y.h"
 
-/* Default value used for nr of packs per urb.
- * 1 to 4 have been tested ok on uhci.
- * To use 3 on ohci, you'd need a patch:
- * look for "0000425-linux-2.6.9-rc4-mm1_ohci-hcd.patch.gz" on
- * "https://bugtrack.alsa-project.org/alsa-bug/bug_view_page.php?bug_id=0000425"
- *
- * 1, 2 and 4 work out of the box on ohci, if I recall correctly.
- * Bigger is safer operation, smaller gives lower latencies.
- */
-#define USX2Y_NRPACKS 4
-
-/* If your system works ok with this module's parameter
- * nrpacks set to 1, you might as well comment
- * this define out, and thereby produce smaller, faster code.
- * You'd also set USX2Y_NRPACKS to 1 then.
- */
-#define USX2Y_NRPACKS_VARIABLE 1
+#define USX2Y_NRPACKS 4			/* Default value used for nr of packs per urb.
+					  1 to 4 have been tested ok on uhci.
+					  To use 3 on ohci, you'd need a patch:
+					  look for "0000425-linux-2.6.9-rc4-mm1_ohci-hcd.patch.gz" on
+					  "https://bugtrack.alsa-project.org/alsa-bug/bug_view_page.php?bug_id=0000425"
+					  .
+					  1, 2 and 4 work out of the box on ohci, if I recall correctly.
+					  Bigger is safer operation,
+					  smaller gives lower latencies.
+					*/
+#define USX2Y_NRPACKS_VARIABLE y	/* If your system works ok with this module's parameter
+					   nrpacks set to 1, you might as well comment 
+					   this #define out, and thereby produce smaller, faster code.
+					   You'd also set USX2Y_NRPACKS to 1 then.
+					*/
 
 #ifdef USX2Y_NRPACKS_VARIABLE
-static int nrpacks = USX2Y_NRPACKS; /* number of packets per urb */
-#define  nr_of_packs() nrpacks
-module_param(nrpacks, int, 0444);
-MODULE_PARM_DESC(nrpacks, "Number of packets per URB.");
+ static int nrpacks = USX2Y_NRPACKS; /* number of packets per urb */
+ #define  nr_of_packs() nrpacks
+ module_param(nrpacks, int, 0444);
+ MODULE_PARM_DESC(nrpacks, "Number of packets per URB.");
 #else
-#define nr_of_packs() USX2Y_NRPACKS
+ #define nr_of_packs() USX2Y_NRPACKS
 #endif
 
-static int usx2y_urb_capt_retire(struct snd_usx2y_substream *subs)
+
+static int usX2Y_urb_capt_retire(snd_usX2Y_substream_t *subs)
 {
 	struct urb	*urb = subs->completed_urb;
-	struct snd_pcm_runtime *runtime = subs->pcm_substream->runtime;
+	snd_pcm_runtime_t *runtime = subs->pcm_substream->runtime;
 	unsigned char	*cp;
-	int		i, len, lens = 0, hwptr_done = subs->hwptr_done;
-	int		cnt, blen;
-	struct usx2ydev	*usx2y = subs->usx2y;
+	int 		i, len, lens = 0, hwptr_done = subs->hwptr_done;
+	usX2Ydev_t	*usX2Y = subs->usX2Y;
 
 	for (i = 0; i < nr_of_packs(); i++) {
-		cp = (unsigned char *)urb->transfer_buffer + urb->iso_frame_desc[i].offset;
+		cp = (unsigned char*)urb->transfer_buffer + urb->iso_frame_desc[i].offset;
 		if (urb->iso_frame_desc[i].status) { /* active? hmm, skip this */
-			snd_printk(KERN_ERR
-				   "active frame status %i. Most probably some hardware problem.\n",
-				   urb->iso_frame_desc[i].status);
+			snd_printk("activ frame status %i. Most propably some hardware problem.\n", urb->iso_frame_desc[i].status);
 			return urb->iso_frame_desc[i].status;
 		}
-		len = urb->iso_frame_desc[i].actual_length / usx2y->stride;
-		if (!len) {
+		len = urb->iso_frame_desc[i].actual_length / usX2Y->stride;
+		if (! len) {
 			snd_printd("0 == len ERROR!\n");
 			continue;
 		}
 
 		/* copy a data chunk */
 		if ((hwptr_done + len) > runtime->buffer_size) {
-			cnt = runtime->buffer_size - hwptr_done;
-			blen = cnt * usx2y->stride;
-			memcpy(runtime->dma_area + hwptr_done * usx2y->stride, cp, blen);
-			memcpy(runtime->dma_area, cp + blen, len * usx2y->stride - blen);
+			int cnt = runtime->buffer_size - hwptr_done;
+			int blen = cnt * usX2Y->stride;
+			memcpy(runtime->dma_area + hwptr_done * usX2Y->stride, cp, blen);
+			memcpy(runtime->dma_area, cp + blen, len * usX2Y->stride - blen);
 		} else {
-			memcpy(runtime->dma_area + hwptr_done * usx2y->stride, cp,
-			       len * usx2y->stride);
+			memcpy(runtime->dma_area + hwptr_done * usX2Y->stride, cp, len * usX2Y->stride);
 		}
 		lens += len;
-		hwptr_done += len;
-		if (hwptr_done >= runtime->buffer_size)
+		if ((hwptr_done += len) >= runtime->buffer_size)
 			hwptr_done -= runtime->buffer_size;
 	}
 
@@ -103,7 +110,6 @@ static int usx2y_urb_capt_retire(struct snd_usx2y_substream *subs)
 	}
 	return 0;
 }
-
 /*
  * prepare urb for playback data pipe
  *
@@ -114,54 +120,50 @@ static int usx2y_urb_capt_retire(struct snd_usx2y_substream *subs)
  * it directly from the buffer.  thus the data is once copied to
  * a temporary buffer and urb points to that.
  */
-static int usx2y_urb_play_prepare(struct snd_usx2y_substream *subs,
+static int usX2Y_urb_play_prepare(snd_usX2Y_substream_t *subs,
 				  struct urb *cap_urb,
 				  struct urb *urb)
 {
-	struct usx2ydev *usx2y = subs->usx2y;
-	struct snd_pcm_runtime *runtime = subs->pcm_substream->runtime;
-	int count, counts, pack, len;
+	int count, counts, pack;
+	usX2Ydev_t* usX2Y = subs->usX2Y;
+	snd_pcm_runtime_t *runtime = subs->pcm_substream->runtime;
 
 	count = 0;
 	for (pack = 0; pack <  nr_of_packs(); pack++) {
 		/* calculate the size of a packet */
-		counts = cap_urb->iso_frame_desc[pack].actual_length / usx2y->stride;
+		counts = cap_urb->iso_frame_desc[pack].actual_length / usX2Y->stride;
 		count += counts;
 		if (counts < 43 || counts > 50) {
-			snd_printk(KERN_ERR "should not be here with counts=%i\n", counts);
+			snd_printk("should not be here with counts=%i\n", counts);
 			return -EPIPE;
 		}
 		/* set up descriptor */
 		urb->iso_frame_desc[pack].offset = pack ?
-			urb->iso_frame_desc[pack - 1].offset +
-			urb->iso_frame_desc[pack - 1].length :
+			urb->iso_frame_desc[pack - 1].offset + urb->iso_frame_desc[pack - 1].length :
 			0;
 		urb->iso_frame_desc[pack].length = cap_urb->iso_frame_desc[pack].actual_length;
 	}
-	if (atomic_read(&subs->state) >= STATE_PRERUNNING) {
+	if (atomic_read(&subs->state) >= state_PRERUNNING)
 		if (subs->hwptr + count > runtime->buffer_size) {
 			/* err, the transferred area goes over buffer boundary.
 			 * copy the data to the temp buffer.
 			 */
+			int len;
 			len = runtime->buffer_size - subs->hwptr;
 			urb->transfer_buffer = subs->tmpbuf;
-			memcpy(subs->tmpbuf, runtime->dma_area +
-			       subs->hwptr * usx2y->stride, len * usx2y->stride);
-			memcpy(subs->tmpbuf + len * usx2y->stride,
-			       runtime->dma_area, (count - len) * usx2y->stride);
+			memcpy(subs->tmpbuf, runtime->dma_area + subs->hwptr * usX2Y->stride, len * usX2Y->stride);
+			memcpy(subs->tmpbuf + len * usX2Y->stride, runtime->dma_area, (count - len) * usX2Y->stride);
 			subs->hwptr += count;
 			subs->hwptr -= runtime->buffer_size;
 		} else {
 			/* set the buffer pointer */
-			urb->transfer_buffer = runtime->dma_area + subs->hwptr * usx2y->stride;
-			subs->hwptr += count;
-			if (subs->hwptr >= runtime->buffer_size)
-				subs->hwptr -= runtime->buffer_size;
+			urb->transfer_buffer = runtime->dma_area + subs->hwptr * usX2Y->stride;
+			if ((subs->hwptr += count) >= runtime->buffer_size)
+			subs->hwptr -= runtime->buffer_size;			
 		}
-	} else {
+	else
 		urb->transfer_buffer = subs->tmpbuf;
-	}
-	urb->transfer_buffer_length = count * usx2y->stride;
+	urb->transfer_buffer_length = count * usX2Y->stride;
 	return 0;
 }
 
@@ -170,10 +172,10 @@ static int usx2y_urb_play_prepare(struct snd_usx2y_substream *subs,
  *
  * update the current position and call callback if a period is processed.
  */
-static void usx2y_urb_play_retire(struct snd_usx2y_substream *subs, struct urb *urb)
+static void usX2Y_urb_play_retire(snd_usX2Y_substream_t *subs, struct urb *urb)
 {
-	struct snd_pcm_runtime *runtime = subs->pcm_substream->runtime;
-	int		len = urb->actual_length / subs->usx2y->stride;
+	snd_pcm_runtime_t *runtime = subs->pcm_substream->runtime;
+	int		len = urb->actual_length / subs->usX2Y->stride;
 
 	subs->transfer_done += len;
 	subs->hwptr_done +=  len;
@@ -185,203 +187,201 @@ static void usx2y_urb_play_retire(struct snd_usx2y_substream *subs, struct urb *
 	}
 }
 
-static int usx2y_urb_submit(struct snd_usx2y_substream *subs, struct urb *urb, int frame)
+static int usX2Y_urb_submit(snd_usX2Y_substream_t *subs, struct urb *urb, int frame)
 {
 	int err;
-
 	if (!urb)
 		return -ENODEV;
-	urb->start_frame = frame + NRURBS * nr_of_packs();  // let hcd do rollover sanity checks
+	urb->start_frame = (frame + NRURBS * nr_of_packs());  // let hcd do rollover sanity checks
 	urb->hcpriv = NULL;
-	urb->dev = subs->usx2y->dev; /* we need to set this at each time */
-	err = usb_submit_urb(urb, GFP_ATOMIC);
-	if (err < 0) {
-		snd_printk(KERN_ERR "usb_submit_urb() returned %i\n", err);
+	urb->dev = subs->usX2Y->chip.dev; /* we need to set this at each time */
+	if ((err = usb_submit_urb(urb, GFP_ATOMIC)) < 0) {
+		snd_printk("usb_submit_urb() returned %i\n", err);
 		return err;
 	}
 	return 0;
 }
 
-static int usx2y_usbframe_complete(struct snd_usx2y_substream *capsubs,
-				   struct snd_usx2y_substream *playbacksubs,
-				   int frame)
+static inline int usX2Y_usbframe_complete(snd_usX2Y_substream_t *capsubs, snd_usX2Y_substream_t *playbacksubs, int frame)
 {
 	int err, state;
-	struct urb *urb = playbacksubs->completed_urb;
+	{
+		struct urb *urb = playbacksubs->completed_urb;
 
-	state = atomic_read(&playbacksubs->state);
-	if (urb) {
-		if (state == STATE_RUNNING)
-			usx2y_urb_play_retire(playbacksubs, urb);
-		else if (state >= STATE_PRERUNNING)
-			atomic_inc(&playbacksubs->state);
-	} else {
-		switch (state) {
-		case STATE_STARTING1:
-			urb = playbacksubs->urb[0];
-			atomic_inc(&playbacksubs->state);
-			break;
-		case STATE_STARTING2:
-			urb = playbacksubs->urb[1];
-			atomic_inc(&playbacksubs->state);
-			break;
+		state = atomic_read(&playbacksubs->state);
+		if (NULL != urb) {
+			if (state == state_RUNNING)
+				usX2Y_urb_play_retire(playbacksubs, urb);
+			else
+				if (state >= state_PRERUNNING) {
+					atomic_inc(&playbacksubs->state);
+				}
+		} else {
+			switch (state) {
+			case state_STARTING1:
+				urb = playbacksubs->urb[0];
+				atomic_inc(&playbacksubs->state);
+				break;
+			case state_STARTING2:
+				urb = playbacksubs->urb[1];
+				atomic_inc(&playbacksubs->state);
+				break;
+			}
 		}
-	}
-	if (urb) {
-		err = usx2y_urb_play_prepare(playbacksubs, capsubs->completed_urb, urb);
-		if (err)
-			return err;
-		err = usx2y_urb_submit(playbacksubs, urb, frame);
-		if (err)
-			return err;
-	}
-
-	playbacksubs->completed_urb = NULL;
-
-	state = atomic_read(&capsubs->state);
-	if (state >= STATE_PREPARED) {
-		if (state == STATE_RUNNING) {
-			err = usx2y_urb_capt_retire(capsubs);
-			if (err)
+		if (urb) {
+			if ((err = usX2Y_urb_play_prepare(playbacksubs, capsubs->completed_urb, urb)) ||
+			    (err = usX2Y_urb_submit(playbacksubs, urb, frame))) {
 				return err;
-		} else if (state >= STATE_PRERUNNING) {
-			atomic_inc(&capsubs->state);
+			}
 		}
-		err = usx2y_urb_submit(capsubs, capsubs->completed_urb, frame);
-		if (err)
+
+		playbacksubs->completed_urb = NULL;
+	}
+	state = atomic_read(&capsubs->state);
+	if (state >= state_PREPARED) {
+		if (state == state_RUNNING) {
+			if ((err = usX2Y_urb_capt_retire(capsubs)))
+				return err;
+		} else
+			if (state >= state_PRERUNNING) {
+				atomic_inc(&capsubs->state);
+			}
+		if ((err = usX2Y_urb_submit(capsubs, capsubs->completed_urb, frame)))
 			return err;
 	}
 	capsubs->completed_urb = NULL;
 	return 0;
 }
 
-static void usx2y_clients_stop(struct usx2ydev *usx2y)
-{
-	struct snd_usx2y_substream *subs;
-	struct urb *urb;
-	int s, u;
 
+static void usX2Y_clients_stop(usX2Ydev_t *usX2Y)
+{
+	int s, u;
 	for (s = 0; s < 4; s++) {
-		subs = usx2y->subs[s];
+		snd_usX2Y_substream_t *subs = usX2Y->subs[s];
 		if (subs) {
 			snd_printdd("%i %p state=%i\n", s, subs, atomic_read(&subs->state));
-			atomic_set(&subs->state, STATE_STOPPED);
+			atomic_set(&subs->state, state_STOPPED);
 		}
 	}
 	for (s = 0; s < 4; s++) {
-		subs = usx2y->subs[s];
+		snd_usX2Y_substream_t *subs = usX2Y->subs[s];
 		if (subs) {
-			if (atomic_read(&subs->state) >= STATE_PRERUNNING)
-				snd_pcm_stop_xrun(subs->pcm_substream);
+			if (atomic_read(&subs->state) >= state_PRERUNNING) {
+				snd_pcm_stop(subs->pcm_substream, SNDRV_PCM_STATE_XRUN);
+			}
 			for (u = 0; u < NRURBS; u++) {
-				urb = subs->urb[u];
-				if (urb)
-					snd_printdd("%i status=%i start_frame=%i\n",
-						    u, urb->status, urb->start_frame);
+				struct urb *urb = subs->urb[u];
+				if (NULL != urb)
+					snd_printdd("%i status=%i start_frame=%i\n", u, urb->status, urb->start_frame);
 			}
 		}
 	}
-	usx2y->prepare_subs = NULL;
-	wake_up(&usx2y->prepare_wait_queue);
+	usX2Y->prepare_subs = NULL;
+	wake_up(&usX2Y->prepare_wait_queue);
 }
 
-static void usx2y_error_urb_status(struct usx2ydev *usx2y,
-				   struct snd_usx2y_substream *subs, struct urb *urb)
+static void usX2Y_error_urb_status(usX2Ydev_t *usX2Y, snd_usX2Y_substream_t *subs, struct urb *urb)
 {
-	snd_printk(KERN_ERR "ep=%i stalled with status=%i\n", subs->endpoint, urb->status);
+	snd_printk("ep=%i stalled with status=%i\n", subs->endpoint, urb->status);
 	urb->status = 0;
-	usx2y_clients_stop(usx2y);
+	usX2Y_clients_stop(usX2Y);
 }
 
-static void i_usx2y_urb_complete(struct urb *urb)
+static void usX2Y_error_sequence(usX2Ydev_t *usX2Y, snd_usX2Y_substream_t *subs, struct urb *urb)
 {
-	struct snd_usx2y_substream *subs = urb->context;
-	struct usx2ydev *usx2y = subs->usx2y;
-	struct snd_usx2y_substream *capsubs, *playbacksubs;
+	snd_printk("Sequence Error!(hcd_frame=%i ep=%i%s;wait=%i,frame=%i).\n"
+		   "Most propably some urb of usb-frame %i is still missing.\n"
+		   "Cause could be too long delays in usb-hcd interrupt handling.\n",
+		   usb_get_current_frame_number(usX2Y->chip.dev),
+		   subs->endpoint, usb_pipein(urb->pipe) ? "in" : "out", usX2Y->wait_iso_frame, urb->start_frame, usX2Y->wait_iso_frame);
+	usX2Y_clients_stop(usX2Y);
+}
 
-	if (unlikely(atomic_read(&subs->state) < STATE_PREPARED)) {
-		snd_printdd("hcd_frame=%i ep=%i%s status=%i start_frame=%i\n",
-			    usb_get_current_frame_number(usx2y->dev),
-			    subs->endpoint, usb_pipein(urb->pipe) ? "in" : "out",
-			    urb->status, urb->start_frame);
+static void i_usX2Y_urb_complete(struct urb *urb, struct pt_regs *regs)
+{
+	snd_usX2Y_substream_t *subs = (snd_usX2Y_substream_t*)urb->context;
+	usX2Ydev_t *usX2Y = subs->usX2Y;
+
+	if (unlikely(atomic_read(&subs->state) < state_PREPARED)) {
+		snd_printdd("hcd_frame=%i ep=%i%s status=%i start_frame=%i\n", usb_get_current_frame_number(usX2Y->chip.dev), subs->endpoint, usb_pipein(urb->pipe) ? "in" : "out", urb->status, urb->start_frame);
 		return;
 	}
 	if (unlikely(urb->status)) {
-		usx2y_error_urb_status(usx2y, subs, urb);
+		usX2Y_error_urb_status(usX2Y, subs, urb);
 		return;
 	}
-
-	subs->completed_urb = urb;
-
-	capsubs = usx2y->subs[SNDRV_PCM_STREAM_CAPTURE];
-	playbacksubs = usx2y->subs[SNDRV_PCM_STREAM_PLAYBACK];
-
-	if (capsubs->completed_urb &&
-	    atomic_read(&capsubs->state) >= STATE_PREPARED &&
-	    (playbacksubs->completed_urb ||
-	     atomic_read(&playbacksubs->state) < STATE_PREPARED)) {
-		if (!usx2y_usbframe_complete(capsubs, playbacksubs, urb->start_frame)) {
-			usx2y->wait_iso_frame += nr_of_packs();
-		} else {
-			snd_printdd("\n");
-			usx2y_clients_stop(usx2y);
-		}
+	if (likely((0xFFFF & urb->start_frame) == usX2Y->wait_iso_frame))
+		subs->completed_urb = urb;
+	else {
+		usX2Y_error_sequence(usX2Y, subs, urb);
+		return;
 	}
-}
-
-static void usx2y_urbs_set_complete(struct usx2ydev *usx2y,
-				    void (*complete)(struct urb *))
-{
-	struct snd_usx2y_substream *subs;
-	struct urb *urb;
-	int s, u;
-
-	for (s = 0; s < 4; s++) {
-		subs = usx2y->subs[s];
-		if (subs) {
-			for (u = 0; u < NRURBS; u++) {
-				urb = subs->urb[u];
-				if (urb)
-					urb->complete = complete;
+	{
+		snd_usX2Y_substream_t *capsubs = usX2Y->subs[SNDRV_PCM_STREAM_CAPTURE],
+			*playbacksubs = usX2Y->subs[SNDRV_PCM_STREAM_PLAYBACK];
+		if (capsubs->completed_urb && atomic_read(&capsubs->state) >= state_PREPARED &&
+		    (playbacksubs->completed_urb || atomic_read(&playbacksubs->state) < state_PREPARED)) {
+			if (!usX2Y_usbframe_complete(capsubs, playbacksubs, urb->start_frame)) {
+				if (nr_of_packs() <= urb->start_frame &&
+				    urb->start_frame <= (2 * nr_of_packs() - 1))	// uhci and ohci
+					usX2Y->wait_iso_frame = urb->start_frame - nr_of_packs();
+				else
+					usX2Y->wait_iso_frame +=  nr_of_packs();
+			} else {
+				snd_printdd("\n");
+				usX2Y_clients_stop(usX2Y);
 			}
 		}
 	}
 }
 
-static void usx2y_subs_startup_finish(struct usx2ydev *usx2y)
+static void usX2Y_urbs_set_complete(usX2Ydev_t * usX2Y, void (*complete)(struct urb *, struct pt_regs *))
 {
-	usx2y_urbs_set_complete(usx2y, i_usx2y_urb_complete);
-	usx2y->prepare_subs = NULL;
-}
-
-static void i_usx2y_subs_startup(struct urb *urb)
-{
-	struct snd_usx2y_substream *subs = urb->context;
-	struct usx2ydev *usx2y = subs->usx2y;
-	struct snd_usx2y_substream *prepare_subs = usx2y->prepare_subs;
-
-	if (prepare_subs) {
-		if (urb->start_frame == prepare_subs->urb[0]->start_frame) {
-			usx2y_subs_startup_finish(usx2y);
-			atomic_inc(&prepare_subs->state);
-			wake_up(&usx2y->prepare_wait_queue);
-		}
+	int s, u;
+	for (s = 0; s < 4; s++) {
+		snd_usX2Y_substream_t *subs = usX2Y->subs[s];
+		if (NULL != subs)
+			for (u = 0; u < NRURBS; u++) {
+				struct urb * urb = subs->urb[u];
+				if (NULL != urb)
+					urb->complete = complete;
+			}
 	}
-
-	i_usx2y_urb_complete(urb);
 }
 
-static void usx2y_subs_prepare(struct snd_usx2y_substream *subs)
+static void usX2Y_subs_startup_finish(usX2Ydev_t * usX2Y)
 {
-	snd_printdd("usx2y_substream_prepare(%p) ep=%i urb0=%p urb1=%p\n",
-		    subs, subs->endpoint, subs->urb[0], subs->urb[1]);
+	usX2Y_urbs_set_complete(usX2Y, i_usX2Y_urb_complete);
+	usX2Y->prepare_subs = NULL;
+}
+
+static void i_usX2Y_subs_startup(struct urb *urb, struct pt_regs *regs)
+{
+	snd_usX2Y_substream_t *subs = (snd_usX2Y_substream_t*)urb->context;
+	usX2Ydev_t *usX2Y = subs->usX2Y;
+	snd_usX2Y_substream_t *prepare_subs = usX2Y->prepare_subs;
+	if (NULL != prepare_subs)
+		if (urb->start_frame == prepare_subs->urb[0]->start_frame) {
+			usX2Y_subs_startup_finish(usX2Y);
+			atomic_inc(&prepare_subs->state);
+			wake_up(&usX2Y->prepare_wait_queue);
+		}
+
+	i_usX2Y_urb_complete(urb, regs);
+}
+
+static void usX2Y_subs_prepare(snd_usX2Y_substream_t *subs)
+{
+	snd_printdd("usX2Y_substream_prepare(%p) ep=%i urb0=%p urb1=%p\n", subs, subs->endpoint, subs->urb[0], subs->urb[1]);
 	/* reset the pointer */
 	subs->hwptr = 0;
 	subs->hwptr_done = 0;
 	subs->transfer_done = 0;
 }
 
-static void usx2y_urb_release(struct urb **urb, int free_tb)
+
+static void usX2Y_urb_release(struct urb** urb, int free_tb)
 {
 	if (*urb) {
 		usb_kill_urb(*urb);
@@ -391,64 +391,61 @@ static void usx2y_urb_release(struct urb **urb, int free_tb)
 		*urb = NULL;
 	}
 }
-
 /*
  * release a substreams urbs
  */
-static void usx2y_urbs_release(struct snd_usx2y_substream *subs)
+static void usX2Y_urbs_release(snd_usX2Y_substream_t *subs)
 {
 	int i;
-
-	snd_printdd("%s %i\n", __func__, subs->endpoint);
+	snd_printdd("usX2Y_urbs_release() %i\n", subs->endpoint);
 	for (i = 0; i < NRURBS; i++)
-		usx2y_urb_release(subs->urb + i,
-				  subs != subs->usx2y->subs[SNDRV_PCM_STREAM_PLAYBACK]);
+		usX2Y_urb_release(subs->urb + i, subs != subs->usX2Y->subs[SNDRV_PCM_STREAM_PLAYBACK]);
 
-	kfree(subs->tmpbuf);
-	subs->tmpbuf = NULL;
+	if (subs->tmpbuf) {
+		kfree(subs->tmpbuf);
+		subs->tmpbuf = NULL;
+	}
 }
-
 /*
  * initialize a substream's urbs
  */
-static int usx2y_urbs_allocate(struct snd_usx2y_substream *subs)
+static int usX2Y_urbs_allocate(snd_usX2Y_substream_t *subs)
 {
 	int i;
 	unsigned int pipe;
-	int is_playback = subs == subs->usx2y->subs[SNDRV_PCM_STREAM_PLAYBACK];
-	struct usb_device *dev = subs->usx2y->dev;
-	struct urb **purb;
+	int is_playback = subs == subs->usX2Y->subs[SNDRV_PCM_STREAM_PLAYBACK];
+	struct usb_device *dev = subs->usX2Y->chip.dev;
 
 	pipe = is_playback ? usb_sndisocpipe(dev, subs->endpoint) :
 			usb_rcvisocpipe(dev, subs->endpoint);
-	subs->maxpacksize = usb_maxpacket(dev, pipe);
+	subs->maxpacksize = usb_maxpacket(dev, pipe, is_playback);
 	if (!subs->maxpacksize)
 		return -EINVAL;
 
-	if (is_playback && !subs->tmpbuf) {	/* allocate a temporary buffer for playback */
+	if (is_playback && NULL == subs->tmpbuf) {	/* allocate a temporary buffer for playback */
 		subs->tmpbuf = kcalloc(nr_of_packs(), subs->maxpacksize, GFP_KERNEL);
-		if (!subs->tmpbuf)
+		if (NULL == subs->tmpbuf) {
+			snd_printk(KERN_ERR "cannot malloc tmpbuf\n");
 			return -ENOMEM;
+		}
 	}
 	/* allocate and initialize data urbs */
 	for (i = 0; i < NRURBS; i++) {
-		purb = subs->urb + i;
+		struct urb** purb = subs->urb + i;
 		if (*purb) {
 			usb_kill_urb(*purb);
 			continue;
 		}
 		*purb = usb_alloc_urb(nr_of_packs(), GFP_KERNEL);
-		if (!*purb) {
-			usx2y_urbs_release(subs);
+		if (NULL == *purb) {
+			usX2Y_urbs_release(subs);
 			return -ENOMEM;
 		}
 		if (!is_playback && !(*purb)->transfer_buffer) {
 			/* allocate a capture buffer per urb */
-			(*purb)->transfer_buffer =
-				kmalloc_array(subs->maxpacksize,
-					      nr_of_packs(), GFP_KERNEL);
-			if (!(*purb)->transfer_buffer) {
-				usx2y_urbs_release(subs);
+			(*purb)->transfer_buffer = kmalloc(subs->maxpacksize * nr_of_packs(), GFP_KERNEL);
+			if (NULL == (*purb)->transfer_buffer) {
+				usX2Y_urbs_release(subs);
 				return -ENOMEM;
 			}
 		}
@@ -457,76 +454,75 @@ static int usx2y_urbs_allocate(struct snd_usx2y_substream *subs)
 		(*purb)->number_of_packets = nr_of_packs();
 		(*purb)->context = subs;
 		(*purb)->interval = 1;
-		(*purb)->complete = i_usx2y_subs_startup;
+		(*purb)->complete = i_usX2Y_subs_startup;
 	}
 	return 0;
 }
 
-static void usx2y_subs_startup(struct snd_usx2y_substream *subs)
+static void usX2Y_subs_startup(snd_usX2Y_substream_t *subs)
 {
-	struct usx2ydev *usx2y = subs->usx2y;
-
-	usx2y->prepare_subs = subs;
+	usX2Ydev_t *usX2Y = subs->usX2Y;
+	usX2Y->prepare_subs = subs;
 	subs->urb[0]->start_frame = -1;
 	wmb();
-	usx2y_urbs_set_complete(usx2y, i_usx2y_subs_startup);
+	usX2Y_urbs_set_complete(usX2Y, i_usX2Y_subs_startup);
 }
 
-static int usx2y_urbs_start(struct snd_usx2y_substream *subs)
+static int usX2Y_urbs_start(snd_usX2Y_substream_t *subs)
 {
 	int i, err;
-	struct usx2ydev *usx2y = subs->usx2y;
-	struct urb *urb;
-	unsigned long pack;
+	usX2Ydev_t *usX2Y = subs->usX2Y;
 
-	err = usx2y_urbs_allocate(subs);
-	if (err < 0)
+	if ((err = usX2Y_urbs_allocate(subs)) < 0)
 		return err;
 	subs->completed_urb = NULL;
 	for (i = 0; i < 4; i++) {
-		struct snd_usx2y_substream *subs = usx2y->subs[i];
-
-		if (subs && atomic_read(&subs->state) >= STATE_PREPARED)
+		snd_usX2Y_substream_t *subs = usX2Y->subs[i];
+		if (subs != NULL && atomic_read(&subs->state) >= state_PREPARED)
 			goto start;
 	}
-
+	usX2Y->wait_iso_frame = -1;
  start:
-	usx2y_subs_startup(subs);
-	for (i = 0; i < NRURBS; i++) {
-		urb = subs->urb[i];
-		if (usb_pipein(urb->pipe)) {
-			if (!i)
-				atomic_set(&subs->state, STATE_STARTING3);
-			urb->dev = usx2y->dev;
-			for (pack = 0; pack < nr_of_packs(); pack++) {
-				urb->iso_frame_desc[pack].offset = subs->maxpacksize * pack;
-				urb->iso_frame_desc[pack].length = subs->maxpacksize;
-			}
-			urb->transfer_buffer_length = subs->maxpacksize * nr_of_packs();
-			err = usb_submit_urb(urb, GFP_ATOMIC);
-			if (err < 0) {
-				snd_printk(KERN_ERR "cannot submit datapipe for urb %d, err = %d\n", i, err);
-				err = -EPIPE;
-				goto cleanup;
+	{
+		usX2Y_subs_startup(subs);
+		for (i = 0; i < NRURBS; i++) {
+			struct urb *urb = subs->urb[i];
+			if (usb_pipein(urb->pipe)) {
+				unsigned long pack;
+				if (0 == i)
+					atomic_set(&subs->state, state_STARTING3);
+				urb->dev = usX2Y->chip.dev;
+				urb->transfer_flags = URB_ISO_ASAP;
+				for (pack = 0; pack < nr_of_packs(); pack++) {
+					urb->iso_frame_desc[pack].offset = subs->maxpacksize * pack;
+					urb->iso_frame_desc[pack].length = subs->maxpacksize;
+				}
+				urb->transfer_buffer_length = subs->maxpacksize * nr_of_packs(); 
+				if ((err = usb_submit_urb(urb, GFP_ATOMIC)) < 0) {
+					snd_printk (KERN_ERR "cannot submit datapipe for urb %d, err = %d\n", i, err);
+					err = -EPIPE;
+					goto cleanup;
+				} else {
+					if (0 > usX2Y->wait_iso_frame)
+						usX2Y->wait_iso_frame = urb->start_frame;
+				}
+				urb->transfer_flags = 0;
 			} else {
-				if (!i)
-					usx2y->wait_iso_frame = urb->start_frame;
+				atomic_set(&subs->state, state_STARTING1);
+				break;
 			}
-			urb->transfer_flags = 0;
-		} else {
-			atomic_set(&subs->state, STATE_STARTING1);
-			break;
 		}
-	}
-	err = 0;
-	wait_event(usx2y->prepare_wait_queue, !usx2y->prepare_subs);
-	if (atomic_read(&subs->state) != STATE_PREPARED)
-		err = -EPIPE;
+		err = 0;
+		wait_event(usX2Y->prepare_wait_queue, NULL == usX2Y->prepare_subs);
+		if (atomic_read(&subs->state) != state_PREPARED) {
+			err = -EPIPE;
+		}
 
- cleanup:
-	if (err) {
-		usx2y_subs_startup_finish(usx2y);
-		usx2y_clients_stop(usx2y);	// something is completely wrong > stop everything
+	cleanup:
+		if (err) {
+			usX2Y_subs_startup_finish(usX2Y);
+			usX2Y_clients_stop(usX2Y);		// something is completely wroong > stop evrything
+		}
 	}
 	return err;
 }
@@ -534,41 +530,40 @@ static int usx2y_urbs_start(struct snd_usx2y_substream *subs)
 /*
  * return the current pcm pointer.  just return the hwptr_done value.
  */
-static snd_pcm_uframes_t snd_usx2y_pcm_pointer(struct snd_pcm_substream *substream)
+static snd_pcm_uframes_t snd_usX2Y_pcm_pointer(snd_pcm_substream_t *substream)
 {
-	struct snd_usx2y_substream *subs = substream->runtime->private_data;
-
+	snd_usX2Y_substream_t *subs = (snd_usX2Y_substream_t *)substream->runtime->private_data;
 	return subs->hwptr_done;
 }
-
 /*
  * start/stop substream
  */
-static int snd_usx2y_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+static int snd_usX2Y_pcm_trigger(snd_pcm_substream_t *substream, int cmd)
 {
-	struct snd_usx2y_substream *subs = substream->runtime->private_data;
+	snd_usX2Y_substream_t *subs = (snd_usX2Y_substream_t *)substream->runtime->private_data;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		snd_printdd("%s(START)\n", __func__);
-		if (atomic_read(&subs->state) == STATE_PREPARED &&
-		    atomic_read(&subs->usx2y->subs[SNDRV_PCM_STREAM_CAPTURE]->state) >= STATE_PREPARED) {
-			atomic_set(&subs->state, STATE_PRERUNNING);
+		snd_printdd("snd_usX2Y_pcm_trigger(START)\n");
+		if (atomic_read(&subs->state) == state_PREPARED &&
+		    atomic_read(&subs->usX2Y->subs[SNDRV_PCM_STREAM_CAPTURE]->state) >= state_PREPARED) {
+			atomic_set(&subs->state, state_PRERUNNING);
 		} else {
 			snd_printdd("\n");
 			return -EPIPE;
 		}
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
-		snd_printdd("%s(STOP)\n", __func__);
-		if (atomic_read(&subs->state) >= STATE_PRERUNNING)
-			atomic_set(&subs->state, STATE_PREPARED);
+		snd_printdd("snd_usX2Y_pcm_trigger(STOP)\n");
+		if (atomic_read(&subs->state) >= state_PRERUNNING)
+			atomic_set(&subs->state, state_PREPARED);
 		break;
 	default:
 		return -EINVAL;
 	}
 	return 0;
 }
+
 
 /*
  * allocate a buffer, setup samplerate
@@ -578,11 +573,12 @@ static int snd_usx2y_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
  * if sg buffer is supported on the later version of alsa, we'll follow
  * that.
  */
-struct s_c2 {
+static struct s_c2
+{
 	char c1, c2;
-};
-
-static const struct s_c2 setrate_44100[] = {
+}
+	SetRate44100[] =
+{
 	{ 0x14, 0x08},	// this line sets 44100, well actually a little less
 	{ 0x18, 0x40},	// only tascam / frontier design knows the further lines .......
 	{ 0x18, 0x42},
@@ -617,8 +613,8 @@ static const struct s_c2 setrate_44100[] = {
 	{ 0x18, 0x7C},
 	{ 0x18, 0x7E}
 };
-
-static const struct s_c2 setrate_48000[] = {
+static struct s_c2 SetRate48000[] =
+{
 	{ 0x14, 0x09},	// this line sets 48000, well actually a little less
 	{ 0x18, 0x40},	// only tascam / frontier design knows the further lines .......
 	{ 0x18, 0x42},
@@ -653,68 +649,63 @@ static const struct s_c2 setrate_48000[] = {
 	{ 0x18, 0x7C},
 	{ 0x18, 0x7E}
 };
+#define NOOF_SETRATE_URBS ARRAY_SIZE(SetRate48000)
 
-#define NOOF_SETRATE_URBS ARRAY_SIZE(setrate_48000)
-
-static void i_usx2y_04int(struct urb *urb)
+static void i_usX2Y_04Int(struct urb* urb, struct pt_regs *regs)
 {
-	struct usx2ydev *usx2y = urb->context;
-
-	if (urb->status)
-		snd_printk(KERN_ERR "snd_usx2y_04int() urb->status=%i\n", urb->status);
-	if (!--usx2y->us04->len)
-		wake_up(&usx2y->in04_wait_queue);
+	usX2Ydev_t*	usX2Y = urb->context;
+	
+	if (urb->status) {
+		snd_printk("snd_usX2Y_04Int() urb->status=%i\n", urb->status);
+	}
+	if (0 == --usX2Y->US04->len)
+		wake_up(&usX2Y->In04WaitQueue);
 }
 
-static int usx2y_rate_set(struct usx2ydev *usx2y, int rate)
+static int usX2Y_rate_set(usX2Ydev_t *usX2Y, int rate)
 {
-	int err = 0, i;
-	struct snd_usx2y_urb_seq *us = NULL;
-	int *usbdata = NULL;
-	const struct s_c2 *ra = rate == 48000 ? setrate_48000 : setrate_44100;
-	struct urb *urb;
+	int			err = 0, i;
+	snd_usX2Y_urbSeq_t	*us = NULL;
+	int			*usbdata = NULL;
+	struct s_c2		*ra = rate == 48000 ? SetRate48000 : SetRate44100;
 
-	if (usx2y->rate != rate) {
-		us = kzalloc(struct_size(us, urb, NOOF_SETRATE_URBS),
-			     GFP_KERNEL);
-		if (!us) {
+	if (usX2Y->rate != rate) {
+		us = kmalloc(sizeof(*us) + sizeof(struct urb*) * NOOF_SETRATE_URBS, GFP_KERNEL);
+		if (NULL == us) {
 			err = -ENOMEM;
 			goto cleanup;
 		}
-		usbdata = kmalloc_array(NOOF_SETRATE_URBS, sizeof(int),
-					GFP_KERNEL);
-		if (!usbdata) {
+		memset(us, 0, sizeof(*us) + sizeof(struct urb*) * NOOF_SETRATE_URBS); 
+		usbdata = kmalloc(sizeof(int)*NOOF_SETRATE_URBS, GFP_KERNEL);
+		if (NULL == usbdata) {
 			err = -ENOMEM;
 			goto cleanup;
 		}
 		for (i = 0; i < NOOF_SETRATE_URBS; ++i) {
-			us->urb[i] = usb_alloc_urb(0, GFP_KERNEL);
-			if (!us->urb[i]) {
+			if (NULL == (us->urb[i] = usb_alloc_urb(0, GFP_KERNEL))) {
 				err = -ENOMEM;
 				goto cleanup;
 			}
-			((char *)(usbdata + i))[0] = ra[i].c1;
-			((char *)(usbdata + i))[1] = ra[i].c2;
-			usb_fill_bulk_urb(us->urb[i], usx2y->dev, usb_sndbulkpipe(usx2y->dev, 4),
-					  usbdata + i, 2, i_usx2y_04int, usx2y);
+			((char*)(usbdata + i))[0] = ra[i].c1;
+			((char*)(usbdata + i))[1] = ra[i].c2;
+			usb_fill_bulk_urb(us->urb[i], usX2Y->chip.dev, usb_sndbulkpipe(usX2Y->chip.dev, 4),
+					  usbdata + i, 2, i_usX2Y_04Int, usX2Y);
+#ifdef OLD_USB
+			us->urb[i]->transfer_flags = USB_QUEUE_BULK;
+#endif
 		}
-		err = usb_urb_ep_type_check(us->urb[0]);
-		if (err < 0)
-			goto cleanup;
 		us->submitted =	0;
 		us->len =	NOOF_SETRATE_URBS;
-		usx2y->us04 =	us;
-		wait_event_timeout(usx2y->in04_wait_queue, !us->len, HZ);
-		usx2y->us04 =	NULL;
+		usX2Y->US04 =	us;
+		wait_event_timeout(usX2Y->In04WaitQueue, 0 == us->len, HZ);
+		usX2Y->US04 =	NULL;
 		if (us->len)
 			err = -ENODEV;
 	cleanup:
 		if (us) {
 			us->submitted =	2*NOOF_SETRATE_URBS;
 			for (i = 0; i < NOOF_SETRATE_URBS; ++i) {
-				urb = us->urb[i];
-				if (!urb)
-					continue;
+				struct urb *urb = us->urb[i];
 				if (urb->status) {
 					if (!err)
 						err = -ENODEV;
@@ -722,171 +713,162 @@ static int usx2y_rate_set(struct usx2ydev *usx2y, int rate)
 				}
 				usb_free_urb(urb);
 			}
-			usx2y->us04 = NULL;
+			usX2Y->US04 = NULL;
 			kfree(usbdata);
 			kfree(us);
-			if (!err)
-				usx2y->rate = rate;
+			if (!err) {
+				usX2Y->rate = rate;
+			}
 		}
 	}
 
 	return err;
 }
 
-static int usx2y_format_set(struct usx2ydev *usx2y, snd_pcm_format_t format)
+
+static int usX2Y_format_set(usX2Ydev_t *usX2Y, snd_pcm_format_t format)
 {
 	int alternate, err;
-	struct list_head *p;
-
+	struct list_head* p;
 	if (format == SNDRV_PCM_FORMAT_S24_3LE) {
 		alternate = 2;
-		usx2y->stride = 6;
+		usX2Y->stride = 6;
 	} else {
 		alternate = 1;
-		usx2y->stride = 4;
+		usX2Y->stride = 4;
 	}
-	list_for_each(p, &usx2y->midi_list) {
+	list_for_each(p, &usX2Y->chip.midi_list) {
 		snd_usbmidi_input_stop(p);
 	}
-	usb_kill_urb(usx2y->in04_urb);
-	err = usb_set_interface(usx2y->dev, 0, alternate);
-	if (err) {
-		snd_printk(KERN_ERR "usb_set_interface error\n");
+	usb_kill_urb(usX2Y->In04urb);
+	if ((err = usb_set_interface(usX2Y->chip.dev, 0, alternate))) {
+		snd_printk("usb_set_interface error \n");
 		return err;
 	}
-	usx2y->in04_urb->dev = usx2y->dev;
-	err = usb_submit_urb(usx2y->in04_urb, GFP_KERNEL);
-	list_for_each(p, &usx2y->midi_list) {
+	usX2Y->In04urb->dev = usX2Y->chip.dev;
+	err = usb_submit_urb(usX2Y->In04urb, GFP_KERNEL);
+	list_for_each(p, &usX2Y->chip.midi_list) {
 		snd_usbmidi_input_start(p);
 	}
-	usx2y->format = format;
-	usx2y->rate = 0;
+	usX2Y->format = format;
+	usX2Y->rate = 0;
 	return err;
 }
 
 
-static int snd_usx2y_pcm_hw_params(struct snd_pcm_substream *substream,
-				   struct snd_pcm_hw_params *hw_params)
+static int snd_usX2Y_pcm_hw_params(snd_pcm_substream_t *substream,
+				   snd_pcm_hw_params_t *hw_params)
 {
 	int			err = 0;
 	unsigned int		rate = params_rate(hw_params);
 	snd_pcm_format_t	format = params_format(hw_params);
-	struct snd_card *card = substream->pstr->pcm->card;
-	struct usx2ydev	*dev = usx2y(card);
-	struct snd_usx2y_substream *subs;
-	struct snd_pcm_substream *test_substream;
-	int i;
+	snd_printdd("snd_usX2Y_hw_params(%p, %p)\n", substream, hw_params);
 
-	mutex_lock(&usx2y(card)->pcm_mutex);
-	snd_printdd("snd_usx2y_hw_params(%p, %p)\n", substream, hw_params);
-	/* all pcm substreams off one usx2y have to operate at the same
-	 * rate & format
-	 */
-	for (i = 0; i < dev->pcm_devs * 2; i++) {
-		subs = dev->subs[i];
-		if (!subs)
-			continue;
-		test_substream = subs->pcm_substream;
-		if (!test_substream || test_substream == substream ||
-		    !test_substream->runtime)
-			continue;
-		if ((test_substream->runtime->format &&
-		     test_substream->runtime->format != format) ||
-		    (test_substream->runtime->rate &&
-		     test_substream->runtime->rate != rate)) {
-			err = -EINVAL;
-			goto error;
+	{	// all pcm substreams off one usX2Y have to operate at the same rate & format
+		snd_card_t *card = substream->pstr->pcm->card;
+		struct list_head *list;
+		list_for_each(list, &card->devices) {
+			snd_device_t *dev;
+			snd_pcm_t *pcm;
+			int s;
+			dev = snd_device(list);
+			if (dev->type != SNDRV_DEV_PCM)
+				continue;
+			pcm = dev->device_data;
+			for (s = 0; s < 2; ++s) {
+				snd_pcm_substream_t *test_substream;
+				test_substream = pcm->streams[s].substream;
+				if (test_substream && test_substream != substream  &&
+				    test_substream->runtime &&
+				    ((test_substream->runtime->format &&
+				      test_substream->runtime->format != format) ||
+				     (test_substream->runtime->rate &&
+				      test_substream->runtime->rate != rate)))
+					return -EINVAL;
+			}
 		}
 	}
-
- error:
-	mutex_unlock(&usx2y(card)->pcm_mutex);
-	return err;
+	if (0 > (err = snd_pcm_lib_malloc_pages(substream, params_buffer_bytes(hw_params)))) {
+		snd_printk("snd_pcm_lib_malloc_pages(%p, %i) returned %i\n", substream, params_buffer_bytes(hw_params), err);
+		return err;
+	}
+	return 0;
 }
 
 /*
  * free the buffer
  */
-static int snd_usx2y_pcm_hw_free(struct snd_pcm_substream *substream)
+static int snd_usX2Y_pcm_hw_free(snd_pcm_substream_t *substream)
 {
-	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct snd_usx2y_substream *subs = runtime->private_data;
-	struct snd_usx2y_substream *cap_subs, *playback_subs;
+	snd_pcm_runtime_t *runtime = substream->runtime;
+	snd_usX2Y_substream_t *subs = (snd_usX2Y_substream_t *)runtime->private_data;
+	down(&subs->usX2Y->prepare_mutex);
+	snd_printdd("snd_usX2Y_hw_free(%p)\n", substream);
 
-	mutex_lock(&subs->usx2y->pcm_mutex);
-	snd_printdd("snd_usx2y_hw_free(%p)\n", substream);
-
-	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-		cap_subs = subs->usx2y->subs[SNDRV_PCM_STREAM_CAPTURE];
-		atomic_set(&subs->state, STATE_STOPPED);
-		usx2y_urbs_release(subs);
+	if (SNDRV_PCM_STREAM_PLAYBACK == substream->stream) {
+		snd_usX2Y_substream_t *cap_subs = subs->usX2Y->subs[SNDRV_PCM_STREAM_CAPTURE];
+		atomic_set(&subs->state, state_STOPPED);
+		usX2Y_urbs_release(subs);
 		if (!cap_subs->pcm_substream ||
 		    !cap_subs->pcm_substream->runtime ||
 		    !cap_subs->pcm_substream->runtime->status ||
 		    cap_subs->pcm_substream->runtime->status->state < SNDRV_PCM_STATE_PREPARED) {
-			atomic_set(&cap_subs->state, STATE_STOPPED);
-			usx2y_urbs_release(cap_subs);
+			atomic_set(&cap_subs->state, state_STOPPED);
+			usX2Y_urbs_release(cap_subs);
 		}
 	} else {
-		playback_subs = subs->usx2y->subs[SNDRV_PCM_STREAM_PLAYBACK];
-		if (atomic_read(&playback_subs->state) < STATE_PREPARED) {
-			atomic_set(&subs->state, STATE_STOPPED);
-			usx2y_urbs_release(subs);
+		snd_usX2Y_substream_t *playback_subs = subs->usX2Y->subs[SNDRV_PCM_STREAM_PLAYBACK];
+		if (atomic_read(&playback_subs->state) < state_PREPARED) {
+			atomic_set(&subs->state, state_STOPPED);
+			usX2Y_urbs_release(subs);
 		}
 	}
-	mutex_unlock(&subs->usx2y->pcm_mutex);
-	return 0;
+	up(&subs->usX2Y->prepare_mutex);
+	return snd_pcm_lib_free_pages(substream);
 }
-
 /*
  * prepare callback
  *
  * set format and initialize urbs
  */
-static int snd_usx2y_pcm_prepare(struct snd_pcm_substream *substream)
+static int snd_usX2Y_pcm_prepare(snd_pcm_substream_t *substream)
 {
-	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct snd_usx2y_substream *subs = runtime->private_data;
-	struct usx2ydev *usx2y = subs->usx2y;
-	struct snd_usx2y_substream *capsubs = subs->usx2y->subs[SNDRV_PCM_STREAM_CAPTURE];
+	snd_pcm_runtime_t *runtime = substream->runtime;
+	snd_usX2Y_substream_t *subs = (snd_usX2Y_substream_t *)runtime->private_data;
+	usX2Ydev_t *usX2Y = subs->usX2Y;
+	snd_usX2Y_substream_t *capsubs = subs->usX2Y->subs[SNDRV_PCM_STREAM_CAPTURE];
 	int err = 0;
+	snd_printdd("snd_usX2Y_pcm_prepare(%p)\n", substream);
 
-	snd_printdd("%s(%p)\n", __func__, substream);
-
-	mutex_lock(&usx2y->pcm_mutex);
-	usx2y_subs_prepare(subs);
-	// Start hardware streams
-	// SyncStream first....
-	if (atomic_read(&capsubs->state) < STATE_PREPARED) {
-		if (usx2y->format != runtime->format) {
-			err = usx2y_format_set(usx2y, runtime->format);
-			if (err < 0)
+	down(&usX2Y->prepare_mutex);
+	usX2Y_subs_prepare(subs);
+// Start hardware streams
+// SyncStream first....
+	if (atomic_read(&capsubs->state) < state_PREPARED) {
+		if (usX2Y->format != runtime->format)
+			if ((err = usX2Y_format_set(usX2Y, runtime->format)) < 0)
 				goto up_prepare_mutex;
-		}
-		if (usx2y->rate != runtime->rate) {
-			err = usx2y_rate_set(usx2y, runtime->rate);
-			if (err < 0)
+		if (usX2Y->rate != runtime->rate)
+			if ((err = usX2Y_rate_set(usX2Y, runtime->rate)) < 0)
 				goto up_prepare_mutex;
-		}
 		snd_printdd("starting capture pipe for %s\n", subs == capsubs ? "self" : "playpipe");
-		err = usx2y_urbs_start(capsubs);
-		if (err < 0)
+		if (0 > (err = usX2Y_urbs_start(capsubs)))
 			goto up_prepare_mutex;
 	}
 
-	if (subs != capsubs && atomic_read(&subs->state) < STATE_PREPARED)
-		err = usx2y_urbs_start(subs);
+	if (subs != capsubs && atomic_read(&subs->state) < state_PREPARED)
+		err = usX2Y_urbs_start(subs);
 
  up_prepare_mutex:
-	mutex_unlock(&usx2y->pcm_mutex);
+	up(&usX2Y->prepare_mutex);
 	return err;
 }
 
-static const struct snd_pcm_hardware snd_usx2y_2c = {
+static snd_pcm_hardware_t snd_usX2Y_2c =
+{
 	.info =			(SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
 				 SNDRV_PCM_INFO_BLOCK_TRANSFER |
-				 SNDRV_PCM_INFO_MMAP_VALID |
-				 SNDRV_PCM_INFO_BATCH),
+				 SNDRV_PCM_INFO_MMAP_VALID),
 	.formats =                 SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_3LE,
 	.rates =                   SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000,
 	.rate_min =                44100,
@@ -901,114 +883,125 @@ static const struct snd_pcm_hardware snd_usx2y_2c = {
 	.fifo_size =              0
 };
 
-static int snd_usx2y_pcm_open(struct snd_pcm_substream *substream)
-{
-	struct snd_usx2y_substream	*subs =
-		((struct snd_usx2y_substream **)
-		 snd_pcm_substream_chip(substream))[substream->stream];
-	struct snd_pcm_runtime	*runtime = substream->runtime;
 
-	if (subs->usx2y->chip_status & USX2Y_STAT_CHIP_MMAP_PCM_URBS)
+
+static int snd_usX2Y_pcm_open(snd_pcm_substream_t *substream)
+{
+	snd_usX2Y_substream_t	*subs = ((snd_usX2Y_substream_t **)
+					 snd_pcm_substream_chip(substream))[substream->stream];
+	snd_pcm_runtime_t	*runtime = substream->runtime;
+
+	if (subs->usX2Y->chip_status & USX2Y_STAT_CHIP_MMAP_PCM_URBS)
 		return -EBUSY;
 
-	runtime->hw = snd_usx2y_2c;
+	runtime->hw = snd_usX2Y_2c;
 	runtime->private_data = subs;
 	subs->pcm_substream = substream;
 	snd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_PERIOD_TIME, 1000, 200000);
 	return 0;
 }
 
-static int snd_usx2y_pcm_close(struct snd_pcm_substream *substream)
+
+
+static int snd_usX2Y_pcm_close(snd_pcm_substream_t *substream)
 {
-	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct snd_usx2y_substream *subs = runtime->private_data;
+	snd_pcm_runtime_t *runtime = substream->runtime;
+	snd_usX2Y_substream_t *subs = (snd_usX2Y_substream_t *)runtime->private_data;
+	int err = 0;
 
 	subs->pcm_substream = NULL;
 
-	return 0;
+	return err;
 }
 
-static const struct snd_pcm_ops snd_usx2y_pcm_ops = {
-	.open =		snd_usx2y_pcm_open,
-	.close =	snd_usx2y_pcm_close,
-	.hw_params =	snd_usx2y_pcm_hw_params,
-	.hw_free =	snd_usx2y_pcm_hw_free,
-	.prepare =	snd_usx2y_pcm_prepare,
-	.trigger =	snd_usx2y_pcm_trigger,
-	.pointer =	snd_usx2y_pcm_pointer,
+
+static snd_pcm_ops_t snd_usX2Y_pcm_ops = 
+{
+	.open =		snd_usX2Y_pcm_open,
+	.close =	snd_usX2Y_pcm_close,
+	.ioctl =	snd_pcm_lib_ioctl,
+	.hw_params =	snd_usX2Y_pcm_hw_params,
+	.hw_free =	snd_usX2Y_pcm_hw_free,
+	.prepare =	snd_usX2Y_pcm_prepare,
+	.trigger =	snd_usX2Y_pcm_trigger,
+	.pointer =	snd_usX2Y_pcm_pointer,
 };
+
 
 /*
  * free a usb stream instance
  */
-static void usx2y_audio_stream_free(struct snd_usx2y_substream **usx2y_substream)
+static void usX2Y_audio_stream_free(snd_usX2Y_substream_t **usX2Y_substream)
 {
-	int stream;
+	if (NULL != usX2Y_substream[SNDRV_PCM_STREAM_PLAYBACK]) {
+		kfree(usX2Y_substream[SNDRV_PCM_STREAM_PLAYBACK]);
+		usX2Y_substream[SNDRV_PCM_STREAM_PLAYBACK] = NULL;
+	}
+	kfree(usX2Y_substream[SNDRV_PCM_STREAM_CAPTURE]);
+	usX2Y_substream[SNDRV_PCM_STREAM_CAPTURE] = NULL;
+}
 
-	for_each_pcm_streams(stream) {
-		kfree(usx2y_substream[stream]);
-		usx2y_substream[stream] = NULL;
+static void snd_usX2Y_pcm_private_free(snd_pcm_t *pcm)
+{
+	snd_usX2Y_substream_t **usX2Y_stream = pcm->private_data;
+	if (usX2Y_stream) {
+		snd_pcm_lib_preallocate_free_for_all(pcm);
+		usX2Y_audio_stream_free(usX2Y_stream);
 	}
 }
 
-static void snd_usx2y_pcm_private_free(struct snd_pcm *pcm)
+static int usX2Y_audio_stream_new(snd_card_t *card, int playback_endpoint, int capture_endpoint)
 {
-	struct snd_usx2y_substream **usx2y_stream = pcm->private_data;
-
-	if (usx2y_stream)
-		usx2y_audio_stream_free(usx2y_stream);
-}
-
-static int usx2y_audio_stream_new(struct snd_card *card, int playback_endpoint, int capture_endpoint)
-{
-	struct snd_pcm *pcm;
+	snd_pcm_t *pcm;
 	int err, i;
-	struct snd_usx2y_substream **usx2y_substream =
-		usx2y(card)->subs + 2 * usx2y(card)->pcm_devs;
+	snd_usX2Y_substream_t **usX2Y_substream =
+		usX2Y(card)->subs + 2 * usX2Y(card)->chip.pcm_devs;
 
 	for (i = playback_endpoint ? SNDRV_PCM_STREAM_PLAYBACK : SNDRV_PCM_STREAM_CAPTURE;
 	     i <= SNDRV_PCM_STREAM_CAPTURE; ++i) {
-		usx2y_substream[i] = kzalloc(sizeof(struct snd_usx2y_substream), GFP_KERNEL);
-		if (!usx2y_substream[i])
+		usX2Y_substream[i] = kcalloc(1, sizeof(snd_usX2Y_substream_t), GFP_KERNEL);
+		if (NULL == usX2Y_substream[i]) {
+			snd_printk(KERN_ERR "cannot malloc\n");
 			return -ENOMEM;
-
-		usx2y_substream[i]->usx2y = usx2y(card);
+		}
+		usX2Y_substream[i]->usX2Y = usX2Y(card);
 	}
 
 	if (playback_endpoint)
-		usx2y_substream[SNDRV_PCM_STREAM_PLAYBACK]->endpoint = playback_endpoint;
-	usx2y_substream[SNDRV_PCM_STREAM_CAPTURE]->endpoint = capture_endpoint;
+		usX2Y_substream[SNDRV_PCM_STREAM_PLAYBACK]->endpoint = playback_endpoint;
+	usX2Y_substream[SNDRV_PCM_STREAM_CAPTURE]->endpoint = capture_endpoint;
 
-	err = snd_pcm_new(card, NAME_ALLCAPS" Audio", usx2y(card)->pcm_devs,
+	err = snd_pcm_new(card, NAME_ALLCAPS" Audio", usX2Y(card)->chip.pcm_devs,
 			  playback_endpoint ? 1 : 0, 1,
 			  &pcm);
 	if (err < 0) {
-		usx2y_audio_stream_free(usx2y_substream);
+		usX2Y_audio_stream_free(usX2Y_substream);
 		return err;
 	}
 
 	if (playback_endpoint)
-		snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &snd_usx2y_pcm_ops);
-	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &snd_usx2y_pcm_ops);
+		snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &snd_usX2Y_pcm_ops);
+	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &snd_usX2Y_pcm_ops);
 
-	pcm->private_data = usx2y_substream;
-	pcm->private_free = snd_usx2y_pcm_private_free;
+	pcm->private_data = usX2Y_substream;
+	pcm->private_free = snd_usX2Y_pcm_private_free;
 	pcm->info_flags = 0;
 
-	sprintf(pcm->name, NAME_ALLCAPS" Audio #%d", usx2y(card)->pcm_devs);
+	sprintf(pcm->name, NAME_ALLCAPS" Audio #%d", usX2Y(card)->chip.pcm_devs);
 
-	if (playback_endpoint) {
-		snd_pcm_set_managed_buffer(pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream,
-					   SNDRV_DMA_TYPE_CONTINUOUS,
-					   NULL,
-					   64*1024, 128*1024);
+	if ((playback_endpoint &&
+	     0 > (err = snd_pcm_lib_preallocate_pages(pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream,
+						     SNDRV_DMA_TYPE_CONTINUOUS,
+						     snd_dma_continuous_data(GFP_KERNEL),
+						     64*1024, 128*1024))) ||
+	    0 > (err = snd_pcm_lib_preallocate_pages(pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream,
+	    					     SNDRV_DMA_TYPE_CONTINUOUS,
+	    					     snd_dma_continuous_data(GFP_KERNEL),
+						     64*1024, 128*1024))) {
+		snd_usX2Y_pcm_private_free(pcm);
+		return err;
 	}
-
-	snd_pcm_set_managed_buffer(pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream,
-				   SNDRV_DMA_TYPE_CONTINUOUS,
-				   NULL,
-				   64*1024, 128*1024);
-	usx2y(card)->pcm_devs++;
+	usX2Y(card)->chip.pcm_devs++;
 
 	return 0;
 }
@@ -1016,19 +1009,18 @@ static int usx2y_audio_stream_new(struct snd_card *card, int playback_endpoint, 
 /*
  * create a chip instance and set its names.
  */
-int usx2y_audio_create(struct snd_card *card)
+int usX2Y_audio_create(snd_card_t* card)
 {
-	int err;
+	int err = 0;
+	
+	INIT_LIST_HEAD(&usX2Y(card)->chip.pcm_list);
 
-	err = usx2y_audio_stream_new(card, 0xA, 0x8);
-	if (err < 0)
+	if (0 > (err = usX2Y_audio_stream_new(card, 0xA, 0x8)))
 		return err;
-	if (le16_to_cpu(usx2y(card)->dev->descriptor.idProduct) == USB_ID_US428) {
-		err = usx2y_audio_stream_new(card, 0, 0xA);
-		if (err < 0)
-			return err;
-	}
-	if (le16_to_cpu(usx2y(card)->dev->descriptor.idProduct) != USB_ID_US122)
-		err = usx2y_rate_set(usx2y(card), 44100);	// Lets us428 recognize output-volume settings, disturbs us122.
+	if (le16_to_cpu(usX2Y(card)->chip.dev->descriptor.idProduct) == USB_ID_US428)
+	     if (0 > (err = usX2Y_audio_stream_new(card, 0, 0xA)))
+		     return err;
+	if (le16_to_cpu(usX2Y(card)->chip.dev->descriptor.idProduct) != USB_ID_US122)
+		err = usX2Y_rate_set(usX2Y(card), 44100);	// Lets us428 recognize output-volume settings, disturbs us122.
 	return err;
 }

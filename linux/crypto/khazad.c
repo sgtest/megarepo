@@ -22,9 +22,8 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/mm.h>
-#include <asm/byteorder.h>
+#include <asm/scatterlist.h>
 #include <linux/crypto.h>
-#include <linux/types.h>
 
 #define KHAZAD_KEY_SIZE		16
 #define KHAZAD_BLOCK_SIZE	8
@@ -753,18 +752,37 @@ static const u64 c[KHAZAD_ROUNDS + 1] = {
 	0xccc41d14c363da5dULL, 0x5fdc7dcd7f5a6c5cULL, 0xf726ffede89d6f8eULL
 };
 
-static int khazad_setkey(struct crypto_tfm *tfm, const u8 *in_key,
-			 unsigned int key_len)
+static int khazad_setkey(void *ctx_arg, const u8 *in_key,
+                       unsigned int key_len, u32 *flags)
 {
-	struct khazad_ctx *ctx = crypto_tfm_ctx(tfm);
-	const __be32 *key = (const __be32 *)in_key;
+
+	struct khazad_ctx *ctx = ctx_arg;
 	int r;
 	const u64 *S = T7;
 	u64 K2, K1;
+	
+	if (key_len != 16)
+	{
+		*flags |= CRYPTO_TFM_RES_BAD_KEY_LEN;
+		return -EINVAL;
+	}
 
-	/* key is supposed to be 32-bit aligned */
-	K2 = ((u64)be32_to_cpu(key[0]) << 32) | be32_to_cpu(key[1]);
-	K1 = ((u64)be32_to_cpu(key[2]) << 32) | be32_to_cpu(key[3]);
+	K2 = ((u64)in_key[ 0] << 56) ^
+	     ((u64)in_key[ 1] << 48) ^
+	     ((u64)in_key[ 2] << 40) ^
+	     ((u64)in_key[ 3] << 32) ^
+	     ((u64)in_key[ 4] << 24) ^
+	     ((u64)in_key[ 5] << 16) ^
+	     ((u64)in_key[ 6] <<  8) ^
+	     ((u64)in_key[ 7]      );
+	K1 = ((u64)in_key[ 8] << 56) ^
+	     ((u64)in_key[ 9] << 48) ^
+	     ((u64)in_key[10] << 40) ^
+	     ((u64)in_key[11] << 32) ^
+	     ((u64)in_key[12] << 24) ^
+	     ((u64)in_key[13] << 16) ^
+	     ((u64)in_key[14] <<  8) ^
+	     ((u64)in_key[15]      );
 
 	/* setup the encrypt key */
 	for (r = 0; r <= KHAZAD_ROUNDS; r++) {
@@ -802,12 +820,19 @@ static int khazad_setkey(struct crypto_tfm *tfm, const u8 *in_key,
 static void khazad_crypt(const u64 roundKey[KHAZAD_ROUNDS + 1],
 		u8 *ciphertext, const u8 *plaintext)
 {
-	const __be64 *src = (const __be64 *)plaintext;
-	__be64 *dst = (__be64 *)ciphertext;
+
 	int r;
 	u64 state;
 
-	state = be64_to_cpu(*src) ^ roundKey[0];
+	state = ((u64)plaintext[0] << 56) ^
+		((u64)plaintext[1] << 48) ^
+		((u64)plaintext[2] << 40) ^
+		((u64)plaintext[3] << 32) ^
+		((u64)plaintext[4] << 24) ^
+		((u64)plaintext[5] << 16) ^
+		((u64)plaintext[6] <<  8) ^
+		((u64)plaintext[7]      ) ^
+		roundKey[0];
 
 	for (r = 1; r < KHAZAD_ROUNDS; r++) {
 		state = T0[(int)(state >> 56)       ] ^
@@ -819,7 +844,7 @@ static void khazad_crypt(const u64 roundKey[KHAZAD_ROUNDS + 1],
 			T6[(int)(state >>  8) & 0xff] ^
 			T7[(int)(state      ) & 0xff] ^
 			roundKey[r];
-	}
+    	}
 
 	state = (T0[(int)(state >> 56)       ] & 0xff00000000000000ULL) ^
 		(T1[(int)(state >> 48) & 0xff] & 0x00ff000000000000ULL) ^
@@ -831,29 +856,36 @@ static void khazad_crypt(const u64 roundKey[KHAZAD_ROUNDS + 1],
 		(T7[(int)(state      ) & 0xff] & 0x00000000000000ffULL) ^
 		roundKey[KHAZAD_ROUNDS];
 
-	*dst = cpu_to_be64(state);
+	ciphertext[0] = (u8)(state >> 56);
+	ciphertext[1] = (u8)(state >> 48);
+	ciphertext[2] = (u8)(state >> 40);
+	ciphertext[3] = (u8)(state >> 32);
+	ciphertext[4] = (u8)(state >> 24);
+	ciphertext[5] = (u8)(state >> 16);
+	ciphertext[6] = (u8)(state >>  8);
+	ciphertext[7] = (u8)(state      );
+
 }
 
-static void khazad_encrypt(struct crypto_tfm *tfm, u8 *dst, const u8 *src)
+static void khazad_encrypt(void *ctx_arg, u8 *dst, const u8 *src)
 {
-	struct khazad_ctx *ctx = crypto_tfm_ctx(tfm);
+	struct khazad_ctx *ctx = ctx_arg;
 	khazad_crypt(ctx->E, dst, src);
 }
 
-static void khazad_decrypt(struct crypto_tfm *tfm, u8 *dst, const u8 *src)
+static void khazad_decrypt(void *ctx_arg, u8 *dst, const u8 *src)
 {
-	struct khazad_ctx *ctx = crypto_tfm_ctx(tfm);
+	struct khazad_ctx *ctx = ctx_arg;
 	khazad_crypt(ctx->D, dst, src);
 }
 
 static struct crypto_alg khazad_alg = {
 	.cra_name		=	"khazad",
-	.cra_driver_name	=	"khazad-generic",
 	.cra_flags		=	CRYPTO_ALG_TYPE_CIPHER,
 	.cra_blocksize		=	KHAZAD_BLOCK_SIZE,
 	.cra_ctxsize		=	sizeof (struct khazad_ctx),
-	.cra_alignmask		=	7,
 	.cra_module		=	THIS_MODULE,
+	.cra_list		=	LIST_HEAD_INIT(khazad_alg.cra_list),
 	.cra_u			=	{ .cipher = {
 	.cia_min_keysize	=	KHAZAD_KEY_SIZE,
 	.cia_max_keysize	=	KHAZAD_KEY_SIZE,
@@ -862,7 +894,7 @@ static struct crypto_alg khazad_alg = {
 	.cia_decrypt		=	khazad_decrypt } }
 };
 
-static int __init khazad_mod_init(void)
+static int __init init(void)
 {
 	int ret = 0;
 	
@@ -870,15 +902,14 @@ static int __init khazad_mod_init(void)
 	return ret;
 }
 
-static void __exit khazad_mod_fini(void)
+static void __exit fini(void)
 {
 	crypto_unregister_alg(&khazad_alg);
 }
 
 
-subsys_initcall(khazad_mod_init);
-module_exit(khazad_mod_fini);
+module_init(init);
+module_exit(fini);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Khazad Cryptographic Algorithm");
-MODULE_ALIAS_CRYPTO("khazad");

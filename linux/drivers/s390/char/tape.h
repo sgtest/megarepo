@@ -1,13 +1,12 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
+ *  drivers/s390/char/tape.h
  *    tape device driver for 3480/3490E/3590 tapes.
  *
  *  S390 and zSeries version
- *    Copyright IBM Corp. 2001, 2009
+ *    Copyright (C) 2001,2002 IBM Deutschland Entwicklung GmbH, IBM Corporation
  *    Author(s): Carsten Otte <cotte@de.ibm.com>
  *		 Tuan Ngo-Anh <ngoanh@de.ibm.com>
  *		 Martin Schwidefsky <schwidefsky@de.ibm.com>
- *		 Stefan Bader <shbader@de.ibm.com>
  */
 
 #ifndef _TAPE_H
@@ -16,6 +15,8 @@
 #include <asm/ccwdev.h>
 #include <asm/debug.h>
 #include <asm/idals.h>
+#include <linux/config.h>
+#include <linux/blkdev.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mtio.h>
@@ -98,12 +99,7 @@ enum tape_op {
 	TO_DIS,		/* Tape display */
 	TO_ASSIGN,	/* Assign tape to channel path */
 	TO_UNASSIGN,	/* Unassign tape from channel path */
-	TO_CRYPT_ON,	/* Enable encrpytion */
-	TO_CRYPT_OFF,	/* Disable encrpytion */
-	TO_KEKL_SET,	/* Set KEK label */
-	TO_KEKL_QUERY,	/* Query KEK label */
-	TO_RDC,		/* Read device characteristics */
-	TO_SIZE,	/* #entries in tape_op_t */
+	TO_SIZE		/* #entries in tape_op_t */
 };
 
 /* Forward declaration */
@@ -115,8 +111,6 @@ enum tape_request_status {
 	TAPE_REQUEST_QUEUED,	/* request is queued to be processed */
 	TAPE_REQUEST_IN_IO,	/* request is currently in IO */
 	TAPE_REQUEST_DONE,	/* request is completed. */
-	TAPE_REQUEST_CANCEL,	/* request should be canceled. */
-	TAPE_REQUEST_LONG_BUSY, /* request has to be restarted after long busy */
 };
 
 /* Tape CCW request */
@@ -129,7 +123,6 @@ struct tape_request {
 	int options;			/* options for execution. */
 	int retries;			/* retry counter for error recovery. */
 	int rescnt;			/* residual count from devstat. */
-	struct timer_list timer;	/* timer for std_assign_timeout(). */
 
 	/* Callback for delivering final status. */
 	void (*callback)(struct tape_request *, void *);
@@ -154,6 +147,12 @@ struct tape_discipline {
 	struct tape_request *(*read_block)(struct tape_device *, size_t);
 	struct tape_request *(*write_block)(struct tape_device *, size_t);
 	void (*process_eov)(struct tape_device*);
+#ifdef CONFIG_S390_TAPE_BLOCK
+	/* Block device stuff. */
+	struct tape_request *(*bread)(struct tape_device *, struct request *);
+	void (*check_locate)(struct tape_device *, struct tape_request *);
+	void (*free_bread)(struct tape_request *);
+#endif
 	/* ioctl function for additional ioctls. */
 	int (*ioctl_fn)(struct tape_device *, unsigned int, unsigned long);
 	/* Array of tape commands with TAPE_NR_MTOPS entries */
@@ -164,17 +163,35 @@ struct tape_discipline {
  * The discipline irq function either returns an error code (<0) which
  * means that the request has failed with an error or one of the following:
  */
-#define TAPE_IO_SUCCESS		0	/* request successful */
-#define TAPE_IO_PENDING		1	/* request still running */
-#define TAPE_IO_RETRY		2	/* retry to current request */
-#define TAPE_IO_STOP		3	/* stop the running request */
-#define TAPE_IO_LONG_BUSY	4	/* delay the running request */
+#define TAPE_IO_SUCCESS 0	/* request successful */
+#define TAPE_IO_PENDING 1	/* request still running */
+#define TAPE_IO_RETRY	2	/* retry to current request */
+#define TAPE_IO_STOP	3	/* stop the running request */
 
 /* Char Frontend Data */
 struct tape_char_data {
 	struct idal_buffer *idal_buf;	/* idal buffer for user char data */
 	int block_size;			/*   of size block_size. */
 };
+
+#ifdef CONFIG_S390_TAPE_BLOCK
+/* Block Frontend Data */
+struct tape_blk_data
+{
+	/* Block device request queue. */
+	request_queue_t *	request_queue;
+	spinlock_t		request_queue_lock;
+
+	/* Task to move entries from block request to CCS request queue. */
+	struct work_struct	requeue_task;
+	atomic_t		requeue_scheduled;
+
+	/* Current position on the tape. */
+	long			block_position;
+	int			medium_changed;
+	struct gendisk *	disk;
+};
+#endif
 
 /* Tape Info */
 struct tape_device {
@@ -185,9 +202,6 @@ struct tape_device {
 	struct ccw_device *		cdev;
 	struct tape_class_device *	nt;
 	struct tape_class_device *	rt;
-
-	/* Device mutex to serialize tape commands. */
-	struct mutex			mutex;
 
 	/* Device discipline information. */
 	struct tape_discipline *	discipline;
@@ -208,9 +222,6 @@ struct tape_device {
 	/* Request queue. */
 	struct list_head		req_queue;
 
-	/* Request wait queue. */
-	wait_queue_head_t		wait_queue;
-
 	/* Each tape device has (currently) two minor numbers. */
 	int				first_minor;
 
@@ -222,13 +233,10 @@ struct tape_device {
 
 	/* Character device frontend data */
 	struct tape_char_data		char_data;
-
-	/* Function to start or stop the next request later. */
-	struct delayed_work		tape_dnr;
-
-	/* Timer for long busy */
-	struct timer_list		lb_timeout;
-
+#ifdef CONFIG_S390_TAPE_BLOCK
+	/* Block dev frontend data */
+	struct tape_blk_data		blk_data;
+#endif
 };
 
 /* Externals from tape_core.c */
@@ -237,7 +245,7 @@ extern void tape_free_request(struct tape_request *);
 extern int tape_do_io(struct tape_device *, struct tape_request *);
 extern int tape_do_io_async(struct tape_device *, struct tape_request *);
 extern int tape_do_io_interruptible(struct tape_device *, struct tape_request *);
-extern int tape_cancel_io(struct tape_device *, struct tape_request *);
+void tape_hotplug_event(struct tape_device *, int major, int action);
 
 static inline int
 tape_do_io_free(struct tape_device *device, struct tape_request *request)
@@ -249,35 +257,42 @@ tape_do_io_free(struct tape_device *device, struct tape_request *request)
 	return rc;
 }
 
-static inline void
-tape_do_io_async_free(struct tape_device *device, struct tape_request *request)
-{
-	request->callback = (void *) tape_free_request;
-	request->callback_data = NULL;
-	tape_do_io_async(device, request);
-}
-
+extern int tape_oper_handler(int irq, int status);
+extern void tape_noper_handler(int irq, int status);
 extern int tape_open(struct tape_device *);
 extern int tape_release(struct tape_device *);
 extern int tape_mtop(struct tape_device *, int, int);
 extern void tape_state_set(struct tape_device *, enum tape_state);
 
 extern int tape_generic_online(struct tape_device *, struct tape_discipline *);
-extern int tape_generic_offline(struct ccw_device *);
+extern int tape_generic_offline(struct tape_device *device);
 
 /* Externals from tape_devmap.c */
 extern int tape_generic_probe(struct ccw_device *);
 extern void tape_generic_remove(struct ccw_device *);
 
-extern struct tape_device *tape_find_device(int devindex);
-extern struct tape_device *tape_get_device(struct tape_device *);
-extern void tape_put_device(struct tape_device *);
+extern struct tape_device *tape_get_device(int devindex);
+extern struct tape_device *tape_get_device_reference(struct tape_device *);
+extern struct tape_device *tape_put_device(struct tape_device *);
 
 /* Externals from tape_char.c */
 extern int tapechar_init(void);
 extern void tapechar_exit(void);
 extern int  tapechar_setup_device(struct tape_device *);
 extern void tapechar_cleanup_device(struct tape_device *);
+
+/* Externals from tape_block.c */
+#ifdef CONFIG_S390_TAPE_BLOCK
+extern int tapeblock_init (void);
+extern void tapeblock_exit(void);
+extern int tapeblock_setup_device(struct tape_device *);
+extern void tapeblock_cleanup_device(struct tape_device *);
+#else
+static inline int tapeblock_init (void) {return 0;}
+static inline void tapeblock_exit (void) {;}
+static inline int tapeblock_setup_device(struct tape_device *t) {return 0;}
+static inline void tapeblock_cleanup_device (struct tape_device *t) {;}
+#endif
 
 /* tape initialisation functions */
 #ifdef CONFIG_PROC_FS
@@ -289,6 +304,8 @@ static inline void tape_proc_cleanup (void) {;}
 #endif
 
 /* a function for dumping device sense info */
+extern void tape_dump_sense(struct tape_device *, struct tape_request *,
+			    struct irb *);
 extern void tape_dump_sense_dbf(struct tape_device *, struct tape_request *,
 				struct irb *);
 

@@ -37,7 +37,6 @@
 #include <net/llc_conn.h>
 #include <net/llc_sap.h>
 #include <net/sock.h>
-#include <net/llc_c_ac.h>
 #include <net/llc_c_ev.h>
 #include <net/llc_pdu.h>
 
@@ -46,6 +45,8 @@
 #else
 #define dprintk(args...)
 #endif
+
+extern u16 llc_circular_between(u8 a, u8 b, u8 c);
 
 /**
  *	llc_util_ns_inside_rx_window - check if sequence number is in rx window
@@ -83,7 +84,7 @@ static u16 llc_util_nr_inside_tx_window(struct sock *sk, u8 nr)
 	if (llc->dev->flags & IFF_LOOPBACK)
 		goto out;
 	rc = 1;
-	if (skb_queue_empty(&llc->pdu_unack_q))
+	if (!skb_queue_len(&llc->pdu_unack_q))
 		goto out;
 	skb = skb_peek(&llc->pdu_unack_q);
 	pdu = llc_pdu_sn_hdr(skb);
@@ -98,7 +99,7 @@ out:
 
 int llc_conn_ev_conn_req(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_conn_state_ev *ev = llc_conn_ev(skb);
+	struct llc_conn_state_ev *ev = llc_conn_ev(skb);
 
 	return ev->prim == LLC_CONN_PRIM &&
 	       ev->prim_type == LLC_PRIM_TYPE_REQ ? 0 : 1;
@@ -106,7 +107,7 @@ int llc_conn_ev_conn_req(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_data_req(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_conn_state_ev *ev = llc_conn_ev(skb);
+	struct llc_conn_state_ev *ev = llc_conn_ev(skb);
 
 	return ev->prim == LLC_DATA_PRIM &&
 	       ev->prim_type == LLC_PRIM_TYPE_REQ ? 0 : 1;
@@ -114,7 +115,7 @@ int llc_conn_ev_data_req(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_disc_req(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_conn_state_ev *ev = llc_conn_ev(skb);
+	struct llc_conn_state_ev *ev = llc_conn_ev(skb);
 
 	return ev->prim == LLC_DISC_PRIM &&
 	       ev->prim_type == LLC_PRIM_TYPE_REQ ? 0 : 1;
@@ -122,7 +123,7 @@ int llc_conn_ev_disc_req(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rst_req(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_conn_state_ev *ev = llc_conn_ev(skb);
+	struct llc_conn_state_ev *ev = llc_conn_ev(skb);
 
 	return ev->prim == LLC_RESET_PRIM &&
 	       ev->prim_type == LLC_PRIM_TYPE_REQ ? 0 : 1;
@@ -130,7 +131,7 @@ int llc_conn_ev_rst_req(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_local_busy_detected(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_conn_state_ev *ev = llc_conn_ev(skb);
+	struct llc_conn_state_ev *ev = llc_conn_ev(skb);
 
 	return ev->type == LLC_CONN_EV_TYPE_SIMPLE &&
 	       ev->prim_type == LLC_CONN_EV_LOCAL_BUSY_DETECTED ? 0 : 1;
@@ -138,7 +139,7 @@ int llc_conn_ev_local_busy_detected(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_local_busy_cleared(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_conn_state_ev *ev = llc_conn_ev(skb);
+	struct llc_conn_state_ev *ev = llc_conn_ev(skb);
 
 	return ev->type == LLC_CONN_EV_TYPE_SIMPLE &&
 	       ev->prim_type == LLC_CONN_EV_LOCAL_BUSY_CLEARED ? 0 : 1;
@@ -151,7 +152,7 @@ int llc_conn_ev_rx_bad_pdu(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_disc_cmd_pbit_set_x(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_un *pdu = llc_pdu_un_hdr(skb);
+	struct llc_pdu_un *pdu = llc_pdu_un_hdr(skb);
 
 	return LLC_PDU_IS_CMD(pdu) && LLC_PDU_TYPE_IS_U(pdu) &&
 	       LLC_U_PDU_CMD(pdu) == LLC_2_PDU_CMD_DISC ? 0 : 1;
@@ -159,7 +160,7 @@ int llc_conn_ev_rx_disc_cmd_pbit_set_x(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_dm_rsp_fbit_set_x(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_un *pdu = llc_pdu_un_hdr(skb);
+	struct llc_pdu_un *pdu = llc_pdu_un_hdr(skb);
 
 	return LLC_PDU_IS_RSP(pdu) && LLC_PDU_TYPE_IS_U(pdu) &&
 	       LLC_U_PDU_RSP(pdu) == LLC_2_PDU_RSP_DM ? 0 : 1;
@@ -167,7 +168,7 @@ int llc_conn_ev_rx_dm_rsp_fbit_set_x(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_frmr_rsp_fbit_set_x(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_un *pdu = llc_pdu_un_hdr(skb);
+	struct llc_pdu_un *pdu = llc_pdu_un_hdr(skb);
 
 	return LLC_PDU_IS_RSP(pdu) && LLC_PDU_TYPE_IS_U(pdu) &&
 	       LLC_U_PDU_RSP(pdu) == LLC_2_PDU_RSP_FRMR ? 0 : 1;
@@ -175,7 +176,7 @@ int llc_conn_ev_rx_frmr_rsp_fbit_set_x(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_i_cmd_pbit_set_0(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
 
 	return llc_conn_space(sk, skb) &&
 	       LLC_PDU_IS_CMD(pdu) && LLC_PDU_TYPE_IS_I(pdu) &&
@@ -185,7 +186,7 @@ int llc_conn_ev_rx_i_cmd_pbit_set_0(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_i_cmd_pbit_set_1(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
 
 	return llc_conn_space(sk, skb) &&
 	       LLC_PDU_IS_CMD(pdu) && LLC_PDU_TYPE_IS_I(pdu) &&
@@ -196,9 +197,9 @@ int llc_conn_ev_rx_i_cmd_pbit_set_1(struct sock *sk, struct sk_buff *skb)
 int llc_conn_ev_rx_i_cmd_pbit_set_0_unexpd_ns(struct sock *sk,
 					      struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
-	const u8 vr = llc_sk(sk)->vR;
-	const u8 ns = LLC_I_GET_NS(pdu);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	u8 vr = llc_sk(sk)->vR;
+	u8 ns = LLC_I_GET_NS(pdu);
 
 	return LLC_PDU_IS_CMD(pdu) && LLC_PDU_TYPE_IS_I(pdu) &&
 	       LLC_I_PF_IS_0(pdu) && ns != vr &&
@@ -208,9 +209,9 @@ int llc_conn_ev_rx_i_cmd_pbit_set_0_unexpd_ns(struct sock *sk,
 int llc_conn_ev_rx_i_cmd_pbit_set_1_unexpd_ns(struct sock *sk,
 					      struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
-	const u8 vr = llc_sk(sk)->vR;
-	const u8 ns = LLC_I_GET_NS(pdu);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	u8 vr = llc_sk(sk)->vR;
+	u8 ns = LLC_I_GET_NS(pdu);
 
 	return LLC_PDU_IS_CMD(pdu) && LLC_PDU_TYPE_IS_I(pdu) &&
 	       LLC_I_PF_IS_1(pdu) && ns != vr &&
@@ -220,21 +221,20 @@ int llc_conn_ev_rx_i_cmd_pbit_set_1_unexpd_ns(struct sock *sk,
 int llc_conn_ev_rx_i_cmd_pbit_set_x_inval_ns(struct sock *sk,
 					     struct sk_buff *skb)
 {
-	const struct llc_pdu_sn * pdu = llc_pdu_sn_hdr(skb);
-	const u8 vr = llc_sk(sk)->vR;
-	const u8 ns = LLC_I_GET_NS(pdu);
-	const u16 rc = LLC_PDU_IS_CMD(pdu) && LLC_PDU_TYPE_IS_I(pdu) &&
-		ns != vr &&
+	struct llc_pdu_sn * pdu = llc_pdu_sn_hdr(skb);
+	u8 vr = llc_sk(sk)->vR;
+	u8 ns = LLC_I_GET_NS(pdu);
+	u16 rc = LLC_PDU_IS_CMD(pdu) && LLC_PDU_TYPE_IS_I(pdu) && ns != vr &&
 		 llc_util_ns_inside_rx_window(ns, vr, llc_sk(sk)->rw) ? 0 : 1;
 	if (!rc)
 		dprintk("%s: matched, state=%d, ns=%d, vr=%d\n",
-			__func__, llc_sk(sk)->state, ns, vr);
+			__FUNCTION__, llc_sk(sk)->state, ns, vr);
 	return rc;
 }
 
 int llc_conn_ev_rx_i_rsp_fbit_set_0(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
 
 	return llc_conn_space(sk, skb) &&
 	       LLC_PDU_IS_RSP(pdu) && LLC_PDU_TYPE_IS_I(pdu) &&
@@ -244,7 +244,7 @@ int llc_conn_ev_rx_i_rsp_fbit_set_0(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_i_rsp_fbit_set_1(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
 
 	return LLC_PDU_IS_RSP(pdu) && LLC_PDU_TYPE_IS_I(pdu) &&
 	       LLC_I_PF_IS_1(pdu) &&
@@ -253,7 +253,7 @@ int llc_conn_ev_rx_i_rsp_fbit_set_1(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_i_rsp_fbit_set_x(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
 
 	return llc_conn_space(sk, skb) &&
 	       LLC_PDU_IS_RSP(pdu) && LLC_PDU_TYPE_IS_I(pdu) &&
@@ -263,9 +263,9 @@ int llc_conn_ev_rx_i_rsp_fbit_set_x(struct sock *sk, struct sk_buff *skb)
 int llc_conn_ev_rx_i_rsp_fbit_set_0_unexpd_ns(struct sock *sk,
 					      struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
-	const u8 vr = llc_sk(sk)->vR;
-	const u8 ns = LLC_I_GET_NS(pdu);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	u8 vr = llc_sk(sk)->vR;
+	u8 ns = LLC_I_GET_NS(pdu);
 
 	return LLC_PDU_IS_RSP(pdu) && LLC_PDU_TYPE_IS_I(pdu) &&
 	       LLC_I_PF_IS_0(pdu) && ns != vr &&
@@ -275,9 +275,9 @@ int llc_conn_ev_rx_i_rsp_fbit_set_0_unexpd_ns(struct sock *sk,
 int llc_conn_ev_rx_i_rsp_fbit_set_1_unexpd_ns(struct sock *sk,
 					      struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
-	const u8 vr = llc_sk(sk)->vR;
-	const u8 ns = LLC_I_GET_NS(pdu);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	u8 vr = llc_sk(sk)->vR;
+	u8 ns = LLC_I_GET_NS(pdu);
 
 	return LLC_PDU_IS_RSP(pdu) && LLC_PDU_TYPE_IS_I(pdu) &&
 	       LLC_I_PF_IS_1(pdu) && ns != vr &&
@@ -287,9 +287,9 @@ int llc_conn_ev_rx_i_rsp_fbit_set_1_unexpd_ns(struct sock *sk,
 int llc_conn_ev_rx_i_rsp_fbit_set_x_unexpd_ns(struct sock *sk,
 					      struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
-	const u8 vr = llc_sk(sk)->vR;
-	const u8 ns = LLC_I_GET_NS(pdu);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	u8 vr = llc_sk(sk)->vR;
+	u8 ns = LLC_I_GET_NS(pdu);
 
 	return LLC_PDU_IS_RSP(pdu) && LLC_PDU_TYPE_IS_I(pdu) && ns != vr &&
 	       !llc_util_ns_inside_rx_window(ns, vr, llc_sk(sk)->rw) ? 0 : 1;
@@ -298,21 +298,20 @@ int llc_conn_ev_rx_i_rsp_fbit_set_x_unexpd_ns(struct sock *sk,
 int llc_conn_ev_rx_i_rsp_fbit_set_x_inval_ns(struct sock *sk,
 					     struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
-	const u8 vr = llc_sk(sk)->vR;
-	const u8 ns = LLC_I_GET_NS(pdu);
-	const u16 rc = LLC_PDU_IS_RSP(pdu) && LLC_PDU_TYPE_IS_I(pdu) &&
-		ns != vr &&
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	u8 vr = llc_sk(sk)->vR;
+	u8 ns = LLC_I_GET_NS(pdu);
+	u16 rc = LLC_PDU_IS_RSP(pdu) && LLC_PDU_TYPE_IS_I(pdu) && ns != vr &&
 		 llc_util_ns_inside_rx_window(ns, vr, llc_sk(sk)->rw) ? 0 : 1;
 	if (!rc)
 		dprintk("%s: matched, state=%d, ns=%d, vr=%d\n",
-			__func__, llc_sk(sk)->state, ns, vr);
+			__FUNCTION__, llc_sk(sk)->state, ns, vr);
 	return rc;
 }
 
 int llc_conn_ev_rx_rej_cmd_pbit_set_0(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
 
 	return LLC_PDU_IS_CMD(pdu) && LLC_PDU_TYPE_IS_S(pdu) &&
 	       LLC_S_PF_IS_0(pdu) &&
@@ -321,7 +320,7 @@ int llc_conn_ev_rx_rej_cmd_pbit_set_0(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_rej_cmd_pbit_set_1(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
 
 	return LLC_PDU_IS_CMD(pdu) && LLC_PDU_TYPE_IS_S(pdu) &&
 	       LLC_S_PF_IS_1(pdu) &&
@@ -330,7 +329,7 @@ int llc_conn_ev_rx_rej_cmd_pbit_set_1(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_rej_rsp_fbit_set_0(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
 
 	return LLC_PDU_IS_RSP(pdu) && LLC_PDU_TYPE_IS_S(pdu) &&
 	       LLC_S_PF_IS_0(pdu) &&
@@ -339,7 +338,7 @@ int llc_conn_ev_rx_rej_rsp_fbit_set_0(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_rej_rsp_fbit_set_1(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
 
 	return LLC_PDU_IS_RSP(pdu) && LLC_PDU_TYPE_IS_S(pdu) &&
 	       LLC_S_PF_IS_1(pdu) &&
@@ -348,7 +347,7 @@ int llc_conn_ev_rx_rej_rsp_fbit_set_1(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_rej_rsp_fbit_set_x(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_un *pdu = llc_pdu_un_hdr(skb);
+	struct llc_pdu_un *pdu = llc_pdu_un_hdr(skb);
 
 	return LLC_PDU_IS_RSP(pdu) && LLC_PDU_TYPE_IS_S(pdu) &&
 	       LLC_S_PDU_RSP(pdu) == LLC_2_PDU_RSP_REJ ? 0 : 1;
@@ -356,7 +355,7 @@ int llc_conn_ev_rx_rej_rsp_fbit_set_x(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_rnr_cmd_pbit_set_0(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
 
 	return LLC_PDU_IS_CMD(pdu) && LLC_PDU_TYPE_IS_S(pdu) &&
 	       LLC_S_PF_IS_0(pdu) &&
@@ -365,7 +364,7 @@ int llc_conn_ev_rx_rnr_cmd_pbit_set_0(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_rnr_cmd_pbit_set_1(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
 
 	return LLC_PDU_IS_CMD(pdu) && LLC_PDU_TYPE_IS_S(pdu) &&
 	       LLC_S_PF_IS_1(pdu) &&
@@ -374,7 +373,7 @@ int llc_conn_ev_rx_rnr_cmd_pbit_set_1(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_rnr_rsp_fbit_set_0(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
 
 	return LLC_PDU_IS_RSP(pdu) && LLC_PDU_TYPE_IS_S(pdu) &&
 	       LLC_S_PF_IS_0(pdu) &&
@@ -383,7 +382,7 @@ int llc_conn_ev_rx_rnr_rsp_fbit_set_0(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_rnr_rsp_fbit_set_1(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
 
 	return LLC_PDU_IS_RSP(pdu) && LLC_PDU_TYPE_IS_S(pdu) &&
 	       LLC_S_PF_IS_1(pdu) &&
@@ -392,7 +391,7 @@ int llc_conn_ev_rx_rnr_rsp_fbit_set_1(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_rr_cmd_pbit_set_0(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
 
 	return LLC_PDU_IS_CMD(pdu) && LLC_PDU_TYPE_IS_S(pdu) &&
 	       LLC_S_PF_IS_0(pdu) &&
@@ -401,7 +400,7 @@ int llc_conn_ev_rx_rr_cmd_pbit_set_0(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_rr_cmd_pbit_set_1(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
 
 	return LLC_PDU_IS_CMD(pdu) && LLC_PDU_TYPE_IS_S(pdu) &&
 	       LLC_S_PF_IS_1(pdu) &&
@@ -410,7 +409,7 @@ int llc_conn_ev_rx_rr_cmd_pbit_set_1(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_rr_rsp_fbit_set_0(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
 
 	return llc_conn_space(sk, skb) &&
 	       LLC_PDU_IS_RSP(pdu) && LLC_PDU_TYPE_IS_S(pdu) &&
@@ -420,7 +419,7 @@ int llc_conn_ev_rx_rr_rsp_fbit_set_0(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_rr_rsp_fbit_set_1(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
 
 	return llc_conn_space(sk, skb) &&
 	       LLC_PDU_IS_RSP(pdu) && LLC_PDU_TYPE_IS_S(pdu) &&
@@ -430,7 +429,7 @@ int llc_conn_ev_rx_rr_rsp_fbit_set_1(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_rx_sabme_cmd_pbit_set_x(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_pdu_un *pdu = llc_pdu_un_hdr(skb);
+	struct llc_pdu_un *pdu = llc_pdu_un_hdr(skb);
 
 	return LLC_PDU_IS_CMD(pdu) && LLC_PDU_TYPE_IS_U(pdu) &&
 	       LLC_U_PDU_CMD(pdu) == LLC_2_PDU_CMD_SABME ? 0 : 1;
@@ -447,7 +446,7 @@ int llc_conn_ev_rx_ua_rsp_fbit_set_x(struct sock *sk, struct sk_buff *skb)
 int llc_conn_ev_rx_xxx_cmd_pbit_set_1(struct sock *sk, struct sk_buff *skb)
 {
 	u16 rc = 1;
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
 
 	if (LLC_PDU_IS_CMD(pdu)) {
 		if (LLC_PDU_TYPE_IS_I(pdu) || LLC_PDU_TYPE_IS_S(pdu)) {
@@ -462,7 +461,7 @@ int llc_conn_ev_rx_xxx_cmd_pbit_set_1(struct sock *sk, struct sk_buff *skb)
 int llc_conn_ev_rx_xxx_cmd_pbit_set_x(struct sock *sk, struct sk_buff *skb)
 {
 	u16 rc = 1;
-	const struct llc_pdu_un *pdu = llc_pdu_un_hdr(skb);
+	struct llc_pdu_un *pdu = llc_pdu_un_hdr(skb);
 
 	if (LLC_PDU_IS_CMD(pdu)) {
 		if (LLC_PDU_TYPE_IS_I(pdu) || LLC_PDU_TYPE_IS_S(pdu))
@@ -478,10 +477,32 @@ int llc_conn_ev_rx_xxx_cmd_pbit_set_x(struct sock *sk, struct sk_buff *skb)
 	return rc;
 }
 
+int llc_conn_ev_rx_xxx_rsp_fbit_set_1(struct sock *sk, struct sk_buff *skb)
+{
+	u16 rc = 1;
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+
+	if (LLC_PDU_IS_RSP(pdu)) {
+		if (LLC_PDU_TYPE_IS_I(pdu) || LLC_PDU_TYPE_IS_S(pdu)) {
+			if (LLC_I_PF_IS_1(pdu))
+				rc = 0;
+		} else if (LLC_PDU_TYPE_IS_U(pdu))
+			switch (LLC_U_PDU_RSP(pdu)) {
+			case LLC_2_PDU_RSP_UA:
+			case LLC_2_PDU_RSP_DM:
+			case LLC_2_PDU_RSP_FRMR:
+				if (LLC_U_PF_IS_1(pdu))
+					rc = 0;
+				break;
+			}
+	}
+	return rc;
+}
+
 int llc_conn_ev_rx_xxx_rsp_fbit_set_x(struct sock *sk, struct sk_buff *skb)
 {
 	u16 rc = 1;
-	const struct llc_pdu_un *pdu = llc_pdu_un_hdr(skb);
+	struct llc_pdu_un *pdu = llc_pdu_un_hdr(skb);
 
 	if (LLC_PDU_IS_RSP(pdu)) {
 		if (LLC_PDU_TYPE_IS_I(pdu) || LLC_PDU_TYPE_IS_S(pdu))
@@ -503,15 +524,15 @@ int llc_conn_ev_rx_zzz_cmd_pbit_set_x_inval_nr(struct sock *sk,
 					       struct sk_buff *skb)
 {
 	u16 rc = 1;
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
-	const u8 vs = llc_sk(sk)->vS;
-	const u8 nr = LLC_I_GET_NR(pdu);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	u8 vs = llc_sk(sk)->vS;
+	u8 nr = LLC_I_GET_NR(pdu);
 
 	if (LLC_PDU_IS_CMD(pdu) &&
 	    (LLC_PDU_TYPE_IS_I(pdu) || LLC_PDU_TYPE_IS_S(pdu)) &&
 	    nr != vs && llc_util_nr_inside_tx_window(sk, nr)) {
 		dprintk("%s: matched, state=%d, vs=%d, nr=%d\n",
-			__func__, llc_sk(sk)->state, vs, nr);
+			__FUNCTION__, llc_sk(sk)->state, vs, nr);
 		rc = 0;
 	}
 	return rc;
@@ -521,16 +542,16 @@ int llc_conn_ev_rx_zzz_rsp_fbit_set_x_inval_nr(struct sock *sk,
 					       struct sk_buff *skb)
 {
 	u16 rc = 1;
-	const struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
-	const u8 vs = llc_sk(sk)->vS;
-	const u8 nr = LLC_I_GET_NR(pdu);
+	struct llc_pdu_sn *pdu = llc_pdu_sn_hdr(skb);
+	u8 vs = llc_sk(sk)->vS;
+	u8 nr = LLC_I_GET_NR(pdu);
 
 	if (LLC_PDU_IS_RSP(pdu) &&
 	    (LLC_PDU_TYPE_IS_I(pdu) || LLC_PDU_TYPE_IS_S(pdu)) &&
 	    nr != vs && llc_util_nr_inside_tx_window(sk, nr)) {
 		rc = 0;
 		dprintk("%s: matched, state=%d, vs=%d, nr=%d\n",
-			__func__, llc_sk(sk)->state, vs, nr);
+			__FUNCTION__, llc_sk(sk)->state, vs, nr);
 	}
 	return rc;
 }
@@ -542,28 +563,28 @@ int llc_conn_ev_rx_any_frame(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_p_tmr_exp(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_conn_state_ev *ev = llc_conn_ev(skb);
+	struct llc_conn_state_ev *ev = llc_conn_ev(skb);
 
 	return ev->type != LLC_CONN_EV_TYPE_P_TMR;
 }
 
 int llc_conn_ev_ack_tmr_exp(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_conn_state_ev *ev = llc_conn_ev(skb);
+	struct llc_conn_state_ev *ev = llc_conn_ev(skb);
 
 	return ev->type != LLC_CONN_EV_TYPE_ACK_TMR;
 }
 
 int llc_conn_ev_rej_tmr_exp(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_conn_state_ev *ev = llc_conn_ev(skb);
+	struct llc_conn_state_ev *ev = llc_conn_ev(skb);
 
 	return ev->type != LLC_CONN_EV_TYPE_REJ_TMR;
 }
 
 int llc_conn_ev_busy_tmr_exp(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_conn_state_ev *ev = llc_conn_ev(skb);
+	struct llc_conn_state_ev *ev = llc_conn_ev(skb);
 
 	return ev->type != LLC_CONN_EV_TYPE_BUSY_TMR;
 }
@@ -575,7 +596,7 @@ int llc_conn_ev_init_p_f_cycle(struct sock *sk, struct sk_buff *skb)
 
 int llc_conn_ev_tx_buffer_full(struct sock *sk, struct sk_buff *skb)
 {
-	const struct llc_conn_state_ev *ev = llc_conn_ev(skb);
+	struct llc_conn_state_ev *ev = llc_conn_ev(skb);
 
 	return ev->type == LLC_CONN_EV_TYPE_SIMPLE &&
 	       ev->prim_type == LLC_CONN_EV_TX_BUFF_FULL ? 0 : 1;
@@ -608,7 +629,7 @@ int llc_conn_ev_qlfy_p_flag_eq_1(struct sock *sk, struct sk_buff *skb)
 }
 
 /**
- *	llc_conn_ev_qlfy_last_frame_eq_1 - checks if frame is last in tx window
+ *	conn_ev_qlfy_last_frame_eq_1 - checks if frame is last in tx window
  *	@sk: current connection structure.
  *	@skb: current event.
  *
@@ -624,7 +645,7 @@ int llc_conn_ev_qlfy_last_frame_eq_1(struct sock *sk, struct sk_buff *skb)
 }
 
 /**
- *	llc_conn_ev_qlfy_last_frame_eq_0 - checks if frame isn't last in tx window
+ *	conn_ev_qlfy_last_frame_eq_0 - checks if frame isn't last in tx window
  *	@sk: current connection structure.
  *	@skb: current event.
  *

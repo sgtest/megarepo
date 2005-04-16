@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * INET		An implementation of the TCP/IP protocol suite for the LINUX
  *		operating system.  INET is implemented using the  BSD Socket
@@ -6,7 +5,9 @@
  *
  *		INET protocol dispatch tables.
  *
- * Authors:	Ross Biro
+ * Version:	$Id: protocol.c,v 1.14 2001/05/18 02:25:49 davem Exp $
+ *
+ * Authors:	Ross Biro, <bir7@leland.Stanford.Edu>
  *		Fred N. van Kempen, <waltje@uWalt.NL.Mugnet.ORG>
  *
  * Fixes:
@@ -17,54 +18,84 @@
  *		Richard Colella	: Hang on hash collision
  *		Vince Laviano	: Modified inet_del_protocol() to correctly
  *				  maintain copy bit.
+ *
+ *		This program is free software; you can redistribute it and/or
+ *		modify it under the terms of the GNU General Public License
+ *		as published by the Free Software Foundation; either version
+ *		2 of the License, or (at your option) any later version.
  */
-#include <linux/cache.h>
+
+#include <asm/uaccess.h>
+#include <asm/system.h>
 #include <linux/module.h>
+#include <linux/types.h>
+#include <linux/kernel.h>
+#include <linux/sched.h>
+#include <linux/string.h>
+#include <linux/config.h>
+#include <linux/socket.h>
+#include <linux/in.h>
+#include <linux/inet.h>
 #include <linux/netdevice.h>
-#include <linux/spinlock.h>
+#include <linux/timer.h>
+#include <net/ip.h>
 #include <net/protocol.h>
+#include <net/tcp.h>
+#include <linux/skbuff.h>
+#include <net/sock.h>
+#include <net/icmp.h>
+#include <net/udp.h>
+#include <net/ipip.h>
+#include <linux/igmp.h>
 
-struct net_protocol __rcu *inet_protos[MAX_INET_PROTOS] __read_mostly;
-EXPORT_SYMBOL(inet_protos);
-const struct net_offload __rcu *inet_offloads[MAX_INET_PROTOS] __read_mostly;
-EXPORT_SYMBOL(inet_offloads);
+struct net_protocol *inet_protos[MAX_INET_PROTOS];
+static DEFINE_SPINLOCK(inet_proto_lock);
 
-int inet_add_protocol(const struct net_protocol *prot, unsigned char protocol)
+/*
+ *	Add a protocol handler to the hash tables
+ */
+
+int inet_add_protocol(struct net_protocol *prot, unsigned char protocol)
 {
-	return !cmpxchg((const struct net_protocol **)&inet_protos[protocol],
-			NULL, prot) ? 0 : -1;
+	int hash, ret;
+
+	hash = protocol & (MAX_INET_PROTOS - 1);
+
+	spin_lock_bh(&inet_proto_lock);
+	if (inet_protos[hash]) {
+		ret = -1;
+	} else {
+		inet_protos[hash] = prot;
+		ret = 0;
+	}
+	spin_unlock_bh(&inet_proto_lock);
+
+	return ret;
 }
+
+/*
+ *	Remove a protocol from the hash tables.
+ */
+ 
+int inet_del_protocol(struct net_protocol *prot, unsigned char protocol)
+{
+	int hash, ret;
+
+	hash = protocol & (MAX_INET_PROTOS - 1);
+
+	spin_lock_bh(&inet_proto_lock);
+	if (inet_protos[hash] == prot) {
+		inet_protos[hash] = NULL;
+		ret = 0;
+	} else {
+		ret = -1;
+	}
+	spin_unlock_bh(&inet_proto_lock);
+
+	synchronize_net();
+
+	return ret;
+}
+
 EXPORT_SYMBOL(inet_add_protocol);
-
-int inet_add_offload(const struct net_offload *prot, unsigned char protocol)
-{
-	return !cmpxchg((const struct net_offload **)&inet_offloads[protocol],
-			NULL, prot) ? 0 : -1;
-}
-EXPORT_SYMBOL(inet_add_offload);
-
-int inet_del_protocol(const struct net_protocol *prot, unsigned char protocol)
-{
-	int ret;
-
-	ret = (cmpxchg((const struct net_protocol **)&inet_protos[protocol],
-		       prot, NULL) == prot) ? 0 : -1;
-
-	synchronize_net();
-
-	return ret;
-}
 EXPORT_SYMBOL(inet_del_protocol);
-
-int inet_del_offload(const struct net_offload *prot, unsigned char protocol)
-{
-	int ret;
-
-	ret = (cmpxchg((const struct net_offload **)&inet_offloads[protocol],
-		       prot, NULL) == prot) ? 0 : -1;
-
-	synchronize_net();
-
-	return ret;
-}
-EXPORT_SYMBOL(inet_del_offload);

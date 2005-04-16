@@ -1,109 +1,78 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __LINUX_NET_AFUNIX_H
 #define __LINUX_NET_AFUNIX_H
+extern void unix_inflight(struct file *fp);
+extern void unix_notinflight(struct file *fp);
+extern void unix_gc(void);
 
-#include <linux/socket.h>
-#include <linux/un.h>
-#include <linux/mutex.h>
-#include <linux/refcount.h>
-#include <net/sock.h>
+#define UNIX_HASH_SIZE	256
 
-void unix_inflight(struct user_struct *user, struct file *fp);
-void unix_notinflight(struct user_struct *user, struct file *fp);
-void unix_destruct_scm(struct sk_buff *skb);
-void unix_gc(void);
-void wait_for_unix_gc(void);
-struct sock *unix_get_socket(struct file *filp);
-struct sock *unix_peer_get(struct sock *sk);
+extern struct hlist_head unix_socket_table[UNIX_HASH_SIZE + 1];
+extern rwlock_t unix_table_lock;
 
-#define UNIX_HASH_MOD	(256 - 1)
-#define UNIX_HASH_SIZE	(256 * 2)
-#define UNIX_HASH_BITS	8
+extern atomic_t unix_tot_inflight;
 
-extern unsigned int unix_tot_inflight;
+static inline struct sock *first_unix_socket(int *i)
+{
+	for (*i = 0; *i <= UNIX_HASH_SIZE; (*i)++) {
+		if (!hlist_empty(&unix_socket_table[*i]))
+			return __sk_head(&unix_socket_table[*i]);
+	}
+	return NULL;
+}
+
+static inline struct sock *next_unix_socket(int *i, struct sock *s)
+{
+	struct sock *next = sk_next(s);
+	/* More in this chain? */
+	if (next)
+		return next;
+	/* Look for next non-empty chain. */
+	for ((*i)++; *i <= UNIX_HASH_SIZE; (*i)++) {
+		if (!hlist_empty(&unix_socket_table[*i]))
+			return __sk_head(&unix_socket_table[*i]);
+	}
+	return NULL;
+}
+
+#define forall_unix_sockets(i, s) \
+	for (s = first_unix_socket(&(i)); s; s = next_unix_socket(&(i),(s)))
 
 struct unix_address {
-	refcount_t	refcnt;
+	atomic_t	refcnt;
 	int		len;
-	struct sockaddr_un name[];
+	unsigned	hash;
+	struct sockaddr_un name[0];
 };
 
 struct unix_skb_parms {
-	struct pid		*pid;		/* Skb credentials	*/
-	kuid_t			uid;
-	kgid_t			gid;
+	struct ucred		creds;		/* Skb credentials	*/
 	struct scm_fp_list	*fp;		/* Passed files		*/
-#ifdef CONFIG_SECURITY_NETWORK
-	u32			secid;		/* Security ID		*/
-#endif
-	u32			consumed;
-} __randomize_layout;
-
-struct scm_stat {
-	atomic_t nr_fds;
 };
 
-#define UNIXCB(skb)	(*(struct unix_skb_parms *)&((skb)->cb))
+#define UNIXCB(skb) 	(*(struct unix_skb_parms*)&((skb)->cb))
+#define UNIXCREDS(skb)	(&UNIXCB((skb)).creds)
 
-#define unix_state_lock(s)	spin_lock(&unix_sk(s)->lock)
-#define unix_state_unlock(s)	spin_unlock(&unix_sk(s)->lock)
-#define unix_state_lock_nested(s) \
-				spin_lock_nested(&unix_sk(s)->lock, \
-				SINGLE_DEPTH_NESTING)
+#define unix_state_rlock(s)	read_lock(&unix_sk(s)->lock)
+#define unix_state_runlock(s)	read_unlock(&unix_sk(s)->lock)
+#define unix_state_wlock(s)	write_lock(&unix_sk(s)->lock)
+#define unix_state_wunlock(s)	write_unlock(&unix_sk(s)->lock)
 
+#ifdef __KERNEL__
 /* The AF_UNIX socket */
 struct unix_sock {
 	/* WARNING: sk has to be the first member */
 	struct sock		sk;
-	struct unix_address	*addr;
-	struct path		path;
-	struct mutex		iolock, bindlock;
-	struct sock		*peer;
-	struct list_head	link;
-	atomic_long_t		inflight;
-	spinlock_t		lock;
-	unsigned long		gc_flags;
-#define UNIX_GC_CANDIDATE	0
-#define UNIX_GC_MAYBE_CYCLE	1
-	struct socket_wq	peer_wq;
-	wait_queue_entry_t	peer_wake;
-	struct scm_stat		scm_stat;
-#if IS_ENABLED(CONFIG_AF_UNIX_OOB)
-	struct sk_buff		*oob_skb;
-#endif
+        struct unix_address     *addr;
+        struct dentry		*dentry;
+        struct vfsmount		*mnt;
+        struct semaphore        readsem;
+        struct sock		*peer;
+        struct sock		*other;
+        struct sock		*gc_tree;
+        atomic_t                inflight;
+        rwlock_t                lock;
+        wait_queue_head_t       peer_wait;
 };
-
-static inline struct unix_sock *unix_sk(const struct sock *sk)
-{
-	return (struct unix_sock *)sk;
-}
-
-#define peer_wait peer_wq.wait
-
-long unix_inq_len(struct sock *sk);
-long unix_outq_len(struct sock *sk);
-
-int __unix_dgram_recvmsg(struct sock *sk, struct msghdr *msg, size_t size,
-			 int flags);
-int __unix_stream_recvmsg(struct sock *sk, struct msghdr *msg, size_t size,
-			  int flags);
-#ifdef CONFIG_SYSCTL
-int unix_sysctl_register(struct net *net);
-void unix_sysctl_unregister(struct net *net);
-#else
-static inline int unix_sysctl_register(struct net *net) { return 0; }
-static inline void unix_sysctl_unregister(struct net *net) {}
-#endif
-
-#ifdef CONFIG_BPF_SYSCALL
-extern struct proto unix_dgram_proto;
-extern struct proto unix_stream_proto;
-
-int unix_dgram_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore);
-int unix_stream_bpf_update_proto(struct sock *sk, struct sk_psock *psock, bool restore);
-void __init unix_bpf_build_proto(void);
-#else
-static inline void __init unix_bpf_build_proto(void)
-{}
+#define unix_sk(__sk) ((struct unix_sock *)__sk)
 #endif
 #endif

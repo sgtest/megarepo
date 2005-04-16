@@ -1,10 +1,25 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef __SOUND_AK4117_H
 #define __SOUND_AK4117_H
 
 /*
  *  Routines for Asahi Kasei AK4117
- *  Copyright (c) by Jaroslav Kysela <perex@perex.cz>,
+ *  Copyright (c) by Jaroslav Kysela <perex@suse.cz>,
+ *
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ *
  */
 
 #define AK4117_REG_PWRDN	0x00	/* power down */
@@ -140,40 +155,37 @@
 typedef void (ak4117_write_t)(void *private_data, unsigned char addr, unsigned char data);
 typedef unsigned char (ak4117_read_t)(void *private_data, unsigned char addr);
 
-enum {
-	AK4117_PARITY_ERRORS,
-	AK4117_V_BIT_ERRORS,
-	AK4117_QCRC_ERRORS,
-	AK4117_CCRC_ERRORS,
-	AK4117_NUM_ERRORS
-};
+typedef struct ak4117 ak4117_t;
 
 struct ak4117 {
-	struct snd_card *card;
+	snd_card_t * card;
 	ak4117_write_t * write;
 	ak4117_read_t * read;
 	void * private_data;
 	unsigned int init: 1;
 	spinlock_t lock;
 	unsigned char regmap[5];
-	struct snd_kcontrol *kctls[AK4117_CONTROLS];
-	struct snd_pcm_substream *substream;
-	unsigned long errors[AK4117_NUM_ERRORS];
+	snd_kcontrol_t *kctls[AK4117_CONTROLS];
+	snd_pcm_substream_t *substream;
+	unsigned long parity_errors;
+	unsigned long v_bit_errors;
+	unsigned long qcrc_errors;
+	unsigned long ccrc_errors;
 	unsigned char rcs0;
 	unsigned char rcs1;
 	unsigned char rcs2;
 	struct timer_list timer;	/* statistic timer */
 	void *change_callback_private;
-	void (*change_callback)(struct ak4117 *ak4117, unsigned char c0, unsigned char c1);
+	void (*change_callback)(ak4117_t *ak4117, unsigned char c0, unsigned char c1);
 };
 
-int snd_ak4117_create(struct snd_card *card, ak4117_read_t *read, ak4117_write_t *write,
-		      const unsigned char pgm[5], void *private_data, struct ak4117 **r_ak4117);
-void snd_ak4117_reg_write(struct ak4117 *ak4117, unsigned char reg, unsigned char mask, unsigned char val);
-void snd_ak4117_reinit(struct ak4117 *ak4117);
-int snd_ak4117_build(struct ak4117 *ak4117, struct snd_pcm_substream *capture_substream);
-int snd_ak4117_external_rate(struct ak4117 *ak4117);
-int snd_ak4117_check_rate_and_errors(struct ak4117 *ak4117, unsigned int flags);
+int snd_ak4117_create(snd_card_t *card, ak4117_read_t *read, ak4117_write_t *write,
+		      unsigned char pgm[5], void *private_data, ak4117_t **r_ak4117);
+void snd_ak4117_reg_write(ak4117_t *ak4117, unsigned char reg, unsigned char mask, unsigned char val);
+void snd_ak4117_reinit(ak4117_t *ak4117);
+int snd_ak4117_build(ak4117_t *ak4117, snd_pcm_substream_t *capture_substream);
+int snd_ak4117_external_rate(ak4117_t *ak4117);
+int snd_ak4117_check_rate_and_errors(ak4117_t *ak4117, unsigned int flags);
 
 #endif /* __SOUND_AK4117_H */
 

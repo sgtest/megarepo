@@ -1,36 +1,63 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *  Digital Audio (PCM) abstract layer
- *  Copyright (c) by Jaroslav Kysela <perex@perex.cz>
+ *  Copyright (c) by Jaroslav Kysela <perex@suse.cz>
+ *
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ *
  */
 
+#include <sound/driver.h>
 #include <linux/time.h>
-#include <linux/gcd.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
 #include <sound/timer.h>
-
-#include "pcm_local.h"
 
 /*
  *  Timer functions
  */
 
-void snd_pcm_timer_resolution_change(struct snd_pcm_substream *substream)
+/* Greatest common divisor */
+static unsigned long gcd(unsigned long a, unsigned long b)
+{
+	unsigned long r;
+	if (a < b) {
+		r = a;
+		a = b;
+		b = r;
+	}
+	while ((r = a % b) != 0) {
+		a = b;
+		b = r;
+	}
+	return b;
+}
+
+void snd_pcm_timer_resolution_change(snd_pcm_substream_t *substream)
 {
 	unsigned long rate, mult, fsize, l, post;
-	struct snd_pcm_runtime *runtime = substream->runtime;
-
-	mult = 1000000000;
+	snd_pcm_runtime_t *runtime = substream->runtime;
+	
+        mult = 1000000000;
 	rate = runtime->rate;
-	if (snd_BUG_ON(!rate))
-		return;
+	snd_assert(rate != 0, return);
 	l = gcd(mult, rate);
 	mult /= l;
 	rate /= l;
 	fsize = runtime->period_size;
-	if (snd_BUG_ON(!fsize))
-		return;
+	snd_assert(fsize != 0, return);
 	l = gcd(rate, fsize);
 	rate /= l;
 	fsize /= l;
@@ -40,42 +67,46 @@ void snd_pcm_timer_resolution_change(struct snd_pcm_substream *substream)
 		post *= 2;
 	}
 	if (rate == 0) {
-		pcm_err(substream->pcm,
-			"pcm timer resolution out of range (rate = %u, period_size = %lu)\n",
-			runtime->rate, runtime->period_size);
+		snd_printk(KERN_ERR "pcm timer resolution out of range (rate = %u, period_size = %lu)\n", runtime->rate, runtime->period_size);
 		runtime->timer_resolution = -1;
 		return;
 	}
 	runtime->timer_resolution = (mult * fsize / rate) * post;
 }
 
-static unsigned long snd_pcm_timer_resolution(struct snd_timer * timer)
+static unsigned long snd_pcm_timer_resolution(snd_timer_t * timer)
 {
-	struct snd_pcm_substream *substream;
-
+	snd_pcm_substream_t * substream;
+	
 	substream = timer->private_data;
 	return substream->runtime ? substream->runtime->timer_resolution : 0;
 }
 
-static int snd_pcm_timer_start(struct snd_timer * timer)
+static int snd_pcm_timer_start(snd_timer_t * timer)
 {
-	struct snd_pcm_substream *substream;
-
+	unsigned long flags;
+	snd_pcm_substream_t * substream;
+	
 	substream = snd_timer_chip(timer);
+	spin_lock_irqsave(&substream->timer_lock, flags);
 	substream->timer_running = 1;
+	spin_unlock_irqrestore(&substream->timer_lock, flags);
 	return 0;
 }
 
-static int snd_pcm_timer_stop(struct snd_timer * timer)
+static int snd_pcm_timer_stop(snd_timer_t * timer)
 {
-	struct snd_pcm_substream *substream;
-
+	unsigned long flags;
+	snd_pcm_substream_t * substream;
+	
 	substream = snd_timer_chip(timer);
+	spin_lock_irqsave(&substream->timer_lock, flags);
 	substream->timer_running = 0;
+	spin_unlock_irqrestore(&substream->timer_lock, flags);
 	return 0;
 }
 
-static const struct snd_timer_hardware snd_pcm_timer =
+static struct _snd_timer_hardware snd_pcm_timer =
 {
 	.flags =	SNDRV_TIMER_HW_AUTO | SNDRV_TIMER_HW_SLAVE,
 	.resolution =	0,
@@ -89,17 +120,17 @@ static const struct snd_timer_hardware snd_pcm_timer =
  *  Init functions
  */
 
-static void snd_pcm_timer_free(struct snd_timer *timer)
+static void snd_pcm_timer_free(snd_timer_t *timer)
 {
-	struct snd_pcm_substream *substream = timer->private_data;
+	snd_pcm_substream_t *substream = timer->private_data;
 	substream->timer = NULL;
 }
 
-void snd_pcm_timer_init(struct snd_pcm_substream *substream)
+void snd_pcm_timer_init(snd_pcm_substream_t *substream)
 {
-	struct snd_timer_id tid;
-	struct snd_timer *timer;
-
+	snd_timer_id_t tid;
+	snd_timer_t *timer;
+	
 	tid.dev_sclass = SNDRV_TIMER_SCLASS_NONE;
 	tid.dev_class = SNDRV_TIMER_CLASS_PCM;
 	tid.card = substream->pcm->card->number;
@@ -121,7 +152,7 @@ void snd_pcm_timer_init(struct snd_pcm_substream *substream)
 	substream->timer = timer;
 }
 
-void snd_pcm_timer_done(struct snd_pcm_substream *substream)
+void snd_pcm_timer_done(snd_pcm_substream_t *substream)
 {
 	if (substream->timer) {
 		snd_device_free(substream->pcm->card, substream->timer);

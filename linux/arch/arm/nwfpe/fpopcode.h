@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
     NetWinder Floating Point Emulator
     (c) Rebel.COM, 1998,1999
@@ -6,11 +5,25 @@
 
     Direct questions, comments to Scott Bambrough <scottb@netwinder.org>
 
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 */
 
 #ifndef __FPOPCODE_H__
 #define __FPOPCODE_H__
 
+#include <linux/config.h>
 
 /*
 ARM Floating Point Instruction Classes
@@ -66,11 +79,11 @@ TABLE 1
 +-------------------------+---+---+---------+---------+
 |  Precision              | u | v | FPSR.EP | length  |
 +-------------------------+---+---+---------+---------+
-| Single                  | 0 | 0 |    x    | 1 words |
-| Double                  | 1 | 1 |    x    | 2 words |
-| Extended                | 1 | 1 |    x    | 3 words |
-| Packed decimal          | 1 | 1 |    0    | 3 words |
-| Expanded packed decimal | 1 | 1 |    1    | 4 words |
+| Single                  | 0 ü 0 |    x    | 1 words |
+| Double                  | 1 ü 1 |    x    | 2 words |
+| Extended                | 1 ü 1 |    x    | 3 words |
+| Packed decimal          | 1 ü 1 |    0    | 3 words |
+| Expanded packed decimal | 1 ü 1 |    1    | 4 words |
 +-------------------------+---+---+---------+---------+
 Note: x = don't care
 */
@@ -80,10 +93,10 @@ TABLE 2
 +---+---+---------------------------------+
 | w | x | Number of registers to transfer |
 +---+---+---------------------------------+
-| 0 | 1 |  1                              |
-| 1 | 0 |  2                              |
-| 1 | 1 |  3                              |
-| 0 | 0 |  4                              |
+| 0 ü 1 |  1                              |
+| 1 ü 0 |  2                              |
+| 1 ü 1 |  3                              |
+| 0 ü 0 |  4                              |
 +---+---+---------------------------------+
 */
 
@@ -144,10 +157,10 @@ TABLE 5
 +-------------------------+---+---+
 |  Rounding Precision     | e | f |
 +-------------------------+---+---+
-| IEEE Single precision   | 0 | 0 |
-| IEEE Double precision   | 0 | 1 |
-| IEEE Extended precision | 1 | 0 |
-| undefined (trap)        | 1 | 1 |
+| IEEE Single precision   | 0 ü 0 |
+| IEEE Double precision   | 0 ü 1 |
+| IEEE Extended precision | 1 ü 0 |
+| undefined (trap)        | 1 ü 1 |
 +-------------------------+---+---+
 */
 
@@ -156,10 +169,10 @@ TABLE 5
 +---------------------------------+---+---+
 |  Rounding Mode                  | g | h |
 +---------------------------------+---+---+
-| Round to nearest (default)      | 0 | 0 |
-| Round toward plus infinity      | 0 | 1 |
-| Round toward negative infinity  | 1 | 0 |
-| Round toward zero               | 1 | 1 |
+| Round to nearest (default)      | 0 ü 0 |
+| Round toward plus infinity      | 0 ü 1 |
+| Round toward negative infinity  | 1 ü 0 |
+| Round toward zero               | 1 ü 1 |
 +---------------------------------+---+---+
 */
 
@@ -357,20 +370,20 @@ TABLE 5
 #define getRoundingMode(opcode)		((opcode & MASK_ROUNDING_MODE) >> 5)
 
 #ifdef CONFIG_FPE_NWFPE_XP
-static inline floatx80 __pure getExtendedConstant(const unsigned int nIndex)
+static inline const floatx80 getExtendedConstant(const unsigned int nIndex)
 {
 	extern const floatx80 floatx80Constant[];
 	return floatx80Constant[nIndex];
 }
 #endif
 
-static inline float64 __pure getDoubleConstant(const unsigned int nIndex)
+static inline const float64 getDoubleConstant(const unsigned int nIndex)
 {
 	extern const float64 float64Constant[];
 	return float64Constant[nIndex];
 }
 
-static inline float32 __pure getSingleConstant(const unsigned int nIndex)
+static inline const float32 getSingleConstant(const unsigned int nIndex)
 {
 	extern const float32 float32Constant[];
 	return float32Constant[nIndex];
@@ -462,8 +475,5 @@ static inline unsigned int getDestinationSize(const unsigned int opcode)
 
 	return (nRc);
 }
-
-extern const float64 float64Constant[];
-extern const float32 float32Constant[];
 
 #endif

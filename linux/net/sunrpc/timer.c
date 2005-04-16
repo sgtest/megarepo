@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * linux/net/sunrpc/timer.c
  *
@@ -18,24 +17,20 @@
 
 #include <linux/types.h>
 #include <linux/unistd.h>
-#include <linux/module.h>
 
 #include <linux/sunrpc/clnt.h>
+#include <linux/sunrpc/xprt.h>
+#include <linux/sunrpc/timer.h>
 
 #define RPC_RTO_MAX (60*HZ)
 #define RPC_RTO_INIT (HZ/5)
 #define RPC_RTO_MIN (HZ/10)
 
-/**
- * rpc_init_rtt - Initialize an RPC RTT estimator context
- * @rt: context to initialize
- * @timeo: initial timeout value, in jiffies
- *
- */
-void rpc_init_rtt(struct rpc_rtt *rt, unsigned long timeo)
+void
+rpc_init_rtt(struct rpc_rtt *rt, unsigned long timeo)
 {
 	unsigned long init = 0;
-	unsigned int i;
+	unsigned i;
 
 	rt->timeo = timeo;
 
@@ -47,18 +42,13 @@ void rpc_init_rtt(struct rpc_rtt *rt, unsigned long timeo)
 		rt->ntimeouts[i] = 0;
 	}
 }
-EXPORT_SYMBOL_GPL(rpc_init_rtt);
 
-/**
- * rpc_update_rtt - Update an RPC RTT estimator context
- * @rt: context to update
- * @timer: timer array index (request type)
- * @m: recent actual RTT, in jiffies
- *
+/*
  * NB: When computing the smoothed RTT and standard deviation,
  *     be careful not to produce negative intermediate results.
  */
-void rpc_update_rtt(struct rpc_rtt *rt, unsigned int timer, long m)
+void
+rpc_update_rtt(struct rpc_rtt *rt, unsigned timer, long m)
 {
 	long *srtt, *sdrtt;
 
@@ -87,27 +77,22 @@ void rpc_update_rtt(struct rpc_rtt *rt, unsigned int timer, long m)
 	if (*sdrtt < RPC_RTO_MIN)
 		*sdrtt = RPC_RTO_MIN;
 }
-EXPORT_SYMBOL_GPL(rpc_update_rtt);
 
-/**
- * rpc_calc_rto - Provide an estimated timeout value
- * @rt: context to use for calculation
- * @timer: timer array index (request type)
- *
- * Estimate RTO for an NFS RPC sent via an unreliable datagram.  Use
- * the mean and mean deviation of RTT for the appropriate type of RPC
- * for frequently issued RPCs, and a fixed default for the others.
- *
- * The justification for doing "other" this way is that these RPCs
- * happen so infrequently that timer estimation would probably be
- * stale.  Also, since many of these RPCs are non-idempotent, a
- * conservative timeout is desired.
- *
+/*
+ * Estimate rto for an nfs rpc sent via. an unreliable datagram.
+ * Use the mean and mean deviation of rtt for the appropriate type of rpc
+ * for the frequent rpcs and a default for the others.
+ * The justification for doing "other" this way is that these rpcs
+ * happen so infrequently that timer est. would probably be stale.
+ * Also, since many of these rpcs are
+ * non-idempotent, a conservative timeout is desired.
  * getattr, lookup,
  * read, write, commit     - A+4D
  * other                   - timeo
  */
-unsigned long rpc_calc_rto(struct rpc_rtt *rt, unsigned int timer)
+
+unsigned long
+rpc_calc_rto(struct rpc_rtt *rt, unsigned timer)
 {
 	unsigned long res;
 
@@ -120,4 +105,3 @@ unsigned long rpc_calc_rto(struct rpc_rtt *rt, unsigned int timer)
 
 	return res;
 }
-EXPORT_SYMBOL_GPL(rpc_calc_rto);

@@ -1,10 +1,12 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  *
  * Copyright (C) Jonathan Naylor G4KLX (g4klx@g4klx.demon.co.uk)
  */
 #include <linux/types.h>
-#include <linux/slab.h>
 #include <linux/socket.h>
 #include <linux/timer.h>
 #include <net/ax25.h>
@@ -13,17 +15,15 @@
 #include <linux/init.h>
 
 static struct sk_buff_head loopback_queue;
-#define ROSE_LOOPBACK_LIMIT 1000
 static struct timer_list loopback_timer;
 
 static void rose_set_loopback_timer(void);
-static void rose_loopback_timer(struct timer_list *unused);
 
 void rose_loopback_init(void)
 {
 	skb_queue_head_init(&loopback_queue);
 
-	timer_setup(&loopback_timer, rose_loopback_timer, 0);
+	init_timer(&loopback_timer);
 }
 
 static int rose_loopback_running(void)
@@ -33,30 +33,36 @@ static int rose_loopback_running(void)
 
 int rose_loopback_queue(struct sk_buff *skb, struct rose_neigh *neigh)
 {
-	struct sk_buff *skbn = NULL;
+	struct sk_buff *skbn;
 
-	if (skb_queue_len(&loopback_queue) < ROSE_LOOPBACK_LIMIT)
-		skbn = skb_clone(skb, GFP_ATOMIC);
+	skbn = skb_clone(skb, GFP_ATOMIC);
 
-	if (skbn) {
-		consume_skb(skb);
+	kfree_skb(skb);
+
+	if (skbn != NULL) {
 		skb_queue_tail(&loopback_queue, skbn);
 
 		if (!rose_loopback_running())
 			rose_set_loopback_timer();
-	} else {
-		kfree_skb(skb);
 	}
 
 	return 1;
 }
 
+static void rose_loopback_timer(unsigned long);
+
 static void rose_set_loopback_timer(void)
 {
-	mod_timer(&loopback_timer, jiffies + 10);
+	del_timer(&loopback_timer);
+
+	loopback_timer.data     = 0;
+	loopback_timer.function = &rose_loopback_timer;
+	loopback_timer.expires  = jiffies + 10;
+
+	add_timer(&loopback_timer);
 }
 
-static void rose_loopback_timer(struct timer_list *unused)
+static void rose_loopback_timer(unsigned long param)
 {
 	struct sk_buff *skb;
 	struct net_device *dev;
@@ -64,59 +70,32 @@ static void rose_loopback_timer(struct timer_list *unused)
 	struct sock *sk;
 	unsigned short frametype;
 	unsigned int lci_i, lci_o;
-	int count;
 
-	for (count = 0; count < ROSE_LOOPBACK_LIMIT; count++) {
-		skb = skb_dequeue(&loopback_queue);
-		if (!skb)
-			return;
-		if (skb->len < ROSE_MIN_LEN) {
-			kfree_skb(skb);
-			continue;
-		}
+	while ((skb = skb_dequeue(&loopback_queue)) != NULL) {
 		lci_i     = ((skb->data[0] << 8) & 0xF00) + ((skb->data[1] << 0) & 0x0FF);
 		frametype = skb->data[2];
-		if (frametype == ROSE_CALL_REQUEST &&
-		    (skb->len <= ROSE_CALL_REQ_FACILITIES_OFF ||
-		     skb->data[ROSE_CALL_REQ_ADDR_LEN_OFF] !=
-		     ROSE_CALL_REQ_ADDR_LEN_VAL)) {
-			kfree_skb(skb);
-			continue;
-		}
-		dest      = (rose_address *)(skb->data + ROSE_CALL_REQ_DEST_ADDR_OFF);
-		lci_o     = ROSE_DEFAULT_MAXVC + 1 - lci_i;
+		dest      = (rose_address *)(skb->data + 4);
+		lci_o     = 0xFFF - lci_i;
 
-		skb_reset_transport_header(skb);
+		skb->h.raw = skb->data;
 
-		sk = rose_find_socket(lci_o, rose_loopback_neigh);
-		if (sk) {
+		if ((sk = rose_find_socket(lci_o, rose_loopback_neigh)) != NULL) {
 			if (rose_process_rx_frame(sk, skb) == 0)
 				kfree_skb(skb);
 			continue;
 		}
 
 		if (frametype == ROSE_CALL_REQUEST) {
-			if (!rose_loopback_neigh->dev) {
-				kfree_skb(skb);
-				continue;
-			}
-
-			dev = rose_dev_get(dest);
-			if (!dev) {
-				kfree_skb(skb);
-				continue;
-			}
-
-			if (rose_rx_call_request(skb, dev, rose_loopback_neigh, lci_o) == 0) {
-				dev_put(dev);
+			if ((dev = rose_dev_get(dest)) != NULL) {
+				if (rose_rx_call_request(skb, dev, rose_loopback_neigh, lci_o) == 0)
+					kfree_skb(skb);
+			} else {
 				kfree_skb(skb);
 			}
 		} else {
 			kfree_skb(skb);
 		}
 	}
-	if (!skb_queue_empty(&loopback_queue))
-		mod_timer(&loopback_timer, jiffies + 1);
 }
 
 void __exit rose_loopback_clear(void)

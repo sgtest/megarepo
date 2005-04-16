@@ -1,6 +1,5 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
- * linux/include/linux/sunrpc/auth_gss.h
+ * linux/include/linux/auth_gss.h
  *
  * Declarations for RPCSEC_GSS
  *
@@ -8,12 +7,14 @@
  * Andy Adamson <andros@umich.edu>
  * Bruce Fields <bfields@umich.edu>
  * Copyright (c) 2000 The Regents of the University of Michigan
+ *
+ * $Id$
  */
 
 #ifndef _LINUX_SUNRPC_AUTH_GSS_H
 #define _LINUX_SUNRPC_AUTH_GSS_H
 
-#include <linux/refcount.h>
+#ifdef __KERNEL__
 #include <linux/sunrpc/auth.h>
 #include <linux/sunrpc/svc.h>
 #include <linux/sunrpc/gss_api.h>
@@ -66,28 +67,31 @@ struct rpc_gss_init_res {
  * the wire when communicating with a server. */
 
 struct gss_cl_ctx {
-	refcount_t		count;
+	atomic_t		count;
 	enum rpc_gss_proc	gc_proc;
 	u32			gc_seq;
-	u32			gc_seq_xmit;
 	spinlock_t		gc_seq_lock;
 	struct gss_ctx		*gc_gss_ctx;
 	struct xdr_netobj	gc_wire_ctx;
-	struct xdr_netobj	gc_acceptor;
 	u32			gc_win;
 	unsigned long		gc_expiry;
-	struct rcu_head		gc_rcu;
 };
 
 struct gss_upcall_msg;
 struct gss_cred {
 	struct rpc_cred		gc_base;
 	enum rpc_gss_svc	gc_service;
-	struct gss_cl_ctx __rcu	*gc_ctx;
+	struct gss_cl_ctx	*gc_ctx;
 	struct gss_upcall_msg	*gc_upcall;
-	const char		*gc_principal;
-	unsigned long		gc_upcall_timestamp;
 };
 
+#define gc_uid			gc_base.cr_uid
+#define gc_count		gc_base.cr_count
+#define gc_flags		gc_base.cr_flags
+#define gc_expire		gc_base.cr_expire
+
+void print_hexl(u32 *p, u_int length, u_int offset);
+
+#endif /* __KERNEL__ */
 #endif /* _LINUX_SUNRPC_AUTH_GSS_H */
 

@@ -1,7 +1,16 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Workbit NinjaSCSI-32Bi/UDE PCI/CardBus SCSI Host Bus Adapter driver
  * Basic data header
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
 */
 
 #ifndef _NSP32_H
@@ -57,6 +66,11 @@ static char * nsp32_model[] = {
 /* Little Endian */
 typedef u32 u32_le;
 typedef u16 u16_le;
+
+/*
+ * MACRO
+ */
+#define BIT(x)      (1UL << (x))
 
 /*
  * BASIC Definitions
@@ -498,7 +512,7 @@ typedef struct _nsp32_lunt {
 /*
  * SCSI TARGET/LUN definition
  */
-#define NSP32_HOST_SCSIID    7  /* SCSI initiator is every time defined as 7 */
+#define NSP32_HOST_SCSIID    7  /* SCSI initiator is everytime defined as 7 */
 #define MAX_TARGET	     8
 #define MAX_LUN		     8	/* XXX: In SPI3, max number of LUN is 64. */
 
@@ -533,15 +547,6 @@ typedef struct _nsp32_sync_table {
   bit:07 06 05 04 03 02 01 00
       ---PERIOD-- ---OFFSET--   */
 #define TO_SYNCREG(period, offset) (((period) & 0x0f) << 4 | ((offset) & 0x0f))
-
-struct nsp32_cmd_priv {
-	enum sam_status status;
-};
-
-static inline struct nsp32_cmd_priv *nsp32_priv(struct scsi_cmnd *cmd)
-{
-	return scsi_cmd_priv(cmd);
-}
 
 typedef struct _nsp32_target {
 	unsigned char	syncreg;	/* value for SYNCREG   */
@@ -612,6 +617,48 @@ typedef struct _nsp32_hw_data {
 #define ARBIT_TIMEOUT_TIME	100	/* 100us */
 #define REQSACK_TIMEOUT_TIME	10000	/* max wait time for REQ/SACK assertion
 					   or negation, 10000us == 10ms */
+
+/**************************************************************************
+ * Compatibility functions
+ */
+
+/* for Kernel 2.4 */
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(2,6,0))
+# define scsi_register_host(template) 	scsi_register_module(MODULE_SCSI_HA, template)
+# define scsi_unregister_host(template) scsi_unregister_module(MODULE_SCSI_HA, template)
+# define scsi_host_put(host)            scsi_unregister(host)
+# define pci_name(pci_dev)              ((pci_dev)->slot_name)
+
+typedef void irqreturn_t;
+# define IRQ_NONE      /* */
+# define IRQ_HANDLED   /* */
+# define IRQ_RETVAL(x) /* */
+
+/* This is ad-hoc version of scsi_host_get_next() */
+static inline struct Scsi_Host *scsi_host_get_next(struct Scsi_Host *host)
+{
+	if (host == NULL) {
+		return scsi_hostlist;
+	} else {
+		return host->next;
+	}
+}
+
+/* This is ad-hoc version of scsi_host_hn_get() */
+static inline struct Scsi_Host *scsi_host_hn_get(unsigned short hostno)
+{
+	struct Scsi_Host *host;
+
+	for (host = scsi_host_get_next(NULL); host != NULL;
+	     host = scsi_host_get_next(host)) {
+		if (host->host_no == hostno) {
+			break;
+		}
+	}
+
+	return host;
+}
+#endif
 
 #endif /* _NSP32_H */
 /* end */

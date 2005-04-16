@@ -24,10 +24,11 @@
  *      - Jay Schulist <jschlst@samba.org>
  */
 
+#include <linux/config.h>
 
 #ifdef CONFIG_COPS_DAYNA
 
-static const unsigned char ffdrv_code[] = {
+unsigned char ffdrv_code[] = {
 	58,3,0,50,228,149,33,255,255,34,226,149,
 	249,17,40,152,33,202,154,183,237,82,77,68,
 	11,107,98,19,54,0,237,176,175,50,80,0,

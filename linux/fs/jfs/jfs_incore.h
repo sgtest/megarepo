@@ -1,17 +1,27 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  *   Copyright (C) International Business Machines Corp., 2000-2004
  *   Portions Copyright (C) Christoph Hellwig, 2001-2002
- */
+ *
+ *   This program is free software;  you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or 
+ *   (at your option) any later version.
+ * 
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY;  without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See
+ *   the GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program;  if not, write to the Free Software 
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */ 
 #ifndef _H_JFS_INCORE
 #define _H_JFS_INCORE
 
-#include <linux/mutex.h>
 #include <linux/rwsem.h>
 #include <linux/slab.h>
 #include <linux/bitops.h>
-#include <linux/uuid.h>
-
 #include "jfs_types.h"
 #include "jfs_xtree.h"
 #include "jfs_dtree.h"
@@ -27,21 +37,18 @@
 struct jfs_inode_info {
 	int	fileset;	/* fileset number (always 16)*/
 	uint	mode2;		/* jfs-specific mode		*/
-	kuid_t	saved_uid;	/* saved for uid mount option */
-	kgid_t	saved_gid;	/* saved for gid mount option */
-	pxd_t	ixpxd;		/* inode extent descriptor	*/
+	pxd_t   ixpxd;		/* inode extent descriptor	*/
 	dxd_t	acl;		/* dxd describing acl	*/
 	dxd_t	ea;		/* dxd describing ea	*/
-	time64_t otime;		/* time created	*/
+	time_t	otime;		/* time created	*/
 	uint	next_index;	/* next available directory entry index */
 	int	acltype;	/* Type of ACL	*/
 	short	btorder;	/* access order	*/
 	short	btindex;	/* btpage entry index*/
 	struct inode *ipimap;	/* inode map			*/
-	unsigned long cflag;	/* commit flags		*/
-	u64	agstart;	/* agstart of the containing IAG */
+	long	cflag;		/* commit flags		*/
 	u16	bxflag;		/* xflag of pseudo buffer?	*/
-	unchar	pad;
+	unchar	agno;		/* ag number			*/
 	signed char active_ag;	/* ag currently allocating from	*/
 	lid_t	blid;		/* lid of pseudo buffer?	*/
 	lid_t	atlhead;	/* anonymous tlock list head	*/
@@ -51,19 +58,23 @@ struct jfs_inode_info {
 	/*
 	 * rdwrlock serializes xtree between reads & writes and synchronizes
 	 * changes to special inodes.  It's use would be redundant on
-	 * directories since the i_mutex taken in the VFS is sufficient.
+	 * directories since the i_sem taken in the VFS is sufficient.
 	 */
 	struct rw_semaphore rdwrlock;
 	/*
-	 * commit_mutex serializes transaction processing on an inode.
+	 * commit_sem serializes transaction processing on an inode.
 	 * It must be taken after beginning a transaction (txBegin), since
 	 * dirty inodes may be committed while a new transaction on the
 	 * inode is blocked in txBegin or TxBeginAnon
 	 */
-	struct mutex commit_mutex;
-	/* xattr_sem allows us to access the xattrs without taking i_mutex */
+	struct semaphore commit_sem;
+	/* xattr_sem allows us to access the xattrs without taking i_sem */
 	struct rw_semaphore xattr_sem;
 	lid_t	xtlid;		/* lid of xtree lock on directory */
+#ifdef CONFIG_JFS_POSIX_ACL
+	struct posix_acl *i_acl;
+	struct posix_acl *i_default_acl;
+#endif
 	union {
 		struct {
 			xtpage_t _xtroot;	/* 288: xtree root */
@@ -76,24 +87,13 @@ struct jfs_inode_info {
 		struct {
 			unchar _unused[16];	/* 16: */
 			dxd_t _dxd;		/* 16: */
-			/* _inline may overflow into _inline_ea when needed */
+			unchar _inline[128];	/* 128: inline symlink */
 			/* _inline_ea may overlay the last part of
 			 * file._xtroot if maxentry = XTROOTINITSLOT
 			 */
-			union {
-				struct {
-					/* 128: inline symlink */
-					unchar _inline[128];
-					/* 128: inline extended attr */
-					unchar _inline_ea[128];
-				};
-				unchar _inline_all[256];
-			};
+			unchar _inline_ea[128];	/* 128: inline extended attr */
 		} link;
 	} u;
-#ifdef CONFIG_QUOTA
-	struct dquot *i_dquot[MAXQUOTAS];
-#endif
 	u32 dev;	/* will die when we get wide dev_t */
 	struct inode	vfs_inode;
 };
@@ -103,13 +103,12 @@ struct jfs_inode_info {
 #define i_dtroot u.dir._dtroot
 #define i_inline u.link._inline
 #define i_inline_ea u.link._inline_ea
-#define i_inline_all u.link._inline_all
 
-#define IREAD_LOCK(ip, subclass) \
-	down_read_nested(&JFS_IP(ip)->rdwrlock, subclass)
+#define JFS_ACL_NOT_CACHED ((void *)-1)
+
+#define IREAD_LOCK(ip)		down_read(&JFS_IP(ip)->rdwrlock)
 #define IREAD_UNLOCK(ip)	up_read(&JFS_IP(ip)->rdwrlock)
-#define IWRITE_LOCK(ip, subclass) \
-	down_write_nested(&JFS_IP(ip)->rdwrlock, subclass)
+#define IWRITE_LOCK(ip)		down_write(&JFS_IP(ip)->rdwrlock)
 #define IWRITE_UNLOCK(ip)	up_write(&JFS_IP(ip)->rdwrlock)
 
 /*
@@ -123,29 +122,6 @@ enum cflags {
 	COMMIT_Dirtable,	/* commit changes to di_dirtable */
 	COMMIT_Stale,		/* data extent is no longer valid */
 	COMMIT_Synclist,	/* metadata pages on group commit synclist */
-};
-
-/*
- * commit_mutex nesting subclasses:
- */
-enum commit_mutex_class
-{
-	COMMIT_MUTEX_PARENT,
-	COMMIT_MUTEX_CHILD,
-	COMMIT_MUTEX_SECOND_PARENT,	/* Renaming */
-	COMMIT_MUTEX_VICTIM		/* Inode being unlinked due to rename */
-};
-
-/*
- * rdwrlock subclasses:
- * The dmap inode may be locked while a normal inode or the imap inode are
- * locked.
- */
-enum rdwrlock_class
-{
-	RDWRLOCK_NORMAL,
-	RDWRLOCK_IMAP,
-	RDWRLOCK_DMAP
 };
 
 #define set_cflag(flag, ip)	set_bit(flag, &(JFS_IP(ip)->cflag))
@@ -175,8 +151,8 @@ struct jfs_sb_info {
 	pxd_t		logpxd;		/* pxd describing log	*/
 	pxd_t		fsckpxd;	/* pxd describing fsck wkspc */
 	pxd_t		ait2;		/* pxd describing AIT copy	*/
-	uuid_t		uuid;		/* 128-bit uuid for volume	*/
-	uuid_t		loguuid;	/* 128-bit uuid for log	*/
+	char		uuid[16];	/* 128-bit uuid for volume	*/
+	char		loguuid[16];	/* 128-bit uuid for log	*/
 	/*
 	 * commit_state is used for synchronization of the jfs_commit
 	 * threads.  It is protected by LAZY_LOCK().
@@ -186,17 +162,12 @@ struct jfs_sb_info {
 	uint		gengen;		/* inode generation generator*/
 	uint		inostamp;	/* shows inode belongs to fileset*/
 
-	/* Formerly in ipbmap */
+        /* Formerly in ipbmap */
 	struct bmap	*bmap;		/* incore bmap descriptor	*/
 	struct nls_table *nls_tab;	/* current codepage		*/
-	struct inode *direct_inode;	/* metadata inode */
 	uint		state;		/* mount/recovery state	*/
 	unsigned long	flag;		/* mount time flags */
 	uint		p_state;	/* state prior to going no integrity */
-	kuid_t		uid;		/* uid to override on-disk uid */
-	kgid_t		gid;		/* gid to override on-disk gid */
-	uint		umask;		/* umask to override on-disk umask */
-	uint		minblks_trim;	/* minimum blocks, for online trim */
 };
 
 /* jfs_sb_info commit_state */
@@ -204,7 +175,7 @@ struct jfs_sb_info {
 
 static inline struct jfs_inode_info *JFS_IP(struct inode *inode)
 {
-	return container_of(inode, struct jfs_inode_info, vfs_inode);
+	return list_entry(inode, struct jfs_inode_info, vfs_inode);
 }
 
 static inline int jfs_dirtable_inline(struct inode *inode)

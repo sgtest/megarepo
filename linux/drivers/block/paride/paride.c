@@ -21,6 +21,7 @@
 #define PI_VERSION      "1.06"
 
 #include <linux/module.h>
+#include <linux/config.h>
 #include <linux/kmod.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
@@ -28,9 +29,14 @@
 #include <linux/string.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
-#include <linux/sched.h>	/* TASK_* */
+
+#ifdef CONFIG_PARPORT_MODULE
+#define CONFIG_PARPORT
+#endif
+
+#ifdef CONFIG_PARPORT
 #include <linux/parport.h>
-#include <linux/slab.h>
+#endif
 
 #include "paride.h"
 
@@ -70,6 +76,8 @@ void pi_read_block(PIA * pi, char *buf, int count)
 
 EXPORT_SYMBOL(pi_read_block);
 
+#ifdef CONFIG_PARPORT
+
 static void pi_wake_up(void *p)
 {
 	PIA *pi = (PIA *) p;
@@ -92,8 +100,11 @@ static void pi_wake_up(void *p)
 		cont();
 }
 
+#endif
+
 int pi_schedule_claimed(PIA * pi, void (*cont) (void))
 {
+#ifdef CONFIG_PARPORT
 	unsigned long flags;
 
 	spin_lock_irqsave(&pi_spinlock, flags);
@@ -104,6 +115,7 @@ int pi_schedule_claimed(PIA * pi, void (*cont) (void))
 	}
 	pi->claimed = 1;
 	spin_unlock_irqrestore(&pi_spinlock, flags);
+#endif
 	return 1;
 }
 EXPORT_SYMBOL(pi_schedule_claimed);
@@ -121,16 +133,20 @@ static void pi_claim(PIA * pi)
 	if (pi->claimed)
 		return;
 	pi->claimed = 1;
+#ifdef CONFIG_PARPORT
 	if (pi->pardev)
 		wait_event(pi->parq,
 			   !parport_claim((struct pardevice *) pi->pardev));
+#endif
 }
 
 static void pi_unclaim(PIA * pi)
 {
 	pi->claimed = 0;
+#ifdef CONFIG_PARPORT
 	if (pi->pardev)
 		parport_release((struct pardevice *) (pi->pardev));
+#endif
 }
 
 void pi_connect(PIA * pi)
@@ -151,15 +167,21 @@ EXPORT_SYMBOL(pi_disconnect);
 
 static void pi_unregister_parport(PIA * pi)
 {
+#ifdef CONFIG_PARPORT
 	if (pi->pardev) {
 		parport_unregister_device((struct pardevice *) (pi->pardev));
 		pi->pardev = NULL;
 	}
+#endif
 }
 
 void pi_release(PIA * pi)
 {
 	pi_unregister_parport(pi);
+#ifndef CONFIG_PARPORT
+	if (pi->reserved)
+		release_region(pi->port, pi->reserved);
+#endif				/* !CONFIG_PARPORT */
 	if (pi->proto->release_proto)
 		pi->proto->release_proto(pi);
 	module_put(pi->proto->owner);
@@ -207,7 +229,7 @@ static int pi_test_proto(PIA * pi, char *scratch, int verbose)
 	return res;
 }
 
-int paride_register(PIP * pr)
+int pi_register(PIP * pr)
 {
 	int k;
 
@@ -215,24 +237,24 @@ int paride_register(PIP * pr)
 		if (protocols[k] && !strcmp(pr->name, protocols[k]->name)) {
 			printk("paride: %s protocol already registered\n",
 			       pr->name);
-			return -1;
+			return 0;
 		}
 	k = 0;
 	while ((k < MAX_PROTOS) && (protocols[k]))
 		k++;
 	if (k == MAX_PROTOS) {
 		printk("paride: protocol table full\n");
-		return -1;
+		return 0;
 	}
 	protocols[k] = pr;
 	pr->index = k;
 	printk("paride: %s registered as protocol %d\n", pr->name, k);
-	return 0;
+	return 1;
 }
 
-EXPORT_SYMBOL(paride_register);
+EXPORT_SYMBOL(pi_register);
 
-void paride_unregister(PIP * pr)
+void pi_unregister(PIP * pr)
 {
 	if (!pr)
 		return;
@@ -243,21 +265,21 @@ void paride_unregister(PIP * pr)
 	protocols[pr->index] = NULL;
 }
 
-EXPORT_SYMBOL(paride_unregister);
+EXPORT_SYMBOL(pi_unregister);
 
-static int pi_register_parport(PIA *pi, int verbose, int unit)
+static int pi_register_parport(PIA * pi, int verbose)
 {
+#ifdef CONFIG_PARPORT
+
 	struct parport *port;
-	struct pardev_cb par_cb;
 
 	port = parport_find_base(pi->port);
 	if (!port)
 		return 0;
-	memset(&par_cb, 0, sizeof(par_cb));
-	par_cb.wakeup = pi_wake_up;
-	par_cb.private = (void *)pi;
-	pi->pardev = parport_register_dev_model(port, pi->device, &par_cb,
-						unit);
+
+	pi->pardev = parport_register_device(port,
+					     pi->device, NULL,
+					     pi_wake_up, NULL, 0, (void *) pi);
 	parport_put_port(port);
 	if (!pi->pardev)
 		return 0;
@@ -268,6 +290,7 @@ static int pi_register_parport(PIA *pi, int verbose, int unit)
 		printk("%s: 0x%x is %s\n", pi->device, pi->port, port->name);
 
 	pi->parname = (char *) port->name;
+#endif
 
 	return 1;
 }
@@ -314,7 +337,7 @@ static int pi_probe_unit(PIA * pi, int unit, char *scratch, int verbose)
 		e = pi->proto->max_units;
 	}
 
-	if (!pi_register_parport(pi, verbose, s))
+	if (!pi_register_parport(pi, verbose))
 		return 0;
 
 	if (pi->proto->test_port) {
@@ -424,6 +447,13 @@ int pi_init(PIA * pi, int autoprobe, int port, int mode,
 			printk("%s: Adapter not found\n", device);
 		return 0;
 	}
+#ifndef CONFIG_PARPORT
+	if (!request_region(pi->port, pi->reserved, pi->device)) {
+		printk(KERN_WARNING "paride: Unable to request region 0x%x\n",
+		       pi->port);
+		return 0;
+	}
+#endif				/* !CONFIG_PARPORT */
 
 	if (pi->parname)
 		printk("%s: Sharing %s at 0x%x\n", pi->device,
@@ -435,45 +465,3 @@ int pi_init(PIA * pi, int autoprobe, int port, int mode,
 }
 
 EXPORT_SYMBOL(pi_init);
-
-static int pi_probe(struct pardevice *par_dev)
-{
-	struct device_driver *drv = par_dev->dev.driver;
-	int len = strlen(drv->name);
-
-	if (strncmp(par_dev->name, drv->name, len))
-		return -ENODEV;
-
-	return 0;
-}
-
-void *pi_register_driver(char *name)
-{
-	struct parport_driver *parp_drv;
-	int ret;
-
-	parp_drv = kzalloc(sizeof(*parp_drv), GFP_KERNEL);
-	if (!parp_drv)
-		return NULL;
-
-	parp_drv->name = name;
-	parp_drv->probe = pi_probe;
-	parp_drv->devmodel = true;
-
-	ret = parport_register_driver(parp_drv);
-	if (ret) {
-		kfree(parp_drv);
-		return NULL;
-	}
-	return (void *)parp_drv;
-}
-EXPORT_SYMBOL(pi_register_driver);
-
-void pi_unregister_driver(void *_drv)
-{
-	struct parport_driver *drv = _drv;
-
-	parport_unregister_driver(drv);
-	kfree(drv);
-}
-EXPORT_SYMBOL(pi_unregister_driver);

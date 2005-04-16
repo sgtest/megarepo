@@ -1,13 +1,14 @@
-// SPDX-License-Identifier: GPL-2.0-only
-/*
- * AimsLab RadioTrack (aka RadioVeveal) driver
- *
- * Copyright 1997 M. Kirkwood
- *
- * Converted to the radio-isa framework by Hans Verkuil <hans.verkuil@cisco.com>
- * Converted to V4L2 API by Mauro Carvalho Chehab <mchehab@kernel.org>
- * Converted to new API by Alan Cox <alan@lxorguk.ukuu.org.uk>
+/* radiotrack (radioreveal) driver for Linux radio support
+ * (c) 1997 M. Kirkwood
+ * Converted to new API by Alan Cox <Alan.Cox@linux.org>
  * Various bugfixes and enhancements by Russell Kroll <rkroll@exploits.org>
+ *
+ * History:
+ * 1999-02-24	Russell Kroll <rkroll@exploits.org>
+ * 		Fine tuning/VIDEO_TUNER_LOW
+ *		Frequency range expanded to start at 87 MHz
+ *
+ * TODO: Allow for more than one of these foolish entities :-)
  *
  * Notes on the hardware (reverse engineered from other peoples'
  * reverse engineering of AIMS' code :-)
@@ -23,173 +24,345 @@
  *   out(port, start_increasing_volume);
  *   wait(a_wee_while);
  *   out(port, stop_changing_the_volume);
- *
- * Fully tested with the Keene USB FM Transmitter and the v4l2-compliance tool.
+ *  
  */
 
-#include <linux/module.h>	/* Modules			*/
+#include <linux/module.h>	/* Modules 			*/
 #include <linux/init.h>		/* Initdata			*/
-#include <linux/ioport.h>	/* request_region		*/
-#include <linux/delay.h>	/* msleep			*/
-#include <linux/videodev2.h>	/* kernel radio structs		*/
-#include <linux/io.h>		/* outb, outb_p			*/
-#include <linux/slab.h>
-#include <media/v4l2-device.h>
-#include <media/v4l2-ioctl.h>
-#include <media/v4l2-ctrls.h>
-#include "radio-isa.h"
-#include "lm7000.h"
-
-MODULE_AUTHOR("M. Kirkwood");
-MODULE_DESCRIPTION("A driver for the RadioTrack/RadioReveal radio card.");
-MODULE_LICENSE("GPL");
-MODULE_VERSION("1.0.0");
+#include <linux/ioport.h>	/* check_region, request_region	*/
+#include <linux/delay.h>	/* udelay			*/
+#include <asm/io.h>		/* outb, outb_p			*/
+#include <asm/uaccess.h>	/* copy to/from user		*/
+#include <linux/videodev.h>	/* kernel radio structs		*/
+#include <linux/config.h>	/* CONFIG_RADIO_RTRACK_PORT 	*/
+#include <asm/semaphore.h>	/* Lock for the I/O 		*/
 
 #ifndef CONFIG_RADIO_RTRACK_PORT
 #define CONFIG_RADIO_RTRACK_PORT -1
 #endif
 
-#define RTRACK_MAX 2
+static int io = CONFIG_RADIO_RTRACK_PORT; 
+static int radio_nr = -1;
+static struct semaphore lock;
 
-static int io[RTRACK_MAX] = { [0] = CONFIG_RADIO_RTRACK_PORT,
-			      [1 ... (RTRACK_MAX - 1)] = -1 };
-static int radio_nr[RTRACK_MAX]	= { [0 ... (RTRACK_MAX - 1)] = -1 };
-
-module_param_array(io, int, NULL, 0444);
-MODULE_PARM_DESC(io, "I/O addresses of the RadioTrack card (0x20f or 0x30f)");
-module_param_array(radio_nr, int, NULL, 0444);
-MODULE_PARM_DESC(radio_nr, "Radio device numbers");
-
-struct rtrack {
-	struct radio_isa_card isa;
+struct rt_device
+{
+	int port;
 	int curvol;
+	unsigned long curfreq;
+	int muted;
 };
 
-static struct radio_isa_card *rtrack_alloc(void)
-{
-	struct rtrack *rt = kzalloc(sizeof(struct rtrack), GFP_KERNEL);
 
-	if (rt)
-		rt->curvol = 0xff;
-	return rt ? &rt->isa : NULL;
+/* local things */
+
+static void sleep_delay(long n)
+{
+	/* Sleep nicely for 'n' uS */
+	int d=n/(1000000/HZ);
+	if(!d)
+		udelay(n);
+	else
+		msleep(jiffies_to_msecs(d));
 }
 
-#define AIMS_BIT_TUN_CE		(1 << 0)
-#define AIMS_BIT_TUN_CLK	(1 << 1)
-#define AIMS_BIT_TUN_DATA	(1 << 2)
-#define AIMS_BIT_VOL_CE		(1 << 3)
-#define AIMS_BIT_TUN_STRQ	(1 << 4)
-/* bit 5 is not connected */
-#define AIMS_BIT_VOL_UP		(1 << 6)	/* active low */
-#define AIMS_BIT_VOL_DN		(1 << 7)	/* active low */
-
-static void rtrack_set_pins(void *handle, u8 pins)
+static void rt_decvol(void)
 {
-	struct radio_isa_card *isa = handle;
-	struct rtrack *rt = container_of(isa, struct rtrack, isa);
-	u8 bits = AIMS_BIT_VOL_DN | AIMS_BIT_VOL_UP | AIMS_BIT_TUN_STRQ;
-
-	if (!v4l2_ctrl_g_ctrl(rt->isa.mute))
-		bits |= AIMS_BIT_VOL_CE;
-
-	if (pins & LM7000_DATA)
-		bits |= AIMS_BIT_TUN_DATA;
-	if (pins & LM7000_CLK)
-		bits |= AIMS_BIT_TUN_CLK;
-	if (pins & LM7000_CE)
-		bits |= AIMS_BIT_TUN_CE;
-
-	outb_p(bits, rt->isa.io);
+	outb(0x58, io);		/* volume down + sigstr + on	*/
+	sleep_delay(100000);
+	outb(0xd8, io);		/* volume steady + sigstr + on	*/
 }
 
-static int rtrack_s_frequency(struct radio_isa_card *isa, u32 freq)
+static void rt_incvol(void)
 {
-	lm7000_set_freq(freq, isa, rtrack_set_pins);
-
-	return 0;
+	outb(0x98, io);		/* volume up + sigstr + on	*/
+	sleep_delay(100000);
+	outb(0xd8, io);		/* volume steady + sigstr + on	*/
 }
 
-static u32 rtrack_g_signal(struct radio_isa_card *isa)
+static void rt_mute(struct rt_device *dev)
 {
-	/* bit set = no signal present */
-	return 0xffff * !(inb(isa->io) & 2);
+	dev->muted = 1;
+	down(&lock);
+	outb(0xd0, io);			/* volume steady, off		*/
+	up(&lock);
 }
 
-static int rtrack_s_mute_volume(struct radio_isa_card *isa, bool mute, int vol)
+static int rt_setvol(struct rt_device *dev, int vol)
 {
-	struct rtrack *rt = container_of(isa, struct rtrack, isa);
-	int curvol = rt->curvol;
+	int i;
 
-	if (mute) {
-		outb(0xd0, isa->io);	/* volume steady + sigstr + off	*/
+	down(&lock);
+	
+	if(vol == dev->curvol) {	/* requested volume = current */
+		if (dev->muted) {	/* user is unmuting the card  */
+			dev->muted = 0;
+			outb (0xd8, io);	/* enable card */
+		}	
+		up(&lock);
 		return 0;
 	}
-	if (vol == 0) {			/* volume = 0 means mute the card */
-		outb(0x48, isa->io);	/* volume down but still "on"	*/
-		msleep(curvol * 3);	/* make sure it's totally down	*/
-	} else if (curvol < vol) {
-		outb(0x98, isa->io);	/* volume up + sigstr + on	*/
-		for (; curvol < vol; curvol++)
-			mdelay(3);
-	} else if (curvol > vol) {
-		outb(0x58, isa->io);	/* volume down + sigstr + on	*/
-		for (; curvol > vol; curvol--)
-			mdelay(3);
+
+	if(vol == 0) {			/* volume = 0 means mute the card */
+		outb(0x48, io);		/* volume down but still "on"	*/
+		sleep_delay(2000000);	/* make sure it's totally down	*/
+		outb(0xd0, io);		/* volume steady, off		*/
+		dev->curvol = 0;	/* track the volume state!	*/
+		up(&lock);
+		return 0;
 	}
-	outb(0xd8, isa->io);		/* volume steady + sigstr + on	*/
-	rt->curvol = vol;
+
+	dev->muted = 0;
+	if(vol > dev->curvol)
+		for(i = dev->curvol; i < vol; i++) 
+			rt_incvol();
+	else
+		for(i = dev->curvol; i > vol; i--) 
+			rt_decvol();
+
+	dev->curvol = vol;
+	up(&lock);
 	return 0;
 }
 
-/* Mute card - prevents noisy bootups */
-static int rtrack_initialize(struct radio_isa_card *isa)
+/* the 128+64 on these outb's is to keep the volume stable while tuning 
+ * without them, the volume _will_ creep up with each frequency change
+ * and bit 4 (+16) is to keep the signal strength meter enabled
+ */
+
+static void send_0_byte(int port, struct rt_device *dev)
 {
-	/* this ensures that the volume is all the way up  */
-	outb(0x90, isa->io);	/* volume up but still "on"	*/
-	msleep(3000);		/* make sure it's totally up	*/
-	outb(0xc0, isa->io);	/* steady volume, mute card	*/
+	if ((dev->curvol == 0) || (dev->muted)) {
+		outb_p(128+64+16+  1, port);   /* wr-enable + data low */
+		outb_p(128+64+16+2+1, port);   /* clock */
+	}
+	else {
+		outb_p(128+64+16+8+  1, port);  /* on + wr-enable + data low */
+		outb_p(128+64+16+8+2+1, port);  /* clock */
+	}
+	sleep_delay(1000); 
+}
+
+static void send_1_byte(int port, struct rt_device *dev)
+{
+	if ((dev->curvol == 0) || (dev->muted)) {
+		outb_p(128+64+16+4  +1, port);   /* wr-enable+data high */
+		outb_p(128+64+16+4+2+1, port);   /* clock */
+	} 
+	else {
+		outb_p(128+64+16+8+4  +1, port); /* on+wr-enable+data high */
+		outb_p(128+64+16+8+4+2+1, port); /* clock */
+	}
+
+	sleep_delay(1000); 
+}
+
+static int rt_setfreq(struct rt_device *dev, unsigned long freq)
+{
+	int i;
+
+	/* adapted from radio-aztech.c */
+
+	/* now uses VIDEO_TUNER_LOW for fine tuning */
+
+	freq += 171200;			/* Add 10.7 MHz IF 		*/
+	freq /= 800;			/* Convert to 50 kHz units	*/
+	
+	down(&lock);			/* Stop other ops interfering */
+	 
+	send_0_byte (io, dev);		/*  0: LSB of frequency		*/
+
+	for (i = 0; i < 13; i++)	/*   : frequency bits (1-13)	*/
+		if (freq & (1 << i))
+			send_1_byte (io, dev);
+		else
+			send_0_byte (io, dev);
+
+	send_0_byte (io, dev);		/* 14: test bit - always 0    */
+	send_0_byte (io, dev);		/* 15: test bit - always 0    */
+
+	send_0_byte (io, dev);		/* 16: band data 0 - always 0 */
+	send_0_byte (io, dev);		/* 17: band data 1 - always 0 */
+	send_0_byte (io, dev);		/* 18: band data 2 - always 0 */
+	send_0_byte (io, dev);		/* 19: time base - always 0   */
+
+	send_0_byte (io, dev);		/* 20: spacing (0 = 25 kHz)   */
+	send_1_byte (io, dev);		/* 21: spacing (1 = 25 kHz)   */
+	send_0_byte (io, dev);		/* 22: spacing (0 = 25 kHz)   */
+	send_1_byte (io, dev);		/* 23: AM/FM (FM = 1, always) */
+
+	if ((dev->curvol == 0) || (dev->muted))
+		outb (0xd0, io);	/* volume steady + sigstr */
+	else
+		outb (0xd8, io);	/* volume steady + sigstr + on */
+		
+	up(&lock);
+
 	return 0;
 }
 
-static const struct radio_isa_ops rtrack_ops = {
-	.alloc = rtrack_alloc,
-	.init = rtrack_initialize,
-	.s_mute_volume = rtrack_s_mute_volume,
-	.s_frequency = rtrack_s_frequency,
-	.g_signal = rtrack_g_signal,
+static int rt_getsigstr(struct rt_device *dev)
+{
+	if (inb(io) & 2)	/* bit set = no signal present	*/
+		return 0;
+	return 1;		/* signal present		*/
+}
+
+static int rt_do_ioctl(struct inode *inode, struct file *file,
+		       unsigned int cmd, void *arg)
+{
+	struct video_device *dev = video_devdata(file);
+	struct rt_device *rt=dev->priv;
+	
+	switch(cmd)
+	{
+		case VIDIOCGCAP:
+		{
+			struct video_capability *v = arg;
+			memset(v,0,sizeof(*v));
+			v->type=VID_TYPE_TUNER;
+			v->channels=1;
+			v->audios=1;
+			strcpy(v->name, "RadioTrack");
+			return 0;
+		}
+		case VIDIOCGTUNER:
+		{
+			struct video_tuner *v = arg;
+			if(v->tuner)	/* Only 1 tuner */ 
+				return -EINVAL;
+			v->rangelow=(87*16000);
+			v->rangehigh=(108*16000);
+			v->flags=VIDEO_TUNER_LOW;
+			v->mode=VIDEO_MODE_AUTO;
+			strcpy(v->name, "FM");
+			v->signal=0xFFFF*rt_getsigstr(rt);
+			return 0;
+		}
+		case VIDIOCSTUNER:
+		{
+			struct video_tuner *v = arg;
+			if(v->tuner!=0)
+				return -EINVAL;
+			/* Only 1 tuner so no setting needed ! */
+			return 0;
+		}
+		case VIDIOCGFREQ:
+		{
+			unsigned long *freq = arg;
+			*freq = rt->curfreq;
+			return 0;
+		}
+		case VIDIOCSFREQ:
+		{
+			unsigned long *freq = arg;
+			rt->curfreq = *freq;
+			rt_setfreq(rt, rt->curfreq);
+			return 0;
+		}
+		case VIDIOCGAUDIO:
+		{	
+			struct video_audio *v = arg;
+			memset(v,0, sizeof(*v));
+			v->flags|=VIDEO_AUDIO_MUTABLE|VIDEO_AUDIO_VOLUME;
+			v->volume=rt->curvol * 6554;
+			v->step=6554;
+			strcpy(v->name, "Radio");
+			return 0;			
+		}
+		case VIDIOCSAUDIO:
+		{
+			struct video_audio *v = arg;
+			if(v->audio) 
+				return -EINVAL;
+			if(v->flags&VIDEO_AUDIO_MUTE) 
+				rt_mute(rt);
+			else
+				rt_setvol(rt,v->volume/6554);
+			return 0;
+		}
+		default:
+			return -ENOIOCTLCMD;
+	}
+}
+
+static int rt_ioctl(struct inode *inode, struct file *file,
+		    unsigned int cmd, unsigned long arg)
+{
+	return video_usercopy(inode, file, cmd, arg, rt_do_ioctl);
+}
+
+static struct rt_device rtrack_unit;
+
+static struct file_operations rtrack_fops = {
+	.owner		= THIS_MODULE,
+	.open           = video_exclusive_open,
+	.release        = video_exclusive_release,
+	.ioctl	        = rt_ioctl,
+	.llseek         = no_llseek,
 };
 
-static const int rtrack_ioports[] = { 0x20f, 0x30f };
-
-static struct radio_isa_driver rtrack_driver = {
-	.driver = {
-		.match		= radio_isa_match,
-		.probe		= radio_isa_probe,
-		.remove		= radio_isa_remove,
-		.driver		= {
-			.name	= "radio-aimslab",
-		},
-	},
-	.io_params = io,
-	.radio_nr_params = radio_nr,
-	.io_ports = rtrack_ioports,
-	.num_of_io_ports = ARRAY_SIZE(rtrack_ioports),
-	.region_size = 2,
-	.card = "AIMSlab RadioTrack/RadioReveal",
-	.ops = &rtrack_ops,
-	.has_stereo = true,
-	.max_volume = 0xff,
+static struct video_device rtrack_radio=
+{
+	.owner		= THIS_MODULE,
+	.name		= "RadioTrack radio",
+	.type		= VID_TYPE_TUNER,
+	.hardware	= VID_HARDWARE_RTRACK,
+	.fops           = &rtrack_fops,
 };
 
 static int __init rtrack_init(void)
 {
-	return isa_register_driver(&rtrack_driver.driver, RTRACK_MAX);
+	if(io==-1)
+	{
+		printk(KERN_ERR "You must set an I/O address with io=0x???\n");
+		return -EINVAL;
+	}
+
+	if (!request_region(io, 2, "rtrack")) 
+	{
+		printk(KERN_ERR "rtrack: port 0x%x already in use\n", io);
+		return -EBUSY;
+	}
+
+	rtrack_radio.priv=&rtrack_unit;
+	
+	if(video_register_device(&rtrack_radio, VFL_TYPE_RADIO, radio_nr)==-1)
+	{
+		release_region(io, 2);
+		return -EINVAL;
+	}
+	printk(KERN_INFO "AIMSlab RadioTrack/RadioReveal card driver.\n");
+
+	/* Set up the I/O locking */
+	
+	init_MUTEX(&lock);
+	
+ 	/* mute card - prevents noisy bootups */
+
+	/* this ensures that the volume is all the way down  */
+	outb(0x48, io);		/* volume down but still "on"	*/
+	sleep_delay(2000000);	/* make sure it's totally down	*/
+	outb(0xc0, io);		/* steady volume, mute card	*/
+	rtrack_unit.curvol = 0;
+
+	return 0;
 }
 
-static void __exit rtrack_exit(void)
+MODULE_AUTHOR("M.Kirkwood");
+MODULE_DESCRIPTION("A driver for the RadioTrack/RadioReveal radio card.");
+MODULE_LICENSE("GPL");
+
+module_param(io, int, 0);
+MODULE_PARM_DESC(io, "I/O address of the RadioTrack card (0x20f or 0x30f)");
+module_param(radio_nr, int, 0);
+
+static void __exit cleanup_rtrack_module(void)
 {
-	isa_unregister_driver(&rtrack_driver.driver);
+	video_unregister_device(&rtrack_radio);
+	release_region(io,2);
 }
 
 module_init(rtrack_init);
-module_exit(rtrack_exit);
+module_exit(cleanup_rtrack_module);
+

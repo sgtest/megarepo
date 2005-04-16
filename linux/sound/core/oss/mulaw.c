@@ -1,6 +1,6 @@
 /*
  *  Mu-Law conversion Plug-In Interface
- *  Copyright (c) 1999 by Jaroslav Kysela <perex@perex.cz>
+ *  Copyright (c) 1999 by Jaroslav Kysela <perex@suse.cz>
  *                        Uros Bizjak <uros@kss-loka.si>
  *
  *  Based on reference implementation by Sun Microsystems, Inc.
@@ -21,6 +21,7 @@
  *
  */
   
+#include <sound/driver.h>
 #include <linux/time.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
@@ -138,39 +139,26 @@ static int ulaw2linear(unsigned char u_val)
  *  Basic Mu-Law plugin
  */
 
-typedef void (*mulaw_f)(struct snd_pcm_plugin *plugin,
-			const struct snd_pcm_plugin_channel *src_channels,
-			struct snd_pcm_plugin_channel *dst_channels,
+typedef void (*mulaw_f)(snd_pcm_plugin_t *plugin,
+			const snd_pcm_plugin_channel_t *src_channels,
+			snd_pcm_plugin_channel_t *dst_channels,
 			snd_pcm_uframes_t frames);
 
-struct mulaw_priv {
+typedef struct mulaw_private_data {
 	mulaw_f func;
-	int cvt_endian;			/* need endian conversion? */
-	unsigned int native_ofs;	/* byte offset in native format */
-	unsigned int copy_ofs;		/* byte offset in s16 format */
-	unsigned int native_bytes;	/* byte size of the native format */
-	unsigned int copy_bytes;	/* bytes to copy per conversion */
-	u16 flip; /* MSB flip for signedness, done after endian conversion */
-};
+	int conv;
+} mulaw_t;
 
-static inline void cvt_s16_to_native(struct mulaw_priv *data,
-				     unsigned char *dst, u16 sample)
-{
-	sample ^= data->flip;
-	if (data->cvt_endian)
-		sample = swab16(sample);
-	if (data->native_bytes > data->copy_bytes)
-		memset(dst, 0, data->native_bytes);
-	memcpy(dst + data->native_ofs, (char *)&sample + data->copy_ofs,
-	       data->copy_bytes);
-}
-
-static void mulaw_decode(struct snd_pcm_plugin *plugin,
-			const struct snd_pcm_plugin_channel *src_channels,
-			struct snd_pcm_plugin_channel *dst_channels,
+static void mulaw_decode(snd_pcm_plugin_t *plugin,
+			const snd_pcm_plugin_channel_t *src_channels,
+			snd_pcm_plugin_channel_t *dst_channels,
 			snd_pcm_uframes_t frames)
 {
-	struct mulaw_priv *data = (struct mulaw_priv *)plugin->extra_data;
+#define PUT_S16_LABELS
+#include "plugin_ops.h"
+#undef PUT_S16_LABELS
+	mulaw_t *data = (mulaw_t *)plugin->extra_data;
+	void *put = put_s16_labels[data->conv];
 	int channel;
 	int nchannels = plugin->src_format.channels;
 	for (channel = 0; channel < nchannels; ++channel) {
@@ -192,33 +180,30 @@ static void mulaw_decode(struct snd_pcm_plugin *plugin,
 		frames1 = frames;
 		while (frames1-- > 0) {
 			signed short sample = ulaw2linear(*src);
-			cvt_s16_to_native(data, dst, sample);
+			goto *put;
+#define PUT_S16_END after
+#include "plugin_ops.h"
+#undef PUT_S16_END
+		after:
 			src += src_step;
 			dst += dst_step;
 		}
 	}
 }
 
-static inline signed short cvt_native_to_s16(struct mulaw_priv *data,
-					     unsigned char *src)
-{
-	u16 sample = 0;
-	memcpy((char *)&sample + data->copy_ofs, src + data->native_ofs,
-	       data->copy_bytes);
-	if (data->cvt_endian)
-		sample = swab16(sample);
-	sample ^= data->flip;
-	return (signed short)sample;
-}
-
-static void mulaw_encode(struct snd_pcm_plugin *plugin,
-			const struct snd_pcm_plugin_channel *src_channels,
-			struct snd_pcm_plugin_channel *dst_channels,
+static void mulaw_encode(snd_pcm_plugin_t *plugin,
+			const snd_pcm_plugin_channel_t *src_channels,
+			snd_pcm_plugin_channel_t *dst_channels,
 			snd_pcm_uframes_t frames)
 {
-	struct mulaw_priv *data = (struct mulaw_priv *)plugin->extra_data;
+#define GET_S16_LABELS
+#include "plugin_ops.h"
+#undef GET_S16_LABELS
+	mulaw_t *data = (mulaw_t *)plugin->extra_data;
+	void *get = get_s16_labels[data->conv];
 	int channel;
 	int nchannels = plugin->src_format.channels;
+	signed short sample = 0;
 	for (channel = 0; channel < nchannels; ++channel) {
 		char *src;
 		char *dst;
@@ -237,7 +222,11 @@ static void mulaw_encode(struct snd_pcm_plugin *plugin,
 		dst_step = dst_channels[channel].area.step / 8;
 		frames1 = frames;
 		while (frames1-- > 0) {
-			signed short sample = cvt_native_to_s16(data, src);
+			goto *get;
+#define GET_S16_END after
+#include "plugin_ops.h"
+#undef GET_S16_END
+		after:
 			*dst = linear2ulaw(sample);
 			src += src_step;
 			dst += dst_step;
@@ -245,77 +234,50 @@ static void mulaw_encode(struct snd_pcm_plugin *plugin,
 	}
 }
 
-static snd_pcm_sframes_t mulaw_transfer(struct snd_pcm_plugin *plugin,
-			      const struct snd_pcm_plugin_channel *src_channels,
-			      struct snd_pcm_plugin_channel *dst_channels,
+static snd_pcm_sframes_t mulaw_transfer(snd_pcm_plugin_t *plugin,
+			      const snd_pcm_plugin_channel_t *src_channels,
+			      snd_pcm_plugin_channel_t *dst_channels,
 			      snd_pcm_uframes_t frames)
 {
-	struct mulaw_priv *data;
+	mulaw_t *data;
 
-	if (snd_BUG_ON(!plugin || !src_channels || !dst_channels))
-		return -ENXIO;
+	snd_assert(plugin != NULL && src_channels != NULL && dst_channels != NULL, return -ENXIO);
 	if (frames == 0)
 		return 0;
 #ifdef CONFIG_SND_DEBUG
 	{
 		unsigned int channel;
 		for (channel = 0; channel < plugin->src_format.channels; channel++) {
-			if (snd_BUG_ON(src_channels[channel].area.first % 8 ||
-				       src_channels[channel].area.step % 8))
-				return -ENXIO;
-			if (snd_BUG_ON(dst_channels[channel].area.first % 8 ||
-				       dst_channels[channel].area.step % 8))
-				return -ENXIO;
+			snd_assert(src_channels[channel].area.first % 8 == 0 &&
+				   src_channels[channel].area.step % 8 == 0,
+				   return -ENXIO);
+			snd_assert(dst_channels[channel].area.first % 8 == 0 &&
+				   dst_channels[channel].area.step % 8 == 0,
+				   return -ENXIO);
 		}
 	}
 #endif
-	if (frames > dst_channels[0].frames)
-		frames = dst_channels[0].frames;
-	data = (struct mulaw_priv *)plugin->extra_data;
+	data = (mulaw_t *)plugin->extra_data;
 	data->func(plugin, src_channels, dst_channels, frames);
 	return frames;
 }
 
-static void init_data(struct mulaw_priv *data, snd_pcm_format_t format)
-{
-#ifdef SNDRV_LITTLE_ENDIAN
-	data->cvt_endian = snd_pcm_format_big_endian(format) > 0;
-#else
-	data->cvt_endian = snd_pcm_format_little_endian(format) > 0;
-#endif
-	if (!snd_pcm_format_signed(format))
-		data->flip = 0x8000;
-	data->native_bytes = snd_pcm_format_physical_width(format) / 8;
-	data->copy_bytes = data->native_bytes < 2 ? 1 : 2;
-	if (snd_pcm_format_little_endian(format)) {
-		data->native_ofs = data->native_bytes - data->copy_bytes;
-		data->copy_ofs = 2 - data->copy_bytes;
-	} else {
-		/* S24 in 4bytes need an 1 byte offset */
-		data->native_ofs = data->native_bytes -
-			snd_pcm_format_width(format) / 8;
-	}
-}
-
-int snd_pcm_plugin_build_mulaw(struct snd_pcm_substream *plug,
-			       struct snd_pcm_plugin_format *src_format,
-			       struct snd_pcm_plugin_format *dst_format,
-			       struct snd_pcm_plugin **r_plugin)
+int snd_pcm_plugin_build_mulaw(snd_pcm_plug_t *plug,
+			       snd_pcm_plugin_format_t *src_format,
+			       snd_pcm_plugin_format_t *dst_format,
+			       snd_pcm_plugin_t **r_plugin)
 {
 	int err;
-	struct mulaw_priv *data;
-	struct snd_pcm_plugin *plugin;
-	struct snd_pcm_plugin_format *format;
+	mulaw_t *data;
+	snd_pcm_plugin_t *plugin;
+	snd_pcm_plugin_format_t *format;
 	mulaw_f func;
 
-	if (snd_BUG_ON(!r_plugin))
-		return -ENXIO;
+	snd_assert(r_plugin != NULL, return -ENXIO);
 	*r_plugin = NULL;
 
-	if (snd_BUG_ON(src_format->rate != dst_format->rate))
-		return -ENXIO;
-	if (snd_BUG_ON(src_format->channels != dst_format->channels))
-		return -ENXIO;
+	snd_assert(src_format->rate == dst_format->rate, return -ENXIO);
+	snd_assert(src_format->channels == dst_format->channels, return -ENXIO);
 
 	if (dst_format->format == SNDRV_PCM_FORMAT_MU_LAW) {
 		format = src_format;
@@ -329,17 +291,17 @@ int snd_pcm_plugin_build_mulaw(struct snd_pcm_substream *plug,
 		snd_BUG();
 		return -EINVAL;
 	}
-	if (!snd_pcm_format_linear(format->format))
-		return -EINVAL;
+	snd_assert(snd_pcm_format_linear(format->format) != 0, return -ENXIO);
 
 	err = snd_pcm_plugin_build(plug, "Mu-Law<->linear conversion",
 				   src_format, dst_format,
-				   sizeof(struct mulaw_priv), &plugin);
+				   sizeof(mulaw_t), &plugin);
 	if (err < 0)
 		return err;
-	data = (struct mulaw_priv *)plugin->extra_data;
+	data = (mulaw_t*)plugin->extra_data;
 	data->func = func;
-	init_data(data, format->format);
+	data->conv = getput_index(format->format);
+	snd_assert(data->conv >= 0 && data->conv < 4*2*2, return -EINVAL);
 	plugin->transfer = mulaw_transfer;
 	*r_plugin = plugin;
 	return 0;

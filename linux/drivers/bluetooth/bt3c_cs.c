@@ -21,12 +21,14 @@
  *
  */
 
+#include <linux/config.h>
 #include <linux/module.h>
 
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/types.h>
+#include <linux/sched.h>
 #include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/ptrace.h>
@@ -39,11 +41,15 @@
 #include <linux/serial.h>
 #include <linux/serial_reg.h>
 #include <linux/bitops.h>
+#include <asm/system.h>
 #include <asm/io.h>
 
 #include <linux/device.h>
 #include <linux/firmware.h>
 
+#include <pcmcia/version.h>
+#include <pcmcia/cs_types.h>
+#include <pcmcia/cs.h>
 #include <pcmcia/cistpl.h>
 #include <pcmcia/ciscode.h>
 #include <pcmcia/ds.h>
@@ -57,18 +63,18 @@
 /* ======================== Module parameters ======================== */
 
 
-MODULE_AUTHOR("Marcel Holtmann <marcel@holtmann.org>");
+MODULE_AUTHOR("Marcel Holtmann <marcel@holtmann.org>, Jose Orlando Pereira <jop@di.uminho.pt>");
 MODULE_DESCRIPTION("Bluetooth driver for the 3Com Bluetooth PCMCIA card");
 MODULE_LICENSE("GPL");
-MODULE_FIRMWARE("BT3CPCC.bin");
 
 
 
 /* ======================== Local structures ======================== */
 
 
-struct bt3c_info {
-	struct pcmcia_device *p_dev;
+typedef struct bt3c_info_t {
+	dev_link_t link;
+	dev_node_t node;
 
 	struct hci_dev *hdev;
 
@@ -80,13 +86,19 @@ struct bt3c_info {
 	unsigned long rx_state;
 	unsigned long rx_count;
 	struct sk_buff *rx_skb;
-};
+} bt3c_info_t;
 
 
-static int bt3c_config(struct pcmcia_device *link);
-static void bt3c_release(struct pcmcia_device *link);
+static void bt3c_config(dev_link_t *link);
+static void bt3c_release(dev_link_t *link);
+static int bt3c_event(event_t event, int priority, event_callback_args_t *args);
 
-static void bt3c_detach(struct pcmcia_device *p_dev);
+static dev_info_t dev_info = "bt3c_cs";
+
+static dev_link_t *bt3c_attach(void);
+static void bt3c_detach(dev_link_t *);
+
+static dev_link_t *dev_list = NULL;
 
 
 /* Transmit states  */
@@ -175,7 +187,7 @@ static int bt3c_write(unsigned int iobase, int fifo_size, __u8 *buf, int len)
 }
 
 
-static void bt3c_write_wakeup(struct bt3c_info *info)
+static void bt3c_write_wakeup(bt3c_info_t *info)
 {
 	if (!info) {
 		BT_ERR("Unknown device");
@@ -186,15 +198,15 @@ static void bt3c_write_wakeup(struct bt3c_info *info)
 		return;
 
 	do {
-		unsigned int iobase = info->p_dev->resource[0]->start;
+		register unsigned int iobase = info->link.io.BasePort1;
 		register struct sk_buff *skb;
-		int len;
+		register int len;
 
-		if (!pcmcia_dev_present(info->p_dev))
+		if (!(info->link.state & DEV_PRESENT))
 			break;
 
-		skb = skb_dequeue(&(info->txq));
-		if (!skb) {
+
+		if (!(skb = skb_dequeue(&(info->txq)))) {
 			clear_bit(XMIT_SENDING, &(info->tx_state));
 			break;
 		}
@@ -202,8 +214,9 @@ static void bt3c_write_wakeup(struct bt3c_info *info)
 		/* Send frame */
 		len = bt3c_write(iobase, 256, skb->data, skb->len);
 
-		if (len != skb->len)
+		if (len != skb->len) {
 			BT_ERR("Very strange");
+		}
 
 		kfree_skb(skb);
 
@@ -213,7 +226,7 @@ static void bt3c_write_wakeup(struct bt3c_info *info)
 }
 
 
-static void bt3c_receive(struct bt3c_info *info)
+static void bt3c_receive(bt3c_info_t *info)
 {
 	unsigned int iobase;
 	int size = 0, avail;
@@ -223,9 +236,10 @@ static void bt3c_receive(struct bt3c_info *info)
 		return;
 	}
 
-	iobase = info->p_dev->resource[0]->start;
+	iobase = info->link.io.BasePort1;
 
 	avail = bt3c_read(iobase, 0x7006);
+	//printk("bt3c_cs: receiving %d bytes\n", avail);
 
 	bt3c_address(iobase, 0x7480);
 	while (size < avail) {
@@ -233,11 +247,10 @@ static void bt3c_receive(struct bt3c_info *info)
 		info->hdev->stat.byte_rx++;
 
 		/* Allocate packet */
-		if (!info->rx_skb) {
+		if (info->rx_skb == NULL) {
 			info->rx_state = RECV_WAIT_PACKET_TYPE;
 			info->rx_count = 0;
-			info->rx_skb = bt_skb_alloc(HCI_MAX_FRAME_SIZE, GFP_ATOMIC);
-			if (!info->rx_skb) {
+			if (!(info->rx_skb = bt_skb_alloc(HCI_MAX_FRAME_SIZE, GFP_ATOMIC))) {
 				BT_ERR("Can't allocate mem for new packet");
 				return;
 			}
@@ -246,10 +259,12 @@ static void bt3c_receive(struct bt3c_info *info)
 
 		if (info->rx_state == RECV_WAIT_PACKET_TYPE) {
 
-			hci_skb_pkt_type(info->rx_skb) = inb(iobase + DATA_L);
+			info->rx_skb->dev = (void *) info->hdev;
+			info->rx_skb->pkt_type = inb(iobase + DATA_L);
 			inb(iobase + DATA_H);
+			//printk("bt3c: PACKET_TYPE=%02x\n", info->rx_skb->pkt_type);
 
-			switch (hci_skb_pkt_type(info->rx_skb)) {
+			switch (info->rx_skb->pkt_type) {
 
 			case HCI_EVENT_PKT:
 				info->rx_state = RECV_WAIT_EVENT_HEADER;
@@ -268,9 +283,9 @@ static void bt3c_receive(struct bt3c_info *info)
 
 			default:
 				/* Unknown packet */
-				BT_ERR("Unknown HCI packet with type 0x%02x received",
-				       hci_skb_pkt_type(info->rx_skb));
+				BT_ERR("Unknown HCI packet with type 0x%02x received", info->rx_skb->pkt_type);
 				info->hdev->stat.err_rx++;
+				clear_bit(HCI_RUNNING, &(info->hdev->flags));
 
 				kfree_skb(info->rx_skb);
 				info->rx_skb = NULL;
@@ -282,7 +297,7 @@ static void bt3c_receive(struct bt3c_info *info)
 
 			__u8 x = inb(iobase + DATA_L);
 
-			skb_put_u8(info->rx_skb, x);
+			*skb_put(info->rx_skb, 1) = x;
 			inb(iobase + DATA_H);
 			info->rx_count--;
 
@@ -296,26 +311,26 @@ static void bt3c_receive(struct bt3c_info *info)
 				switch (info->rx_state) {
 
 				case RECV_WAIT_EVENT_HEADER:
-					eh = hci_event_hdr(info->rx_skb);
+					eh = (struct hci_event_hdr *)(info->rx_skb->data);
 					info->rx_state = RECV_WAIT_DATA;
 					info->rx_count = eh->plen;
 					break;
 
 				case RECV_WAIT_ACL_HEADER:
-					ah = hci_acl_hdr(info->rx_skb);
+					ah = (struct hci_acl_hdr *)(info->rx_skb->data);
 					dlen = __le16_to_cpu(ah->dlen);
 					info->rx_state = RECV_WAIT_DATA;
 					info->rx_count = dlen;
 					break;
 
 				case RECV_WAIT_SCO_HEADER:
-					sh = hci_sco_hdr(info->rx_skb);
+					sh = (struct hci_sco_hdr *)(info->rx_skb->data);
 					info->rx_state = RECV_WAIT_DATA;
 					info->rx_count = sh->dlen;
 					break;
 
 				case RECV_WAIT_DATA:
-					hci_recv_frame(info->hdev, info->rx_skb);
+					hci_recv_frame(info->rx_skb);
 					info->rx_skb = NULL;
 					break;
 
@@ -331,18 +346,18 @@ static void bt3c_receive(struct bt3c_info *info)
 }
 
 
-static irqreturn_t bt3c_interrupt(int irq, void *dev_inst)
+static irqreturn_t bt3c_interrupt(int irq, void *dev_inst, struct pt_regs *regs)
 {
-	struct bt3c_info *info = dev_inst;
+	bt3c_info_t *info = dev_inst;
 	unsigned int iobase;
 	int iir;
-	irqreturn_t r = IRQ_NONE;
 
-	if (!info || !info->hdev)
-		/* our irq handler is shared */
+	if (!info || !info->hdev) {
+		BT_ERR("Call of irq %d for unknown device", irq);
 		return IRQ_NONE;
+	}
 
-	iobase = info->p_dev->resource[0]->start;
+	iobase = info->link.io.BasePort1;
 
 	spin_lock(&(info->lock));
 
@@ -354,13 +369,14 @@ static irqreturn_t bt3c_interrupt(int irq, void *dev_inst)
 			BT_ERR("Very strange (stat=0x%04x)", stat);
 		} else if ((stat & 0xff) != 0xff) {
 			if (stat & 0x0020) {
-				int status = bt3c_read(iobase, 0x7002) & 0x10;
-				bt_dev_info(info->hdev, "Antenna %s",
-							status ? "out" : "in");
+				int stat = bt3c_read(iobase, 0x7002) & 0x10;
+				BT_INFO("%s: Antenna %s", info->hdev->name,
+							stat ? "out" : "in");
 			}
 			if (stat & 0x0001)
 				bt3c_receive(info);
 			if (stat & 0x0002) {
+				//BT_ERR("Ack (stat=0x%04x)", stat);
 				clear_bit(XMIT_SENDING, &(info->tx_state));
 				bt3c_write_wakeup(info);
 			}
@@ -369,12 +385,11 @@ static irqreturn_t bt3c_interrupt(int irq, void *dev_inst)
 
 			outb(iir, iobase + CONTROL);
 		}
-		r = IRQ_HANDLED;
 	}
 
 	spin_unlock(&(info->lock));
 
-	return r;
+	return IRQ_HANDLED;
 }
 
 
@@ -384,7 +399,7 @@ static irqreturn_t bt3c_interrupt(int irq, void *dev_inst)
 
 static int bt3c_hci_flush(struct hci_dev *hdev)
 {
-	struct bt3c_info *info = hci_get_drvdata(hdev);
+	bt3c_info_t *info = (bt3c_info_t *)(hdev->driver_data);
 
 	/* Drop TX queue */
 	skb_queue_purge(&(info->txq));
@@ -395,24 +410,37 @@ static int bt3c_hci_flush(struct hci_dev *hdev)
 
 static int bt3c_hci_open(struct hci_dev *hdev)
 {
+	set_bit(HCI_RUNNING, &(hdev->flags));
+
 	return 0;
 }
 
 
 static int bt3c_hci_close(struct hci_dev *hdev)
 {
+	if (!test_and_clear_bit(HCI_RUNNING, &(hdev->flags)))
+		return 0;
+
 	bt3c_hci_flush(hdev);
 
 	return 0;
 }
 
 
-static int bt3c_hci_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
+static int bt3c_hci_send_frame(struct sk_buff *skb)
 {
-	struct bt3c_info *info = hci_get_drvdata(hdev);
+	bt3c_info_t *info;
+	struct hci_dev *hdev = (struct hci_dev *)(skb->dev);
 	unsigned long flags;
 
-	switch (hci_skb_pkt_type(skb)) {
+	if (!hdev) {
+		BT_ERR("Frame for unknown HCI device (hdev=NULL)");
+		return -ENODEV;
+	}
+
+	info = (bt3c_info_t *) (hdev->driver_data);
+
+	switch (skb->pkt_type) {
 	case HCI_COMMAND_PKT:
 		hdev->stat.cmd_tx++;
 		break;
@@ -422,10 +450,10 @@ static int bt3c_hci_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
 	case HCI_SCODATA_PKT:
 		hdev->stat.sco_tx++;
 		break;
-	}
+	};
 
 	/* Prepend skb with frame type */
-	memcpy(skb_push(skb, 1), &hci_skb_pkt_type(skb), 1);
+	memcpy(skb_push(skb, 1), &(skb->pkt_type), 1);
 	skb_queue_tail(&(info->txq), skb);
 
 	spin_lock_irqsave(&(info->lock), flags);
@@ -438,21 +466,41 @@ static int bt3c_hci_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
 }
 
 
+static void bt3c_hci_destruct(struct hci_dev *hdev)
+{
+}
+
+
+static int bt3c_hci_ioctl(struct hci_dev *hdev, unsigned int cmd, unsigned long arg)
+{
+	return -ENOIOCTLCMD;
+}
+
+
 
 /* ======================== Card services HCI interaction ======================== */
 
 
-static int bt3c_load_firmware(struct bt3c_info *info,
-			      const unsigned char *firmware,
-			      int count)
+static struct device *bt3c_device(void)
+{
+	static struct device dev = {
+		.bus_id = "pcmcia",
+	};
+	kobject_set_name(&dev.kobj, "bt3c");
+	kobject_init(&dev.kobj);
+
+	return &dev;
+}
+
+
+static int bt3c_load_firmware(bt3c_info_t *info, unsigned char *firmware, int count)
 {
 	char *ptr = (char *) firmware;
 	char b[9];
-	unsigned int iobase, tmp, tn;
-	unsigned long size, addr, fcs;
+	unsigned int iobase, size, addr, fcs, tmp;
 	int i, err = 0;
 
-	iobase = info->p_dev->resource[0]->start;
+	iobase = info->link.io.BasePort1;
 
 	/* Reset */
 	bt3c_io_write(iobase, 0x8040, 0x0404);
@@ -474,25 +522,20 @@ static int bt3c_load_firmware(struct bt3c_info *info,
 
 		memset(b, 0, sizeof(b));
 		memcpy(b, ptr + 2, 2);
-		if (kstrtoul(b, 16, &size) < 0)
-			return -EINVAL;
+		size = simple_strtol(b, NULL, 16);
 
 		memset(b, 0, sizeof(b));
 		memcpy(b, ptr + 4, 8);
-		if (kstrtoul(b, 16, &addr) < 0)
-			return -EINVAL;
+		addr = simple_strtol(b, NULL, 16);
 
 		memset(b, 0, sizeof(b));
 		memcpy(b, ptr + (size * 2) + 2, 2);
-		if (kstrtoul(b, 16, &fcs) < 0)
-			return -EINVAL;
+		fcs = simple_strtol(b, NULL, 16);
 
 		memset(b, 0, sizeof(b));
 		for (tmp = 0, i = 0; i < size; i++) {
 			memcpy(b, ptr + (i * 2) + 2, 2);
-			if (kstrtouint(b, 16, &tn))
-				return -EINVAL;
-			tmp += tn;
+			tmp += simple_strtol(b, NULL, 16);
 		}
 
 		if (((tmp + fcs) & 0xff) != 0xff) {
@@ -507,8 +550,7 @@ static int bt3c_load_firmware(struct bt3c_info *info,
 			memset(b, 0, sizeof(b));
 			for (i = 0; i < (size - 4) / 2; i++) {
 				memcpy(b, ptr + (i * 4) + 12, 4);
-				if (kstrtouint(b, 16, &tmp))
-					return -EINVAL;
+				tmp = simple_strtol(b, NULL, 16);
 				bt3c_put(iobase, tmp);
 			}
 		}
@@ -535,7 +577,7 @@ error:
 }
 
 
-static int bt3c_open(struct bt3c_info *info)
+static int bt3c_open(bt3c_info_t *info)
 {
 	const struct firmware *firmware;
 	struct hci_dev *hdev;
@@ -558,17 +600,20 @@ static int bt3c_open(struct bt3c_info *info)
 
 	info->hdev = hdev;
 
-	hdev->bus = HCI_PCCARD;
-	hci_set_drvdata(hdev, info);
-	SET_HCIDEV_DEV(hdev, &info->p_dev->dev);
+	hdev->type = HCI_PCCARD;
+	hdev->driver_data = info;
 
-	hdev->open  = bt3c_hci_open;
-	hdev->close = bt3c_hci_close;
-	hdev->flush = bt3c_hci_flush;
-	hdev->send  = bt3c_hci_send_frame;
+	hdev->open     = bt3c_hci_open;
+	hdev->close    = bt3c_hci_close;
+	hdev->flush    = bt3c_hci_flush;
+	hdev->send     = bt3c_hci_send_frame;
+	hdev->destruct = bt3c_hci_destruct;
+	hdev->ioctl    = bt3c_hci_ioctl;
+
+	hdev->owner = THIS_MODULE;
 
 	/* Load firmware */
-	err = request_firmware(&firmware, "BT3CPCC.bin", &info->p_dev->dev);
+	err = request_firmware(&firmware, "BT3CPCC.bin", bt3c_device());
 	if (err < 0) {
 		BT_ERR("Firmware request failed");
 		goto error;
@@ -602,7 +647,7 @@ error:
 }
 
 
-static int bt3c_close(struct bt3c_info *info)
+static int bt3c_close(bt3c_info_t *info)
 {
 	struct hci_dev *hdev = info->hdev;
 
@@ -611,139 +656,305 @@ static int bt3c_close(struct bt3c_info *info)
 
 	bt3c_hci_close(hdev);
 
-	hci_unregister_dev(hdev);
+	if (hci_unregister_dev(hdev) < 0)
+		BT_ERR("Can't unregister HCI device %s", hdev->name);
+
 	hci_free_dev(hdev);
 
 	return 0;
 }
 
-static int bt3c_probe(struct pcmcia_device *link)
+static dev_link_t *bt3c_attach(void)
 {
-	struct bt3c_info *info;
+	bt3c_info_t *info;
+	client_reg_t client_reg;
+	dev_link_t *link;
+	int ret;
 
 	/* Create new info device */
-	info = devm_kzalloc(&link->dev, sizeof(*info), GFP_KERNEL);
+	info = kmalloc(sizeof(*info), GFP_KERNEL);
 	if (!info)
-		return -ENOMEM;
+		return NULL;
+	memset(info, 0, sizeof(*info));
 
-	info->p_dev = link;
+	link = &info->link;
 	link->priv = info;
 
-	link->config_flags |= CONF_ENABLE_IRQ | CONF_AUTO_SET_VPP |
-		CONF_AUTO_SET_IO;
+	link->io.Attributes1 = IO_DATA_PATH_WIDTH_8;
+	link->io.NumPorts1 = 8;
+	link->irq.Attributes = IRQ_TYPE_EXCLUSIVE | IRQ_HANDLE_PRESENT;
+	link->irq.IRQInfo1 = IRQ_LEVEL_ID;
 
-	return bt3c_config(link);
-}
+	link->irq.Handler = bt3c_interrupt;
+	link->irq.Instance = info;
 
+	link->conf.Attributes = CONF_ENABLE_IRQ;
+	link->conf.Vcc = 50;
+	link->conf.IntType = INT_MEMORY_AND_IO;
 
-static void bt3c_detach(struct pcmcia_device *link)
-{
-	bt3c_release(link);
-}
+	/* Register with Card Services */
+	link->next = dev_list;
+	dev_list = link;
+	client_reg.dev_info = &dev_info;
+	client_reg.EventMask =
+	    CS_EVENT_CARD_INSERTION | CS_EVENT_CARD_REMOVAL |
+	    CS_EVENT_RESET_PHYSICAL | CS_EVENT_CARD_RESET |
+	    CS_EVENT_PM_SUSPEND | CS_EVENT_PM_RESUME;
+	client_reg.event_handler = &bt3c_event;
+	client_reg.Version = 0x0210;
+	client_reg.event_callback_args.client_data = link;
 
-static int bt3c_check_config(struct pcmcia_device *p_dev, void *priv_data)
-{
-	int *try = priv_data;
-
-	if (!try)
-		p_dev->io_lines = 16;
-
-	if ((p_dev->resource[0]->end != 8) || (p_dev->resource[0]->start == 0))
-		return -EINVAL;
-
-	p_dev->resource[0]->end = 8;
-	p_dev->resource[0]->flags &= ~IO_DATA_PATH_WIDTH;
-	p_dev->resource[0]->flags |= IO_DATA_PATH_WIDTH_8;
-
-	return pcmcia_request_io(p_dev);
-}
-
-static int bt3c_check_config_notpicky(struct pcmcia_device *p_dev,
-				      void *priv_data)
-{
-	static unsigned int base[5] = { 0x3f8, 0x2f8, 0x3e8, 0x2e8, 0x0 };
-	int j;
-
-	if (p_dev->io_lines > 3)
-		return -ENODEV;
-
-	p_dev->resource[0]->flags &= ~IO_DATA_PATH_WIDTH;
-	p_dev->resource[0]->flags |= IO_DATA_PATH_WIDTH_8;
-	p_dev->resource[0]->end = 8;
-
-	for (j = 0; j < 5; j++) {
-		p_dev->resource[0]->start = base[j];
-		p_dev->io_lines = base[j] ? 16 : 3;
-		if (!pcmcia_request_io(p_dev))
-			return 0;
+	ret = pcmcia_register_client(&link->handle, &client_reg);
+	if (ret != CS_SUCCESS) {
+		cs_error(link->handle, RegisterClient, ret);
+		bt3c_detach(link);
+		return NULL;
 	}
-	return -ENODEV;
+
+	return link;
 }
 
-static int bt3c_config(struct pcmcia_device *link)
-{
-	struct bt3c_info *info = link->priv;
-	int i;
-	unsigned long try;
 
-	/* First pass: look for a config entry that looks normal.
-	 * Two tries: without IO aliases, then with aliases
-	 */
-	for (try = 0; try < 2; try++)
-		if (!pcmcia_loop_config(link, bt3c_check_config, (void *) try))
-			goto found_port;
+static void bt3c_detach(dev_link_t *link)
+{
+	bt3c_info_t *info = link->priv;
+	dev_link_t **linkp;
+	int ret;
+
+	/* Locate device structure */
+	for (linkp = &dev_list; *linkp; linkp = &(*linkp)->next)
+		if (*linkp == link)
+			break;
+
+	if (*linkp == NULL)
+		return;
+
+	if (link->state & DEV_CONFIG)
+		bt3c_release(link);
+
+	if (link->handle) {
+		ret = pcmcia_deregister_client(link->handle);
+		if (ret != CS_SUCCESS)
+			cs_error(link->handle, DeregisterClient, ret);
+	}
+
+	/* Unlink device structure, free bits */
+	*linkp = link->next;
+
+	kfree(info);
+}
+
+static int get_tuple(client_handle_t handle, tuple_t *tuple, cisparse_t *parse)
+{
+	int i;
+
+	i = pcmcia_get_tuple_data(handle, tuple);
+	if (i != CS_SUCCESS)
+		return i;
+
+	return pcmcia_parse_tuple(handle, tuple, parse);
+}
+
+static int first_tuple(client_handle_t handle, tuple_t *tuple, cisparse_t *parse)
+{
+	if (pcmcia_get_first_tuple(handle, tuple) != CS_SUCCESS)
+		return CS_NO_MORE_ITEMS;
+	return get_tuple(handle, tuple, parse);
+}
+
+static int next_tuple(client_handle_t handle, tuple_t *tuple, cisparse_t *parse)
+{
+	if (pcmcia_get_next_tuple(handle, tuple) != CS_SUCCESS)
+		return CS_NO_MORE_ITEMS;
+	return get_tuple(handle, tuple, parse);
+}
+
+static void bt3c_config(dev_link_t *link)
+{
+	static kio_addr_t base[5] = { 0x3f8, 0x2f8, 0x3e8, 0x2e8, 0x0 };
+	client_handle_t handle = link->handle;
+	bt3c_info_t *info = link->priv;
+	tuple_t tuple;
+	u_short buf[256];
+	cisparse_t parse;
+	cistpl_cftable_entry_t *cf = &parse.cftable_entry;
+	config_info_t config;
+	int i, j, try, last_ret, last_fn;
+
+	tuple.TupleData = (cisdata_t *)buf;
+	tuple.TupleOffset = 0;
+	tuple.TupleDataMax = 255;
+	tuple.Attributes = 0;
+
+	/* Get configuration register information */
+	tuple.DesiredTuple = CISTPL_CONFIG;
+	last_ret = first_tuple(handle, &tuple, &parse);
+	if (last_ret != CS_SUCCESS) {
+		last_fn = ParseTuple;
+		goto cs_failed;
+	}
+	link->conf.ConfigBase = parse.config.base;
+	link->conf.Present = parse.config.rmask[0];
+
+	/* Configure card */
+	link->state |= DEV_CONFIG;
+	i = pcmcia_get_configuration_info(handle, &config);
+	link->conf.Vcc = config.Vcc;
+
+	/* First pass: look for a config entry that looks normal. */
+	tuple.TupleData = (cisdata_t *)buf;
+	tuple.TupleOffset = 0;
+	tuple.TupleDataMax = 255;
+	tuple.Attributes = 0;
+	tuple.DesiredTuple = CISTPL_CFTABLE_ENTRY;
+	/* Two tries: without IO aliases, then with aliases */
+	for (try = 0; try < 2; try++) {
+		i = first_tuple(handle, &tuple, &parse);
+		while (i != CS_NO_MORE_ITEMS) {
+			if (i != CS_SUCCESS)
+				goto next_entry;
+			if (cf->vpp1.present & (1 << CISTPL_POWER_VNOM))
+				link->conf.Vpp1 = link->conf.Vpp2 = cf->vpp1.param[CISTPL_POWER_VNOM] / 10000;
+			if ((cf->io.nwin > 0) && (cf->io.win[0].len == 8) && (cf->io.win[0].base != 0)) {
+				link->conf.ConfigIndex = cf->index;
+				link->io.BasePort1 = cf->io.win[0].base;
+				link->io.IOAddrLines = (try == 0) ? 16 : cf->io.flags & CISTPL_IO_LINES_MASK;
+				i = pcmcia_request_io(link->handle, &link->io);
+				if (i == CS_SUCCESS)
+					goto found_port;
+			}
+next_entry:
+			i = next_tuple(handle, &tuple, &parse);
+		}
+	}
 
 	/* Second pass: try to find an entry that isn't picky about
-	 * its base address, then try to grab any standard serial port
-	 * address, and finally try to get any free port.
-	 */
-	if (!pcmcia_loop_config(link, bt3c_check_config_notpicky, NULL))
-		goto found_port;
-
-	BT_ERR("No usable port range found");
-	goto failed;
+	   its base address, then try to grab any standard serial port
+	   address, and finally try to get any free port. */
+	i = first_tuple(handle, &tuple, &parse);
+	while (i != CS_NO_MORE_ITEMS) {
+		if ((i == CS_SUCCESS) && (cf->io.nwin > 0) && ((cf->io.flags & CISTPL_IO_LINES_MASK) <= 3)) {
+			link->conf.ConfigIndex = cf->index;
+			for (j = 0; j < 5; j++) {
+				link->io.BasePort1 = base[j];
+				link->io.IOAddrLines = base[j] ? 16 : 3;
+				i = pcmcia_request_io(link->handle, &link->io);
+				if (i == CS_SUCCESS)
+					goto found_port;
+			}
+		}
+		i = next_tuple(handle, &tuple, &parse);
+	}
 
 found_port:
-	i = pcmcia_request_irq(link, &bt3c_interrupt);
-	if (i != 0)
+	if (i != CS_SUCCESS) {
+		BT_ERR("No usable port range found");
+		cs_error(link->handle, RequestIO, i);
 		goto failed;
+	}
 
-	i = pcmcia_enable_device(link);
-	if (i != 0)
+	i = pcmcia_request_irq(link->handle, &link->irq);
+	if (i != CS_SUCCESS) {
+		cs_error(link->handle, RequestIRQ, i);
+		link->irq.AssignedIRQ = 0;
+	}
+
+	i = pcmcia_request_configuration(link->handle, &link->conf);
+	if (i != CS_SUCCESS) {
+		cs_error(link->handle, RequestConfiguration, i);
 		goto failed;
+	}
 
 	if (bt3c_open(info) != 0)
 		goto failed;
 
-	return 0;
+	strcpy(info->node.dev_name, info->hdev->name);
+	link->dev = &info->node;
+	link->state &= ~DEV_CONFIG_PENDING;
+
+	return;
+
+cs_failed:
+	cs_error(link->handle, last_fn, last_ret);
 
 failed:
 	bt3c_release(link);
-	return -ENODEV;
 }
 
 
-static void bt3c_release(struct pcmcia_device *link)
+static void bt3c_release(dev_link_t *link)
 {
-	struct bt3c_info *info = link->priv;
+	bt3c_info_t *info = link->priv;
 
-	bt3c_close(info);
+	if (link->state & DEV_PRESENT)
+		bt3c_close(info);
 
-	pcmcia_disable_device(link);
+	link->dev = NULL;
+
+	pcmcia_release_configuration(link->handle);
+	pcmcia_release_io(link->handle, &link->io);
+	pcmcia_release_irq(link->handle, &link->irq);
+
+	link->state &= ~DEV_CONFIG;
 }
 
 
-static const struct pcmcia_device_id bt3c_ids[] = {
-	PCMCIA_DEVICE_PROD_ID13("3COM", "Bluetooth PC Card", 0xefce0a31, 0xd4ce9b02),
-	PCMCIA_DEVICE_NULL
-};
-MODULE_DEVICE_TABLE(pcmcia, bt3c_ids);
+static int bt3c_event(event_t event, int priority, event_callback_args_t *args)
+{
+	dev_link_t *link = args->client_data;
+	bt3c_info_t *info = link->priv;
+
+	switch (event) {
+	case CS_EVENT_CARD_REMOVAL:
+		link->state &= ~DEV_PRESENT;
+		if (link->state & DEV_CONFIG) {
+			bt3c_close(info);
+			bt3c_release(link);
+		}
+		break;
+	case CS_EVENT_CARD_INSERTION:
+		link->state |= DEV_PRESENT | DEV_CONFIG_PENDING;
+		bt3c_config(link);
+		break;
+	case CS_EVENT_PM_SUSPEND:
+		link->state |= DEV_SUSPEND;
+		/* Fall through... */
+	case CS_EVENT_RESET_PHYSICAL:
+		if (link->state & DEV_CONFIG)
+			pcmcia_release_configuration(link->handle);
+		break;
+	case CS_EVENT_PM_RESUME:
+		link->state &= ~DEV_SUSPEND;
+		/* Fall through... */
+	case CS_EVENT_CARD_RESET:
+		if (DEV_OK(link))
+			pcmcia_request_configuration(link->handle, &link->conf);
+		break;
+	}
+
+	return 0;
+}
 
 static struct pcmcia_driver bt3c_driver = {
 	.owner		= THIS_MODULE,
-	.name		= "bt3c_cs",
-	.probe		= bt3c_probe,
-	.remove		= bt3c_detach,
-	.id_table	= bt3c_ids,
+	.drv		= {
+		.name	= "bt3c_cs",
+	},
+	.attach		= bt3c_attach,
+	.detach		= bt3c_detach,
 };
-module_pcmcia_driver(bt3c_driver);
+
+static int __init init_bt3c_cs(void)
+{
+	return pcmcia_register_driver(&bt3c_driver);
+}
+
+
+static void __exit exit_bt3c_cs(void)
+{
+	pcmcia_unregister_driver(&bt3c_driver);
+	BUG_ON(dev_list != NULL);
+}
+
+module_init(init_bt3c_cs);
+module_exit(exit_bt3c_cs);

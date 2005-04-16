@@ -1,11 +1,11 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *  linux/arch/alpha/mm/fault.c
  *
  *  Copyright (C) 1995  Linus Torvalds
  */
 
-#include <linux/sched/signal.h>
+#include <linux/config.h>
+#include <linux/sched.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <asm/io.h>
@@ -22,10 +22,12 @@
 #include <linux/ptrace.h>
 #include <linux/mman.h>
 #include <linux/smp.h>
+#include <linux/smp_lock.h>
 #include <linux/interrupt.h>
-#include <linux/extable.h>
-#include <linux/uaccess.h>
-#include <linux/perf_event.h>
+#include <linux/module.h>
+
+#include <asm/system.h>
+#include <asm/uaccess.h>
 
 extern void die_if_kernel(char *,struct pt_regs *,long, unsigned long *);
 
@@ -79,7 +81,7 @@ __load_new_mm_context(struct mm_struct *next_mm)
 /* Macro for exception fixup code to access integer registers.  */
 #define dpf_reg(r)							\
 	(((unsigned long *)regs)[(r) <= 8 ? (r) : (r) <= 15 ? (r)-16 :	\
-				 (r) <= 18 ? (r)+10 : (r)-10])
+				 (r) <= 18 ? (r)+8 : (r)-10])
 
 asmlinkage void
 do_page_fault(unsigned long address, unsigned long mmcsr,
@@ -88,9 +90,8 @@ do_page_fault(unsigned long address, unsigned long mmcsr,
 	struct vm_area_struct * vma;
 	struct mm_struct *mm = current->mm;
 	const struct exception_table_entry *fixup;
-	int si_code = SEGV_MAPERR;
-	vm_fault_t fault;
-	unsigned int flags = FAULT_FLAG_DEFAULT;
+	int fault, si_code = SEGV_MAPERR;
+	siginfo_t info;
 
 	/* As of EV6, a load into $31/$f31 is a prefetch, and never faults
 	   (or is suppressed by the PALcode).  Support that for older CPUs
@@ -108,18 +109,15 @@ do_page_fault(unsigned long address, unsigned long mmcsr,
 
 	/* If we're in an interrupt context, or have no user context,
 	   we must not take the fault.  */
-	if (!mm || faulthandler_disabled())
+	if (!mm || in_interrupt())
 		goto no_context;
 
 #ifdef CONFIG_ALPHA_LARGE_VMALLOC
 	if (address >= TASK_SIZE)
 		goto vmalloc_fault;
 #endif
-	if (user_mode(regs))
-		flags |= FAULT_FLAG_USER;
-	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, address);
-retry:
-	mmap_read_lock(mm);
+
+	down_read(&mm->mmap_sem);
 	vma = find_vma(mm, address);
 	if (!vma)
 		goto bad_area;
@@ -144,50 +142,35 @@ retry:
 	} else {
 		if (!(vma->vm_flags & VM_WRITE))
 			goto bad_area;
-		flags |= FAULT_FLAG_WRITE;
 	}
 
+ survive:
 	/* If for any reason at all we couldn't handle the fault,
 	   make sure we exit gracefully rather than endlessly redo
 	   the fault.  */
-	fault = handle_mm_fault(vma, address, flags, regs);
+	fault = handle_mm_fault(mm, vma, address, cause > 0);
+	up_read(&mm->mmap_sem);
 
-	if (fault_signal_pending(fault, regs))
-		return;
-
-	/* The fault is fully completed (including releasing mmap lock) */
-	if (fault & VM_FAULT_COMPLETED)
-		return;
-
-	if (unlikely(fault & VM_FAULT_ERROR)) {
-		if (fault & VM_FAULT_OOM)
-			goto out_of_memory;
-		else if (fault & VM_FAULT_SIGSEGV)
-			goto bad_area;
-		else if (fault & VM_FAULT_SIGBUS)
-			goto do_sigbus;
+	switch (fault) {
+	      case VM_FAULT_MINOR:
+		current->min_flt++;
+		break;
+	      case VM_FAULT_MAJOR:
+		current->maj_flt++;
+		break;
+	      case VM_FAULT_SIGBUS:
+		goto do_sigbus;
+	      case VM_FAULT_OOM:
+		goto out_of_memory;
+	      default:
 		BUG();
 	}
-
-	if (fault & VM_FAULT_RETRY) {
-		flags |= FAULT_FLAG_TRIED;
-
-		/* No need to mmap_read_unlock(mm) as we would
-		 * have already released it in __lock_page_or_retry
-		 * in mm/filemap.c.
-		 */
-
-		goto retry;
-	}
-
-	mmap_read_unlock(mm);
-
 	return;
 
 	/* Something tried to access memory that isn't in our memory map.
 	   Fix it, but check if it's kernel or user first.  */
  bad_area:
-	mmap_read_unlock(mm);
+	up_read(&mm->mmap_sem);
 
 	if (user_mode(regs))
 		goto do_sigsegv;
@@ -206,28 +189,40 @@ retry:
 	printk(KERN_ALERT "Unable to handle kernel paging request at "
 	       "virtual address %016lx\n", address);
 	die_if_kernel("Oops", regs, cause, (unsigned long*)regs - 16);
-	make_task_dead(SIGKILL);
+	do_exit(SIGKILL);
 
 	/* We ran out of memory, or some other thing happened to us that
 	   made us unable to handle the page fault gracefully.  */
  out_of_memory:
-	mmap_read_unlock(mm);
+	if (current->pid == 1) {
+		yield();
+		down_read(&mm->mmap_sem);
+		goto survive;
+	}
+	printk(KERN_ALERT "VM: killing process %s(%d)\n",
+	       current->comm, current->pid);
 	if (!user_mode(regs))
 		goto no_context;
-	pagefault_out_of_memory();
-	return;
+	do_exit(SIGKILL);
 
  do_sigbus:
-	mmap_read_unlock(mm);
 	/* Send a sigbus, regardless of whether we were in kernel
 	   or user mode.  */
-	force_sig_fault(SIGBUS, BUS_ADRERR, (void __user *) address);
+	info.si_signo = SIGBUS;
+	info.si_errno = 0;
+	info.si_code = BUS_ADRERR;
+	info.si_addr = (void __user *) address;
+	force_sig_info(SIGBUS, &info, current);
 	if (!user_mode(regs))
 		goto no_context;
 	return;
 
  do_sigsegv:
-	force_sig_fault(SIGSEGV, si_code, (void __user *) address);
+	info.si_signo = SIGSEGV;
+	info.si_errno = 0;
+	info.si_code = si_code;
+	info.si_addr = (void __user *) address;
+	force_sig_info(SIGSEGV, &info, current);
 	return;
 
 #ifdef CONFIG_ALPHA_LARGE_VMALLOC

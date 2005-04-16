@@ -1,40 +1,115 @@
-// SPDX-License-Identifier: GPL-2.0+
 /*
  * USB Compaq iPAQ driver
  *
  *	Copyright (C) 2001 - 2002
  *	    Ganesh Varadarajan <ganesh@veritas.com>
+ *
+ *	This program is free software; you can redistribute it and/or modify
+ *	it under the terms of the GNU General Public License as published by
+ *	the Free Software Foundation; either version 2 of the License, or
+ *	(at your option) any later version.
+ *
+ * (12/12/2002) ganesh
+ * 	Added support for practically all devices supported by ActiveSync
+ * 	on Windows. Thanks to Wes Cilldhaire <billybobjoehenrybob@hotmail.com>.
+ *
+ * (26/11/2002) ganesh
+ * 	Added insmod options to specify product and vendor id.
+ * 	Use modprobe ipaq vendor=0xfoo product=0xbar
+ *
+ * (26/7/2002) ganesh
+ * 	Fixed up broken error handling in ipaq_open. Retry the "kickstart"
+ * 	packet much harder - this drastically reduces connection failures.
+ *
+ * (30/4/2002) ganesh
+ * 	Added support for the Casio EM500. Completely untested. Thanks
+ * 	to info from Nathan <wfilardo@fuse.net>
+ *
+ * (19/3/2002) ganesh
+ *	Don't submit urbs while holding spinlocks. Not strictly necessary
+ *	in 2.5.x.
+ *
+ * (8/3/2002) ganesh
+ * 	The ipaq sometimes emits a '\0' before the CLIENT string. At this
+ * 	point of time, the ppp ldisc is not yet attached to the tty, so
+ * 	n_tty echoes "^ " to the ipaq, which messes up the chat. In 2.5.6-pre2
+ * 	this causes a panic because echo_char() tries to sleep in interrupt
+ * 	context.
+ * 	The fix is to tell the upper layers that this is a raw device so that
+ * 	echoing is suppressed. Thanks to Lyle Lindholm for a detailed bug
+ * 	report.
+ *
+ * (25/2/2002) ganesh
+ * 	Added support for the HP Jornada 548 and 568. Completely untested.
+ * 	Thanks to info from Heath Robinson and Arieh Davidoff.
  */
 
+#include <linux/config.h>
 #include <linux/kernel.h>
 #include <linux/errno.h>
+#include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/tty.h>
 #include <linux/tty_driver.h>
 #include <linux/tty_flip.h>
 #include <linux/module.h>
 #include <linux/spinlock.h>
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
 #include <linux/usb.h>
-#include <linux/usb/serial.h>
+#include "usb-serial.h"
+#include "ipaq.h"
 
 #define KP_RETRIES	100
 
+/*
+ * Version Information
+ */
+
+#define DRIVER_VERSION "v0.5"
 #define DRIVER_AUTHOR "Ganesh Varadarajan <ganesh@veritas.com>"
 #define DRIVER_DESC "USB PocketPC PDA driver"
 
-static int connect_retries = KP_RETRIES;
-static int initial_wait;
+static __u16 product, vendor;
+static int debug;
 
 /* Function prototypes for an ipaq */
-static int  ipaq_open(struct tty_struct *tty,
-			struct usb_serial_port *port);
-static int ipaq_calc_num_ports(struct usb_serial *serial,
-					struct usb_serial_endpoints *epds);
-static int  ipaq_startup(struct usb_serial *serial);
+static int  ipaq_open (struct usb_serial_port *port, struct file *filp);
+static void ipaq_close (struct usb_serial_port *port, struct file *filp);
+static int  ipaq_startup (struct usb_serial *serial);
+static void ipaq_shutdown (struct usb_serial *serial);
+static int ipaq_write(struct usb_serial_port *port, const unsigned char *buf,
+		       int count);
+static int ipaq_write_bulk(struct usb_serial_port *port, const unsigned char *buf,
+			   int count);
+static void ipaq_write_gather(struct usb_serial_port *port);
+static void ipaq_read_bulk_callback (struct urb *urb, struct pt_regs *regs);
+static void ipaq_write_bulk_callback(struct urb *urb, struct pt_regs *regs);
+static int ipaq_write_room(struct usb_serial_port *port);
+static int ipaq_chars_in_buffer(struct usb_serial_port *port);
+static void ipaq_destroy_lists(struct usb_serial_port *port);
 
-static const struct usb_device_id ipaq_id_table[] = {
-	{ USB_DEVICE(0x0104, 0x00BE) }, /* Socket USB Sync */
+
+static struct usb_device_id ipaq_id_table [] = {
+	/* The first entry is a placeholder for the insmod-specified device */
+	{ USB_DEVICE(0x049F, 0x0003) },
+	{ USB_DEVICE(0x1690, 0x0601) }, /* Askey USB Sync */
+	{ USB_DEVICE(0x0960, 0x0065) }, /* BCOM USB Sync 0065 */
+	{ USB_DEVICE(0x0960, 0x0066) }, /* BCOM USB Sync 0066 */
+	{ USB_DEVICE(0x0960, 0x0067) }, /* BCOM USB Sync 0067 */
+	{ USB_DEVICE(0x07CF, 0x2001) }, /* CASIO USB Sync 2001 */
+	{ USB_DEVICE(0x07CF, 0x2002) }, /* CASIO USB Sync 2002 */
+	{ USB_DEVICE(0x07CF, 0x2003) }, /* CASIO USB Sync 2003 */
+	{ USB_DEVICE(0x049F, 0x0003) }, /* Compaq iPAQ USB Sync */
+	{ USB_DEVICE(0x049F, 0x0032) }, /* Compaq iPAQ USB Sync */
+	{ USB_DEVICE(0x413C, 0x4001) }, /* Dell Axim USB Sync */
+	{ USB_DEVICE(0x413C, 0x4002) }, /* Dell Axim USB Sync */
+	{ USB_DEVICE(0x413C, 0x4003) }, /* Dell Axim USB Sync */
+	{ USB_DEVICE(0x413C, 0x4004) }, /* Dell Axim USB Sync */
+	{ USB_DEVICE(0x413C, 0x4005) }, /* Dell Axim USB Sync */
+	{ USB_DEVICE(0x413C, 0x4006) }, /* Dell Axim USB Sync */
+	{ USB_DEVICE(0x413C, 0x4007) }, /* Dell Axim USB Sync */
+	{ USB_DEVICE(0x413C, 0x4008) }, /* Dell Axim USB Sync */
+	{ USB_DEVICE(0x413C, 0x4009) }, /* Dell Axim USB Sync */
 	{ USB_DEVICE(0x03F0, 0x1016) }, /* HP USB Sync */
 	{ USB_DEVICE(0x03F0, 0x1116) }, /* HP USB Sync 1611 */
 	{ USB_DEVICE(0x03F0, 0x1216) }, /* HP USB Sync 1612 */
@@ -50,13 +125,7 @@ static const struct usb_device_id ipaq_id_table[] = {
 	{ USB_DEVICE(0x03F0, 0x5016) }, /* HP USB Sync 1650 */
 	{ USB_DEVICE(0x03F0, 0x5116) }, /* HP USB Sync 1651 */
 	{ USB_DEVICE(0x03F0, 0x5216) }, /* HP USB Sync 1652 */
-	{ USB_DEVICE(0x0409, 0x00D5) }, /* NEC USB Sync */
-	{ USB_DEVICE(0x0409, 0x00D6) }, /* NEC USB Sync */
-	{ USB_DEVICE(0x0409, 0x00D7) }, /* NEC USB Sync */
-	{ USB_DEVICE(0x0409, 0x8024) }, /* NEC USB Sync */
-	{ USB_DEVICE(0x0409, 0x8025) }, /* NEC USB Sync */
-	{ USB_DEVICE(0x043E, 0x9C01) }, /* LGE USB Sync */
-	{ USB_DEVICE(0x045E, 0x00CE) }, /* Microsoft USB Sync */
+	{ USB_DEVICE(0x094B, 0x0001) }, /* Linkup Systems USB Sync */
 	{ USB_DEVICE(0x045E, 0x0400) }, /* Windows Powered Pocket PC 2002 */
 	{ USB_DEVICE(0x045E, 0x0401) }, /* Windows Powered Pocket PC 2002 */
 	{ USB_DEVICE(0x045E, 0x0402) }, /* Windows Powered Pocket PC 2002 */
@@ -182,90 +251,18 @@ static const struct usb_device_id ipaq_id_table[] = {
 	{ USB_DEVICE(0x045E, 0x04E8) }, /* Windows Powered Smartphone 2003 */
 	{ USB_DEVICE(0x045E, 0x04E9) }, /* Windows Powered Smartphone 2003 */
 	{ USB_DEVICE(0x045E, 0x04EA) }, /* Windows Powered Smartphone 2003 */
-	{ USB_DEVICE(0x049F, 0x0003) }, /* Compaq iPAQ USB Sync */
-	{ USB_DEVICE(0x049F, 0x0032) }, /* Compaq iPAQ USB Sync */
-	{ USB_DEVICE(0x04A4, 0x0014) }, /* Hitachi USB Sync */
-	{ USB_DEVICE(0x04AD, 0x0301) }, /* USB Sync 0301 */
-	{ USB_DEVICE(0x04AD, 0x0302) }, /* USB Sync 0302 */
-	{ USB_DEVICE(0x04AD, 0x0303) }, /* USB Sync 0303 */
-	{ USB_DEVICE(0x04AD, 0x0306) }, /* GPS Pocket PC USB Sync */
-	{ USB_DEVICE(0x04B7, 0x0531) }, /* MyGuide 7000 XL USB Sync */
-	{ USB_DEVICE(0x04C5, 0x1058) }, /* FUJITSU USB Sync */
-	{ USB_DEVICE(0x04C5, 0x1079) }, /* FUJITSU USB Sync */
-	{ USB_DEVICE(0x04DA, 0x2500) }, /* Panasonic USB Sync */
-	{ USB_DEVICE(0x04DD, 0x9102) }, /* SHARP WS003SH USB Modem */
-	{ USB_DEVICE(0x04DD, 0x9121) }, /* SHARP WS004SH USB Modem */
-	{ USB_DEVICE(0x04DD, 0x9123) }, /* SHARP WS007SH USB Modem */
-	{ USB_DEVICE(0x04DD, 0x9151) }, /* SHARP S01SH USB Modem */
-	{ USB_DEVICE(0x04DD, 0x91AC) }, /* SHARP WS011SH USB Modem */
-	{ USB_DEVICE(0x04E8, 0x5F00) }, /* Samsung NEXiO USB Sync */
-	{ USB_DEVICE(0x04E8, 0x5F01) }, /* Samsung NEXiO USB Sync */
-	{ USB_DEVICE(0x04E8, 0x5F02) }, /* Samsung NEXiO USB Sync */
-	{ USB_DEVICE(0x04E8, 0x5F03) }, /* Samsung NEXiO USB Sync */
-	{ USB_DEVICE(0x04E8, 0x5F04) }, /* Samsung NEXiO USB Sync */
-	{ USB_DEVICE(0x04E8, 0x6611) }, /* Samsung MITs USB Sync */
-	{ USB_DEVICE(0x04E8, 0x6613) }, /* Samsung MITs USB Sync */
-	{ USB_DEVICE(0x04E8, 0x6615) }, /* Samsung MITs USB Sync */
-	{ USB_DEVICE(0x04E8, 0x6617) }, /* Samsung MITs USB Sync */
-	{ USB_DEVICE(0x04E8, 0x6619) }, /* Samsung MITs USB Sync */
-	{ USB_DEVICE(0x04E8, 0x661B) }, /* Samsung MITs USB Sync */
-	{ USB_DEVICE(0x04E8, 0x662E) }, /* Samsung MITs USB Sync */
-	{ USB_DEVICE(0x04E8, 0x6630) }, /* Samsung MITs USB Sync */
-	{ USB_DEVICE(0x04E8, 0x6632) }, /* Samsung MITs USB Sync */
-	{ USB_DEVICE(0x04f1, 0x3011) }, /* JVC USB Sync */
-	{ USB_DEVICE(0x04F1, 0x3012) }, /* JVC USB Sync */
-	{ USB_DEVICE(0x0502, 0x1631) }, /* c10 Series */
-	{ USB_DEVICE(0x0502, 0x1632) }, /* c20 Series */
-	{ USB_DEVICE(0x0502, 0x16E1) }, /* Acer n10 Handheld USB Sync */
-	{ USB_DEVICE(0x0502, 0x16E2) }, /* Acer n20 Handheld USB Sync */
-	{ USB_DEVICE(0x0502, 0x16E3) }, /* Acer n30 Handheld USB Sync */
-	{ USB_DEVICE(0x0536, 0x01A0) }, /* HHP PDT */
-	{ USB_DEVICE(0x0543, 0x0ED9) }, /* ViewSonic Color Pocket PC V35 */
-	{ USB_DEVICE(0x0543, 0x1527) }, /* ViewSonic Color Pocket PC V36 */
-	{ USB_DEVICE(0x0543, 0x1529) }, /* ViewSonic Color Pocket PC V37 */
-	{ USB_DEVICE(0x0543, 0x152B) }, /* ViewSonic Color Pocket PC V38 */
-	{ USB_DEVICE(0x0543, 0x152E) }, /* ViewSonic Pocket PC */
-	{ USB_DEVICE(0x0543, 0x1921) }, /* ViewSonic Communicator Pocket PC */
-	{ USB_DEVICE(0x0543, 0x1922) }, /* ViewSonic Smartphone */
-	{ USB_DEVICE(0x0543, 0x1923) }, /* ViewSonic Pocket PC V30 */
-	{ USB_DEVICE(0x05E0, 0x2000) }, /* Symbol USB Sync */
-	{ USB_DEVICE(0x05E0, 0x2001) }, /* Symbol USB Sync 0x2001 */
-	{ USB_DEVICE(0x05E0, 0x2002) }, /* Symbol USB Sync 0x2002 */
-	{ USB_DEVICE(0x05E0, 0x2003) }, /* Symbol USB Sync 0x2003 */
-	{ USB_DEVICE(0x05E0, 0x2004) }, /* Symbol USB Sync 0x2004 */
-	{ USB_DEVICE(0x05E0, 0x2005) }, /* Symbol USB Sync 0x2005 */
-	{ USB_DEVICE(0x05E0, 0x2006) }, /* Symbol USB Sync 0x2006 */
-	{ USB_DEVICE(0x05E0, 0x2007) }, /* Symbol USB Sync 0x2007 */
-	{ USB_DEVICE(0x05E0, 0x2008) }, /* Symbol USB Sync 0x2008 */
-	{ USB_DEVICE(0x05E0, 0x2009) }, /* Symbol USB Sync 0x2009 */
-	{ USB_DEVICE(0x05E0, 0x200A) }, /* Symbol USB Sync 0x200A */
-	{ USB_DEVICE(0x067E, 0x1001) }, /* Intermec Mobile Computer */
-	{ USB_DEVICE(0x07CF, 0x2001) }, /* CASIO USB Sync 2001 */
-	{ USB_DEVICE(0x07CF, 0x2002) }, /* CASIO USB Sync 2002 */
-	{ USB_DEVICE(0x07CF, 0x2003) }, /* CASIO USB Sync 2003 */
+	{ USB_DEVICE(0x0961, 0x0010) }, /* Portatec USB Sync */
+	{ USB_DEVICE(0x5E04, 0xCE00) }, /* SAGEM Wireless Assistant */
+	{ USB_DEVICE(0x0104, 0x00BE) }, /* Socket USB Sync */
 	{ USB_DEVICE(0x0930, 0x0700) }, /* TOSHIBA USB Sync 0700 */
 	{ USB_DEVICE(0x0930, 0x0705) }, /* TOSHIBA Pocket PC e310 */
-	{ USB_DEVICE(0x0930, 0x0706) }, /* TOSHIBA Pocket PC e740 */
 	{ USB_DEVICE(0x0930, 0x0707) }, /* TOSHIBA Pocket PC e330 Series */
-	{ USB_DEVICE(0x0930, 0x0708) }, /* TOSHIBA Pocket PC e350 Series */
+	{ USB_DEVICE(0x0930, 0x0708) }, /* TOSHIBA Pocket PC e350 Series */
+	{ USB_DEVICE(0x0930, 0x0706) }, /* TOSHIBA Pocket PC e740 */
 	{ USB_DEVICE(0x0930, 0x0709) }, /* TOSHIBA Pocket PC e750 Series */
 	{ USB_DEVICE(0x0930, 0x070A) }, /* TOSHIBA Pocket PC e400 Series */
 	{ USB_DEVICE(0x0930, 0x070B) }, /* TOSHIBA Pocket PC e800 Series */
-	{ USB_DEVICE(0x094B, 0x0001) }, /* Linkup Systems USB Sync */
-	{ USB_DEVICE(0x0960, 0x0065) }, /* BCOM USB Sync 0065 */
-	{ USB_DEVICE(0x0960, 0x0066) }, /* BCOM USB Sync 0066 */
-	{ USB_DEVICE(0x0960, 0x0067) }, /* BCOM USB Sync 0067 */
-	{ USB_DEVICE(0x0961, 0x0010) }, /* Portatec USB Sync */
-	{ USB_DEVICE(0x099E, 0x0052) }, /* Trimble GeoExplorer */
-	{ USB_DEVICE(0x099E, 0x4000) }, /* TDS Data Collector */
-	{ USB_DEVICE(0x0B05, 0x4200) }, /* ASUS USB Sync */
-	{ USB_DEVICE(0x0B05, 0x4201) }, /* ASUS USB Sync */
-	{ USB_DEVICE(0x0B05, 0x4202) }, /* ASUS USB Sync */
-	{ USB_DEVICE(0x0B05, 0x420F) }, /* ASUS USB Sync */
-	{ USB_DEVICE(0x0B05, 0x9200) }, /* ASUS USB Sync */
-	{ USB_DEVICE(0x0B05, 0x9202) }, /* ASUS USB Sync */
 	{ USB_DEVICE(0x0BB4, 0x00CE) }, /* HTC USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x00CF) }, /* HTC USB Modem */
 	{ USB_DEVICE(0x0BB4, 0x0A01) }, /* PocketPC USB Sync */
 	{ USB_DEVICE(0x0BB4, 0x0A02) }, /* PocketPC USB Sync */
 	{ USB_DEVICE(0x0BB4, 0x0A03) }, /* PocketPC USB Sync */
@@ -425,101 +422,234 @@ static const struct usb_device_id ipaq_id_table[] = {
 	{ USB_DEVICE(0x0BB4, 0x0A9D) }, /* SmartPhone USB Sync */
 	{ USB_DEVICE(0x0BB4, 0x0A9E) }, /* SmartPhone USB Sync */
 	{ USB_DEVICE(0x0BB4, 0x0A9F) }, /* SmartPhone USB Sync */
-	{ USB_DEVICE(0x0BB4, 0x0BCE) }, /* "High Tech Computer Corp" */
+	{ USB_DEVICE(0x0409, 0x00D5) }, /* NEC USB Sync */
+	{ USB_DEVICE(0x0409, 0x00D6) }, /* NEC USB Sync */
+	{ USB_DEVICE(0x0409, 0x00D7) }, /* NEC USB Sync */
+	{ USB_DEVICE(0x0409, 0x8024) }, /* NEC USB Sync */
+	{ USB_DEVICE(0x0409, 0x8025) }, /* NEC USB Sync */
+	{ USB_DEVICE(0x04A4, 0x0014) }, /* Hitachi USB Sync */
 	{ USB_DEVICE(0x0BF8, 0x1001) }, /* Fujitsu Siemens Computers USB Sync */
-	{ USB_DEVICE(0x0C44, 0x03A2) }, /* Motorola iDEN Smartphone */
-	{ USB_DEVICE(0x0C8E, 0x6000) }, /* Cesscom Luxian Series */
-	{ USB_DEVICE(0x0CAD, 0x9001) }, /* Motorola PowerPad Pocket PC Device */
-	{ USB_DEVICE(0x0F4E, 0x0200) }, /* Freedom Scientific USB Sync */
 	{ USB_DEVICE(0x0F98, 0x0201) }, /* Cyberbank USB Sync */
-	{ USB_DEVICE(0x0FB8, 0x3001) }, /* Wistron USB Sync */
-	{ USB_DEVICE(0x0FB8, 0x3002) }, /* Wistron USB Sync */
-	{ USB_DEVICE(0x0FB8, 0x3003) }, /* Wistron USB Sync */
-	{ USB_DEVICE(0x0FB8, 0x4001) }, /* Wistron USB Sync */
-	{ USB_DEVICE(0x1066, 0x00CE) }, /* E-TEN USB Sync */
+	{ USB_DEVICE(0x0502, 0x16E1) }, /* Acer n10 Handheld USB Sync */
+	{ USB_DEVICE(0x0502, 0x16E3) }, /* Acer n30 Handheld USB Sync */
+	{ USB_DEVICE(0x0502, 0x16E2) }, /* Acer n20 Handheld USB Sync */
+	{ USB_DEVICE(0x0502, 0x1631) }, /* c10 Series */
+	{ USB_DEVICE(0x0502, 0x1632) }, /* c20 Series */
+	{ USB_DEVICE(0x0B05, 0x9202) }, /* ASUS USB Sync */
+	{ USB_DEVICE(0x0B05, 0x420F) }, /* ASUS USB Sync */
+	{ USB_DEVICE(0x0B05, 0x4200) }, /* ASUS USB Sync */
+	{ USB_DEVICE(0x0B05, 0x4201) }, /* ASUS USB Sync */
+	{ USB_DEVICE(0x0B05, 0x4202) }, /* ASUS USB Sync */
+	{ USB_DEVICE(0x0B05, 0x9200) }, /* ASUS USB Sync */
+	{ USB_DEVICE(0x0C8E, 0x6000) }, /* Cesscom Luxian Series */
+	{ USB_DEVICE(0x04AD, 0x0301) }, /* USB Sync 0301 */
+	{ USB_DEVICE(0x04AD, 0x0302) }, /* USB Sync 0302 */
+	{ USB_DEVICE(0x04AD, 0x0303) }, /* USB Sync 0303 */
 	{ USB_DEVICE(0x1066, 0x0300) }, /* E-TEN P3XX Pocket PC */
 	{ USB_DEVICE(0x1066, 0x0500) }, /* E-TEN P5XX Pocket PC */
 	{ USB_DEVICE(0x1066, 0x0600) }, /* E-TEN P6XX Pocket PC */
 	{ USB_DEVICE(0x1066, 0x0700) }, /* E-TEN P7XX Pocket PC */
-	{ USB_DEVICE(0x1114, 0x0001) }, /* Psion Teklogix Sync 753x */
-	{ USB_DEVICE(0x1114, 0x0004) }, /* Psion Teklogix Sync netBookPro */
-	{ USB_DEVICE(0x1114, 0x0006) }, /* Psion Teklogix Sync 7525 */
+	{ USB_DEVICE(0x1066, 0x00CE) }, /* E-TEN USB Sync */
+	{ USB_DEVICE(0x0F4E, 0x0200) }, /* Freedom Scientific USB Sync */
+	{ USB_DEVICE(0x04C5, 0x1058) }, /* FUJITSU USB Sync */
+	{ USB_DEVICE(0x04C5, 0x1079) }, /* FUJITSU USB Sync */
+	{ USB_DEVICE(0x067E, 0x1001) }, /* Intermec Mobile Computer */
+	{ USB_DEVICE(0x04f1, 0x3011) }, /* JVC USB Sync */
+	{ USB_DEVICE(0x04F1, 0x3012) }, /* JVC USB Sync */
+	{ USB_DEVICE(0x3708, 0x20CE) }, /* Legend USB Sync */
+	{ USB_DEVICE(0x3708, 0x21CE) }, /* Lenovo USB Sync */
+	{ USB_DEVICE(0x043E, 0x9C01) }, /* LGE USB Sync */
+	{ USB_DEVICE(0x04DA, 0x2500) }, /* Panasonic USB Sync */
+	{ USB_DEVICE(0x3340, 0x0B1C) }, /* Generic PPC StrongARM */
+	{ USB_DEVICE(0x3340, 0x0E3A) }, /* Generic PPC USB Sync */
+	{ USB_DEVICE(0x3340, 0x0F3A) }, /* Generic SmartPhone USB Sync */
+	{ USB_DEVICE(0x3340, 0x0F1C) }, /* Itautec USB Sync */
+	{ USB_DEVICE(0x3340, 0x1326) }, /* Itautec USB Sync */
+	{ USB_DEVICE(0x3340, 0x3326) }, /* MEDION Winodws Moble USB Sync */
+	{ USB_DEVICE(0x3340, 0x0326) }, /* Mio DigiWalker 338 */
+	{ USB_DEVICE(0x3340, 0x0426) }, /* Mio DigiWalker 338 */
+	{ USB_DEVICE(0x3340, 0x011C) }, /* Mio DigiWalker PPC StrongARM */
+	{ USB_DEVICE(0x3340, 0x053A) }, /* Mio DigiWalker SmartPhone USB Sync */
+	{ USB_DEVICE(0x3340, 0x043A) }, /* Mio DigiWalker USB Sync */
+	{ USB_DEVICE(0x3340, 0x071C) }, /* MiTAC USB Sync */
+	{ USB_DEVICE(0x3340, 0x051C) }, /* MiTAC USB Sync 528 */
+	{ USB_DEVICE(0x3340, 0x2326) }, /* Vobis USB Sync */
+	{ USB_DEVICE(0x3340, 0x191C) }, /* YAKUMO USB Sync */
+	{ USB_DEVICE(0x4113, 0x0210) }, /* Mobile Media Technology USB Sync */
+	{ USB_DEVICE(0x4113, 0x0211) }, /* Mobile Media Technology USB Sync */
+	{ USB_DEVICE(0x4113, 0x0400) }, /* Mobile Media Technology USB Sync */
+	{ USB_DEVICE(0x4113, 0x0410) }, /* Mobile Media Technology USB Sync */
+	{ USB_DEVICE(0x0CAD, 0x9001) }, /* Motorola PowerPad Pocket PC Device */
+	{ USB_DEVICE(0x0C44, 0x03A2) }, /* Motorola iDEN Smartphone */
+	{ USB_DEVICE(0x04E8, 0x6611) }, /* Samsung MITs USB Sync */
+	{ USB_DEVICE(0x04E8, 0x6613) }, /* Samsung MITs USB Sync */
+	{ USB_DEVICE(0x04E8, 0x6615) }, /* Samsung MITs USB Sync */
+	{ USB_DEVICE(0x04E8, 0x6617) }, /* Samsung MITs USB Sync */
+	{ USB_DEVICE(0x04E8, 0x6619) }, /* Samsung MITs USB Sync */
+	{ USB_DEVICE(0x04E8, 0x661B) }, /* Samsung MITs USB Sync */
+	{ USB_DEVICE(0x04E8, 0x5F00) }, /* Samsung NEXiO USB Sync */
+	{ USB_DEVICE(0x04E8, 0x5F01) }, /* Samsung NEXiO USB Sync */
+	{ USB_DEVICE(0x04E8, 0x5F02) }, /* Samsung NEXiO USB Sync */
+	{ USB_DEVICE(0x04E8, 0x5F03) }, /* Samsung NEXiO USB Sync */
+	{ USB_DEVICE(0x04E8, 0x5F04) }, /* Samsung NEXiO USB Sync */
+	{ USB_DEVICE(0x04E8, 0x662E) }, /* Samsung MITs USB Sync */
+	{ USB_DEVICE(0x04E8, 0x6630) }, /* Samsung MITs USB Sync */
+	{ USB_DEVICE(0x04E8, 0x6632) }, /* Samsung MITs USB Sync */
+	{ USB_DEVICE(0x4505, 0x0010) }, /* Smartphone */
+	{ USB_DEVICE(0x05E0, 0x2000) }, /* Symbol USB Sync */
+	{ USB_DEVICE(0x05E0, 0x2001) }, /* Symbol USB Sync 0x2001 */
+	{ USB_DEVICE(0x05E0, 0x2002) }, /* Symbol USB Sync 0x2002 */
+	{ USB_DEVICE(0x05E0, 0x2003) }, /* Symbol USB Sync 0x2003 */
+	{ USB_DEVICE(0x05E0, 0x2004) }, /* Symbol USB Sync 0x2004 */
+	{ USB_DEVICE(0x05E0, 0x2005) }, /* Symbol USB Sync 0x2005 */
+	{ USB_DEVICE(0x05E0, 0x2006) }, /* Symbol USB Sync 0x2006 */
+	{ USB_DEVICE(0x05E0, 0x2007) }, /* Symbol USB Sync 0x2007 */
+	{ USB_DEVICE(0x05E0, 0x2008) }, /* Symbol USB Sync 0x2008 */
+	{ USB_DEVICE(0x05E0, 0x2009) }, /* Symbol USB Sync 0x2009 */
+	{ USB_DEVICE(0x05E0, 0x200A) }, /* Symbol USB Sync 0x200A */
 	{ USB_DEVICE(0x1182, 0x1388) }, /* VES USB Sync */
-	{ USB_DEVICE(0x11D9, 0x1002) }, /* Rugged Pocket PC 2003 */
+	{ USB_DEVICE(0x0543, 0x0ED9) }, /* ViewSonic Color Pocket PC V35 */
+	{ USB_DEVICE(0x0543, 0x1527) }, /* ViewSonic Color Pocket PC V36 */
+	{ USB_DEVICE(0x0543, 0x1529) }, /* ViewSonic Color Pocket PC V37 */
+	{ USB_DEVICE(0x0543, 0x152B) }, /* ViewSonic Color Pocket PC V38 */
+	{ USB_DEVICE(0x0543, 0x152E) }, /* ViewSonic Pocket PC */
+	{ USB_DEVICE(0x0543, 0x1921) }, /* ViewSonic Communicator Pocket PC */
+	{ USB_DEVICE(0x0543, 0x1922) }, /* ViewSonic Smartphone */
+	{ USB_DEVICE(0x0543, 0x1923) }, /* ViewSonic Pocket PC V30 */
+	{ USB_DEVICE(0x0536, 0x01A0) }, /* HHP PDT */
+	{ USB_DEVICE(0x099E, 0x0052) }, /* Trimble GeoExplorer */
+	{ USB_DEVICE(0x099E, 0x4000) }, /* TDS Data Collector */
+	{ USB_DEVICE(0x0FB8, 0x3001) }, /* Wistron USB Sync */
+	{ USB_DEVICE(0x0FB8, 0x3002) }, /* Wistron USB Sync */
+	{ USB_DEVICE(0x0FB8, 0x3003) }, /* Wistron USB Sync */
+	{ USB_DEVICE(0x0FB8, 0x4001) }, /* Wistron USB Sync */
 	{ USB_DEVICE(0x11D9, 0x1003) }, /* Rugged Pocket PC 2003 */
-	{ USB_DEVICE(0x1231, 0xCE01) }, /* USB Sync 03 */
-	{ USB_DEVICE(0x1231, 0xCE02) }, /* USB Sync 03 */
-	{ USB_DEVICE(0x1690, 0x0601) }, /* Askey USB Sync */
+	{ USB_DEVICE(0x11D9, 0x1002) }, /* Rugged Pocket PC 2003 */
 	{ USB_DEVICE(0x22B8, 0x4204) }, /* Motorola MPx200 Smartphone */
 	{ USB_DEVICE(0x22B8, 0x4214) }, /* Motorola MPc GSM */
 	{ USB_DEVICE(0x22B8, 0x4224) }, /* Motorola MPx220 Smartphone */
 	{ USB_DEVICE(0x22B8, 0x4234) }, /* Motorola MPc CDMA */
 	{ USB_DEVICE(0x22B8, 0x4244) }, /* Motorola MPx100 Smartphone */
-	{ USB_DEVICE(0x3340, 0x011C) }, /* Mio DigiWalker PPC StrongARM */
-	{ USB_DEVICE(0x3340, 0x0326) }, /* Mio DigiWalker 338 */
-	{ USB_DEVICE(0x3340, 0x0426) }, /* Mio DigiWalker 338 */
-	{ USB_DEVICE(0x3340, 0x043A) }, /* Mio DigiWalker USB Sync */
-	{ USB_DEVICE(0x3340, 0x051C) }, /* MiTAC USB Sync 528 */
-	{ USB_DEVICE(0x3340, 0x053A) }, /* Mio DigiWalker SmartPhone USB Sync */
-	{ USB_DEVICE(0x3340, 0x071C) }, /* MiTAC USB Sync */
-	{ USB_DEVICE(0x3340, 0x0B1C) }, /* Generic PPC StrongARM */
-	{ USB_DEVICE(0x3340, 0x0E3A) }, /* Generic PPC USB Sync */
-	{ USB_DEVICE(0x3340, 0x0F1C) }, /* Itautec USB Sync */
-	{ USB_DEVICE(0x3340, 0x0F3A) }, /* Generic SmartPhone USB Sync */
-	{ USB_DEVICE(0x3340, 0x1326) }, /* Itautec USB Sync */
-	{ USB_DEVICE(0x3340, 0x191C) }, /* YAKUMO USB Sync */
-	{ USB_DEVICE(0x3340, 0x2326) }, /* Vobis USB Sync */
-	{ USB_DEVICE(0x3340, 0x3326) }, /* MEDION Winodws Moble USB Sync */
-	{ USB_DEVICE(0x3708, 0x20CE) }, /* Legend USB Sync */
-	{ USB_DEVICE(0x3708, 0x21CE) }, /* Lenovo USB Sync */
-	{ USB_DEVICE(0x4113, 0x0210) }, /* Mobile Media Technology USB Sync */
-	{ USB_DEVICE(0x4113, 0x0211) }, /* Mobile Media Technology USB Sync */
-	{ USB_DEVICE(0x4113, 0x0400) }, /* Mobile Media Technology USB Sync */
-	{ USB_DEVICE(0x4113, 0x0410) }, /* Mobile Media Technology USB Sync */
-	{ USB_DEVICE(0x413C, 0x4001) }, /* Dell Axim USB Sync */
-	{ USB_DEVICE(0x413C, 0x4002) }, /* Dell Axim USB Sync */
-	{ USB_DEVICE(0x413C, 0x4003) }, /* Dell Axim USB Sync */
-	{ USB_DEVICE(0x413C, 0x4004) }, /* Dell Axim USB Sync */
-	{ USB_DEVICE(0x413C, 0x4005) }, /* Dell Axim USB Sync */
-	{ USB_DEVICE(0x413C, 0x4006) }, /* Dell Axim USB Sync */
-	{ USB_DEVICE(0x413C, 0x4007) }, /* Dell Axim USB Sync */
-	{ USB_DEVICE(0x413C, 0x4008) }, /* Dell Axim USB Sync */
-	{ USB_DEVICE(0x413C, 0x4009) }, /* Dell Axim USB Sync */
-	{ USB_DEVICE(0x4505, 0x0010) }, /* Smartphone */
-	{ USB_DEVICE(0x5E04, 0xCE00) }, /* SAGEM Wireless Assistant */
+	{ USB_DEVICE(0x1231, 0xCE01) }, /* USB Sync 03 */
+	{ USB_DEVICE(0x1231, 0xCE02) }, /* USB Sync 03 */
 	{ }                             /* Terminating entry */
 };
 
-MODULE_DEVICE_TABLE(usb, ipaq_id_table);
+MODULE_DEVICE_TABLE (usb, ipaq_id_table);
+
+static struct usb_driver ipaq_driver = {
+	.owner =	THIS_MODULE,
+	.name =		"ipaq",
+	.probe =	usb_serial_probe,
+	.disconnect =	usb_serial_disconnect,
+	.id_table =	ipaq_id_table,
+};
 
 
 /* All of the device info needed for the Compaq iPAQ */
-static struct usb_serial_driver ipaq_device = {
-	.driver = {
-		.owner =	THIS_MODULE,
-		.name =		"ipaq",
-	},
-	.description =		"PocketPC PDA",
+static struct usb_serial_device_type ipaq_device = {
+	.owner =		THIS_MODULE,
+	.name =			"PocketPC PDA",
 	.id_table =		ipaq_id_table,
-	.bulk_in_size =		256,
-	.bulk_out_size =	256,
+	.num_interrupt_in =	NUM_DONT_CARE,
+	.num_bulk_in =		1,
+	.num_bulk_out =		1,
+	.num_ports =		1,
 	.open =			ipaq_open,
+	.close =		ipaq_close,
 	.attach =		ipaq_startup,
-	.calc_num_ports =	ipaq_calc_num_ports,
+	.shutdown =		ipaq_shutdown,
+	.write =		ipaq_write,
+	.write_room =		ipaq_write_room,
+	.chars_in_buffer =	ipaq_chars_in_buffer,
+	.read_bulk_callback =	ipaq_read_bulk_callback,
+	.write_bulk_callback =	ipaq_write_bulk_callback,
 };
 
-static struct usb_serial_driver * const serial_drivers[] = {
-	&ipaq_device, NULL
-};
+static spinlock_t	write_list_lock;
+static int		bytes_in;
+static int		bytes_out;
 
-static int ipaq_open(struct tty_struct *tty,
-			struct usb_serial_port *port)
+static int ipaq_open(struct usb_serial_port *port, struct file *filp)
 {
 	struct usb_serial	*serial = port->serial;
-	int			result = 0;
-	int			retries = connect_retries;
+	struct ipaq_private	*priv;
+	struct ipaq_packet	*pkt;
+	int			i, result = 0;
+	int			retries = KP_RETRIES;
 
-	msleep(1000*initial_wait);
+	dbg("%s - port %d", __FUNCTION__, port->number);
+
+	bytes_in = 0;
+	bytes_out = 0;
+	priv = (struct ipaq_private *)kmalloc(sizeof(struct ipaq_private), GFP_KERNEL);
+	if (priv == NULL) {
+		err("%s - Out of memory", __FUNCTION__);
+		return -ENOMEM;
+	}
+	usb_set_serial_port_data(port, priv);
+	priv->active = 0;
+	priv->queue_len = 0;
+	priv->free_len = 0;
+	INIT_LIST_HEAD(&priv->queue);
+	INIT_LIST_HEAD(&priv->freelist);
+
+	for (i = 0; i < URBDATA_QUEUE_MAX / PACKET_SIZE; i++) {
+		pkt = kmalloc(sizeof(struct ipaq_packet), GFP_KERNEL);
+		if (pkt == NULL) {
+			goto enomem;
+		}
+		pkt->data = kmalloc(PACKET_SIZE, GFP_KERNEL);
+		if (pkt->data == NULL) {
+			kfree(pkt);
+			goto enomem;
+		}
+		pkt->len = 0;
+		pkt->written = 0;
+		INIT_LIST_HEAD(&pkt->list);
+		list_add(&pkt->list, &priv->freelist);
+		priv->free_len += PACKET_SIZE;
+	}
+
+	/*
+	 * Force low latency on. This will immediately push data to the line
+	 * discipline instead of queueing.
+	 */
+
+	port->tty->low_latency = 1;
+	port->tty->raw = 1;
+	port->tty->real_raw = 1;
+
+	/*
+	 * Lose the small buffers usbserial provides. Make larger ones.
+	 */
+
+	kfree(port->bulk_in_buffer);
+	kfree(port->bulk_out_buffer);
+	port->bulk_in_buffer = kmalloc(URBDATA_SIZE, GFP_KERNEL);
+	if (port->bulk_in_buffer == NULL) {
+		goto enomem;
+	}
+	port->bulk_out_buffer = kmalloc(URBDATA_SIZE, GFP_KERNEL);
+	if (port->bulk_out_buffer == NULL) {
+		kfree(port->bulk_in_buffer);
+		goto enomem;
+	}
+	port->read_urb->transfer_buffer = port->bulk_in_buffer;
+	port->write_urb->transfer_buffer = port->bulk_out_buffer;
+	port->read_urb->transfer_buffer_length = URBDATA_SIZE;
+	port->bulk_out_size = port->write_urb->transfer_buffer_length = URBDATA_SIZE;
+	
+	/* Start reading from the device */
+	usb_fill_bulk_urb(port->read_urb, serial->dev, 
+		      usb_rcvbulkpipe(serial->dev, port->bulk_in_endpointAddress),
+		      port->read_urb->transfer_buffer, port->read_urb->transfer_buffer_length,
+		      ipaq_read_bulk_callback, port);
+	result = usb_submit_urb(port->read_urb, GFP_KERNEL);
+	if (result) {
+		err("%s - failed submitting read urb, error %d", __FUNCTION__, result);
+		goto error;
+	}
 
 	/*
 	 * Send out control message observed in win98 sniffs. Not sure what
@@ -528,81 +658,316 @@ static int ipaq_open(struct tty_struct *tty,
 	 * through. Since this has a reasonably high failure rate, we retry
 	 * several times.
 	 */
-	while (retries) {
-		retries--;
+
+	while (retries--) {
 		result = usb_control_msg(serial->dev,
 				usb_sndctrlpipe(serial->dev, 0), 0x22, 0x21,
 				0x1, 0, NULL, 0, 100);
-		if (!result)
-			break;
-
-		msleep(1000);
+		if (result == 0) {
+			return 0;
+		}
 	}
-	if (!retries && result) {
-		dev_err(&port->dev, "%s - failed doing control urb, error %d\n",
-							__func__, result);
-		return result;
-	}
+	err("%s - failed doing control urb, error %d", __FUNCTION__, result);
+	goto error;
 
-	return usb_serial_generic_open(tty, port);
+enomem:
+	result = -ENOMEM;
+	err("%s - Out of memory", __FUNCTION__);
+error:
+	ipaq_destroy_lists(port);
+	kfree(priv);
+	return result;
 }
 
-static int ipaq_calc_num_ports(struct usb_serial *serial,
-					struct usb_serial_endpoints *epds)
+
+static void ipaq_close(struct usb_serial_port *port, struct file *filp)
 {
-	/*
-	 * Some of the devices in ipaq_id_table[] are composite, and we
-	 * shouldn't bind to all the interfaces. This test will rule out
-	 * some obviously invalid possibilities.
-	 */
-	if (epds->num_bulk_in == 0 || epds->num_bulk_out == 0)
-		return -ENODEV;
+	struct ipaq_private	*priv = usb_get_serial_port_data(port);
 
+	dbg("%s - port %d", __FUNCTION__, port->number);
+			 
 	/*
-	 * A few devices have four endpoints, seemingly Yakuma devices, and
-	 * we need the second pair.
+	 * shut down bulk read and write
 	 */
-	if (epds->num_bulk_in > 1 && epds->num_bulk_out > 1) {
-		epds->bulk_in[0] = epds->bulk_in[1];
-		epds->bulk_out[0] = epds->bulk_out[1];
+	usb_kill_urb(port->write_urb);
+	usb_kill_urb(port->read_urb);
+	ipaq_destroy_lists(port);
+	kfree(priv);
+	usb_set_serial_port_data(port, NULL);
+
+	/* Uncomment the following line if you want to see some statistics in your syslog */
+	/* info ("Bytes In = %d  Bytes Out = %d", bytes_in, bytes_out); */
+}
+
+static void ipaq_read_bulk_callback(struct urb *urb, struct pt_regs *regs)
+{
+	struct usb_serial_port	*port = (struct usb_serial_port *)urb->context;
+	struct tty_struct	*tty;
+	unsigned char		*data = urb->transfer_buffer;
+	int			i, result;
+
+	dbg("%s - port %d", __FUNCTION__, port->number);
+
+	if (urb->status) {
+		dbg("%s - nonzero read bulk status received: %d", __FUNCTION__, urb->status);
+		return;
 	}
 
-	/*
-	 * Other devices have 3 endpoints, but we only use the first bulk in
-	 * and out endpoints.
-	 */
-	epds->num_bulk_in = 1;
-	epds->num_bulk_out = 1;
+	usb_serial_debug_data(debug, &port->dev, __FUNCTION__, urb->actual_length, data);
 
-	return 1;
+	tty = port->tty;
+	if (tty && urb->actual_length) {
+		for (i = 0; i < urb->actual_length ; ++i) {
+			/* if we insert more than TTY_FLIPBUF_SIZE characters, we drop them. */
+			if(tty->flip.count >= TTY_FLIPBUF_SIZE) {
+				tty_flip_buffer_push(tty);
+			}
+			/* this doesn't actually push the data through unless tty->low_latency is set */
+			tty_insert_flip_char(tty, data[i], 0);
+		}
+		tty_flip_buffer_push(tty);
+		bytes_in += urb->actual_length;
+	}
+
+	/* Continue trying to always read  */
+	usb_fill_bulk_urb(port->read_urb, port->serial->dev, 
+		      usb_rcvbulkpipe(port->serial->dev, port->bulk_in_endpointAddress),
+		      port->read_urb->transfer_buffer, port->read_urb->transfer_buffer_length,
+		      ipaq_read_bulk_callback, port);
+	result = usb_submit_urb(port->read_urb, GFP_ATOMIC);
+	if (result)
+		err("%s - failed resubmitting read urb, error %d", __FUNCTION__, result);
+	return;
 }
+
+static int ipaq_write(struct usb_serial_port *port, const unsigned char *buf,
+		       int count)
+{
+	const unsigned char	*current_position = buf;
+	int			bytes_sent = 0;
+	int			transfer_size;
+
+	dbg("%s - port %d", __FUNCTION__, port->number);
+
+	while (count > 0) {
+		transfer_size = min(count, PACKET_SIZE);
+		if (ipaq_write_bulk(port, current_position, transfer_size)) {
+			break;
+		}
+		current_position += transfer_size;
+		bytes_sent += transfer_size;
+		count -= transfer_size;
+		bytes_out += transfer_size;
+	}
+
+	return bytes_sent;
+} 
+
+static int ipaq_write_bulk(struct usb_serial_port *port, const unsigned char *buf,
+			   int count)
+{
+	struct ipaq_private	*priv = usb_get_serial_port_data(port);
+	struct ipaq_packet	*pkt = NULL;
+	int			result = 0;
+	unsigned long		flags;
+
+	if (priv->free_len <= 0) {
+		dbg("%s - we're stuffed", __FUNCTION__);
+		return -EAGAIN;
+	}
+
+	spin_lock_irqsave(&write_list_lock, flags);
+	if (!list_empty(&priv->freelist)) {
+		pkt = list_entry(priv->freelist.next, struct ipaq_packet, list);
+		list_del(&pkt->list);
+		priv->free_len -= PACKET_SIZE;
+	}
+	spin_unlock_irqrestore(&write_list_lock, flags);
+	if (pkt == NULL) {
+		dbg("%s - we're stuffed", __FUNCTION__);
+		return -EAGAIN;
+	}
+
+	memcpy(pkt->data, buf, count);
+	usb_serial_debug_data(debug, &port->dev, __FUNCTION__, count, pkt->data);
+
+	pkt->len = count;
+	pkt->written = 0;
+	spin_lock_irqsave(&write_list_lock, flags);
+	list_add_tail(&pkt->list, &priv->queue);
+	priv->queue_len += count;
+	if (priv->active == 0) {
+		priv->active = 1;
+		ipaq_write_gather(port);
+		spin_unlock_irqrestore(&write_list_lock, flags);
+		result = usb_submit_urb(port->write_urb, GFP_ATOMIC);
+		if (result) {
+			err("%s - failed submitting write urb, error %d", __FUNCTION__, result);
+		}
+	} else {
+		spin_unlock_irqrestore(&write_list_lock, flags);
+	}
+	return result;
+}
+
+static void ipaq_write_gather(struct usb_serial_port *port)
+{
+	struct ipaq_private	*priv = usb_get_serial_port_data(port);
+	struct usb_serial	*serial = port->serial;
+	int			count, room;
+	struct ipaq_packet	*pkt, *tmp;
+	struct urb		*urb = port->write_urb;
+
+	if (urb->status == -EINPROGRESS) {
+		/* Should never happen */
+		err("%s - flushing while urb is active !", __FUNCTION__);
+		return;
+	}
+	room = URBDATA_SIZE;
+	list_for_each_entry_safe(pkt, tmp, &priv->queue, list) {
+		count = min(room, (int)(pkt->len - pkt->written));
+		memcpy(urb->transfer_buffer + (URBDATA_SIZE - room),
+		       pkt->data + pkt->written, count);
+		room -= count;
+		pkt->written += count;
+		priv->queue_len -= count;
+		if (pkt->written == pkt->len) {
+			list_move(&pkt->list, &priv->freelist);
+			priv->free_len += PACKET_SIZE;
+		}
+		if (room == 0) {
+			break;
+		}
+	}
+
+	count = URBDATA_SIZE - room;
+	usb_fill_bulk_urb(port->write_urb, serial->dev, 
+		      usb_sndbulkpipe(serial->dev, port->bulk_out_endpointAddress),
+		      port->write_urb->transfer_buffer, count, ipaq_write_bulk_callback,
+		      port);
+	return;
+}
+
+static void ipaq_write_bulk_callback(struct urb *urb, struct pt_regs *regs)
+{
+	struct usb_serial_port	*port = (struct usb_serial_port *)urb->context;
+	struct ipaq_private	*priv = usb_get_serial_port_data(port);
+	unsigned long		flags;
+	int			result;
+
+	dbg("%s - port %d", __FUNCTION__, port->number);
+	
+	if (urb->status) {
+		dbg("%s - nonzero write bulk status received: %d", __FUNCTION__, urb->status);
+	}
+
+	spin_lock_irqsave(&write_list_lock, flags);
+	if (!list_empty(&priv->queue)) {
+		ipaq_write_gather(port);
+		spin_unlock_irqrestore(&write_list_lock, flags);
+		result = usb_submit_urb(port->write_urb, GFP_ATOMIC);
+		if (result) {
+			err("%s - failed submitting write urb, error %d", __FUNCTION__, result);
+		}
+	} else {
+		priv->active = 0;
+		spin_unlock_irqrestore(&write_list_lock, flags);
+	}
+
+	schedule_work(&port->work);
+}
+
+static int ipaq_write_room(struct usb_serial_port *port)
+{
+	struct ipaq_private	*priv = usb_get_serial_port_data(port);
+
+	dbg("%s - freelen %d", __FUNCTION__, priv->free_len);
+	return priv->free_len;
+}
+
+static int ipaq_chars_in_buffer(struct usb_serial_port *port)
+{
+	struct ipaq_private	*priv = usb_get_serial_port_data(port);
+
+	dbg("%s - queuelen %d", __FUNCTION__, priv->queue_len);
+	return priv->queue_len;
+}
+
+static void ipaq_destroy_lists(struct usb_serial_port *port)
+{
+	struct ipaq_private	*priv = usb_get_serial_port_data(port);
+	struct ipaq_packet	*pkt, *tmp;
+
+	list_for_each_entry_safe(pkt, tmp, &priv->queue, list) {
+		kfree(pkt->data);
+		kfree(pkt);
+	}
+	list_for_each_entry_safe(pkt, tmp, &priv->freelist, list) {
+		kfree(pkt->data);
+		kfree(pkt);
+	}
+}
+
 
 static int ipaq_startup(struct usb_serial *serial)
 {
+	dbg("%s", __FUNCTION__);
 	if (serial->dev->actconfig->desc.bConfigurationValue != 1) {
-		/*
-		 * FIXME: HP iPaq rx3715, possibly others, have 1 config that
-		 * is labeled as 2
-		 */
-
-		dev_err(&serial->dev->dev, "active config #%d != 1 ??\n",
+		err("active config #%d != 1 ??",
 			serial->dev->actconfig->desc.bConfigurationValue);
 		return -ENODEV;
 	}
-
-	return usb_reset_configuration(serial->dev);
+	return usb_reset_configuration (serial->dev);
 }
 
-module_usb_serial_driver(serial_drivers, ipaq_id_table);
+static void ipaq_shutdown(struct usb_serial *serial)
+{
+	dbg("%s", __FUNCTION__);
+}
 
-MODULE_AUTHOR(DRIVER_AUTHOR);
-MODULE_DESCRIPTION(DRIVER_DESC);
+static int __init ipaq_init(void)
+{
+	int retval;
+	spin_lock_init(&write_list_lock);
+	retval = usb_serial_register(&ipaq_device);
+	if (retval) 
+		goto failed_usb_serial_register;
+	info(DRIVER_DESC " " DRIVER_VERSION);
+	if (vendor) {
+		ipaq_id_table[0].idVendor = vendor;
+		ipaq_id_table[0].idProduct = product;
+	}
+	retval = usb_register(&ipaq_driver);
+	if (retval)
+		goto failed_usb_register;
+		  
+	return 0;
+failed_usb_register:
+	usb_serial_deregister(&ipaq_device);
+failed_usb_serial_register:
+	return retval;
+}
+
+
+static void __exit ipaq_exit(void)
+{
+	usb_deregister(&ipaq_driver);
+	usb_serial_deregister(&ipaq_device);
+}
+
+
+module_init(ipaq_init);
+module_exit(ipaq_exit);
+
+MODULE_AUTHOR( DRIVER_AUTHOR );
+MODULE_DESCRIPTION( DRIVER_DESC );
 MODULE_LICENSE("GPL");
 
-module_param(connect_retries, int, 0644);
-MODULE_PARM_DESC(connect_retries,
-		"Maximum number of connect retries (one second each)");
+module_param(debug, bool, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(debug, "Debug enabled or not");
 
-module_param(initial_wait, int, 0644);
-MODULE_PARM_DESC(initial_wait,
-		"Time to wait before attempting a connection (in seconds)");
+module_param(vendor, ushort, 0);
+MODULE_PARM_DESC(vendor, "User specified USB idVendor");
+
+module_param(product, ushort, 0);
+MODULE_PARM_DESC(product, "User specified USB idProduct");

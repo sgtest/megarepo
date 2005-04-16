@@ -34,6 +34,8 @@
 #ifndef _LINUX_SUNRPC_GSS_ERR_H
 #define _LINUX_SUNRPC_GSS_ERR_H
 
+#ifdef __KERNEL__
+
 typedef unsigned int OM_uint32;
 
 /*
@@ -62,6 +64,16 @@ typedef unsigned int OM_uint32;
 #define GSS_C_GSS_CODE 1
 #define GSS_C_MECH_CODE 2
 
+
+/*
+ * Define the default Quality of Protection for per-message services.  Note
+ * that an implementation that offers multiple levels of QOP may either reserve
+ * a value (for example zero, as assumed here) to mean "default protection", or
+ * alternatively may simply equate GSS_C_QOP_DEFAULT to a specific explicit
+ * QOP value.  However a value of 0 should always be interpreted by a GSSAPI
+ * implementation as a request for the default protection level.
+ */
+#define GSS_C_QOP_DEFAULT 0
 
 /*
  * Expiration time of 2^32-1 seconds means infinite lifetime for a
@@ -161,4 +173,5 @@ typedef unsigned int OM_uint32;
 /* XXXX This is a necessary evil until the spec is fixed */
 #define GSS_S_CRED_UNAVAIL GSS_S_FAILURE
 
+#endif /* __KERNEL__ */
 #endif /* __LINUX_SUNRPC_GSS_ERR_H */

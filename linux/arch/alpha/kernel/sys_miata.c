@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  *	linux/arch/alpha/kernel/sys_miata.c
  *
@@ -18,10 +17,12 @@
 #include <linux/reboot.h>
 
 #include <asm/ptrace.h>
+#include <asm/system.h>
 #include <asm/dma.h>
 #include <asm/irq.h>
 #include <asm/mmu_context.h>
 #include <asm/io.h>
+#include <asm/pgtable.h>
 #include <asm/core_cia.h>
 #include <asm/tlbflush.h>
 
@@ -32,7 +33,7 @@
 
 
 static void 
-miata_srm_device_interrupt(unsigned long vector)
+miata_srm_device_interrupt(unsigned long vector, struct pt_regs * regs)
 {
 	int irq;
 
@@ -55,7 +56,7 @@ miata_srm_device_interrupt(unsigned long vector)
 	if (irq >= 16)
 		irq = irq + 8;
 
-	handle_irq(irq);
+	handle_irq(irq, regs);
 }
 
 static void __init
@@ -80,10 +81,8 @@ miata_init_irq(void)
 	init_pyxis_irqs(0x63b0000);
 
 	common_init_isa_dma();
-	if (request_irq(16 + 2, no_action, 0, "halt-switch", NULL))
-		pr_err("Failed to register halt-switch interrupt\n");
-	if (request_irq(16 + 6, no_action, 0, "timer-cascade", NULL))
-		pr_err("Failed to register timer-cascade interrupt\n");
+	setup_irq(16+2, &halt_switch_irqaction);	/* SRM only? */
+	setup_irq(16+6, &timer_cascade_irqaction);
 }
 
 
@@ -151,10 +150,10 @@ miata_init_irq(void)
  * comes in on.  This makes interrupt processing much easier.
  */
 
-static int
-miata_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
+static int __init
+miata_map_irq(struct pci_dev *dev, u8 slot, u8 pin)
 {
-        static char irq_tab[18][5] = {
+        static char irq_tab[18][5] __initdata = {
 		/*INT    INTA   INTB   INTC   INTD */
 		{16+ 8, 16+ 8, 16+ 8, 16+ 8, 16+ 8},  /* IdSel 14,  DC21142 */
 		{   -1,    -1,    -1,    -1,    -1},  /* IdSel 15,  EIDE    */
@@ -184,21 +183,17 @@ miata_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 
 	if((slot == 7) && (PCI_FUNC(dev->devfn) == 3)) {
 		u8 irq=0;
-		struct pci_dev *pdev = pci_get_slot(dev->bus, dev->devfn & ~7);
-		if(pdev == NULL || pci_read_config_byte(pdev, 0x40,&irq) != PCIBIOS_SUCCESSFUL) {
-			pci_dev_put(pdev);
+
+		if(pci_read_config_byte(pci_find_slot(dev->bus->number, dev->devfn & ~(7)), 0x40,&irq)!=PCIBIOS_SUCCESSFUL)
 			return -1;
-		}
-		else	{
-			pci_dev_put(pdev);
+		else	
 			return irq;
-		}
 	}
 
 	return COMMON_TABLE_LOOKUP;
 }
 
-static u8
+static u8 __init
 miata_swizzle(struct pci_dev *dev, u8 *pinp)
 {
 	int slot, pin = *pinp;
@@ -220,7 +215,7 @@ miata_swizzle(struct pci_dev *dev, u8 *pinp)
 				slot = PCI_SLOT(dev->devfn) + 9;
 				break;
 			}
-			pin = pci_swizzle_interrupt_pin(dev, pin);
+			pin = bridge_swizzle(pin, PCI_SLOT(dev->devfn));
 
 			/* Move up the chain of bridges.  */
 			dev = dev->bus->self;

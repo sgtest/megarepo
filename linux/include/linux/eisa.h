@@ -1,11 +1,10 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _LINUX_EISA_H
 #define _LINUX_EISA_H
 
 #include <linux/ioport.h>
 #include <linux/device.h>
-#include <linux/mod_devicetable.h>
 
+#define EISA_SIG_LEN   8
 #define EISA_MAX_SLOTS 8
 
 #define EISA_MAX_RESOURCES 4
@@ -28,6 +27,12 @@
 #define EISA_CONFIG_ENABLED         1
 #define EISA_CONFIG_FORCED          2
 
+/* The EISA signature, in ASCII form, null terminated */
+struct eisa_device_id {
+	char          sig[EISA_SIG_LEN];
+	unsigned long driver_data;
+};
+
 /* There is not much we can say about an EISA device, apart from
  * signature, slot number, and base address. dma_mask is set by
  * default to parent device mask..*/
@@ -41,7 +46,7 @@ struct eisa_device {
 	u64                   dma_mask;
 	struct device         dev; /* generic device */
 #ifdef CONFIG_EISA_NAMES
-	char		      pretty_name[50];
+	char		      pretty_name[DEVICE_NAME_SIZE];
 #endif
 };
 
@@ -62,29 +67,19 @@ struct eisa_driver {
 
 #define to_eisa_driver(drv) container_of(drv,struct eisa_driver, driver)
 
-/* These external functions are only available when EISA support is enabled. */
-#ifdef CONFIG_EISA
-
 extern struct bus_type eisa_bus_type;
 int eisa_driver_register (struct eisa_driver *edrv);
 void eisa_driver_unregister (struct eisa_driver *edrv);
 
-#else /* !CONFIG_EISA */
-
-static inline int eisa_driver_register (struct eisa_driver *edrv) { return 0; }
-static inline void eisa_driver_unregister (struct eisa_driver *edrv) { }
-
-#endif /* !CONFIG_EISA */
-
 /* Mimics pci.h... */
 static inline void *eisa_get_drvdata (struct eisa_device *edev)
 {
-        return dev_get_drvdata(&edev->dev);
+        return edev->dev.driver_data;
 }
 
 static inline void eisa_set_drvdata (struct eisa_device *edev, void *data)
 {
-        dev_set_drvdata(&edev->dev, data);
+        edev->dev.driver_data = data;
 }
 
 /* The EISA root device. There's rumours about machines with multiple

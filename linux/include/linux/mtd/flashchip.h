@@ -1,7 +1,13 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
-/*
- * Copyright © 2000      Red Hat UK Limited
- * Copyright © 2000-2010 David Woodhouse <dwmw2@infradead.org>
+
+/* 
+ * struct flchip definition
+ * 
+ * Contains information about the location and state of a given flash device 
+ *
+ * (C) 2000 Red Hat. GPLd.
+ *
+ * $Id: flashchip.h,v 1.15 2004/11/05 22:41:06 nico Exp $
+ *
  */
 
 #ifndef __MTD_FLASHCHIP_H__
@@ -9,12 +15,11 @@
 
 /* For spinlocks. sched.h includes spinlock.h from whichever directory it
  * happens to be in - so we don't have to care whether we're on 2.2, which
- * has asm/spinlock.h, or 2.4, which has linux/spinlock.h
+ * has asm/spinlock.h, or 2.4, which has linux/spinlock.h 
  */
 #include <linux/sched.h>
-#include <linux/mutex.h>
 
-typedef enum {
+typedef enum { 
 	FL_READY,
 	FL_STATUS,
 	FL_CFI_QUERY,
@@ -24,7 +29,6 @@ typedef enum {
 	FL_ERASE_SUSPENDED,
 	FL_WRITING,
 	FL_WRITING_TO_BUFFER,
-	FL_OTP_WRITE,
 	FL_WRITE_SUSPENDING,
 	FL_WRITE_SUSPENDED,
 	FL_PM_SUSPENDED,
@@ -35,22 +39,12 @@ typedef enum {
 	FL_POINT,
 	FL_XIP_WHILE_ERASING,
 	FL_XIP_WHILE_WRITING,
-	FL_SHUTDOWN,
-	/* These 2 come from nand_state_t, which has been unified here */
-	FL_READING,
-	FL_CACHEDPRG,
-	/* These 4 come from onenand_state_t, which has been unified here */
-	FL_RESETTING,
-	FL_OTPING,
-	FL_PREPARING_ERASE,
-	FL_VERIFYING_ERASE,
-
 	FL_UNKNOWN
 } flstate_t;
 
 
 
-/* NOTE: confusingly, this can be used to refer to more than one chip at a time,
+/* NOTE: confusingly, this can be used to refer to more than one chip at a time, 
    if they're interleaved.  This can even refer to individual partitions on
    the same physical chip when present. */
 
@@ -68,21 +62,17 @@ struct flchip {
 	flstate_t state;
 	flstate_t oldstate;
 
-	unsigned int write_suspended:1;
-	unsigned int erase_suspended:1;
+	int write_suspended:1;
+	int erase_suspended:1;
 	unsigned long in_progress_block_addr;
-	unsigned long in_progress_block_mask;
 
-	struct mutex mutex;
+	spinlock_t *mutex;
+	spinlock_t _spinlock; /* We do it like this because sometimes they'll be shared. */
 	wait_queue_head_t wq; /* Wait on here when we're waiting for the chip
 			     to be ready */
 	int word_write_time;
 	int buffer_write_time;
 	int erase_time;
-
-	int word_write_time_max;
-	int buffer_write_time_max;
-	int erase_time_max;
 
 	void *priv;
 };
@@ -90,7 +80,7 @@ struct flchip {
 /* This is used to handle contention on write/erase operations
    between partitions of the same physical chip. */
 struct flchip_shared {
-	struct mutex lock;
+	spinlock_t lock;
 	struct flchip *writing;
 	struct flchip *erasing;
 };

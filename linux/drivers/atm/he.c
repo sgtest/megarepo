@@ -1,3 +1,5 @@
+/* $Id: he.c,v 1.18 2003/05/06 22:57:15 chas Exp $ */
+
 /*
 
   he.c
@@ -53,7 +55,9 @@
 
  */
 
+#include <linux/config.h>
 #include <linux/module.h>
+#include <linux/version.h>
 #include <linux/kernel.h>
 #include <linux/skbuff.h>
 #include <linux/pci.h>
@@ -66,19 +70,22 @@
 #include <linux/sched.h>
 #include <linux/timer.h>
 #include <linux/interrupt.h>
-#include <linux/dma-mapping.h>
-#include <linux/bitmap.h>
-#include <linux/slab.h>
 #include <asm/io.h>
 #include <asm/byteorder.h>
-#include <linux/uaccess.h>
+#include <asm/uaccess.h>
 
 #include <linux/atmdev.h>
 #include <linux/atm.h>
 #include <linux/sonet.h>
 
+#define USE_TASKLET
 #undef USE_SCATTERGATHER
 #undef USE_CHECKSUM_HW			/* still confused about this */
+#define USE_RBPS
+#undef USE_RBPS_POOL			/* if memory is tight try this */
+#undef USE_RBPL_POOL			/* if memory is tight try this */
+#define USE_TPD_POOL
+/* #undef CONFIG_ATM_HE_USE_SUNI */
 /* #undef HE_DEBUG */
 
 #include "he.h"
@@ -93,13 +100,17 @@
 #define HPRINTK(fmt,args...)	do { } while (0)
 #endif /* HE_DEBUG */
 
+/* version definition */
+
+static char *version = "$Id: he.c,v 1.18 2003/05/06 22:57:15 chas Exp $";
+
 /* declarations */
 
 static int he_open(struct atm_vcc *vcc);
 static void he_close(struct atm_vcc *vcc);
 static int he_send(struct atm_vcc *vcc, struct sk_buff *skb);
 static int he_ioctl(struct atm_dev *dev, unsigned int cmd, void __user *arg);
-static irqreturn_t he_irq_handler(int irq, void *dev_id);
+static irqreturn_t he_irq_handler(int irq, void *dev_id, struct pt_regs *regs);
 static void he_tasklet(unsigned long data);
 static int he_proc_read(struct atm_dev *dev,loff_t *pos,char *page);
 static int he_start(struct atm_dev *dev);
@@ -112,12 +123,12 @@ static u8 read_prom_byte(struct he_dev *he_dev, int addr);
 /* globals */
 
 static struct he_dev *he_devs;
-static bool disable64;
+static int disable64;
 static short nvpibits = -1;
 static short nvcibits = -1;
 static short rx_skb_reserve = 16;
-static bool irq_coalesce = true;
-static bool sdh;
+static int irq_coalesce = 1;
+static int sdh = 0;
 
 /* Read from EEPROM = 0000 0011b */
 static unsigned int readtab[] = {
@@ -161,7 +172,7 @@ static unsigned int clocktab[] = {
 	CLK_LOW
 };     
 
-static const struct atmdev_ops he_ops =
+static struct atmdev_ops he_ops =
 {
 	.open =		he_open,
 	.close =	he_close,	
@@ -329,6 +340,7 @@ __find_vcc(struct he_dev *he_dev, unsigned cid)
 {
 	struct hlist_head *head;
 	struct atm_vcc *vcc;
+	struct hlist_node *node;
 	struct sock *s;
 	short vpi;
 	int vci;
@@ -337,7 +349,7 @@ __find_vcc(struct he_dev *he_dev, unsigned cid)
 	vci = cid & ((1 << he_dev->vcibits) - 1);
 	head = &vcc_hash[vci & (VCC_HTABLE_SIZE -1)];
 
-	sk_for_each(s, head) {
+	sk_for_each(s, node, head) {
 		vcc = atm_sk(s);
 		if (vcc->dev == he_dev->atm_dev &&
 		    vcc->vci == vci && vcc->vpi == vpi &&
@@ -348,44 +360,43 @@ __find_vcc(struct he_dev *he_dev, unsigned cid)
 	return NULL;
 }
 
-static int he_init_one(struct pci_dev *pci_dev,
-		       const struct pci_device_id *pci_ent)
+static int __devinit
+he_init_one(struct pci_dev *pci_dev, const struct pci_device_id *pci_ent)
 {
 	struct atm_dev *atm_dev = NULL;
 	struct he_dev *he_dev = NULL;
 	int err = 0;
 
-	printk(KERN_INFO "ATM he driver\n");
+	printk(KERN_INFO "he: %s\n", version);
 
 	if (pci_enable_device(pci_dev))
 		return -EIO;
-	if (dma_set_mask_and_coherent(&pci_dev->dev, DMA_BIT_MASK(32)) != 0) {
+	if (pci_set_dma_mask(pci_dev, HE_DMA_MASK) != 0) {
 		printk(KERN_WARNING "he: no suitable dma available\n");
 		err = -EIO;
 		goto init_one_failure;
 	}
 
-	atm_dev = atm_dev_register(DEV_LABEL, &pci_dev->dev, &he_ops, -1, NULL);
+	atm_dev = atm_dev_register(DEV_LABEL, &he_ops, -1, NULL);
 	if (!atm_dev) {
 		err = -ENODEV;
 		goto init_one_failure;
 	}
 	pci_set_drvdata(pci_dev, atm_dev);
 
-	he_dev = kzalloc(sizeof(struct he_dev),
+	he_dev = (struct he_dev *) kmalloc(sizeof(struct he_dev),
 							GFP_KERNEL);
 	if (!he_dev) {
 		err = -ENOMEM;
 		goto init_one_failure;
 	}
+	memset(he_dev, 0, sizeof(struct he_dev));
+
 	he_dev->pci_dev = pci_dev;
 	he_dev->atm_dev = atm_dev;
 	he_dev->atm_dev->dev_data = he_dev;
 	atm_dev->dev_data = he_dev;
 	he_dev->number = atm_dev->number;
-	tasklet_init(&he_dev->tasklet, he_tasklet, (unsigned long) he_dev);
-	spin_lock_init(&he_dev->global_lock);
-
 	if (he_start(atm_dev)) {
 		he_stop(he_dev);
 		err = -ENODEV;
@@ -400,12 +411,14 @@ static int he_init_one(struct pci_dev *pci_dev,
 init_one_failure:
 	if (atm_dev)
 		atm_dev_deregister(atm_dev);
-	kfree(he_dev);
+	if (he_dev)
+		kfree(he_dev);
 	pci_disable_device(pci_dev);
 	return err;
 }
 
-static void he_remove_one(struct pci_dev *pci_dev)
+static void __devexit
+he_remove_one (struct pci_dev *pci_dev)
 {
 	struct atm_dev *atm_dev;
 	struct he_dev *he_dev;
@@ -419,6 +432,7 @@ static void he_remove_one(struct pci_dev *pci_dev)
 	atm_dev_deregister(atm_dev);
 	kfree(he_dev);
 
+	pci_set_drvdata(pci_dev, NULL);
 	pci_disable_device(pci_dev);
 }
 
@@ -442,7 +456,8 @@ rate_to_atmf(unsigned rate)		/* cps to atm forum format */
 	return (NONZERO | (exp << 9) | (rate & 0x1ff));
 }
 
-static void he_init_rx_lbfp0(struct he_dev *he_dev)
+static void __init
+he_init_rx_lbfp0(struct he_dev *he_dev)
 {
 	unsigned i, lbm_offset, lbufd_index, lbuf_addr, lbuf_count;
 	unsigned lbufs_per_row = he_dev->cells_per_row / he_dev->cells_per_lbuf;
@@ -472,7 +487,8 @@ static void he_init_rx_lbfp0(struct he_dev *he_dev)
 	he_writel(he_dev, he_dev->r0_numbuffs, RLBF0_C);
 }
 
-static void he_init_rx_lbfp1(struct he_dev *he_dev)
+static void __init
+he_init_rx_lbfp1(struct he_dev *he_dev)
 {
 	unsigned i, lbm_offset, lbufd_index, lbuf_addr, lbuf_count;
 	unsigned lbufs_per_row = he_dev->cells_per_row / he_dev->cells_per_lbuf;
@@ -502,7 +518,8 @@ static void he_init_rx_lbfp1(struct he_dev *he_dev)
 	he_writel(he_dev, he_dev->r1_numbuffs, RLBF1_C);
 }
 
-static void he_init_tx_lbfp(struct he_dev *he_dev)
+static void __init
+he_init_tx_lbfp(struct he_dev *he_dev)
 {
 	unsigned i, lbm_offset, lbufd_index, lbuf_addr, lbuf_count;
 	unsigned lbufs_per_row = he_dev->cells_per_row / he_dev->cells_per_lbuf;
@@ -531,16 +548,17 @@ static void he_init_tx_lbfp(struct he_dev *he_dev)
 	he_writel(he_dev, lbufd_index - 1, TLBF_T);
 }
 
-static int he_init_tpdrq(struct he_dev *he_dev)
+static int __init
+he_init_tpdrq(struct he_dev *he_dev)
 {
-	he_dev->tpdrq_base = dma_alloc_coherent(&he_dev->pci_dev->dev,
-						CONFIG_TPDRQ_SIZE * sizeof(struct he_tpdrq),
-						&he_dev->tpdrq_phys,
-						GFP_KERNEL);
+	he_dev->tpdrq_base = pci_alloc_consistent(he_dev->pci_dev,
+		CONFIG_TPDRQ_SIZE * sizeof(struct he_tpdrq), &he_dev->tpdrq_phys);
 	if (he_dev->tpdrq_base == NULL) {
 		hprintk("failed to alloc tpdrq\n");
 		return -ENOMEM;
 	}
+	memset(he_dev->tpdrq_base, 0,
+				CONFIG_TPDRQ_SIZE * sizeof(struct he_tpdrq));
 
 	he_dev->tpdrq_tail = he_dev->tpdrq_base;
 	he_dev->tpdrq_head = he_dev->tpdrq_base;
@@ -552,7 +570,8 @@ static int he_init_tpdrq(struct he_dev *he_dev)
 	return 0;
 }
 
-static void he_init_cs_block(struct he_dev *he_dev)
+static void __init
+he_init_cs_block(struct he_dev *he_dev)
 {
 	unsigned clock, rate, delta;
 	int reg;
@@ -647,7 +666,8 @@ static void he_init_cs_block(struct he_dev *he_dev)
 
 }
 
-static int he_init_cs_block_rcm(struct he_dev *he_dev)
+static int __init
+he_init_cs_block_rcm(struct he_dev *he_dev)
 {
 	unsigned (*rategrid)[16][16];
 	unsigned rate, delta;
@@ -718,7 +738,7 @@ static int he_init_cs_block_rcm(struct he_dev *he_dev)
 			instead of '/ 512', use '>> 9' to prevent a call
 			to divdu3 on x86 platforms
 		*/
-		rate_cps = (unsigned long long) (1UL << exp) * (man + 512) >> 9;
+		rate_cps = (unsigned long long) (1 << exp) * (man + 512) >> 9;
 
 		if (rate_cps < 10)
 			rate_cps = 10;	/* 2.2.1 minimum payload rate is 10 cps */
@@ -739,13 +759,13 @@ static int he_init_cs_block_rcm(struct he_dev *he_dev)
 #else
 		/* this is pretty, but avoids _divdu3 and is mostly correct */
 		mult = he_dev->atm_dev->link_rate / ATM_OC3_PCR;
-		if (rate_cps > (272ULL * mult))
+		if (rate_cps > (272 * mult))
 			buf = 4;
-		else if (rate_cps > (204ULL * mult))
+		else if (rate_cps > (204 * mult))
 			buf = 3;
-		else if (rate_cps > (136ULL * mult))
+		else if (rate_cps > (136 * mult))
 			buf = 2;
-		else if (rate_cps > (68ULL * mult))
+		else if (rate_cps > (68 * mult))
 			buf = 1;
 		else
 			buf = 0;
@@ -767,72 +787,125 @@ static int he_init_cs_block_rcm(struct he_dev *he_dev)
 	return 0;
 }
 
-static int he_init_group(struct he_dev *he_dev, int group)
+static int __init
+he_init_group(struct he_dev *he_dev, int group)
 {
-	struct he_buff *heb, *next;
-	dma_addr_t mapping;
 	int i;
 
+#ifdef USE_RBPS
+	/* small buffer pool */
+#ifdef USE_RBPS_POOL
+	he_dev->rbps_pool = pci_pool_create("rbps", he_dev->pci_dev,
+			CONFIG_RBPS_BUFSIZE, 8, 0);
+	if (he_dev->rbps_pool == NULL) {
+		hprintk("unable to create rbps pages\n");
+		return -ENOMEM;
+	}
+#else /* !USE_RBPS_POOL */
+	he_dev->rbps_pages = pci_alloc_consistent(he_dev->pci_dev,
+		CONFIG_RBPS_SIZE * CONFIG_RBPS_BUFSIZE, &he_dev->rbps_pages_phys);
+	if (he_dev->rbps_pages == NULL) {
+		hprintk("unable to create rbps page pool\n");
+		return -ENOMEM;
+	}
+#endif /* USE_RBPS_POOL */
+
+	he_dev->rbps_base = pci_alloc_consistent(he_dev->pci_dev,
+		CONFIG_RBPS_SIZE * sizeof(struct he_rbp), &he_dev->rbps_phys);
+	if (he_dev->rbps_base == NULL) {
+		hprintk("failed to alloc rbps\n");
+		return -ENOMEM;
+	}
+	memset(he_dev->rbps_base, 0, CONFIG_RBPS_SIZE * sizeof(struct he_rbp));
+	he_dev->rbps_virt = kmalloc(CONFIG_RBPS_SIZE * sizeof(struct he_virt), GFP_KERNEL);
+
+	for (i = 0; i < CONFIG_RBPS_SIZE; ++i) {
+		dma_addr_t dma_handle;
+		void *cpuaddr;
+
+#ifdef USE_RBPS_POOL 
+		cpuaddr = pci_pool_alloc(he_dev->rbps_pool, SLAB_KERNEL|SLAB_DMA, &dma_handle);
+		if (cpuaddr == NULL)
+			return -ENOMEM;
+#else
+		cpuaddr = he_dev->rbps_pages + (i * CONFIG_RBPS_BUFSIZE);
+		dma_handle = he_dev->rbps_pages_phys + (i * CONFIG_RBPS_BUFSIZE);
+#endif
+
+		he_dev->rbps_virt[i].virt = cpuaddr;
+		he_dev->rbps_base[i].status = RBP_LOANED | RBP_SMALLBUF | (i << RBP_INDEX_OFF);
+		he_dev->rbps_base[i].phys = dma_handle;
+
+	}
+	he_dev->rbps_tail = &he_dev->rbps_base[CONFIG_RBPS_SIZE - 1];
+
+	he_writel(he_dev, he_dev->rbps_phys, G0_RBPS_S + (group * 32));
+	he_writel(he_dev, RBPS_MASK(he_dev->rbps_tail),
+						G0_RBPS_T + (group * 32));
+	he_writel(he_dev, CONFIG_RBPS_BUFSIZE/4,
+						G0_RBPS_BS + (group * 32));
+	he_writel(he_dev,
+			RBP_THRESH(CONFIG_RBPS_THRESH) |
+			RBP_QSIZE(CONFIG_RBPS_SIZE - 1) |
+			RBP_INT_ENB,
+						G0_RBPS_QI + (group * 32));
+#else /* !USE_RBPS */
 	he_writel(he_dev, 0x0, G0_RBPS_S + (group * 32));
 	he_writel(he_dev, 0x0, G0_RBPS_T + (group * 32));
 	he_writel(he_dev, 0x0, G0_RBPS_QI + (group * 32));
 	he_writel(he_dev, RBP_THRESH(0x1) | RBP_QSIZE(0x0),
-		  G0_RBPS_BS + (group * 32));
-
-	/* bitmap table */
-	he_dev->rbpl_table = bitmap_zalloc(RBPL_TABLE_SIZE, GFP_KERNEL);
-	if (!he_dev->rbpl_table) {
-		hprintk("unable to allocate rbpl bitmap table\n");
-		return -ENOMEM;
-	}
-
-	/* rbpl_virt 64-bit pointers */
-	he_dev->rbpl_virt = kmalloc_array(RBPL_TABLE_SIZE,
-					  sizeof(*he_dev->rbpl_virt),
-					  GFP_KERNEL);
-	if (!he_dev->rbpl_virt) {
-		hprintk("unable to allocate rbpl virt table\n");
-		goto out_free_rbpl_table;
-	}
+						G0_RBPS_BS + (group * 32));
+#endif /* USE_RBPS */
 
 	/* large buffer pool */
-	he_dev->rbpl_pool = dma_pool_create("rbpl", &he_dev->pci_dev->dev,
-					    CONFIG_RBPL_BUFSIZE, 64, 0);
+#ifdef USE_RBPL_POOL
+	he_dev->rbpl_pool = pci_pool_create("rbpl", he_dev->pci_dev,
+			CONFIG_RBPL_BUFSIZE, 8, 0);
 	if (he_dev->rbpl_pool == NULL) {
 		hprintk("unable to create rbpl pool\n");
-		goto out_free_rbpl_virt;
+		return -ENOMEM;
 	}
+#else /* !USE_RBPL_POOL */
+	he_dev->rbpl_pages = (void *) pci_alloc_consistent(he_dev->pci_dev,
+		CONFIG_RBPL_SIZE * CONFIG_RBPL_BUFSIZE, &he_dev->rbpl_pages_phys);
+	if (he_dev->rbpl_pages == NULL) {
+		hprintk("unable to create rbpl pages\n");
+		return -ENOMEM;
+	}
+#endif /* USE_RBPL_POOL */
 
-	he_dev->rbpl_base = dma_alloc_coherent(&he_dev->pci_dev->dev,
-					       CONFIG_RBPL_SIZE * sizeof(struct he_rbp),
-					       &he_dev->rbpl_phys, GFP_KERNEL);
+	he_dev->rbpl_base = pci_alloc_consistent(he_dev->pci_dev,
+		CONFIG_RBPL_SIZE * sizeof(struct he_rbp), &he_dev->rbpl_phys);
 	if (he_dev->rbpl_base == NULL) {
-		hprintk("failed to alloc rbpl_base\n");
-		goto out_destroy_rbpl_pool;
+		hprintk("failed to alloc rbpl\n");
+		return -ENOMEM;
 	}
-
-	INIT_LIST_HEAD(&he_dev->rbpl_outstanding);
+	memset(he_dev->rbpl_base, 0, CONFIG_RBPL_SIZE * sizeof(struct he_rbp));
+	he_dev->rbpl_virt = kmalloc(CONFIG_RBPL_SIZE * sizeof(struct he_virt), GFP_KERNEL);
 
 	for (i = 0; i < CONFIG_RBPL_SIZE; ++i) {
+		dma_addr_t dma_handle;
+		void *cpuaddr;
 
-		heb = dma_pool_alloc(he_dev->rbpl_pool, GFP_KERNEL, &mapping);
-		if (!heb)
-			goto out_free_rbpl;
-		heb->mapping = mapping;
-		list_add(&heb->entry, &he_dev->rbpl_outstanding);
+#ifdef USE_RBPL_POOL
+		cpuaddr = pci_pool_alloc(he_dev->rbpl_pool, SLAB_KERNEL|SLAB_DMA, &dma_handle);
+		if (cpuaddr == NULL)
+			return -ENOMEM;
+#else
+		cpuaddr = he_dev->rbpl_pages + (i * CONFIG_RBPL_BUFSIZE);
+		dma_handle = he_dev->rbpl_pages_phys + (i * CONFIG_RBPL_BUFSIZE);
+#endif
 
-		set_bit(i, he_dev->rbpl_table);
-		he_dev->rbpl_virt[i] = heb;
-		he_dev->rbpl_hint = i + 1;
-		he_dev->rbpl_base[i].idx =  i << RBP_IDX_OFFSET;
-		he_dev->rbpl_base[i].phys = mapping + offsetof(struct he_buff, data);
+		he_dev->rbpl_virt[i].virt = cpuaddr;
+		he_dev->rbpl_base[i].status = RBP_LOANED | (i << RBP_INDEX_OFF);
+		he_dev->rbpl_base[i].phys = dma_handle;
 	}
 	he_dev->rbpl_tail = &he_dev->rbpl_base[CONFIG_RBPL_SIZE - 1];
 
 	he_writel(he_dev, he_dev->rbpl_phys, G0_RBPL_S + (group * 32));
 	he_writel(he_dev, RBPL_MASK(he_dev->rbpl_tail),
 						G0_RBPL_T + (group * 32));
-	he_writel(he_dev, (CONFIG_RBPL_BUFSIZE - sizeof(struct he_buff))/4,
+	he_writel(he_dev, CONFIG_RBPL_BUFSIZE/4,
 						G0_RBPL_BS + (group * 32));
 	he_writel(he_dev,
 			RBP_THRESH(CONFIG_RBPL_THRESH) |
@@ -842,13 +915,13 @@ static int he_init_group(struct he_dev *he_dev, int group)
 
 	/* rx buffer ready queue */
 
-	he_dev->rbrq_base = dma_alloc_coherent(&he_dev->pci_dev->dev,
-					       CONFIG_RBRQ_SIZE * sizeof(struct he_rbrq),
-					       &he_dev->rbrq_phys, GFP_KERNEL);
+	he_dev->rbrq_base = pci_alloc_consistent(he_dev->pci_dev,
+		CONFIG_RBRQ_SIZE * sizeof(struct he_rbrq), &he_dev->rbrq_phys);
 	if (he_dev->rbrq_base == NULL) {
 		hprintk("failed to allocate rbrq\n");
-		goto out_free_rbpl;
+		return -ENOMEM;
 	}
+	memset(he_dev->rbrq_base, 0, CONFIG_RBRQ_SIZE * sizeof(struct he_rbrq));
 
 	he_dev->rbrq_head = he_dev->rbrq_base;
 	he_writel(he_dev, he_dev->rbrq_phys, G0_RBRQ_ST + (group * 16));
@@ -866,13 +939,13 @@ static int he_init_group(struct he_dev *he_dev, int group)
 
 	/* tx buffer ready queue */
 
-	he_dev->tbrq_base = dma_alloc_coherent(&he_dev->pci_dev->dev,
-					       CONFIG_TBRQ_SIZE * sizeof(struct he_tbrq),
-					       &he_dev->tbrq_phys, GFP_KERNEL);
+	he_dev->tbrq_base = pci_alloc_consistent(he_dev->pci_dev,
+		CONFIG_TBRQ_SIZE * sizeof(struct he_tbrq), &he_dev->tbrq_phys);
 	if (he_dev->tbrq_base == NULL) {
 		hprintk("failed to allocate tbrq\n");
-		goto out_free_rbpq_base;
+		return -ENOMEM;
 	}
+	memset(he_dev->tbrq_base, 0, CONFIG_TBRQ_SIZE * sizeof(struct he_tbrq));
 
 	he_dev->tbrq_head = he_dev->tbrq_base;
 
@@ -882,38 +955,18 @@ static int he_init_group(struct he_dev *he_dev, int group)
 	he_writel(he_dev, CONFIG_TBRQ_THRESH, G0_TBRQ_THRESH + (group * 16));
 
 	return 0;
-
-out_free_rbpq_base:
-	dma_free_coherent(&he_dev->pci_dev->dev, CONFIG_RBRQ_SIZE *
-			  sizeof(struct he_rbrq), he_dev->rbrq_base,
-			  he_dev->rbrq_phys);
-out_free_rbpl:
-	list_for_each_entry_safe(heb, next, &he_dev->rbpl_outstanding, entry)
-		dma_pool_free(he_dev->rbpl_pool, heb, heb->mapping);
-
-	dma_free_coherent(&he_dev->pci_dev->dev, CONFIG_RBPL_SIZE *
-			  sizeof(struct he_rbp), he_dev->rbpl_base,
-			  he_dev->rbpl_phys);
-out_destroy_rbpl_pool:
-	dma_pool_destroy(he_dev->rbpl_pool);
-out_free_rbpl_virt:
-	kfree(he_dev->rbpl_virt);
-out_free_rbpl_table:
-	bitmap_free(he_dev->rbpl_table);
-
-	return -ENOMEM;
 }
 
-static int he_init_irq(struct he_dev *he_dev)
+static int __init
+he_init_irq(struct he_dev *he_dev)
 {
 	int i;
 
 	/* 2.9.3.5  tail offset for each interrupt queue is located after the
 		    end of the interrupt queue */
 
-	he_dev->irq_base = dma_alloc_coherent(&he_dev->pci_dev->dev,
-					      (CONFIG_IRQ_SIZE + 1) * sizeof(struct he_irq),
-					      &he_dev->irq_phys, GFP_KERNEL);
+	he_dev->irq_base = pci_alloc_consistent(he_dev->pci_dev,
+			(CONFIG_IRQ_SIZE+1) * sizeof(struct he_irq), &he_dev->irq_phys);
 	if (he_dev->irq_base == NULL) {
 		hprintk("failed to allocate irq\n");
 		return -ENOMEM;
@@ -956,8 +1009,7 @@ static int he_init_irq(struct he_dev *he_dev)
 	he_writel(he_dev, 0x0, GRP_54_MAP);
 	he_writel(he_dev, 0x0, GRP_76_MAP);
 
-	if (request_irq(he_dev->pci_dev->irq,
-			he_irq_handler, IRQF_SHARED, DEV_LABEL, he_dev)) {
+	if (request_irq(he_dev->pci_dev->irq, he_irq_handler, SA_INTERRUPT|SA_SHIRQ, DEV_LABEL, he_dev)) {
 		hprintk("irq %d already in use\n", he_dev->pci_dev->irq);
 		return -EINVAL;
 	}   
@@ -967,7 +1019,8 @@ static int he_init_irq(struct he_dev *he_dev)
 	return 0;
 }
 
-static int he_start(struct atm_dev *dev)
+static int __init
+he_start(struct atm_dev *dev)
 {
 	struct he_dev *he_dev;
 	struct pci_dev *pci_dev;
@@ -1054,7 +1107,7 @@ static int he_start(struct atm_dev *dev)
 	he_writel(he_dev, 0x0, RESET_CNTL);
 	he_writel(he_dev, 0xff, RESET_CNTL);
 
-	msleep(16);	/* 16 ms */
+	udelay(16*1000);	/* 16 ms */
 	status = he_readl(he_dev, RESET_CNTL);
 	if ((status & BOARD_RST_STATUS) == 0) {
 		hprintk("reset failed\n");
@@ -1087,8 +1140,15 @@ static int he_start(struct atm_dev *dev)
 	for (i = 0; i < 6; ++i)
 		dev->esi[i] = read_prom_byte(he_dev, MAC_ADDR + i);
 
-	hprintk("%s%s, %pM\n", he_dev->prod_id,
-		he_dev->media & 0x40 ? "SM" : "MM", dev->esi);
+	hprintk("%s%s, %x:%x:%x:%x:%x:%x\n",
+				he_dev->prod_id,
+					he_dev->media & 0x40 ? "SM" : "MM",
+						dev->esi[0],
+						dev->esi[1],
+						dev->esi[2],
+						dev->esi[3],
+						dev->esi[4],
+						dev->esi[5]);
 	he_dev->atm_dev->link_rate = he_is622(he_dev) ?
 						ATM_OC12_PCR : ATM_OC3_PCR;
 
@@ -1116,6 +1176,11 @@ static int he_start(struct atm_dev *dev)
 	/* 4.10 initialize the interrupt queues */
 	if ((err = he_init_irq(he_dev)) != 0)
 		return err;
+
+#ifdef USE_TASKLET
+	tasklet_init(&he_dev->tasklet, he_tasklet, (unsigned long) he_dev);
+#endif
+	spin_lock_init(&he_dev->global_lock);
 
 	/* 4.11 enable pci bus controller state machines */
 	host_cntl |= (OUTFF_ENB | CMDFF_ENB |
@@ -1420,14 +1485,29 @@ static int he_start(struct atm_dev *dev)
 
 	he_init_tpdrq(he_dev);
 
-	he_dev->tpd_pool = dma_pool_create("tpd", &he_dev->pci_dev->dev,
-					   sizeof(struct he_tpd), TPD_ALIGNMENT, 0);
+#ifdef USE_TPD_POOL
+	he_dev->tpd_pool = pci_pool_create("tpd", he_dev->pci_dev,
+		sizeof(struct he_tpd), TPD_ALIGNMENT, 0);
 	if (he_dev->tpd_pool == NULL) {
-		hprintk("unable to create tpd dma_pool\n");
+		hprintk("unable to create tpd pci_pool\n");
 		return -ENOMEM;         
 	}
 
 	INIT_LIST_HEAD(&he_dev->outstanding_tpds);
+#else
+	he_dev->tpd_base = (void *) pci_alloc_consistent(he_dev->pci_dev,
+			CONFIG_NUMTPDS * sizeof(struct he_tpd), &he_dev->tpd_base_phys);
+	if (!he_dev->tpd_base)
+		return -ENOMEM;
+
+	for (i = 0; i < CONFIG_NUMTPDS; ++i) {
+		he_dev->tpd_base[i].status = (i << TPD_ADDR_SHIFT);
+		he_dev->tpd_base[i].inuse = 0;
+	}
+		
+	he_dev->tpd_head = he_dev->tpd_base;
+	he_dev->tpd_end = &he_dev->tpd_base[CONFIG_NUMTPDS - 1];
+#endif
 
 	if (he_init_group(he_dev, 0) != 0)
 		return -ENOMEM;
@@ -1460,20 +1540,19 @@ static int he_start(struct atm_dev *dev)
 
 	/* host status page */
 
-	he_dev->hsp = dma_alloc_coherent(&he_dev->pci_dev->dev,
-					 sizeof(struct he_hsp),
-					 &he_dev->hsp_phys, GFP_KERNEL);
+	he_dev->hsp = pci_alloc_consistent(he_dev->pci_dev,
+				sizeof(struct he_hsp), &he_dev->hsp_phys);
 	if (he_dev->hsp == NULL) {
 		hprintk("failed to allocate host status page\n");
 		return -ENOMEM;
 	}
+	memset(he_dev->hsp, 0, sizeof(struct he_hsp));
 	he_writel(he_dev, he_dev->hsp_phys, HSP_BA);
 
 	/* initialize framer */
 
 #ifdef CONFIG_ATM_HE_USE_SUNI
-	if (he_isMM(he_dev))
-		suni_init(he_dev->atm_dev);
+	suni_init(he_dev->atm_dev);
 	if (he_dev->atm_dev->phy && he_dev->atm_dev->phy->start)
 		he_dev->atm_dev->phy->start(he_dev->atm_dev);
 #endif /* CONFIG_ATM_HE_USE_SUNI */
@@ -1485,7 +1564,6 @@ static int he_start(struct atm_dev *dev)
 		val = he_phy_get(he_dev->atm_dev, SUNI_TPOP_APM);
 		val = (val & ~SUNI_TPOP_APM_S) | (SUNI_TPOP_S_SDH << SUNI_TPOP_APM_S_SHIFT);
 		he_phy_put(he_dev->atm_dev, val, SUNI_TPOP_APM);
-		he_phy_put(he_dev->atm_dev, SUNI_TACP_IUCHP_CLP, SUNI_TACP_IUCHP);
 	}
 
 	/* 5.1.12 enable transmit and receive */
@@ -1523,10 +1601,9 @@ static int he_start(struct atm_dev *dev)
 static void
 he_stop(struct he_dev *he_dev)
 {
-	struct he_buff *heb, *next;
-	struct pci_dev *pci_dev;
-	u32 gen_cntl_0, reg;
 	u16 command;
+	u32 gen_cntl_0, reg;
+	struct pci_dev *pci_dev;
 
 	pci_dev = he_dev->pci_dev;
 
@@ -1537,7 +1614,9 @@ he_stop(struct he_dev *he_dev)
 		gen_cntl_0 &= ~(INT_PROC_ENBL | INIT_ENB);
 		pci_write_config_dword(pci_dev, GEN_CNTL_0, gen_cntl_0);
 
+#ifdef USE_TASKLET
 		tasklet_disable(&he_dev->tasklet);
+#endif
 
 		/* disable recv and transmit */
 
@@ -1559,38 +1638,78 @@ he_stop(struct he_dev *he_dev)
 		free_irq(he_dev->irq, he_dev);
 
 	if (he_dev->irq_base)
-		dma_free_coherent(&he_dev->pci_dev->dev, (CONFIG_IRQ_SIZE + 1)
-				  * sizeof(struct he_irq), he_dev->irq_base, he_dev->irq_phys);
+		pci_free_consistent(he_dev->pci_dev, (CONFIG_IRQ_SIZE+1)
+			* sizeof(struct he_irq), he_dev->irq_base, he_dev->irq_phys);
 
 	if (he_dev->hsp)
-		dma_free_coherent(&he_dev->pci_dev->dev, sizeof(struct he_hsp),
-				  he_dev->hsp, he_dev->hsp_phys);
+		pci_free_consistent(he_dev->pci_dev, sizeof(struct he_hsp),
+						he_dev->hsp, he_dev->hsp_phys);
 
 	if (he_dev->rbpl_base) {
-		list_for_each_entry_safe(heb, next, &he_dev->rbpl_outstanding, entry)
-			dma_pool_free(he_dev->rbpl_pool, heb, heb->mapping);
+#ifdef USE_RBPL_POOL
+		for (i = 0; i < CONFIG_RBPL_SIZE; ++i) {
+			void *cpuaddr = he_dev->rbpl_virt[i].virt;
+			dma_addr_t dma_handle = he_dev->rbpl_base[i].phys;
 
-		dma_free_coherent(&he_dev->pci_dev->dev, CONFIG_RBPL_SIZE
-				  * sizeof(struct he_rbp), he_dev->rbpl_base, he_dev->rbpl_phys);
+			pci_pool_free(he_dev->rbpl_pool, cpuaddr, dma_handle);
+		}
+#else
+		pci_free_consistent(he_dev->pci_dev, CONFIG_RBPL_SIZE
+			* CONFIG_RBPL_BUFSIZE, he_dev->rbpl_pages, he_dev->rbpl_pages_phys);
+#endif
+		pci_free_consistent(he_dev->pci_dev, CONFIG_RBPL_SIZE
+			* sizeof(struct he_rbp), he_dev->rbpl_base, he_dev->rbpl_phys);
 	}
 
-	kfree(he_dev->rbpl_virt);
-	bitmap_free(he_dev->rbpl_table);
-	dma_pool_destroy(he_dev->rbpl_pool);
+#ifdef USE_RBPL_POOL
+	if (he_dev->rbpl_pool)
+		pci_pool_destroy(he_dev->rbpl_pool);
+#endif
+
+#ifdef USE_RBPS
+	if (he_dev->rbps_base) {
+#ifdef USE_RBPS_POOL
+		for (i = 0; i < CONFIG_RBPS_SIZE; ++i) {
+			void *cpuaddr = he_dev->rbps_virt[i].virt;
+			dma_addr_t dma_handle = he_dev->rbps_base[i].phys;
+
+			pci_pool_free(he_dev->rbps_pool, cpuaddr, dma_handle);
+		}
+#else
+		pci_free_consistent(he_dev->pci_dev, CONFIG_RBPS_SIZE
+			* CONFIG_RBPS_BUFSIZE, he_dev->rbps_pages, he_dev->rbps_pages_phys);
+#endif
+		pci_free_consistent(he_dev->pci_dev, CONFIG_RBPS_SIZE
+			* sizeof(struct he_rbp), he_dev->rbps_base, he_dev->rbps_phys);
+	}
+
+#ifdef USE_RBPS_POOL
+	if (he_dev->rbps_pool)
+		pci_pool_destroy(he_dev->rbps_pool);
+#endif
+
+#endif /* USE_RBPS */
 
 	if (he_dev->rbrq_base)
-		dma_free_coherent(&he_dev->pci_dev->dev, CONFIG_RBRQ_SIZE * sizeof(struct he_rbrq),
-				  he_dev->rbrq_base, he_dev->rbrq_phys);
+		pci_free_consistent(he_dev->pci_dev, CONFIG_RBRQ_SIZE * sizeof(struct he_rbrq),
+							he_dev->rbrq_base, he_dev->rbrq_phys);
 
 	if (he_dev->tbrq_base)
-		dma_free_coherent(&he_dev->pci_dev->dev, CONFIG_TBRQ_SIZE * sizeof(struct he_tbrq),
-				  he_dev->tbrq_base, he_dev->tbrq_phys);
+		pci_free_consistent(he_dev->pci_dev, CONFIG_TBRQ_SIZE * sizeof(struct he_tbrq),
+							he_dev->tbrq_base, he_dev->tbrq_phys);
 
 	if (he_dev->tpdrq_base)
-		dma_free_coherent(&he_dev->pci_dev->dev, CONFIG_TBRQ_SIZE * sizeof(struct he_tbrq),
-				  he_dev->tpdrq_base, he_dev->tpdrq_phys);
+		pci_free_consistent(he_dev->pci_dev, CONFIG_TBRQ_SIZE * sizeof(struct he_tbrq),
+							he_dev->tpdrq_base, he_dev->tpdrq_phys);
 
-	dma_pool_destroy(he_dev->tpd_pool);
+#ifdef USE_TPD_POOL
+	if (he_dev->tpd_pool)
+		pci_pool_destroy(he_dev->tpd_pool);
+#else
+	if (he_dev->tpd_base)
+		pci_free_consistent(he_dev->pci_dev, CONFIG_NUMTPDS * sizeof(struct he_tpd),
+							he_dev->tpd_base, he_dev->tpd_base_phys);
+#endif
 
 	if (he_dev->pci_dev) {
 		pci_read_config_word(he_dev->pci_dev, PCI_COMMAND, &command);
@@ -1605,20 +1724,42 @@ he_stop(struct he_dev *he_dev)
 static struct he_tpd *
 __alloc_tpd(struct he_dev *he_dev)
 {
+#ifdef USE_TPD_POOL
 	struct he_tpd *tpd;
-	dma_addr_t mapping;
+	dma_addr_t dma_handle; 
 
-	tpd = dma_pool_alloc(he_dev->tpd_pool, GFP_ATOMIC, &mapping);
+	tpd = pci_pool_alloc(he_dev->tpd_pool, SLAB_ATOMIC|SLAB_DMA, &dma_handle);              
 	if (tpd == NULL)
 		return NULL;
 			
-	tpd->status = TPD_ADDR(mapping);
+	tpd->status = TPD_ADDR(dma_handle);
 	tpd->reserved = 0; 
 	tpd->iovec[0].addr = 0; tpd->iovec[0].len = 0;
 	tpd->iovec[1].addr = 0; tpd->iovec[1].len = 0;
 	tpd->iovec[2].addr = 0; tpd->iovec[2].len = 0;
 
 	return tpd;
+#else
+	int i;
+
+	for (i = 0; i < CONFIG_NUMTPDS; ++i) {
+		++he_dev->tpd_head;
+		if (he_dev->tpd_head > he_dev->tpd_end) {
+			he_dev->tpd_head = he_dev->tpd_base;
+		}
+
+		if (!he_dev->tpd_head->inuse) {
+			he_dev->tpd_head->inuse = 1;
+			he_dev->tpd_head->status &= TPD_MASK;
+			he_dev->tpd_head->iovec[0].addr = 0; he_dev->tpd_head->iovec[0].len = 0;
+			he_dev->tpd_head->iovec[1].addr = 0; he_dev->tpd_head->iovec[1].len = 0;
+			he_dev->tpd_head->iovec[2].addr = 0; he_dev->tpd_head->iovec[2].len = 0;
+			return he_dev->tpd_head;
+		}
+	}
+	hprintk("out of tpds -- increase CONFIG_NUMTPDS (%d)\n", CONFIG_NUMTPDS);
+	return NULL;
+#endif
 }
 
 #define AAL5_LEN(buf,len) 						\
@@ -1641,12 +1782,13 @@ he_service_rbrq(struct he_dev *he_dev, int group)
 	struct he_rbrq *rbrq_tail = (struct he_rbrq *)
 				((unsigned long)he_dev->rbrq_base |
 					he_dev->hsp->group[group].rbrq_tail);
+	struct he_rbp *rbp = NULL;
 	unsigned cid, lastcid = -1;
+	unsigned buf_len = 0;
 	struct sk_buff *skb;
 	struct atm_vcc *vcc = NULL;
 	struct he_vcc *he_vcc;
-	struct he_buff *heb, *next;
-	int i;
+	struct he_iovec *iov;
 	int pdus_assembled = 0;
 	int updated = 0;
 
@@ -1666,35 +1808,46 @@ he_service_rbrq(struct he_dev *he_dev, int group)
 			RBRQ_CON_CLOSED(he_dev->rbrq_head) ? " CON_CLOSED" : "",
 			RBRQ_HBUF_ERR(he_dev->rbrq_head) ? " HBUF_ERR" : "");
 
-		i = RBRQ_ADDR(he_dev->rbrq_head) >> RBP_IDX_OFFSET;
-		heb = he_dev->rbpl_virt[i];
-
+#ifdef USE_RBPS
+		if (RBRQ_ADDR(he_dev->rbrq_head) & RBP_SMALLBUF)
+			rbp = &he_dev->rbps_base[RBP_INDEX(RBRQ_ADDR(he_dev->rbrq_head))];
+		else
+#endif
+			rbp = &he_dev->rbpl_base[RBP_INDEX(RBRQ_ADDR(he_dev->rbrq_head))];
+		
+		buf_len = RBRQ_BUFLEN(he_dev->rbrq_head) * 4;
 		cid = RBRQ_CID(he_dev->rbrq_head);
+
 		if (cid != lastcid)
 			vcc = __find_vcc(he_dev, cid);
 		lastcid = cid;
 
-		if (vcc == NULL || (he_vcc = HE_VCC(vcc)) == NULL) {
-			hprintk("vcc/he_vcc == NULL  (cid 0x%x)\n", cid);
-			if (!RBRQ_HBUF_ERR(he_dev->rbrq_head)) {
-				clear_bit(i, he_dev->rbpl_table);
-				list_del(&heb->entry);
-				dma_pool_free(he_dev->rbpl_pool, heb, heb->mapping);
-			}
+		if (vcc == NULL) {
+			hprintk("vcc == NULL  (cid 0x%x)\n", cid);
+			if (!RBRQ_HBUF_ERR(he_dev->rbrq_head))
+					rbp->status &= ~RBP_LOANED;
 					
+			goto next_rbrq_entry;
+		}
+
+		he_vcc = HE_VCC(vcc);
+		if (he_vcc == NULL) {
+			hprintk("he_vcc == NULL  (cid 0x%x)\n", cid);
+			if (!RBRQ_HBUF_ERR(he_dev->rbrq_head))
+					rbp->status &= ~RBP_LOANED;
 			goto next_rbrq_entry;
 		}
 
 		if (RBRQ_HBUF_ERR(he_dev->rbrq_head)) {
 			hprintk("HBUF_ERR!  (cid 0x%x)\n", cid);
-			atomic_inc(&vcc->stats->rx_drop);
+				atomic_inc(&vcc->stats->rx_drop);
 			goto return_host_buffers;
 		}
 
-		heb->len = RBRQ_BUFLEN(he_dev->rbrq_head) * 4;
-		clear_bit(i, he_dev->rbpl_table);
-		list_move_tail(&heb->entry, &he_vcc->buffers);
-		he_vcc->pdu_len += heb->len;
+		he_vcc->iov_tail->iov_base = RBRQ_ADDR(he_dev->rbrq_head);
+		he_vcc->iov_tail->iov_len = buf_len;
+		he_vcc->pdu_len += buf_len;
+		++he_vcc->iov_tail;
 
 		if (RBRQ_CON_CLOSED(he_dev->rbrq_head)) {
 			lastcid = -1;
@@ -1703,6 +1856,12 @@ he_service_rbrq(struct he_dev *he_dev, int group)
 			goto return_host_buffers;
 		}
 
+#ifdef notdef
+		if ((he_vcc->iov_tail - he_vcc->iov_head) > HE_MAXIOV) {
+			hprintk("iovec full!  cid 0x%x\n", cid);
+			goto return_host_buffers;
+		}
+#endif
 		if (!RBRQ_END_PDU(he_dev->rbrq_head))
 			goto next_rbrq_entry;
 
@@ -1728,25 +1887,34 @@ he_service_rbrq(struct he_dev *he_dev, int group)
 		if (rx_skb_reserve > 0)
 			skb_reserve(skb, rx_skb_reserve);
 
-		__net_timestamp(skb);
+		do_gettimeofday(&skb->stamp);
 
-		list_for_each_entry(heb, &he_vcc->buffers, entry)
-			skb_put_data(skb, &heb->data, heb->len);
+		for (iov = he_vcc->iov_head;
+				iov < he_vcc->iov_tail; ++iov) {
+#ifdef USE_RBPS
+			if (iov->iov_base & RBP_SMALLBUF)
+				memcpy(skb_put(skb, iov->iov_len),
+					he_dev->rbps_virt[RBP_INDEX(iov->iov_base)].virt, iov->iov_len);
+			else
+#endif
+				memcpy(skb_put(skb, iov->iov_len),
+					he_dev->rbpl_virt[RBP_INDEX(iov->iov_base)].virt, iov->iov_len);
+		}
 
 		switch (vcc->qos.aal) {
 			case ATM_AAL0:
 				/* 2.10.1.5 raw cell receive */
 				skb->len = ATM_AAL0_SDU;
-				skb_set_tail_pointer(skb, skb->len);
+				skb->tail = skb->data + skb->len;
 				break;
 			case ATM_AAL5:
 				/* 2.10.1.2 aal5 receive */
 
 				skb->len = AAL5_LEN(skb->data, he_vcc->pdu_len);
-				skb_set_tail_pointer(skb, skb->len);
+				skb->tail = skb->data + skb->len;
 #ifdef USE_CHECKSUM_HW
 				if (vcc->vpi == 0 && vcc->vci >= ATM_NOT_RSV_VCI) {
-					skb->ip_summed = CHECKSUM_COMPLETE;
+					skb->ip_summed = CHECKSUM_HW;
 					skb->csum = TCP_CKSUM(skb->data,
 							he_vcc->pdu_len);
 				}
@@ -1762,24 +1930,32 @@ he_service_rbrq(struct he_dev *he_dev, int group)
 #ifdef notdef
 		ATM_SKB(skb)->vcc = vcc;
 #endif
-		spin_unlock(&he_dev->global_lock);
 		vcc->push(vcc, skb);
-		spin_lock(&he_dev->global_lock);
 
 		atomic_inc(&vcc->stats->rx);
 
 return_host_buffers:
 		++pdus_assembled;
 
-		list_for_each_entry_safe(heb, next, &he_vcc->buffers, entry)
-			dma_pool_free(he_dev->rbpl_pool, heb, heb->mapping);
-		INIT_LIST_HEAD(&he_vcc->buffers);
+		for (iov = he_vcc->iov_head;
+				iov < he_vcc->iov_tail; ++iov) {
+#ifdef USE_RBPS
+			if (iov->iov_base & RBP_SMALLBUF)
+				rbp = &he_dev->rbps_base[RBP_INDEX(iov->iov_base)];
+			else
+#endif
+				rbp = &he_dev->rbpl_base[RBP_INDEX(iov->iov_base)];
+
+			rbp->status &= ~RBP_LOANED;
+		}
+
+		he_vcc->iov_tail = he_vcc->iov_head;
 		he_vcc->pdu_len = 0;
 
 next_rbrq_entry:
 		he_dev->rbrq_head = (struct he_rbrq *)
 				((unsigned long) he_dev->rbrq_base |
-					RBRQ_MASK(he_dev->rbrq_head + 1));
+					RBRQ_MASK(++he_dev->rbrq_head));
 
 	}
 	read_unlock(&vcc_sklist_lock);
@@ -1803,7 +1979,9 @@ he_service_tbrq(struct he_dev *he_dev, int group)
 					he_dev->hsp->group[group].tbrq_tail);
 	struct he_tpd *tpd;
 	int slot, updated = 0;
+#ifdef USE_TPD_POOL
 	struct he_tpd *__tpd;
+#endif
 
 	/* 2.1.6 transmit buffer return queue */
 
@@ -1815,6 +1993,7 @@ he_service_tbrq(struct he_dev *he_dev, int group)
 			TBRQ_TPD(he_dev->tbrq_head), 
 			TBRQ_EOS(he_dev->tbrq_head) ? " EOS" : "",
 			TBRQ_MULTIPLE(he_dev->tbrq_head) ? " MULTIPLE" : "");
+#ifdef USE_TPD_POOL
 		tpd = NULL;
 		list_for_each_entry(__tpd, &he_dev->outstanding_tpds, entry) {
 			if (TPD_ADDR(__tpd->status) == TBRQ_TPD(he_dev->tbrq_head)) {
@@ -1829,6 +2008,9 @@ he_service_tbrq(struct he_dev *he_dev, int group)
 						TBRQ_TPD(he_dev->tbrq_head));
 			goto next_tbrq_entry;
 		}
+#else
+		tpd = &he_dev->tpd_base[ TPD_INDEX(TBRQ_TPD(he_dev->tbrq_head)) ];
+#endif
 
 		if (TBRQ_EOS(he_dev->tbrq_head)) {
 			HPRINTK("wake_up(tx_waitq) cid 0x%x\n",
@@ -1841,10 +2023,10 @@ he_service_tbrq(struct he_dev *he_dev, int group)
 
 		for (slot = 0; slot < TPD_MAXIOV; ++slot) {
 			if (tpd->iovec[slot].addr)
-				dma_unmap_single(&he_dev->pci_dev->dev,
+				pci_unmap_single(he_dev->pci_dev,
 					tpd->iovec[slot].addr,
 					tpd->iovec[slot].len & TPD_LEN_MASK,
-							DMA_TO_DEVICE);
+							PCI_DMA_TODEVICE);
 			if (tpd->iovec[slot].len & TPD_LST)
 				break;
 				
@@ -1858,11 +2040,15 @@ he_service_tbrq(struct he_dev *he_dev, int group)
 		}
 
 next_tbrq_entry:
+#ifdef USE_TPD_POOL
 		if (tpd)
-			dma_pool_free(he_dev->tpd_pool, tpd, TPD_ADDR(tpd->status));
+			pci_pool_free(he_dev->tpd_pool, tpd, TPD_ADDR(tpd->status));
+#else
+		tpd->inuse = 0;
+#endif
 		he_dev->tbrq_head = (struct he_tbrq *)
 				((unsigned long) he_dev->tbrq_base |
-					TBRQ_MASK(he_dev->tbrq_head + 1));
+					TBRQ_MASK(++he_dev->tbrq_head));
 	}
 
 	if (updated) {
@@ -1874,52 +2060,62 @@ next_tbrq_entry:
 	}
 }
 
+
 static void
 he_service_rbpl(struct he_dev *he_dev, int group)
 {
-	struct he_rbp *new_tail;
+	struct he_rbp *newtail;
 	struct he_rbp *rbpl_head;
-	struct he_buff *heb;
-	dma_addr_t mapping;
-	int i;
 	int moved = 0;
 
 	rbpl_head = (struct he_rbp *) ((unsigned long)he_dev->rbpl_base |
 					RBPL_MASK(he_readl(he_dev, G0_RBPL_S)));
 
 	for (;;) {
-		new_tail = (struct he_rbp *) ((unsigned long)he_dev->rbpl_base |
+		newtail = (struct he_rbp *) ((unsigned long)he_dev->rbpl_base |
 						RBPL_MASK(he_dev->rbpl_tail+1));
 
 		/* table 3.42 -- rbpl_tail should never be set to rbpl_head */
-		if (new_tail == rbpl_head)
+		if ((newtail == rbpl_head) || (newtail->status & RBP_LOANED))
 			break;
 
-		i = find_next_zero_bit(he_dev->rbpl_table, RBPL_TABLE_SIZE, he_dev->rbpl_hint);
-		if (i > (RBPL_TABLE_SIZE - 1)) {
-			i = find_first_zero_bit(he_dev->rbpl_table, RBPL_TABLE_SIZE);
-			if (i > (RBPL_TABLE_SIZE - 1))
-				break;
-		}
-		he_dev->rbpl_hint = i + 1;
-
-		heb = dma_pool_alloc(he_dev->rbpl_pool, GFP_ATOMIC, &mapping);
-		if (!heb)
-			break;
-		heb->mapping = mapping;
-		list_add(&heb->entry, &he_dev->rbpl_outstanding);
-		he_dev->rbpl_virt[i] = heb;
-		set_bit(i, he_dev->rbpl_table);
-		new_tail->idx = i << RBP_IDX_OFFSET;
-		new_tail->phys = mapping + offsetof(struct he_buff, data);
-
-		he_dev->rbpl_tail = new_tail;
+		newtail->status |= RBP_LOANED;
+		he_dev->rbpl_tail = newtail;
 		++moved;
 	} 
 
 	if (moved)
 		he_writel(he_dev, RBPL_MASK(he_dev->rbpl_tail), G0_RBPL_T);
 }
+
+#ifdef USE_RBPS
+static void
+he_service_rbps(struct he_dev *he_dev, int group)
+{
+	struct he_rbp *newtail;
+	struct he_rbp *rbps_head;
+	int moved = 0;
+
+	rbps_head = (struct he_rbp *) ((unsigned long)he_dev->rbps_base |
+					RBPS_MASK(he_readl(he_dev, G0_RBPS_S)));
+
+	for (;;) {
+		newtail = (struct he_rbp *) ((unsigned long)he_dev->rbps_base |
+						RBPS_MASK(he_dev->rbps_tail+1));
+
+		/* table 3.42 -- rbps_tail should never be set to rbps_head */
+		if ((newtail == rbps_head) || (newtail->status & RBP_LOANED))
+			break;
+
+		newtail->status |= RBP_LOANED;
+		he_dev->rbps_tail = newtail;
+		++moved;
+	} 
+
+	if (moved)
+		he_writel(he_dev, RBPS_MASK(he_dev->rbps_tail), G0_RBPS_T);
+}
+#endif /* USE_RBPS */
 
 static void
 he_tasklet(unsigned long data)
@@ -1930,7 +2126,9 @@ he_tasklet(unsigned long data)
 	int updated = 0;
 
 	HPRINTK("tasklet (0x%lx)\n", data);
+#ifdef USE_TASKLET
 	spin_lock_irqsave(&he_dev->global_lock, flags);
+#endif
 
 	while (he_dev->irq_head != he_dev->irq_tail) {
 		++updated;
@@ -1941,14 +2139,18 @@ he_tasklet(unsigned long data)
 		switch (type) {
 			case ITYPE_RBRQ_THRESH:
 				HPRINTK("rbrq%d threshold\n", group);
-				fallthrough;
+				/* fall through */
 			case ITYPE_RBRQ_TIMER:
-				if (he_service_rbrq(he_dev, group))
+				if (he_service_rbrq(he_dev, group)) {
 					he_service_rbpl(he_dev, group);
+#ifdef USE_RBPS
+					he_service_rbps(he_dev, group);
+#endif /* USE_RBPS */
+				}
 				break;
 			case ITYPE_TBRQ_THRESH:
 				HPRINTK("tbrq%d threshold\n", group);
-				fallthrough;
+				/* fall through */
 			case ITYPE_TPD_COMPLETE:
 				he_service_tbrq(he_dev, group);
 				break;
@@ -1956,7 +2158,9 @@ he_tasklet(unsigned long data)
 				he_service_rbpl(he_dev, group);
 				break;
 			case ITYPE_RBPS_THRESH:
-				/* shouldn't happen unless small buffers enabled */
+#ifdef USE_RBPS
+				he_service_rbps(he_dev, group);
+#endif /* USE_RBPS */
 				break;
 			case ITYPE_PHY:
 				HPRINTK("phy interrupt\n");
@@ -1984,6 +2188,9 @@ he_tasklet(unsigned long data)
 
 				he_service_rbrq(he_dev, 0);
 				he_service_rbpl(he_dev, 0);
+#ifdef USE_RBPS
+				he_service_rbps(he_dev, 0);
+#endif /* USE_RBPS */
 				he_service_tbrq(he_dev, 0);
 				break;
 			default:
@@ -2005,11 +2212,13 @@ he_tasklet(unsigned long data)
 			IRQ_TAIL(he_dev->irq_tail), IRQ0_HEAD);
 		(void) he_readl(he_dev, INT_FIFO); /* 8.1.2 controller errata; flush posted writes */
 	}
+#ifdef USE_TASKLET
 	spin_unlock_irqrestore(&he_dev->global_lock, flags);
+#endif
 }
 
 static irqreturn_t
-he_irq_handler(int irq, void *dev_id)
+he_irq_handler(int irq, void *dev_id, struct pt_regs *regs)
 {
 	unsigned long flags;
 	struct he_dev *he_dev = (struct he_dev * )dev_id;
@@ -2037,7 +2246,11 @@ he_irq_handler(int irq, void *dev_id)
 
 	if (he_dev->irq_head != he_dev->irq_tail) {
 		handled = 1;
+#ifdef USE_TASKLET
 		tasklet_schedule(&he_dev->tasklet);
+#else
+		he_tasklet((unsigned long) he_dev);
+#endif
 		he_writel(he_dev, INT_CLEAR_A, INT_FIFO);	/* clear interrupt */
 		(void) he_readl(he_dev, INT_FIFO);		/* flush posted writes */
 	}
@@ -2071,8 +2284,6 @@ __enqueue_tpd(struct he_dev *he_dev, struct he_tpd *tpd, unsigned cid)
 				TPDRQ_MASK(he_readl(he_dev, TPDRQ_B_H)));
 
 		if (new_tail == he_dev->tpdrq_head) {
-			int slot;
-
 			hprintk("tpdrq full (cid 0x%x)\n", cid);
 			/*
 			 * FIXME
@@ -2080,13 +2291,6 @@ __enqueue_tpd(struct he_dev *he_dev, struct he_tpd *tpd, unsigned cid)
 			 * after service_tbrq, service the backlog
 			 * for now, we just drop the pdu
 			 */
-			for (slot = 0; slot < TPD_MAXIOV; ++slot) {
-				if (tpd->iovec[slot].addr)
-					dma_unmap_single(&he_dev->pci_dev->dev,
-						tpd->iovec[slot].addr,
-						tpd->iovec[slot].len & TPD_LEN_MASK,
-								DMA_TO_DEVICE);
-			}
 			if (tpd->skb) {
 				if (tpd->vcc->pop)
 					tpd->vcc->pop(tpd->vcc, tpd->skb);
@@ -2094,14 +2298,23 @@ __enqueue_tpd(struct he_dev *he_dev, struct he_tpd *tpd, unsigned cid)
 					dev_kfree_skb_any(tpd->skb);
 				atomic_inc(&tpd->vcc->stats->tx_err);
 			}
-			dma_pool_free(he_dev->tpd_pool, tpd, TPD_ADDR(tpd->status));
+#ifdef USE_TPD_POOL
+			pci_pool_free(he_dev->tpd_pool, tpd, TPD_ADDR(tpd->status));
+#else
+			tpd->inuse = 0;
+#endif
 			return;
 		}
 	}
 
 	/* 2.1.5 transmit packet descriptor ready queue */
+#ifdef USE_TPD_POOL
 	list_add_tail(&tpd->entry, &he_dev->outstanding_tpds);
 	he_dev->tpdrq_tail->tpd = TPD_ADDR(tpd->status);
+#else
+	he_dev->tpdrq_tail->tpd = he_dev->tpd_base_phys +
+				(TPD_INDEX(tpd->status) * sizeof(struct he_tpd));
+#endif
 	he_dev->tpdrq_tail->cid = cid;
 	wmb();
 
@@ -2131,13 +2344,13 @@ he_open(struct atm_vcc *vcc)
 
 	cid = he_mkcid(he_dev, vpi, vci);
 
-	he_vcc = kmalloc(sizeof(struct he_vcc), GFP_ATOMIC);
+	he_vcc = (struct he_vcc *) kmalloc(sizeof(struct he_vcc), GFP_ATOMIC);
 	if (he_vcc == NULL) {
 		hprintk("unable to allocate he_vcc during open\n");
 		return -ENOMEM;
 	}
 
-	INIT_LIST_HEAD(&he_vcc->buffers);
+	he_vcc->iov_tail = he_vcc->iov_head;
 	he_vcc->pdu_len = 0;
 	he_vcc->rc_index = -1;
 
@@ -2291,8 +2504,13 @@ he_open(struct atm_vcc *vcc)
 			goto open_failed;
 		}
 
-		rsr1 = RSR1_GROUP(0) | RSR1_RBPL_ONLY;
-		rsr4 = RSR4_GROUP(0) | RSR4_RBPL_ONLY;
+#ifdef USE_RBPS
+		rsr1 = RSR1_GROUP(0);
+		rsr4 = RSR4_GROUP(0);
+#else /* !USE_RBPS */
+		rsr1 = RSR1_GROUP(0)|RSR1_RBPL_ONLY;
+		rsr4 = RSR4_GROUP(0)|RSR4_RBPL_ONLY;
+#endif /* USE_RBPS */
 		rsr0 = vcc->qos.rxtp.traffic_class == ATM_UBR ? 
 				(RSR0_EPD_ENABLE|RSR0_PPD_ENABLE) : 0;
 
@@ -2315,7 +2533,8 @@ he_open(struct atm_vcc *vcc)
 open_failed:
 
 	if (err) {
-		kfree(he_vcc);
+		if (he_vcc)
+			kfree(he_vcc);
 		clear_bit(ATM_VF_ADDR, &vcc->flags);
 	}
 	else
@@ -2391,7 +2610,7 @@ he_close(struct atm_vcc *vcc)
 		 * TBRQ, the host issues the close command to the adapter.
 		 */
 
-		while (((tx_inuse = refcount_read(&sk_atm(vcc)->sk_wmem_alloc)) > 1) &&
+		while (((tx_inuse = atomic_read(&sk_atm(vcc)->sk_wmem_alloc)) > 0) &&
 		       (retry < MAX_RETRY)) {
 			msleep(sleep);
 			if (sleep < 250)
@@ -2400,7 +2619,7 @@ he_close(struct atm_vcc *vcc)
 			++retry;
 		}
 
-		if (tx_inuse > 1)
+		if (tx_inuse)
 			hprintk("close tx cid 0x%x tx_inuse = %d\n", cid, tx_inuse);
 
 		/* 2.3.1.1 generic close operations with flush */
@@ -2548,9 +2767,9 @@ he_send(struct atm_vcc *vcc, struct sk_buff *skb)
 	}
 
 #ifdef USE_SCATTERGATHER
-	tpd->iovec[slot].addr = dma_map_single(&he_dev->pci_dev->dev, skb->data,
-				skb_headlen(skb), DMA_TO_DEVICE);
-	tpd->iovec[slot].len = skb_headlen(skb);
+	tpd->iovec[slot].addr = pci_map_single(he_dev->pci_dev, skb->data,
+				skb->len - skb->data_len, PCI_DMA_TODEVICE);
+	tpd->iovec[slot].len = skb->len - skb->data_len;
 	++slot;
 
 	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
@@ -2577,16 +2796,17 @@ he_send(struct atm_vcc *vcc, struct sk_buff *skb)
 			slot = 0;
 		}
 
-		tpd->iovec[slot].addr = skb_frag_dma_map(&he_dev->pci_dev->dev,
-				frag, 0, skb_frag_size(frag), DMA_TO_DEVICE);
-		tpd->iovec[slot].len = skb_frag_size(frag);
+		tpd->iovec[slot].addr = pci_map_single(he_dev->pci_dev,
+			(void *) page_address(frag->page) + frag->page_offset,
+				frag->size, PCI_DMA_TODEVICE);
+		tpd->iovec[slot].len = frag->size;
 		++slot;
 
 	}
 
 	tpd->iovec[slot - 1].len |= TPD_LST;
 #else
-	tpd->address0 = dma_map_single(&he_dev->pci_dev->dev, skb->data, skb->len, DMA_TO_DEVICE);
+	tpd->address0 = pci_map_single(he_dev->pci_dev, skb->data, skb->len, PCI_DMA_TODEVICE);
 	tpd->length0 = skb->len | TPD_LST;
 #endif
 	tpd->status |= TPD_INT;
@@ -2620,15 +2840,10 @@ he_ioctl(struct atm_dev *atm_dev, unsigned int cmd, void __user *arg)
 			if (copy_from_user(&reg, arg,
 					   sizeof(struct he_ioctl_reg)))
 				return -EFAULT;
-
+			
 			spin_lock_irqsave(&he_dev->global_lock, flags);
 			switch (reg.type) {
 				case HE_REGTYPE_PCI:
-					if (reg.addr >= HE_REGMAP_SIZE) {
-						err = -EINVAL;
-						break;
-					}
-
 					reg.val = he_readl(he_dev, reg.addr);
 					break;
 				case HE_REGTYPE_RCM:
@@ -2712,7 +2927,7 @@ he_proc_read(struct atm_dev *dev, loff_t *pos, char *page)
 
 	left = *pos;
 	if (!left--)
-		return sprintf(page, "ATM he driver\n");
+		return sprintf(page, "%s\n", version);
 
 	if (!left--)
 		return sprintf(page, "%s%s\n\n",
@@ -2781,7 +2996,8 @@ he_proc_read(struct atm_dev *dev, loff_t *pos, char *page)
 
 /* eeprom routines  -- see 4.7 */
 
-static u8 read_prom_byte(struct he_dev *he_dev, int addr)
+u8
+read_prom_byte(struct he_dev *he_dev, int addr)
 {
 	u32 val = 0, tmp_read = 0;
 	int i, j = 0;
@@ -2795,7 +3011,7 @@ static u8 read_prom_byte(struct he_dev *he_dev, int addr)
 	he_writel(he_dev, val, HOST_CNTL);
        
 	/* Send READ instruction */
-	for (i = 0; i < ARRAY_SIZE(readtab); i++) {
+	for (i = 0; i < sizeof(readtab)/sizeof(readtab[0]); i++) {
 		he_writel(he_dev, val | readtab[i], HOST_CNTL);
 		udelay(EEPROM_DELAY);
 	}
@@ -2846,8 +3062,9 @@ MODULE_PARM_DESC(irq_coalesce, "use interrupt coalescing (default 1)");
 module_param(sdh, bool, 0);
 MODULE_PARM_DESC(sdh, "use SDH framing (default 0)");
 
-static const struct pci_device_id he_pci_tbl[] = {
-	{ PCI_VDEVICE(FORE, PCI_DEVICE_ID_FORE_HE), 0 },
+static struct pci_device_id he_pci_tbl[] = {
+	{ PCI_VENDOR_ID_FORE, PCI_DEVICE_ID_FORE_HE, PCI_ANY_ID, PCI_ANY_ID,
+	  0, 0, 0 },
 	{ 0, }
 };
 
@@ -2856,8 +3073,19 @@ MODULE_DEVICE_TABLE(pci, he_pci_tbl);
 static struct pci_driver he_driver = {
 	.name =		"he",
 	.probe =	he_init_one,
-	.remove =	he_remove_one,
+	.remove =	__devexit_p(he_remove_one),
 	.id_table =	he_pci_tbl,
 };
 
-module_pci_driver(he_driver);
+static int __init he_init(void)
+{
+	return pci_register_driver(&he_driver);
+}
+
+static void __exit he_cleanup(void)
+{
+	pci_unregister_driver(&he_driver);
+}
+
+module_init(he_init);
+module_exit(he_cleanup);

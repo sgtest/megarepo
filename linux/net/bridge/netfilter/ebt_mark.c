@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  *  ebt_mark
  *
@@ -14,98 +13,56 @@
  * Marking a frame doesn't really change anything in the frame anyway.
  */
 
-#include <linux/module.h>
-#include <linux/netfilter/x_tables.h>
 #include <linux/netfilter_bridge/ebtables.h>
 #include <linux/netfilter_bridge/ebt_mark_t.h>
+#include <linux/module.h>
 
-static unsigned int
-ebt_mark_tg(struct sk_buff *skb, const struct xt_action_param *par)
+static int ebt_target_mark(struct sk_buff **pskb, unsigned int hooknr,
+   const struct net_device *in, const struct net_device *out,
+   const void *data, unsigned int datalen)
 {
-	const struct ebt_mark_t_info *info = par->targinfo;
-	int action = info->target & -16;
+	struct ebt_mark_t_info *info = (struct ebt_mark_t_info *)data;
 
-	if (action == MARK_SET_VALUE)
-		skb->mark = info->mark;
-	else if (action == MARK_OR_VALUE)
-		skb->mark |= info->mark;
-	else if (action == MARK_AND_VALUE)
-		skb->mark &= info->mark;
-	else
-		skb->mark ^= info->mark;
-
-	return info->target | ~EBT_VERDICT_BITS;
+	if ((*pskb)->nfmark != info->mark) {
+		(*pskb)->nfmark = info->mark;
+		(*pskb)->nfcache |= NFC_ALTERED;
+	}
+	return info->target;
 }
 
-static int ebt_mark_tg_check(const struct xt_tgchk_param *par)
+static int ebt_target_mark_check(const char *tablename, unsigned int hookmask,
+   const struct ebt_entry *e, void *data, unsigned int datalen)
 {
-	const struct ebt_mark_t_info *info = par->targinfo;
-	int tmp;
+	struct ebt_mark_t_info *info = (struct ebt_mark_t_info *)data;
 
-	tmp = info->target | ~EBT_VERDICT_BITS;
-	if (BASE_CHAIN && tmp == EBT_RETURN)
+	if (datalen != EBT_ALIGN(sizeof(struct ebt_mark_t_info)))
 		return -EINVAL;
-	if (ebt_invalid_target(tmp))
+	if (BASE_CHAIN && info->target == EBT_RETURN)
 		return -EINVAL;
-	tmp = info->target & ~EBT_VERDICT_BITS;
-	if (tmp != MARK_SET_VALUE && tmp != MARK_OR_VALUE &&
-	    tmp != MARK_AND_VALUE && tmp != MARK_XOR_VALUE)
+	CLEAR_BASE_CHAIN_BIT;
+	if (INVALID_TARGET)
 		return -EINVAL;
 	return 0;
 }
-#ifdef CONFIG_NETFILTER_XTABLES_COMPAT
-struct compat_ebt_mark_t_info {
-	compat_ulong_t mark;
-	compat_uint_t target;
-};
 
-static void mark_tg_compat_from_user(void *dst, const void *src)
+static struct ebt_target mark_target =
 {
-	const struct compat_ebt_mark_t_info *user = src;
-	struct ebt_mark_t_info *kern = dst;
-
-	kern->mark = user->mark;
-	kern->target = user->target;
-}
-
-static int mark_tg_compat_to_user(void __user *dst, const void *src)
-{
-	struct compat_ebt_mark_t_info __user *user = dst;
-	const struct ebt_mark_t_info *kern = src;
-
-	if (put_user(kern->mark, &user->mark) ||
-	    put_user(kern->target, &user->target))
-		return -EFAULT;
-	return 0;
-}
-#endif
-
-static struct xt_target ebt_mark_tg_reg __read_mostly = {
-	.name		= "mark",
-	.revision	= 0,
-	.family		= NFPROTO_BRIDGE,
-	.target		= ebt_mark_tg,
-	.checkentry	= ebt_mark_tg_check,
-	.targetsize	= sizeof(struct ebt_mark_t_info),
-#ifdef CONFIG_NETFILTER_XTABLES_COMPAT
-	.compatsize	= sizeof(struct compat_ebt_mark_t_info),
-	.compat_from_user = mark_tg_compat_from_user,
-	.compat_to_user	= mark_tg_compat_to_user,
-#endif
+	.name		= EBT_MARK_TARGET,
+	.target		= ebt_target_mark,
+	.check		= ebt_target_mark_check,
 	.me		= THIS_MODULE,
 };
 
-static int __init ebt_mark_init(void)
+static int __init init(void)
 {
-	return xt_register_target(&ebt_mark_tg_reg);
+	return ebt_register_target(&mark_target);
 }
 
-static void __exit ebt_mark_fini(void)
+static void __exit fini(void)
 {
-	xt_unregister_target(&ebt_mark_tg_reg);
+	ebt_unregister_target(&mark_target);
 }
 
-module_init(ebt_mark_init);
-module_exit(ebt_mark_fini);
-MODULE_DESCRIPTION("Ebtables: Packet mark modification");
+module_init(init);
+module_exit(fini);
 MODULE_LICENSE("GPL");

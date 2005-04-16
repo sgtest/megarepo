@@ -1,120 +1,153 @@
-// SPDX-License-Identifier: GPL-2.0
 /* Bluetooth HCI driver model support. */
 
-#include <linux/module.h>
+#include <linux/config.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
 
-static struct class *bt_class;
+#ifndef CONFIG_BT_HCI_CORE_DEBUG
+#undef  BT_DBG
+#define BT_DBG(D...)
+#endif
 
-static void bt_link_release(struct device *dev)
+static ssize_t show_name(struct class_device *cdev, char *buf)
 {
-	struct hci_conn *conn = to_hci_conn(dev);
-	kfree(conn);
+	struct hci_dev *hdev = class_get_devdata(cdev);
+	return sprintf(buf, "%s\n", hdev->name);
 }
 
-static const struct device_type bt_link = {
-	.name    = "link",
-	.release = bt_link_release,
-};
-
-/*
- * The rfcomm tty device will possibly retain even when conn
- * is down, and sysfs doesn't support move zombie device,
- * so we should move the device before conn device is destroyed.
- */
-static int __match_tty(struct device *dev, void *data)
+static ssize_t show_type(struct class_device *cdev, char *buf)
 {
-	return !strncmp(dev_name(dev), "rfcomm", 6);
+	struct hci_dev *hdev = class_get_devdata(cdev);
+	return sprintf(buf, "%d\n", hdev->type);
 }
 
-void hci_conn_init_sysfs(struct hci_conn *conn)
+static ssize_t show_address(struct class_device *cdev, char *buf)
 {
-	struct hci_dev *hdev = conn->hdev;
-
-	BT_DBG("conn %p", conn);
-
-	conn->dev.type = &bt_link;
-	conn->dev.class = bt_class;
-	conn->dev.parent = &hdev->dev;
-
-	device_initialize(&conn->dev);
+	struct hci_dev *hdev = class_get_devdata(cdev);
+	bdaddr_t bdaddr;
+	baswap(&bdaddr, &hdev->bdaddr);
+	return sprintf(buf, "%s\n", batostr(&bdaddr));
 }
 
-void hci_conn_add_sysfs(struct hci_conn *conn)
+static ssize_t show_flags(struct class_device *cdev, char *buf)
 {
-	struct hci_dev *hdev = conn->hdev;
+	struct hci_dev *hdev = class_get_devdata(cdev);
+	return sprintf(buf, "0x%lx\n", hdev->flags);
+}
 
-	BT_DBG("conn %p", conn);
+static ssize_t show_inquiry_cache(struct class_device *cdev, char *buf)
+{
+	struct hci_dev *hdev = class_get_devdata(cdev);
+	struct inquiry_cache *cache = &hdev->inq_cache;
+	struct inquiry_entry *e;
+	int n = 0;
 
-	dev_set_name(&conn->dev, "%s:%d", hdev->name, conn->handle);
+	hci_dev_lock_bh(hdev);
 
-	if (device_add(&conn->dev) < 0) {
-		bt_dev_err(hdev, "failed to register connection device");
-		return;
+	for (e = cache->list; e; e = e->next) {
+		struct inquiry_data *data = &e->data;
+		bdaddr_t bdaddr;
+		baswap(&bdaddr, &data->bdaddr);
+		n += sprintf(buf + n, "%s %d %d %d 0x%.2x%.2x%.2x 0x%.4x %d %u\n",
+				batostr(&bdaddr),
+				data->pscan_rep_mode, data->pscan_period_mode, data->pscan_mode,
+				data->dev_class[2], data->dev_class[1], data->dev_class[0],
+				__le16_to_cpu(data->clock_offset), data->rssi, e->timestamp);
 	}
 
-	hci_dev_hold(hdev);
+	hci_dev_unlock_bh(hdev);
+	return n;
 }
 
-void hci_conn_del_sysfs(struct hci_conn *conn)
-{
-	struct hci_dev *hdev = conn->hdev;
+static CLASS_DEVICE_ATTR(name, S_IRUGO, show_name, NULL);
+static CLASS_DEVICE_ATTR(type, S_IRUGO, show_type, NULL);
+static CLASS_DEVICE_ATTR(address, S_IRUGO, show_address, NULL);
+static CLASS_DEVICE_ATTR(flags, S_IRUGO, show_flags, NULL);
+static CLASS_DEVICE_ATTR(inquiry_cache, S_IRUGO, show_inquiry_cache, NULL);
 
-	if (!device_is_registered(&conn->dev))
-		return;
-
-	while (1) {
-		struct device *dev;
-
-		dev = device_find_child(&conn->dev, NULL, __match_tty);
-		if (!dev)
-			break;
-		device_move(dev, NULL, DPM_ORDER_DEV_LAST);
-		put_device(dev);
-	}
-
-	device_del(&conn->dev);
-
-	hci_dev_put(hdev);
-}
-
-static void bt_host_release(struct device *dev)
-{
-	struct hci_dev *hdev = to_hci_dev(dev);
-
-	if (hci_dev_test_flag(hdev, HCI_UNREGISTER))
-		hci_release_dev(hdev);
-	else
-		kfree(hdev);
-	module_put(THIS_MODULE);
-}
-
-static const struct device_type bt_host = {
-	.name    = "host",
-	.release = bt_host_release,
+static struct class_device_attribute *bt_attrs[] = {
+	&class_device_attr_name,
+	&class_device_attr_type,
+	&class_device_attr_address,
+	&class_device_attr_flags,
+	&class_device_attr_inquiry_cache,
+	NULL
 };
 
-void hci_init_sysfs(struct hci_dev *hdev)
+#ifdef CONFIG_HOTPLUG
+static int bt_hotplug(struct class_device *cdev, char **envp, int num_envp, char *buf, int size)
 {
-	struct device *dev = &hdev->dev;
+	struct hci_dev *hdev = class_get_devdata(cdev);
+	int n, i = 0;
 
-	dev->type = &bt_host;
-	dev->class = bt_class;
+	envp[i++] = buf;
+	n = snprintf(buf, size, "INTERFACE=%s", hdev->name) + 1;
+	buf += n;
+	size -= n;
 
-	__module_get(THIS_MODULE);
-	device_initialize(dev);
+	if ((size <= 0) || (i >= num_envp))
+		return -ENOMEM;
+
+	envp[i] = NULL;
+	return 0;
+}
+#endif
+
+static void bt_release(struct class_device *cdev)
+{
+	struct hci_dev *hdev = class_get_devdata(cdev);
+
+	kfree(hdev);
+}
+
+static struct class bt_class = {
+	.name		= "bluetooth",
+	.release	= bt_release,
+#ifdef CONFIG_HOTPLUG
+	.hotplug	= bt_hotplug,
+#endif
+};
+
+int hci_register_sysfs(struct hci_dev *hdev)
+{
+	struct class_device *cdev = &hdev->class_dev;
+	unsigned int i;
+	int err;
+
+	BT_DBG("%p name %s type %d", hdev, hdev->name, hdev->type);
+
+	cdev->class = &bt_class;
+	class_set_devdata(cdev, hdev);
+
+	strlcpy(cdev->class_id, hdev->name, BUS_ID_SIZE);
+	err = class_device_register(cdev);
+	if (err < 0)
+		return err;
+
+	for (i = 0; bt_attrs[i]; i++)
+		class_device_create_file(cdev, bt_attrs[i]);
+
+	return 0;
+}
+
+void hci_unregister_sysfs(struct hci_dev *hdev)
+{
+	struct class_device * cdev = &hdev->class_dev;
+
+	BT_DBG("%p name %s type %d", hdev, hdev->name, hdev->type);
+
+	class_device_del(cdev);
 }
 
 int __init bt_sysfs_init(void)
 {
-	bt_class = class_create(THIS_MODULE, "bluetooth");
-
-	return PTR_ERR_OR_ZERO(bt_class);
+	return class_register(&bt_class);
 }
 
-void bt_sysfs_cleanup(void)
+void __exit bt_sysfs_cleanup(void)
 {
-	class_destroy(bt_class);
+	class_unregister(&bt_class);
 }

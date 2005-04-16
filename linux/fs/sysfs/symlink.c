@@ -1,83 +1,76 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
- * fs/sysfs/symlink.c - sysfs symlink implementation
- *
- * Copyright (c) 2001-3 Patrick Mochel
- * Copyright (c) 2007 SUSE Linux Products GmbH
- * Copyright (c) 2007 Tejun Heo <teheo@suse.de>
- *
- * Please see Documentation/filesystems/sysfs.rst for more information.
+ * symlink.c - operations for sysfs symlinks.
  */
 
 #include <linux/fs.h>
 #include <linux/module.h>
 #include <linux/kobject.h>
-#include <linux/mutex.h>
-#include <linux/security.h>
+#include <linux/namei.h>
 
 #include "sysfs.h"
 
-static int sysfs_do_create_link_sd(struct kernfs_node *parent,
-				   struct kobject *target_kobj,
-				   const char *name, int warn)
+static int object_depth(struct kobject * kobj)
 {
-	struct kernfs_node *kn, *target = NULL;
+	struct kobject * p = kobj;
+	int depth = 0;
+	do { depth++; } while ((p = p->parent));
+	return depth;
+}
 
-	if (WARN_ON(!name || !parent))
-		return -EINVAL;
+static int object_path_length(struct kobject * kobj)
+{
+	struct kobject * p = kobj;
+	int length = 1;
+	do {
+		length += strlen(kobject_name(p)) + 1;
+		p = p->parent;
+	} while (p);
+	return length;
+}
 
-	/*
-	 * We don't own @target_kobj and it may be removed at any time.
-	 * Synchronize using sysfs_symlink_target_lock.  See
-	 * sysfs_remove_dir() for details.
-	 */
-	spin_lock(&sysfs_symlink_target_lock);
-	if (target_kobj->sd) {
-		target = target_kobj->sd;
-		kernfs_get(target);
+static void fill_object_path(struct kobject * kobj, char * buffer, int length)
+{
+	struct kobject * p;
+
+	--length;
+	for (p = kobj; p; p = p->parent) {
+		int cur = strlen(kobject_name(p));
+
+		/* back up enough to print this bus id with '/' */
+		length -= cur;
+		strncpy(buffer + length,kobject_name(p),cur);
+		*(buffer + --length) = '/';
 	}
-	spin_unlock(&sysfs_symlink_target_lock);
+}
 
-	if (!target)
-		return -ENOENT;
+static int sysfs_add_link(struct dentry * parent, char * name, struct kobject * target)
+{
+	struct sysfs_dirent * parent_sd = parent->d_fsdata;
+	struct sysfs_symlink * sl;
+	int error = 0;
 
-	kn = kernfs_create_link(parent, name, target);
-	kernfs_put(target);
+	error = -ENOMEM;
+	sl = kmalloc(sizeof(*sl), GFP_KERNEL);
+	if (!sl)
+		goto exit1;
 
-	if (!IS_ERR(kn))
+	sl->link_name = kmalloc(strlen(name) + 1, GFP_KERNEL);
+	if (!sl->link_name)
+		goto exit2;
+
+	strcpy(sl->link_name, name);
+	sl->target_kobj = kobject_get(target);
+
+	error = sysfs_make_dirent(parent_sd, NULL, sl, S_IFLNK|S_IRWXUGO,
+				SYSFS_KOBJ_LINK);
+	if (!error)
 		return 0;
 
-	if (warn && PTR_ERR(kn) == -EEXIST)
-		sysfs_warn_dup(parent, name);
-	return PTR_ERR(kn);
-}
-
-/**
- *	sysfs_create_link_sd - create symlink to a given object.
- *	@kn:		directory we're creating the link in.
- *	@target:	object we're pointing to.
- *	@name:		name of the symlink.
- */
-int sysfs_create_link_sd(struct kernfs_node *kn, struct kobject *target,
-			 const char *name)
-{
-	return sysfs_do_create_link_sd(kn, target, name, 1);
-}
-
-static int sysfs_do_create_link(struct kobject *kobj, struct kobject *target,
-				const char *name, int warn)
-{
-	struct kernfs_node *parent = NULL;
-
-	if (!kobj)
-		parent = sysfs_root_kn;
-	else
-		parent = kobj->sd;
-
-	if (!parent)
-		return -EFAULT;
-
-	return sysfs_do_create_link_sd(parent, target, name, warn);
+	kfree(sl->link_name);
+exit2:
+	kfree(sl);
+exit1:
+	return error;
 }
 
 /**
@@ -86,113 +79,102 @@ static int sysfs_do_create_link(struct kobject *kobj, struct kobject *target,
  *	@target:	object we're pointing to.
  *	@name:		name of the symlink.
  */
-int sysfs_create_link(struct kobject *kobj, struct kobject *target,
-		      const char *name)
+int sysfs_create_link(struct kobject * kobj, struct kobject * target, char * name)
 {
-	return sysfs_do_create_link(kobj, target, name, 1);
-}
-EXPORT_SYMBOL_GPL(sysfs_create_link);
+	struct dentry * dentry = kobj->dentry;
+	int error = 0;
 
-/**
- *	sysfs_create_link_nowarn - create symlink between two objects.
- *	@kobj:	object whose directory we're creating the link in.
- *	@target:	object we're pointing to.
- *	@name:		name of the symlink.
- *
- *	This function does the same as sysfs_create_link(), but it
- *	doesn't warn if the link already exists.
- */
-int sysfs_create_link_nowarn(struct kobject *kobj, struct kobject *target,
-			     const char *name)
-{
-	return sysfs_do_create_link(kobj, target, name, 0);
-}
-EXPORT_SYMBOL_GPL(sysfs_create_link_nowarn);
+	BUG_ON(!kobj || !kobj->dentry || !name);
 
-/**
- *	sysfs_delete_link - remove symlink in object's directory.
- *	@kobj:	object we're acting for.
- *	@targ:	object we're pointing to.
- *	@name:	name of the symlink to remove.
- *
- *	Unlike sysfs_remove_link sysfs_delete_link has enough information
- *	to successfully delete symlinks in tagged directories.
- */
-void sysfs_delete_link(struct kobject *kobj, struct kobject *targ,
-			const char *name)
-{
-	const void *ns = NULL;
-
-	/*
-	 * We don't own @target and it may be removed at any time.
-	 * Synchronize using sysfs_symlink_target_lock.  See
-	 * sysfs_remove_dir() for details.
-	 */
-	spin_lock(&sysfs_symlink_target_lock);
-	if (targ->sd && kernfs_ns_enabled(kobj->sd))
-		ns = targ->sd->ns;
-	spin_unlock(&sysfs_symlink_target_lock);
-	kernfs_remove_by_name_ns(kobj->sd, name, ns);
+	down(&dentry->d_inode->i_sem);
+	error = sysfs_add_link(dentry, name, target);
+	up(&dentry->d_inode->i_sem);
+	return error;
 }
+
 
 /**
  *	sysfs_remove_link - remove symlink in object's directory.
  *	@kobj:	object we're acting for.
  *	@name:	name of the symlink to remove.
  */
-void sysfs_remove_link(struct kobject *kobj, const char *name)
+
+void sysfs_remove_link(struct kobject * kobj, char * name)
 {
-	struct kernfs_node *parent = NULL;
-
-	if (!kobj)
-		parent = sysfs_root_kn;
-	else
-		parent = kobj->sd;
-
-	kernfs_remove_by_name(parent, name);
+	sysfs_hash_and_remove(kobj->dentry,name);
 }
+
+static int sysfs_get_target_path(struct kobject * kobj, struct kobject * target,
+				   char *path)
+{
+	char * s;
+	int depth, size;
+
+	depth = object_depth(kobj);
+	size = object_path_length(target) + depth * 3 - 1;
+	if (size > PATH_MAX)
+		return -ENAMETOOLONG;
+
+	pr_debug("%s: depth = %d, size = %d\n", __FUNCTION__, depth, size);
+
+	for (s = path; depth--; s += 3)
+		strcpy(s,"../");
+
+	fill_object_path(target, path, size);
+	pr_debug("%s: path = '%s'\n", __FUNCTION__, path);
+
+	return 0;
+}
+
+static int sysfs_getlink(struct dentry *dentry, char * path)
+{
+	struct kobject *kobj, *target_kobj;
+	int error = 0;
+
+	kobj = sysfs_get_kobject(dentry->d_parent);
+	if (!kobj)
+		return -EINVAL;
+
+	target_kobj = sysfs_get_kobject(dentry);
+	if (!target_kobj) {
+		kobject_put(kobj);
+		return -EINVAL;
+	}
+
+	down_read(&sysfs_rename_sem);
+	error = sysfs_get_target_path(kobj, target_kobj, path);
+	up_read(&sysfs_rename_sem);
+	
+	kobject_put(kobj);
+	kobject_put(target_kobj);
+	return error;
+
+}
+
+static int sysfs_follow_link(struct dentry *dentry, struct nameidata *nd)
+{
+	int error = -ENOMEM;
+	unsigned long page = get_zeroed_page(GFP_KERNEL);
+	if (page)
+		error = sysfs_getlink(dentry, (char *) page); 
+	nd_set_link(nd, error ? ERR_PTR(error) : (char *)page);
+	return 0;
+}
+
+static void sysfs_put_link(struct dentry *dentry, struct nameidata *nd)
+{
+	char *page = nd_get_link(nd);
+	if (!IS_ERR(page))
+		free_page((unsigned long)page);
+}
+
+struct inode_operations sysfs_symlink_inode_operations = {
+	.readlink = generic_readlink,
+	.follow_link = sysfs_follow_link,
+	.put_link = sysfs_put_link,
+};
+
+
+EXPORT_SYMBOL_GPL(sysfs_create_link);
 EXPORT_SYMBOL_GPL(sysfs_remove_link);
 
-/**
- *	sysfs_rename_link_ns - rename symlink in object's directory.
- *	@kobj:	object we're acting for.
- *	@targ:	object we're pointing to.
- *	@old:	previous name of the symlink.
- *	@new:	new name of the symlink.
- *	@new_ns: new namespace of the symlink.
- *
- *	A helper function for the common rename symlink idiom.
- */
-int sysfs_rename_link_ns(struct kobject *kobj, struct kobject *targ,
-			 const char *old, const char *new, const void *new_ns)
-{
-	struct kernfs_node *parent, *kn = NULL;
-	const void *old_ns = NULL;
-	int result;
-
-	if (!kobj)
-		parent = sysfs_root_kn;
-	else
-		parent = kobj->sd;
-
-	if (targ->sd)
-		old_ns = targ->sd->ns;
-
-	result = -ENOENT;
-	kn = kernfs_find_and_get_ns(parent, old, old_ns);
-	if (!kn)
-		goto out;
-
-	result = -EINVAL;
-	if (kernfs_type(kn) != KERNFS_LINK)
-		goto out;
-	if (kn->symlink.target_kn->priv != targ)
-		goto out;
-
-	result = kernfs_rename_ns(kn, parent, new, new_ns);
-
-out:
-	kernfs_put(kn);
-	return result;
-}
-EXPORT_SYMBOL_GPL(sysfs_rename_link_ns);

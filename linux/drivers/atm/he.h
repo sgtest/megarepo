@@ -1,3 +1,5 @@
+/* $Id: he.h,v 1.4 2003/05/06 22:48:00 chas Exp $ */
+
 /*
 
   he.h
@@ -51,6 +53,8 @@
 #define CONFIG_IRQ_SIZE		128
 #define CONFIG_IRQ_THRESH	(CONFIG_IRQ_SIZE/2)
 
+#define CONFIG_NUMTPDS		256
+
 #define CONFIG_TPDRQ_SIZE	512
 #define TPDRQ_MASK(x)		(((unsigned long)(x))&((CONFIG_TPDRQ_SIZE<<3)-1))
 
@@ -66,6 +70,11 @@
 #define CONFIG_RBPL_THRESH	64
 #define CONFIG_RBPL_BUFSIZE	4096
 #define RBPL_MASK(x)		(((unsigned long)(x))&((CONFIG_RBPL_SIZE<<3)-1))
+
+#define CONFIG_RBPS_SIZE	1024
+#define CONFIG_RBPS_THRESH	64
+#define CONFIG_RBPS_BUFSIZE	128
+#define RBPS_MASK(x)		(((unsigned long)(x))&((CONFIG_RBPS_SIZE<<3)-1))
 
 /* 5.1.3 initialize connection memory */
 
@@ -133,7 +142,12 @@ struct he_tpd {
 	struct sk_buff *skb;
 	struct atm_vcc *vcc;
 
+#ifdef USE_TPD_POOL
 	struct list_head entry;
+#else
+	u32 inuse;
+	char padding[32 - sizeof(u32) - (2*sizeof(void*))];
+#endif
 };
 
 #define TPD_ALIGNMENT	64
@@ -198,37 +212,36 @@ struct he_hsp {
 	} group[HE_NUM_GROUPS];
 };
 
-/*
- * figure 2.9 receive buffer pools
- *
- * since a virtual address might be more than 32 bits, we store an index
- * in the virt member of he_rbp.  NOTE: the lower six bits in the  rbrq
- * addr member are used for buffer status further limiting us to 26 bits.
- */
+/* figure 2.9 receive buffer pools */
 
 struct he_rbp {
 	volatile u32 phys;
-	volatile u32 idx;	/* virt */
+	volatile u32 status;
 };
 
-#define RBP_IDX_OFFSET 6
+/* NOTE: it is suggested that virt be the virtual address of the host
+   buffer.  on a 64-bit machine, this would not work.  Instead, we
+   store the real virtual address in another list, and store an index
+   (and buffer status) in the virt member.
+*/
 
-/*
- * the he dma engine will try to hold an extra 16 buffers in its local
- * caches.  and add a couple buffers for safety.
- */
+#define RBP_INDEX_OFF	6
+#define RBP_INDEX(x)	(((long)(x) >> RBP_INDEX_OFF) & 0xffff)
+#define RBP_LOANED	0x80000000
+#define RBP_SMALLBUF	0x40000000
 
-#define RBPL_TABLE_SIZE (CONFIG_RBPL_SIZE + 16 + 2)
-
-struct he_buff {
-	struct list_head entry;
-	dma_addr_t mapping;
-	unsigned long len;
-	u8 data[];
+struct he_virt {
+	void *virt;
 };
+
+#define RBPL_ALIGNMENT CONFIG_RBPL_SIZE
+#define RBPS_ALIGNMENT CONFIG_RBPS_SIZE
 
 #ifdef notyet
 struct he_group {
+	u32 rpbs_size, rpbs_qsize;
+	struct he_rbp rbps_ba;
+
 	u32 rpbl_size, rpbl_qsize;
 	struct he_rpb_entry *rbpl_ba;
 };
@@ -256,7 +269,13 @@ struct he_dev {
 
 	char prod_id[30];
 	char mac_addr[6];
-	int media;
+	int media;			/*  
+					 *  0x26 = HE155 MM 
+					 *  0x27 = HE622 MM 
+					 *  0x46 = HE155 SM 
+					 *  0x47 = HE622 SM 
+					 */
+
 
 	unsigned int vcibits, vpibits;
 	unsigned int cells_per_row;
@@ -280,9 +299,16 @@ struct he_dev {
 	volatile unsigned *irq_tailoffset;
 	int irq_peak;
 
+#ifdef USE_TASKLET
 	struct tasklet_struct tasklet;
-	struct dma_pool *tpd_pool;
+#endif
+#ifdef USE_TPD_POOL
+	struct pci_pool *tpd_pool;
 	struct list_head outstanding_tpds;
+#else
+	struct he_tpd *tpd_head, *tpd_base, *tpd_end;
+	dma_addr_t tpd_base_phys;
+#endif
 
 	dma_addr_t tpdrq_phys;
 	struct he_tpdrq *tpdrq_base, *tpdrq_tail, *tpdrq_head;
@@ -293,14 +319,29 @@ struct he_dev {
 	struct he_rbrq *rbrq_base, *rbrq_head;
 	int rbrq_peak;
 
-	struct he_buff **rbpl_virt;
-	unsigned long *rbpl_table;
-	unsigned long rbpl_hint;
-	struct dma_pool *rbpl_pool;
+#ifdef USE_RBPL_POOL
+	struct pci_pool *rbpl_pool;
+#else
+	void *rbpl_pages;
+	dma_addr_t rbpl_pages_phys;
+#endif
 	dma_addr_t rbpl_phys;
 	struct he_rbp *rbpl_base, *rbpl_tail;
-	struct list_head rbpl_outstanding;
+	struct he_virt *rbpl_virt;
 	int rbpl_peak;
+
+#ifdef USE_RBPS
+#ifdef USE_RBPS_POOL
+	struct pci_pool *rbps_pool;
+#else
+	void *rbps_pages;
+	dma_addr_t rbps_pages_phys;
+#endif
+#endif
+	dma_addr_t rbps_phys;
+	struct he_rbp *rbps_base, *rbps_tail;
+	struct he_virt *rbps_virt;
+	int rbps_peak;
 
 	dma_addr_t tbrq_phys;
 	struct he_tbrq *tbrq_base, *tbrq_head;
@@ -314,12 +355,20 @@ struct he_dev {
 	struct he_dev *next;
 };
 
+struct he_iovec
+{
+	u32 iov_base;
+	u32 iov_len;
+};
+
 #define HE_MAXIOV 20
 
 struct he_vcc
 {
-	struct list_head buffers;
+	struct he_iovec iov_head[HE_MAXIOV];
+	struct he_iovec *iov_tail;
 	int pdu_len;
+
 	int rc_index;
 
 	wait_queue_head_t rx_waitq;
@@ -330,6 +379,8 @@ struct he_vcc
 
 #define PCI_VENDOR_ID_FORE	0x1127
 #define PCI_DEVICE_ID_FORE_HE	0x400
+
+#define HE_DMA_MASK		0xffffffff
 
 #define GEN_CNTL_0				0x40
 #define  INT_PROC_ENBL		(1<<25)
@@ -345,7 +396,6 @@ struct he_vcc
 #define HE_DEV(dev) ((struct he_dev *) (dev)->dev_data)
 
 #define he_is622(dev)	((dev)->media & 0x1)
-#define he_isMM(dev)	((dev)->media & 0x20)
 
 #define HE_REGMAP_SIZE	0x100000
 
@@ -830,8 +880,8 @@ struct he_vcc
 #define M_SN		0x3a	/* integer */
 #define MEDIA		0x3e	/* integer */
 #define  HE155MM	0x26
-#define  HE622MM	0x27
-#define  HE155SM	0x46
+#define  HE155SM	0x27
+#define  HE622MM	0x46
 #define  HE622SM	0x47
 #define MAC_ADDR	0x42	/* char[] */
 

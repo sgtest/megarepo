@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Instruction-patching support.
  *
@@ -11,6 +10,7 @@
 #include <asm/patch.h>
 #include <asm/processor.h>
 #include <asm/sections.h>
+#include <asm/system.h>
 #include <asm/unistd.h>
 
 /*
@@ -64,30 +64,22 @@ ia64_patch (u64 insn_addr, u64 mask, u64 val)
 void
 ia64_patch_imm64 (u64 insn_addr, u64 val)
 {
-	/* The assembler may generate offset pointing to either slot 1
-	   or slot 2 for a long (2-slot) instruction, occupying slots 1
-	   and 2.  */
-  	insn_addr &= -16UL;
-	ia64_patch(insn_addr + 2,
+	ia64_patch(insn_addr,
 		   0x01fffefe000UL, (  ((val & 0x8000000000000000UL) >> 27) /* bit 63 -> 36 */
 				     | ((val & 0x0000000000200000UL) <<  0) /* bit 21 -> 21 */
 				     | ((val & 0x00000000001f0000UL) <<  6) /* bit 16 -> 22 */
 				     | ((val & 0x000000000000ff80UL) << 20) /* bit  7 -> 27 */
 				     | ((val & 0x000000000000007fUL) << 13) /* bit  0 -> 13 */));
-	ia64_patch(insn_addr + 1, 0x1ffffffffffUL, val >> 22);
+	ia64_patch(insn_addr - 1, 0x1ffffffffffUL, val >> 22);
 }
 
 void
 ia64_patch_imm60 (u64 insn_addr, u64 val)
 {
-	/* The assembler may generate offset pointing to either slot 1
-	   or slot 2 for a long (2-slot) instruction, occupying slots 1
-	   and 2.  */
-  	insn_addr &= -16UL;
-	ia64_patch(insn_addr + 2,
+	ia64_patch(insn_addr,
 		   0x011ffffe000UL, (  ((val & 0x0800000000000000UL) >> 23) /* bit 59 -> 36 */
 				     | ((val & 0x00000000000fffffUL) << 13) /* bit  0 -> 13 */));
-	ia64_patch(insn_addr + 1, 0x1fffffffffcUL, val >> 18);
+	ia64_patch(insn_addr - 1, 0x1fffffffffcUL, val >> 18);
 }
 
 /*
@@ -115,30 +107,7 @@ ia64_patch_vtop (unsigned long start, unsigned long end)
 	ia64_srlz_i();
 }
 
-/*
- * Disable the RSE workaround by turning the conditional branch
- * that we tagged in each place the workaround was used into an
- * unconditional branch.
- */
-void __init
-ia64_patch_rse (unsigned long start, unsigned long end)
-{
-	s32 *offp = (s32 *) start;
-	u64 ip, *b;
-
-	while (offp < (s32 *) end) {
-		ip = (u64) offp + *offp;
-
-		b = (u64 *)(ip & -16);
-		b[1] &= ~0xf800000L;
-		ia64_fc((void *) ip);
-		++offp;
-	}
-	ia64_sync_i();
-	ia64_srlz_i();
-}
-
-void __init
+void
 ia64_patch_mckinley_e9 (unsigned long start, unsigned long end)
 {
 	static int first_time = 1;
@@ -152,16 +121,19 @@ ia64_patch_mckinley_e9 (unsigned long start, unsigned long end)
 		first_time = 0;
 		if (need_workaround)
 			printk(KERN_INFO "Leaving McKinley Errata 9 workaround enabled\n");
+		else
+			printk(KERN_INFO "McKinley Errata 9 workaround not needed; "
+			       "disabling it\n");
 	}
 	if (need_workaround)
 		return;
 
 	while (offp < (s32 *) end) {
 		wp = (u64 *) ia64_imva((char *) offp + *offp);
-		wp[0] = 0x0000000100000011UL; /* nop.m 0; nop.i 0; br.ret.sptk.many b6 */
-		wp[1] = 0x0084006880000200UL;
-		wp[2] = 0x0000000100000000UL; /* nop.m 0; nop.i 0; nop.i 0 */
-		wp[3] = 0x0004000000000200UL;
+		wp[0] = 0x0000000100000000UL; /* nop.m 0; nop.i 0; nop.i 0 */
+		wp[1] = 0x0004000000000200UL;
+		wp[2] = 0x0000000100000011UL; /* nop.m 0; nop.i 0; br.ret.sptk.many b6 */
+		wp[3] = 0x0084006880000200UL;
 		ia64_fc(wp); ia64_fc(wp + 2);
 		++offp;
 	}
@@ -169,7 +141,7 @@ ia64_patch_mckinley_e9 (unsigned long start, unsigned long end)
 	ia64_srlz_i();
 }
 
-static void __init
+static void
 patch_fsyscall_table (unsigned long start, unsigned long end)
 {
 	extern unsigned long fsyscall_table[NR_syscalls];
@@ -186,7 +158,7 @@ patch_fsyscall_table (unsigned long start, unsigned long end)
 	ia64_srlz_i();
 }
 
-static void __init
+static void
 patch_brl_fsys_bubble_down (unsigned long start, unsigned long end)
 {
 	extern char fsys_bubble_down[];
@@ -204,7 +176,7 @@ patch_brl_fsys_bubble_down (unsigned long start, unsigned long end)
 	ia64_srlz_i();
 }
 
-void __init
+void
 ia64_patch_gate (void)
 {
 #	define START(name)	((unsigned long) __start_gate_##name##_patchlist)
@@ -214,24 +186,4 @@ ia64_patch_gate (void)
 	patch_brl_fsys_bubble_down(START(brl_fsys_bubble_down), END(brl_fsys_bubble_down));
 	ia64_patch_vtop(START(vtop), END(vtop));
 	ia64_patch_mckinley_e9(START(mckinley_e9), END(mckinley_e9));
-}
-
-void ia64_patch_phys_stack_reg(unsigned long val)
-{
-	s32 * offp = (s32 *) __start___phys_stack_reg_patchlist;
-	s32 * end = (s32 *) __end___phys_stack_reg_patchlist;
-	u64 ip, mask, imm;
-
-	/* see instruction format A4: adds r1 = imm13, r3 */
-	mask = (0x3fUL << 27) | (0x7f << 13);
-	imm = (((val >> 7) & 0x3f) << 27) | (val & 0x7f) << 13;
-
-	while (offp < end) {
-		ip = (u64) offp + *offp;
-		ia64_patch(ip, mask, imm);
-		ia64_fc((void *)ip);
-		++offp;
-	}
-	ia64_sync_i();
-	ia64_srlz_i();
 }

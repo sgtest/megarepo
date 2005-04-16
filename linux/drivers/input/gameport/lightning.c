@@ -1,5 +1,6 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /*
+ * $Id: lightning.c,v 1.20 2002/01/22 20:41:31 vojtech Exp $
+ *
  *  Copyright (c) 1998-2001 Vojtech Pavlik
  */
 
@@ -8,6 +9,23 @@
  */
 
 /*
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ *
+ * Should you need to contact me, the author, you can do so either by
+ * e-mail - mail your message to <vojtech@ucw.cz>, or by paper mail:
+ * Vojtech Pavlik, Simunkova 1594, Prague 8, 182 00 Czech Republic
  */
 
 #include <asm/io.h>
@@ -18,6 +36,7 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/gameport.h>
+#include <linux/slab.h>
 
 #define L4_PORT			0x201
 #define L4_SELECT_ANALOG	0xa4
@@ -290,7 +309,7 @@ static int __init l4_init(void)
 	int i, cards = 0;
 
 	if (!request_region(L4_PORT, 1, "lightning"))
-		return -EBUSY;
+		return -1;
 
 	for (i = 0; i < 2; i++)
 		if (l4_add_card(i) == 0)
@@ -300,7 +319,7 @@ static int __init l4_init(void)
 
 	if (!cards) {
 		release_region(L4_PORT, 1);
-		return -ENODEV;
+		return -1;
 	}
 
 	return 0;

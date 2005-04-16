@@ -1,35 +1,33 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Kernel support for the ptrace() and syscall tracing interfaces.
  *
  * Copyright (C) 1999-2005 Hewlett-Packard Co
  *	David Mosberger-Tang <davidm@hpl.hp.com>
- * Copyright (C) 2006 Intel Co
- *  2006-08-12	- IA64 Native Utrace implementation support added by
- *	Anil S Keshavamurthy <anil.s.keshavamurthy@intel.com>
  *
  * Derived from the x86 and Alpha versions.
  */
+#include <linux/config.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
-#include <linux/sched/task.h>
-#include <linux/sched/task_stack.h>
+#include <linux/slab.h>
 #include <linux/mm.h>
 #include <linux/errno.h>
 #include <linux/ptrace.h>
+#include <linux/smp_lock.h>
 #include <linux/user.h>
 #include <linux/security.h>
 #include <linux/audit.h>
-#include <linux/signal.h>
-#include <linux/regset.h>
-#include <linux/elf.h>
-#include <linux/resume_user_mode.h>
 
+#include <asm/pgtable.h>
 #include <asm/processor.h>
 #include <asm/ptrace_offsets.h>
 #include <asm/rse.h>
-#include <linux/uaccess.h>
+#include <asm/system.h>
+#include <asm/uaccess.h>
 #include <asm/unwind.h>
+#ifdef CONFIG_PERFMON
+#include <asm/perfmon.h>
+#endif
 
 #include "entry.h"
 
@@ -255,7 +253,7 @@ get_rnat (struct task_struct *task, struct switch_stack *sw,
 	long num_regs, nbits;
 	struct pt_regs *pt;
 
-	pt = task_pt_regs(task);
+	pt = ia64_task_regs(task);
 	kbsp = (unsigned long *) sw->ar_bspstore;
 	ubspstore = (unsigned long *) pt->ar_bspstore;
 
@@ -315,7 +313,7 @@ put_rnat (struct task_struct *task, struct switch_stack *sw,
 	struct pt_regs *pt;
 	unsigned long cfm, *urbs_kargs;
 
-	pt = task_pt_regs(task);
+	pt = ia64_task_regs(task);
 	kbsp = (unsigned long *) sw->ar_bspstore;
 	ubspstore = (unsigned long *) pt->ar_bspstore;
 
@@ -408,7 +406,7 @@ ia64_peek (struct task_struct *child, struct switch_stack *child_stack,
 
 	urbs_end = (long *) user_rbs_end;
 	laddr = (unsigned long *) addr;
-	child_regs = task_pt_regs(child);
+	child_regs = ia64_task_regs(child);
 	bspstore = (unsigned long *) child_regs->ar_bspstore;
 	krbs = (unsigned long *) child + IA64_RBS_OFFSET/8;
 	if (on_kernel_rbs(addr, (unsigned long) bspstore,
@@ -452,7 +450,7 @@ ia64_peek (struct task_struct *child, struct switch_stack *child_stack,
 			return 0;
 		}
 	}
-	copied = access_process_vm(child, addr, &ret, sizeof(ret), FOLL_FORCE);
+	copied = access_process_vm(child, addr, &ret, sizeof(ret), 0);
 	if (copied != sizeof(ret))
 		return -EIO;
 	*val = ret;
@@ -468,7 +466,7 @@ ia64_poke (struct task_struct *child, struct switch_stack *child_stack,
 	struct pt_regs *child_regs;
 
 	laddr = (unsigned long *) addr;
-	child_regs = task_pt_regs(child);
+	child_regs = ia64_task_regs(child);
 	bspstore = (unsigned long *) child_regs->ar_bspstore;
 	krbs = (unsigned long *) child + IA64_RBS_OFFSET/8;
 	if (on_kernel_rbs(addr, (unsigned long) bspstore,
@@ -488,8 +486,7 @@ ia64_poke (struct task_struct *child, struct switch_stack *child_stack,
 				*ia64_rse_skip_regs(krbs, regnum) = val;
 			}
 		}
-	} else if (access_process_vm(child, addr, &val, sizeof(val),
-				FOLL_FORCE | FOLL_WRITE)
+	} else if (access_process_vm(child, addr, &val, sizeof(val), 1)
 		   != sizeof(val))
 		return -EIO;
 	return 0;
@@ -543,78 +540,90 @@ ia64_sync_user_rbs (struct task_struct *child, struct switch_stack *sw,
 		ret = ia64_peek(child, sw, user_rbs_end, addr, &val);
 		if (ret < 0)
 			return ret;
-		if (access_process_vm(child, addr, &val, sizeof(val),
-				FOLL_FORCE | FOLL_WRITE)
+		if (access_process_vm(child, addr, &val, sizeof(val), 1)
 		    != sizeof(val))
 			return -EIO;
 	}
 	return 0;
 }
 
-static long
-ia64_sync_kernel_rbs (struct task_struct *child, struct switch_stack *sw,
-		unsigned long user_rbs_start, unsigned long user_rbs_end)
+static inline int
+thread_matches (struct task_struct *thread, unsigned long addr)
 {
-	unsigned long addr, val;
-	long ret;
+	unsigned long thread_rbs_end;
+	struct pt_regs *thread_regs;
 
-	/* now copy word for word from user rbs to kernel rbs: */
-	for (addr = user_rbs_start; addr < user_rbs_end; addr += 8) {
-		if (access_process_vm(child, addr, &val, sizeof(val),
-				FOLL_FORCE)
-				!= sizeof(val))
-			return -EIO;
+	if (ptrace_check_attach(thread, 0) < 0)
+		/*
+		 * If the thread is not in an attachable state, we'll
+		 * ignore it.  The net effect is that if ADDR happens
+		 * to overlap with the portion of the thread's
+		 * register backing store that is currently residing
+		 * on the thread's kernel stack, then ptrace() may end
+		 * up accessing a stale value.  But if the thread
+		 * isn't stopped, that's a problem anyhow, so we're
+		 * doing as well as we can...
+		 */
+		return 0;
 
-		ret = ia64_poke(child, sw, user_rbs_end, addr, val);
-		if (ret < 0)
-			return ret;
-	}
-	return 0;
-}
+	thread_regs = ia64_task_regs(thread);
+	thread_rbs_end = ia64_get_user_rbs_end(thread, thread_regs, NULL);
+	if (!on_kernel_rbs(addr, thread_regs->ar_bspstore, thread_rbs_end))
+		return 0;
 
-typedef long (*syncfunc_t)(struct task_struct *, struct switch_stack *,
-			    unsigned long, unsigned long);
-
-static void do_sync_rbs(struct unw_frame_info *info, void *arg)
-{
-	struct pt_regs *pt;
-	unsigned long urbs_end;
-	syncfunc_t fn = arg;
-
-	if (unw_unwind_to_user(info) < 0)
-		return;
-	pt = task_pt_regs(info->task);
-	urbs_end = ia64_get_user_rbs_end(info->task, pt, NULL);
-
-	fn(info->task, info->sw, pt->ar_bspstore, urbs_end);
+	return 1;	/* looks like we've got a winner */
 }
 
 /*
- * when a thread is stopped (ptraced), debugger might change thread's user
- * stack (change memory directly), and we must avoid the RSE stored in kernel
- * to override user stack (user space's RSE is newer than kernel's in the
- * case). To workaround the issue, we copy kernel RSE to user RSE before the
- * task is stopped, so user RSE has updated data.  we then copy user RSE to
- * kernel after the task is resummed from traced stop and kernel will use the
- * newer RSE to return to user. TIF_RESTORE_RSE is the flag to indicate we need
- * synchronize user RSE to kernel.
+ * GDB apparently wants to be able to read the register-backing store
+ * of any thread when attached to a given process.  If we are peeking
+ * or poking an address that happens to reside in the kernel-backing
+ * store of another thread, we need to attach to that thread, because
+ * otherwise we end up accessing stale data.
+ *
+ * task_list_lock must be read-locked before calling this routine!
  */
-void ia64_ptrace_stop(void)
+static struct task_struct *
+find_thread_for_addr (struct task_struct *child, unsigned long addr)
 {
-	if (test_and_set_tsk_thread_flag(current, TIF_RESTORE_RSE))
-		return;
-	set_notify_resume(current);
-	unw_init_running(do_sync_rbs, ia64_sync_user_rbs);
-}
+	struct task_struct *g, *p;
+	struct mm_struct *mm;
+	int mm_users;
 
-/*
- * This is called to read back the register backing store.
- */
-void ia64_sync_krbs(void)
-{
-	clear_tsk_thread_flag(current, TIF_RESTORE_RSE);
+	if (!(mm = get_task_mm(child)))
+		return child;
 
-	unw_init_running(do_sync_rbs, ia64_sync_kernel_rbs);
+	/* -1 because of our get_task_mm(): */
+	mm_users = atomic_read(&mm->mm_users) - 1;
+	if (mm_users <= 1)
+		goto out;		/* not multi-threaded */
+
+	/*
+	 * First, traverse the child's thread-list.  Good for scalability with
+	 * NPTL-threads.
+	 */
+	p = child;
+	do {
+		if (thread_matches(p, addr)) {
+			child = p;
+			goto out;
+		}
+		if (mm_users-- <= 1)
+			goto out;
+	} while ((p = next_thread(p)) != child);
+
+	do_each_thread(g, p) {
+		if (child->mm != mm)
+			continue;
+
+		if (thread_matches(p, addr)) {
+			child = p;
+			goto out;
+		}
+	} while_each_thread(g, p);
+  out:
+	mmput(mm);
+	return child;
 }
 
 /*
@@ -623,19 +632,13 @@ void ia64_sync_krbs(void)
 inline void
 ia64_flush_fph (struct task_struct *task)
 {
-	struct ia64_psr *psr = ia64_psr(task_pt_regs(task));
+	struct ia64_psr *psr = ia64_psr(ia64_task_regs(task));
 
-	/*
-	 * Prevent migrating this task while
-	 * we're fiddling with the FPU state
-	 */
-	preempt_disable();
 	if (ia64_is_local_fpu_owner(task) && psr->mfh) {
 		psr->mfh = 0;
 		task->thread.flags |= IA64_THREAD_FPH_VALID;
 		ia64_save_fpu(&task->thread.fph[0]);
 	}
-	preempt_enable();
 }
 
 /*
@@ -649,7 +652,7 @@ ia64_flush_fph (struct task_struct *task)
 void
 ia64_sync_fph (struct task_struct *task)
 {
-	struct ia64_psr *psr = ia64_psr(task_pt_regs(task));
+	struct ia64_psr *psr = ia64_psr(ia64_task_regs(task));
 
 	ia64_flush_fph(task);
 	if (!(task->thread.flags & IA64_THREAD_FPH_VALID)) {
@@ -658,6 +661,25 @@ ia64_sync_fph (struct task_struct *task)
 	}
 	ia64_drop_fpu(task);
 	psr->dfh = 1;
+}
+
+static int
+access_fr (struct unw_frame_info *info, int regnum, int hi,
+	   unsigned long *data, int write_access)
+{
+	struct ia64_fpreg fpval;
+	int ret;
+
+	ret = unw_get_fr(info, regnum, &fpval);
+	if (ret < 0)
+		return ret;
+
+	if (write_access) {
+		fpval.u.bits[hi] = *data;
+		ret = unw_set_fr(info, regnum, fpval);
+	} else
+		*data = fpval.u.bits[hi];
+	return ret;
 }
 
 /*
@@ -669,59 +691,25 @@ convert_to_non_syscall (struct task_struct *child, struct pt_regs  *pt,
 			unsigned long cfm)
 {
 	struct unw_frame_info info, prev_info;
-	unsigned long ip, sp, pr;
+	unsigned long ip, pr;
 
 	unw_init_from_blocked_task(&info, child);
 	while (1) {
 		prev_info = info;
 		if (unw_unwind(&info) < 0)
 			return;
-
-		unw_get_sp(&info, &sp);
-		if ((long)((unsigned long)child + IA64_STK_OFFSET - sp)
-		    < IA64_PT_REGS_SIZE) {
-			dprintk("ptrace.%s: ran off the top of the kernel "
-				"stack\n", __func__);
+		if (unw_get_rp(&info, &ip) < 0)
 			return;
-		}
-		if (unw_get_pr (&prev_info, &pr) < 0) {
-			unw_get_rp(&prev_info, &ip);
-			dprintk("ptrace.%s: failed to read "
-				"predicate register (ip=0x%lx)\n",
-				__func__, ip);
-			return;
-		}
-		if (unw_is_intr_frame(&info)
-		    && (pr & (1UL << PRED_USER_STACK)))
+		if (ip < FIXADDR_USER_END)
 			break;
 	}
 
-	/*
-	 * Note: at the time of this call, the target task is blocked
-	 * in notify_resume_user() and by clearling PRED_LEAVE_SYSCALL
-	 * (aka, "pLvSys") we redirect execution from
-	 * .work_pending_syscall_end to .work_processed_kernel.
-	 */
 	unw_get_pr(&prev_info, &pr);
-	pr &= ~((1UL << PRED_SYSCALL) | (1UL << PRED_LEAVE_SYSCALL));
+	pr &= ~(1UL << PRED_SYSCALL);
 	pr |=  (1UL << PRED_NON_SYSCALL);
 	unw_set_pr(&prev_info, pr);
 
 	pt->cr_ifs = (1UL << 63) | cfm;
-	/*
-	 * Clear the memory that is NOT written on syscall-entry to
-	 * ensure we do not leak kernel-state to user when execution
-	 * resumes.
-	 */
-	pt->r2 = 0;
-	pt->r3 = 0;
-	pt->r14 = 0;
-	memset(&pt->r16, 0, 16*8);	/* clear r16-r31 */
-	memset(&pt->f6, 0, 6*16);	/* clear f6-f11 */
-	pt->b7 = 0;
-	pt->ar_ccv = 0;
-	pt->ar_csd = 0;
-	pt->ar_ssd = 0;
 }
 
 static int
@@ -760,8 +748,323 @@ access_nat_bits (struct task_struct *child, struct pt_regs *pt,
 }
 
 static int
-access_elf_reg(struct task_struct *target, struct unw_frame_info *info,
-		unsigned long addr, unsigned long *data, int write_access);
+access_uarea (struct task_struct *child, unsigned long addr,
+	      unsigned long *data, int write_access)
+{
+	unsigned long *ptr, regnum, urbs_end, rnat_addr, cfm;
+	struct switch_stack *sw;
+	struct pt_regs *pt;
+#	define pt_reg_addr(pt, reg)	((void *)			    \
+					 ((unsigned long) (pt)		    \
+					  + offsetof(struct pt_regs, reg)))
+
+
+	pt = ia64_task_regs(child);
+	sw = (struct switch_stack *) (child->thread.ksp + 16);
+
+	if ((addr & 0x7) != 0) {
+		dprintk("ptrace: unaligned register address 0x%lx\n", addr);
+		return -1;
+	}
+
+	if (addr < PT_F127 + 16) {
+		/* accessing fph */
+		if (write_access)
+			ia64_sync_fph(child);
+		else
+			ia64_flush_fph(child);
+		ptr = (unsigned long *)
+			((unsigned long) &child->thread.fph + addr);
+	} else if ((addr >= PT_F10) && (addr < PT_F11 + 16)) {
+		/* scratch registers untouched by kernel (saved in pt_regs) */
+		ptr = pt_reg_addr(pt, f10) + (addr - PT_F10);
+	} else if (addr >= PT_F12 && addr < PT_F15 + 16) {
+		/*
+		 * Scratch registers untouched by kernel (saved in
+		 * switch_stack).
+		 */
+		ptr = (unsigned long *) ((long) sw
+					 + (addr - PT_NAT_BITS - 32));
+	} else if (addr < PT_AR_LC + 8) {
+		/* preserved state: */
+		struct unw_frame_info info;
+		char nat = 0;
+		int ret;
+
+		unw_init_from_blocked_task(&info, child);
+		if (unw_unwind_to_user(&info) < 0)
+			return -1;
+
+		switch (addr) {
+		      case PT_NAT_BITS:
+			return access_nat_bits(child, pt, &info,
+					       data, write_access);
+
+		      case PT_R4: case PT_R5: case PT_R6: case PT_R7:
+			if (write_access) {
+				/* read NaT bit first: */
+				unsigned long dummy;
+
+				ret = unw_get_gr(&info, (addr - PT_R4)/8 + 4,
+						 &dummy, &nat);
+				if (ret < 0)
+					return ret;
+			}
+			return unw_access_gr(&info, (addr - PT_R4)/8 + 4, data,
+					     &nat, write_access);
+
+		      case PT_B1: case PT_B2: case PT_B3:
+		      case PT_B4: case PT_B5:
+			return unw_access_br(&info, (addr - PT_B1)/8 + 1, data,
+					     write_access);
+
+		      case PT_AR_EC:
+			return unw_access_ar(&info, UNW_AR_EC, data,
+					     write_access);
+
+		      case PT_AR_LC:
+			return unw_access_ar(&info, UNW_AR_LC, data,
+					     write_access);
+
+		      default:
+			if (addr >= PT_F2 && addr < PT_F5 + 16)
+				return access_fr(&info, (addr - PT_F2)/16 + 2,
+						 (addr & 8) != 0, data,
+						 write_access);
+			else if (addr >= PT_F16 && addr < PT_F31 + 16)
+				return access_fr(&info,
+						 (addr - PT_F16)/16 + 16,
+						 (addr & 8) != 0,
+						 data, write_access);
+			else {
+				dprintk("ptrace: rejecting access to register "
+					"address 0x%lx\n", addr);
+				return -1;
+			}
+		}
+	} else if (addr < PT_F9+16) {
+		/* scratch state */
+		switch (addr) {
+		      case PT_AR_BSP:
+			/*
+			 * By convention, we use PT_AR_BSP to refer to
+			 * the end of the user-level backing store.
+			 * Use ia64_rse_skip_regs(PT_AR_BSP, -CFM.sof)
+			 * to get the real value of ar.bsp at the time
+			 * the kernel was entered.
+			 *
+			 * Furthermore, when changing the contents of
+			 * PT_AR_BSP (or PT_CFM) we MUST copy any
+			 * users-level stacked registers that are
+			 * stored on the kernel stack back to
+			 * user-space because otherwise, we might end
+			 * up clobbering kernel stacked registers.
+			 * Also, if this happens while the task is
+			 * blocked in a system call, which convert the
+			 * state such that the non-system-call exit
+			 * path is used.  This ensures that the proper
+			 * state will be picked up when resuming
+			 * execution.  However, it *also* means that
+			 * once we write PT_AR_BSP/PT_CFM, it won't be
+			 * possible to modify the syscall arguments of
+			 * the pending system call any longer.  This
+			 * shouldn't be an issue because modifying
+			 * PT_AR_BSP/PT_CFM generally implies that
+			 * we're either abandoning the pending system
+			 * call or that we defer it's re-execution
+			 * (e.g., due to GDB doing an inferior
+			 * function call).
+			 */
+			urbs_end = ia64_get_user_rbs_end(child, pt, &cfm);
+			if (write_access) {
+				if (*data != urbs_end) {
+					if (ia64_sync_user_rbs(child, sw,
+							       pt->ar_bspstore,
+							       urbs_end) < 0)
+						return -1;
+					if (in_syscall(pt))
+						convert_to_non_syscall(child,
+								       pt,
+								       cfm);
+					/*
+					 * Simulate user-level write
+					 * of ar.bsp:
+					 */
+					pt->loadrs = 0;
+					pt->ar_bspstore = *data;
+				}
+			} else
+				*data = urbs_end;
+			return 0;
+
+		      case PT_CFM:
+			urbs_end = ia64_get_user_rbs_end(child, pt, &cfm);
+			if (write_access) {
+				if (((cfm ^ *data) & PFM_MASK) != 0) {
+					if (ia64_sync_user_rbs(child, sw,
+							       pt->ar_bspstore,
+							       urbs_end) < 0)
+						return -1;
+					if (in_syscall(pt))
+						convert_to_non_syscall(child,
+								       pt,
+								       cfm);
+					pt->cr_ifs = ((pt->cr_ifs & ~PFM_MASK)
+						      | (*data & PFM_MASK));
+				}
+			} else
+				*data = cfm;
+			return 0;
+
+		      case PT_CR_IPSR:
+			if (write_access)
+				pt->cr_ipsr = ((*data & IPSR_MASK)
+					       | (pt->cr_ipsr & ~IPSR_MASK));
+			else
+				*data = (pt->cr_ipsr & IPSR_MASK);
+			return 0;
+
+		      case PT_AR_RNAT:
+			urbs_end = ia64_get_user_rbs_end(child, pt, NULL);
+			rnat_addr = (long) ia64_rse_rnat_addr((long *)
+							      urbs_end);
+			if (write_access)
+				return ia64_poke(child, sw, urbs_end,
+						 rnat_addr, *data);
+			else
+				return ia64_peek(child, sw, urbs_end,
+						 rnat_addr, data);
+
+		      case PT_R1:
+			ptr = pt_reg_addr(pt, r1);
+			break;
+		      case PT_R2:  case PT_R3:
+			ptr = pt_reg_addr(pt, r2) + (addr - PT_R2);
+			break;
+		      case PT_R8:  case PT_R9:  case PT_R10: case PT_R11:
+			ptr = pt_reg_addr(pt, r8) + (addr - PT_R8);
+			break;
+		      case PT_R12: case PT_R13:
+			ptr = pt_reg_addr(pt, r12) + (addr - PT_R12);
+			break;
+		      case PT_R14:
+			ptr = pt_reg_addr(pt, r14);
+			break;
+		      case PT_R15:
+			ptr = pt_reg_addr(pt, r15);
+			break;
+		      case PT_R16: case PT_R17: case PT_R18: case PT_R19:
+		      case PT_R20: case PT_R21: case PT_R22: case PT_R23:
+		      case PT_R24: case PT_R25: case PT_R26: case PT_R27:
+		      case PT_R28: case PT_R29: case PT_R30: case PT_R31:
+			ptr = pt_reg_addr(pt, r16) + (addr - PT_R16);
+			break;
+		      case PT_B0:
+			ptr = pt_reg_addr(pt, b0);
+			break;
+		      case PT_B6:
+			ptr = pt_reg_addr(pt, b6);
+			break;
+		      case PT_B7:
+			ptr = pt_reg_addr(pt, b7);
+			break;
+		      case PT_F6:  case PT_F6+8: case PT_F7: case PT_F7+8:
+		      case PT_F8:  case PT_F8+8: case PT_F9: case PT_F9+8:
+			ptr = pt_reg_addr(pt, f6) + (addr - PT_F6);
+			break;
+		      case PT_AR_BSPSTORE:
+			ptr = pt_reg_addr(pt, ar_bspstore);
+			break;
+		      case PT_AR_RSC:
+			ptr = pt_reg_addr(pt, ar_rsc);
+			break;
+		      case PT_AR_UNAT:
+			ptr = pt_reg_addr(pt, ar_unat);
+			break;
+		      case PT_AR_PFS:
+			ptr = pt_reg_addr(pt, ar_pfs);
+			break;
+		      case PT_AR_CCV:
+			ptr = pt_reg_addr(pt, ar_ccv);
+			break;
+		      case PT_AR_FPSR:
+			ptr = pt_reg_addr(pt, ar_fpsr);
+			break;
+		      case PT_CR_IIP:
+			ptr = pt_reg_addr(pt, cr_iip);
+			break;
+		      case PT_PR:
+			ptr = pt_reg_addr(pt, pr);
+			break;
+			/* scratch register */
+
+		      default:
+			/* disallow accessing anything else... */
+			dprintk("ptrace: rejecting access to register "
+				"address 0x%lx\n", addr);
+			return -1;
+		}
+	} else if (addr <= PT_AR_SSD) {
+		ptr = pt_reg_addr(pt, ar_csd) + (addr - PT_AR_CSD);
+	} else {
+		/* access debug registers */
+
+		if (addr >= PT_IBR) {
+			regnum = (addr - PT_IBR) >> 3;
+			ptr = &child->thread.ibr[0];
+		} else {
+			regnum = (addr - PT_DBR) >> 3;
+			ptr = &child->thread.dbr[0];
+		}
+
+		if (regnum >= 8) {
+			dprintk("ptrace: rejecting access to register "
+				"address 0x%lx\n", addr);
+			return -1;
+		}
+#ifdef CONFIG_PERFMON
+		/*
+		 * Check if debug registers are used by perfmon. This
+		 * test must be done once we know that we can do the
+		 * operation, i.e. the arguments are all valid, but
+		 * before we start modifying the state.
+		 *
+		 * Perfmon needs to keep a count of how many processes
+		 * are trying to modify the debug registers for system
+		 * wide monitoring sessions.
+		 *
+		 * We also include read access here, because they may
+		 * cause the PMU-installed debug register state
+		 * (dbr[], ibr[]) to be reset. The two arrays are also
+		 * used by perfmon, but we do not use
+		 * IA64_THREAD_DBG_VALID. The registers are restored
+		 * by the PMU context switch code.
+		 */
+		if (pfm_use_debug_registers(child)) return -1;
+#endif
+
+		if (!(child->thread.flags & IA64_THREAD_DBG_VALID)) {
+			child->thread.flags |= IA64_THREAD_DBG_VALID;
+			memset(child->thread.dbr, 0,
+			       sizeof(child->thread.dbr));
+			memset(child->thread.ibr, 0,
+			       sizeof(child->thread.ibr));
+		}
+
+		ptr += regnum;
+
+		if ((regnum & 1) && write_access) {
+			/* don't let the user set kernel-level breakpoints: */
+			*ptr = *data & ~(7UL << 56);
+			return 0;
+		}
+	}
+	if (write_access)
+		*ptr = *data;
+	else
+		*data = *ptr;
+	return 0;
+}
 
 static long
 ptrace_getregs (struct task_struct *child, struct pt_all_user_regs __user *ppr)
@@ -775,10 +1078,10 @@ ptrace_getregs (struct task_struct *child, struct pt_all_user_regs __user *ppr)
 	char nat = 0;
 	int i;
 
-	if (!access_ok(ppr, sizeof(struct pt_all_user_regs)))
+	if (!access_ok(VERIFY_WRITE, ppr, sizeof(struct pt_all_user_regs)))
 		return -EIO;
 
-	pt = task_pt_regs(child);
+	pt = ia64_task_regs(child);
 	sw = (struct switch_stack *) (child->thread.ksp + 16);
 	unw_init_from_blocked_task(&info, child);
 	if (unw_unwind_to_user(&info) < 0) {
@@ -790,13 +1093,13 @@ ptrace_getregs (struct task_struct *child, struct pt_all_user_regs __user *ppr)
 		return -EIO;
 	}
 
-	if (access_elf_reg(child, &info, ELF_CR_IPSR_OFFSET, &psr, 0) < 0 ||
-	    access_elf_reg(child, &info, ELF_AR_EC_OFFSET, &ec, 0) < 0 ||
-	    access_elf_reg(child, &info, ELF_AR_LC_OFFSET, &lc, 0) < 0 ||
-	    access_elf_reg(child, &info, ELF_AR_RNAT_OFFSET, &rnat, 0) < 0 ||
-	    access_elf_reg(child, &info, ELF_AR_BSP_OFFSET, &bsp, 0) < 0 ||
-	    access_elf_reg(child, &info, ELF_CFM_OFFSET, &cfm, 0) < 0 ||
-	    access_elf_reg(child, &info, ELF_NAT_OFFSET, &nat_bits, 0) < 0)
+	if (access_uarea(child, PT_CR_IPSR, &psr, 0) < 0
+	    || access_uarea(child, PT_AR_EC, &ec, 0) < 0
+	    || access_uarea(child, PT_AR_LC, &lc, 0) < 0
+	    || access_uarea(child, PT_AR_RNAT, &rnat, 0) < 0
+	    || access_uarea(child, PT_AR_BSP, &bsp, 0) < 0
+	    || access_uarea(child, PT_CFM, &cfm, 0)
+	    || access_uarea(child, PT_NAT_BITS, &nat_bits, 0))
 		return -EIO;
 
 	/* control regs */
@@ -910,20 +1213,20 @@ ptrace_getregs (struct task_struct *child, struct pt_all_user_regs __user *ppr)
 static long
 ptrace_setregs (struct task_struct *child, struct pt_all_user_regs __user *ppr)
 {
-	unsigned long psr, rsc, ec, lc, rnat, bsp, cfm, nat_bits, val = 0;
+	unsigned long psr, ec, lc, rnat, bsp, cfm, nat_bits, val = 0;
 	struct unw_frame_info info;
 	struct switch_stack *sw;
 	struct ia64_fpreg fpval;
 	struct pt_regs *pt;
-	long retval = 0;
+	long ret, retval = 0;
 	int i;
 
 	memset(&fpval, 0, sizeof(fpval));
 
-	if (!access_ok(ppr, sizeof(struct pt_all_user_regs)))
+	if (!access_ok(VERIFY_READ, ppr, sizeof(struct pt_all_user_regs)))
 		return -EIO;
 
-	pt = task_pt_regs(child);
+	pt = ia64_task_regs(child);
 	sw = (struct switch_stack *) (child->thread.ksp + 16);
 	unw_init_from_blocked_task(&info, child);
 	if (unw_unwind_to_user(&info) < 0) {
@@ -943,7 +1246,7 @@ ptrace_setregs (struct task_struct *child, struct pt_all_user_regs __user *ppr)
 	/* app regs */
 
 	retval |= __get_user(pt->ar_pfs, &ppr->ar[PT_AUR_PFS]);
-	retval |= __get_user(rsc, &ppr->ar[PT_AUR_RSC]);
+	retval |= __get_user(pt->ar_rsc, &ppr->ar[PT_AUR_RSC]);
 	retval |= __get_user(pt->ar_bspstore, &ppr->ar[PT_AUR_BSPSTORE]);
 	retval |= __get_user(pt->ar_unat, &ppr->ar[PT_AUR_UNAT]);
 	retval |= __get_user(pt->ar_ccv, &ppr->ar[PT_AUR_CCV]);
@@ -1040,45 +1343,16 @@ ptrace_setregs (struct task_struct *child, struct pt_all_user_regs __user *ppr)
 
 	retval |= __get_user(nat_bits, &ppr->nat);
 
-	retval |= access_elf_reg(child, &info, ELF_CR_IPSR_OFFSET, &psr, 1);
-	retval |= access_elf_reg(child, &info, ELF_AR_RSC_OFFSET, &rsc, 1);
-	retval |= access_elf_reg(child, &info, ELF_AR_EC_OFFSET, &ec, 1);
-	retval |= access_elf_reg(child, &info, ELF_AR_LC_OFFSET, &lc, 1);
-	retval |= access_elf_reg(child, &info, ELF_AR_RNAT_OFFSET, &rnat, 1);
-	retval |= access_elf_reg(child, &info, ELF_AR_BSP_OFFSET, &bsp, 1);
-	retval |= access_elf_reg(child, &info, ELF_CFM_OFFSET, &cfm, 1);
-	retval |= access_elf_reg(child, &info, ELF_NAT_OFFSET, &nat_bits, 1);
+	retval |= access_uarea(child, PT_CR_IPSR, &psr, 1);
+	retval |= access_uarea(child, PT_AR_EC, &ec, 1);
+	retval |= access_uarea(child, PT_AR_LC, &lc, 1);
+	retval |= access_uarea(child, PT_AR_RNAT, &rnat, 1);
+	retval |= access_uarea(child, PT_AR_BSP, &bsp, 1);
+	retval |= access_uarea(child, PT_CFM, &cfm, 1);
+	retval |= access_uarea(child, PT_NAT_BITS, &nat_bits, 1);
 
-	return retval ? -EIO : 0;
-}
-
-void
-user_enable_single_step (struct task_struct *child)
-{
-	struct ia64_psr *child_psr = ia64_psr(task_pt_regs(child));
-
-	set_tsk_thread_flag(child, TIF_SINGLESTEP);
-	child_psr->ss = 1;
-}
-
-void
-user_enable_block_step (struct task_struct *child)
-{
-	struct ia64_psr *child_psr = ia64_psr(task_pt_regs(child));
-
-	set_tsk_thread_flag(child, TIF_SINGLESTEP);
-	child_psr->tb = 1;
-}
-
-void
-user_disable_single_step (struct task_struct *child)
-{
-	struct ia64_psr *child_psr = ia64_psr(task_pt_regs(child));
-
-	/* make sure the single step/taken-branch trap bits are not set: */
-	clear_tsk_thread_flag(child, TIF_SINGLESTEP);
-	child_psr->ss = 0;
-	child_psr->tb = 0;
+	ret = retval ? -EIO : 0;
+	return ret;
 }
 
 /*
@@ -1089,88 +1363,252 @@ user_disable_single_step (struct task_struct *child)
 void
 ptrace_disable (struct task_struct *child)
 {
-	user_disable_single_step(child);
+	struct ia64_psr *child_psr = ia64_psr(ia64_task_regs(child));
+
+	/* make sure the single step/taken-branch trap bits are not set: */
+	child_psr->ss = 0;
+	child_psr->tb = 0;
 }
 
-static int
-access_uarea (struct task_struct *child, unsigned long addr,
-	      unsigned long *data, int write_access);
-
-long
-arch_ptrace (struct task_struct *child, long request,
-	     unsigned long addr, unsigned long data)
+asmlinkage long
+sys_ptrace (long request, pid_t pid, unsigned long addr, unsigned long data)
 {
+	struct pt_regs *pt;
+	unsigned long urbs_end, peek_or_poke;
+	struct task_struct *child;
+	struct switch_stack *sw;
+	long ret;
+
+	lock_kernel();
+	ret = -EPERM;
+	if (request == PTRACE_TRACEME) {
+		/* are we already being traced? */
+		if (current->ptrace & PT_PTRACED)
+			goto out;
+		ret = security_ptrace(current->parent, current);
+		if (ret)
+			goto out;
+		current->ptrace |= PT_PTRACED;
+		ret = 0;
+		goto out;
+	}
+
+	peek_or_poke = (request == PTRACE_PEEKTEXT
+			|| request == PTRACE_PEEKDATA
+			|| request == PTRACE_POKETEXT
+			|| request == PTRACE_POKEDATA);
+	ret = -ESRCH;
+	read_lock(&tasklist_lock);
+	{
+		child = find_task_by_pid(pid);
+		if (child) {
+			if (peek_or_poke)
+				child = find_thread_for_addr(child, addr);
+			get_task_struct(child);
+		}
+	}
+	read_unlock(&tasklist_lock);
+	if (!child)
+		goto out;
+	ret = -EPERM;
+	if (pid == 1)		/* no messing around with init! */
+		goto out_tsk;
+
+	if (request == PTRACE_ATTACH) {
+		ret = ptrace_attach(child);
+		goto out_tsk;
+	}
+
+	ret = ptrace_check_attach(child, request == PTRACE_KILL);
+	if (ret < 0)
+		goto out_tsk;
+
+	pt = ia64_task_regs(child);
+	sw = (struct switch_stack *) (child->thread.ksp + 16);
+
 	switch (request) {
-	case PTRACE_PEEKTEXT:
-	case PTRACE_PEEKDATA:
+	      case PTRACE_PEEKTEXT:
+	      case PTRACE_PEEKDATA:
 		/* read word at location addr */
-		if (ptrace_access_vm(child, addr, &data, sizeof(data),
-				FOLL_FORCE)
-		    != sizeof(data))
-			return -EIO;
-		/* ensure return value is not mistaken for error code */
-		force_successful_syscall_return();
-		return data;
+		urbs_end = ia64_get_user_rbs_end(child, pt, NULL);
+		ret = ia64_peek(child, sw, urbs_end, addr, &data);
+		if (ret == 0) {
+			ret = data;
+			/* ensure "ret" is not mistaken as an error code: */
+			force_successful_syscall_return();
+		}
+		goto out_tsk;
 
-	/* PTRACE_POKETEXT and PTRACE_POKEDATA is handled
-	 * by the generic ptrace_request().
-	 */
+	      case PTRACE_POKETEXT:
+	      case PTRACE_POKEDATA:
+		/* write the word at location addr */
+		urbs_end = ia64_get_user_rbs_end(child, pt, NULL);
+		ret = ia64_poke(child, sw, urbs_end, addr, data);
+		goto out_tsk;
 
-	case PTRACE_PEEKUSR:
+	      case PTRACE_PEEKUSR:
 		/* read the word at addr in the USER area */
-		if (access_uarea(child, addr, &data, 0) < 0)
-			return -EIO;
-		/* ensure return value is not mistaken for error code */
+		if (access_uarea(child, addr, &data, 0) < 0) {
+			ret = -EIO;
+			goto out_tsk;
+		}
+		ret = data;
+		/* ensure "ret" is not mistaken as an error code */
 		force_successful_syscall_return();
-		return data;
+		goto out_tsk;
 
-	case PTRACE_POKEUSR:
+	      case PTRACE_POKEUSR:
 		/* write the word at addr in the USER area */
-		if (access_uarea(child, addr, &data, 1) < 0)
-			return -EIO;
-		return 0;
+		if (access_uarea(child, addr, &data, 1) < 0) {
+			ret = -EIO;
+			goto out_tsk;
+		}
+		ret = 0;
+		goto out_tsk;
 
-	case PTRACE_OLD_GETSIGINFO:
+	      case PTRACE_OLD_GETSIGINFO:
 		/* for backwards-compatibility */
-		return ptrace_request(child, PTRACE_GETSIGINFO, addr, data);
+		ret = ptrace_request(child, PTRACE_GETSIGINFO, addr, data);
+		goto out_tsk;
 
-	case PTRACE_OLD_SETSIGINFO:
+	      case PTRACE_OLD_SETSIGINFO:
 		/* for backwards-compatibility */
-		return ptrace_request(child, PTRACE_SETSIGINFO, addr, data);
+		ret = ptrace_request(child, PTRACE_SETSIGINFO, addr, data);
+		goto out_tsk;
 
-	case PTRACE_GETREGS:
-		return ptrace_getregs(child,
-				      (struct pt_all_user_regs __user *) data);
+	      case PTRACE_SYSCALL:
+		/* continue and stop at next (return from) syscall */
+	      case PTRACE_CONT:
+		/* restart after signal. */
+		ret = -EIO;
+		if (data > _NSIG)
+			goto out_tsk;
+		if (request == PTRACE_SYSCALL)
+			set_tsk_thread_flag(child, TIF_SYSCALL_TRACE);
+		else
+			clear_tsk_thread_flag(child, TIF_SYSCALL_TRACE);
+		child->exit_code = data;
 
-	case PTRACE_SETREGS:
-		return ptrace_setregs(child,
-				      (struct pt_all_user_regs __user *) data);
+		/*
+		 * Make sure the single step/taken-branch trap bits
+		 * are not set:
+		 */
+		ia64_psr(pt)->ss = 0;
+		ia64_psr(pt)->tb = 0;
 
-	default:
-		return ptrace_request(child, request, addr, data);
+		wake_up_process(child);
+		ret = 0;
+		goto out_tsk;
+
+	      case PTRACE_KILL:
+		/*
+		 * Make the child exit.  Best I can do is send it a
+		 * sigkill.  Perhaps it should be put in the status
+		 * that it wants to exit.
+		 */
+		if (child->exit_state == EXIT_ZOMBIE)
+			/* already dead */
+			goto out_tsk;
+		child->exit_code = SIGKILL;
+
+		ptrace_disable(child);
+		wake_up_process(child);
+		ret = 0;
+		goto out_tsk;
+
+	      case PTRACE_SINGLESTEP:
+		/* let child execute for one instruction */
+	      case PTRACE_SINGLEBLOCK:
+		ret = -EIO;
+		if (data > _NSIG)
+			goto out_tsk;
+
+		clear_tsk_thread_flag(child, TIF_SYSCALL_TRACE);
+		if (request == PTRACE_SINGLESTEP) {
+			ia64_psr(pt)->ss = 1;
+		} else {
+			ia64_psr(pt)->tb = 1;
+		}
+		child->exit_code = data;
+
+		/* give it a chance to run. */
+		wake_up_process(child);
+		ret = 0;
+		goto out_tsk;
+
+	      case PTRACE_DETACH:
+		/* detach a process that was attached. */
+		ret = ptrace_detach(child, data);
+		goto out_tsk;
+
+	      case PTRACE_GETREGS:
+		ret = ptrace_getregs(child,
+				     (struct pt_all_user_regs __user *) data);
+		goto out_tsk;
+
+	      case PTRACE_SETREGS:
+		ret = ptrace_setregs(child,
+				     (struct pt_all_user_regs __user *) data);
+		goto out_tsk;
+
+	      default:
+		ret = ptrace_request(child, request, addr, data);
+		goto out_tsk;
+	}
+  out_tsk:
+	put_task_struct(child);
+  out:
+	unlock_kernel();
+	return ret;
+}
+
+
+void
+syscall_trace (void)
+{
+	if (!test_thread_flag(TIF_SYSCALL_TRACE))
+		return;
+	if (!(current->ptrace & PT_PTRACED))
+		return;
+	/*
+	 * The 0x80 provides a way for the tracing parent to
+	 * distinguish between a syscall stop and SIGTRAP delivery.
+	 */
+	ptrace_notify(SIGTRAP
+		      | ((current->ptrace & PT_TRACESYSGOOD) ? 0x80 : 0));
+
+	/*
+	 * This isn't the same as continuing with a signal, but it
+	 * will do for normal use.  strace only continues with a
+	 * signal if the stopping signal is not SIGTRAP.  -brl
+	 */
+	if (current->exit_code) {
+		send_sig(current->exit_code, current, 1);
+		current->exit_code = 0;
 	}
 }
 
-
 /* "asmlinkage" so the input arguments are preserved... */
 
-asmlinkage long
+asmlinkage void
 syscall_trace_enter (long arg0, long arg1, long arg2, long arg3,
 		     long arg4, long arg5, long arg6, long arg7,
 		     struct pt_regs regs)
 {
-	if (test_thread_flag(TIF_SYSCALL_TRACE))
-		if (ptrace_report_syscall_entry(&regs))
-			return -ENOSYS;
+	long syscall;
 
-	/* copy user rbs to kernel rbs */
-	if (test_thread_flag(TIF_RESTORE_RSE))
-		ia64_sync_krbs();
+	if (unlikely(current->audit_context)) {
+		if (IS_IA32_PROCESS(&regs))
+			syscall = regs.r1;
+		else
+			syscall = regs.r15;
 
+		audit_syscall_entry(current, syscall, arg0, arg1, arg2, arg3);
+	}
 
-	audit_syscall_entry(regs.r15, arg0, arg1, arg2, arg3);
-
-	return 0;
+	if (test_thread_flag(TIF_SYSCALL_TRACE)
+	    && (current->ptrace & PT_PTRACED))
+		syscall_trace();
 }
 
 /* "asmlinkage" so the input arguments are preserved... */
@@ -1180,835 +1618,10 @@ syscall_trace_leave (long arg0, long arg1, long arg2, long arg3,
 		     long arg4, long arg5, long arg6, long arg7,
 		     struct pt_regs regs)
 {
-	int step;
-
-	audit_syscall_exit(&regs);
-
-	step = test_thread_flag(TIF_SINGLESTEP);
-	if (step || test_thread_flag(TIF_SYSCALL_TRACE))
-		ptrace_report_syscall_exit(&regs, step);
-
-	/* copy user rbs to kernel rbs */
-	if (test_thread_flag(TIF_RESTORE_RSE))
-		ia64_sync_krbs();
-}
-
-/* Utrace implementation starts here */
-struct regset_get {
-	void *kbuf;
-	void __user *ubuf;
-};
-
-struct regset_set {
-	const void *kbuf;
-	const void __user *ubuf;
-};
-
-struct regset_getset {
-	struct task_struct *target;
-	const struct user_regset *regset;
-	union {
-		struct regset_get get;
-		struct regset_set set;
-	} u;
-	unsigned int pos;
-	unsigned int count;
-	int ret;
-};
-
-static const ptrdiff_t pt_offsets[32] =
-{
-#define R(n) offsetof(struct pt_regs, r##n)
-	[0] = -1, R(1), R(2), R(3),
-	[4] = -1, [5] = -1, [6] = -1, [7] = -1,
-	R(8), R(9), R(10), R(11), R(12), R(13), R(14), R(15),
-	R(16), R(17), R(18), R(19), R(20), R(21), R(22), R(23),
-	R(24), R(25), R(26), R(27), R(28), R(29), R(30), R(31),
-#undef R
-};
-
-static int
-access_elf_gpreg(struct task_struct *target, struct unw_frame_info *info,
-		unsigned long addr, unsigned long *data, int write_access)
-{
-	struct pt_regs *pt = task_pt_regs(target);
-	unsigned reg = addr / sizeof(unsigned long);
-	ptrdiff_t d = pt_offsets[reg];
-
-	if (d >= 0) {
-		unsigned long *ptr = (void *)pt + d;
-		if (write_access)
-			*ptr = *data;
-		else
-			*data = *ptr;
-		return 0;
-	} else {
-		char nat = 0;
-		if (write_access) {
-			/* read NaT bit first: */
-			unsigned long dummy;
-			int ret = unw_get_gr(info, reg, &dummy, &nat);
-			if (ret < 0)
-				return ret;
-		}
-		return unw_access_gr(info, reg, data, &nat, write_access);
-	}
-}
-
-static int
-access_elf_breg(struct task_struct *target, struct unw_frame_info *info,
-		unsigned long addr, unsigned long *data, int write_access)
-{
-	struct pt_regs *pt;
-	unsigned long *ptr = NULL;
-
-	pt = task_pt_regs(target);
-	switch (addr) {
-	case ELF_BR_OFFSET(0):
-		ptr = &pt->b0;
-		break;
-	case ELF_BR_OFFSET(1) ... ELF_BR_OFFSET(5):
-		return unw_access_br(info, (addr - ELF_BR_OFFSET(0))/8,
-				     data, write_access);
-	case ELF_BR_OFFSET(6):
-		ptr = &pt->b6;
-		break;
-	case ELF_BR_OFFSET(7):
-		ptr = &pt->b7;
-	}
-	if (write_access)
-		*ptr = *data;
-	else
-		*data = *ptr;
-	return 0;
-}
-
-static int
-access_elf_areg(struct task_struct *target, struct unw_frame_info *info,
-		unsigned long addr, unsigned long *data, int write_access)
-{
-	struct pt_regs *pt;
-	unsigned long cfm, urbs_end;
-	unsigned long *ptr = NULL;
-
-	pt = task_pt_regs(target);
-	if (addr >= ELF_AR_RSC_OFFSET && addr <= ELF_AR_SSD_OFFSET) {
-		switch (addr) {
-		case ELF_AR_RSC_OFFSET:
-			/* force PL3 */
-			if (write_access)
-				pt->ar_rsc = *data | (3 << 2);
-			else
-				*data = pt->ar_rsc;
-			return 0;
-		case ELF_AR_BSP_OFFSET:
-			/*
-			 * By convention, we use PT_AR_BSP to refer to
-			 * the end of the user-level backing store.
-			 * Use ia64_rse_skip_regs(PT_AR_BSP, -CFM.sof)
-			 * to get the real value of ar.bsp at the time
-			 * the kernel was entered.
-			 *
-			 * Furthermore, when changing the contents of
-			 * PT_AR_BSP (or PT_CFM) while the task is
-			 * blocked in a system call, convert the state
-			 * so that the non-system-call exit
-			 * path is used.  This ensures that the proper
-			 * state will be picked up when resuming
-			 * execution.  However, it *also* means that
-			 * once we write PT_AR_BSP/PT_CFM, it won't be
-			 * possible to modify the syscall arguments of
-			 * the pending system call any longer.  This
-			 * shouldn't be an issue because modifying
-			 * PT_AR_BSP/PT_CFM generally implies that
-			 * we're either abandoning the pending system
-			 * call or that we defer it's re-execution
-			 * (e.g., due to GDB doing an inferior
-			 * function call).
-			 */
-			urbs_end = ia64_get_user_rbs_end(target, pt, &cfm);
-			if (write_access) {
-				if (*data != urbs_end) {
-					if (in_syscall(pt))
-						convert_to_non_syscall(target,
-								       pt,
-								       cfm);
-					/*
-					 * Simulate user-level write
-					 * of ar.bsp:
-					 */
-					pt->loadrs = 0;
-					pt->ar_bspstore = *data;
-				}
-			} else
-				*data = urbs_end;
-			return 0;
-		case ELF_AR_BSPSTORE_OFFSET:
-			ptr = &pt->ar_bspstore;
-			break;
-		case ELF_AR_RNAT_OFFSET:
-			ptr = &pt->ar_rnat;
-			break;
-		case ELF_AR_CCV_OFFSET:
-			ptr = &pt->ar_ccv;
-			break;
-		case ELF_AR_UNAT_OFFSET:
-			ptr = &pt->ar_unat;
-			break;
-		case ELF_AR_FPSR_OFFSET:
-			ptr = &pt->ar_fpsr;
-			break;
-		case ELF_AR_PFS_OFFSET:
-			ptr = &pt->ar_pfs;
-			break;
-		case ELF_AR_LC_OFFSET:
-			return unw_access_ar(info, UNW_AR_LC, data,
-					     write_access);
-		case ELF_AR_EC_OFFSET:
-			return unw_access_ar(info, UNW_AR_EC, data,
-					     write_access);
-		case ELF_AR_CSD_OFFSET:
-			ptr = &pt->ar_csd;
-			break;
-		case ELF_AR_SSD_OFFSET:
-			ptr = &pt->ar_ssd;
-		}
-	} else if (addr >= ELF_CR_IIP_OFFSET && addr <= ELF_CR_IPSR_OFFSET) {
-		switch (addr) {
-		case ELF_CR_IIP_OFFSET:
-			ptr = &pt->cr_iip;
-			break;
-		case ELF_CFM_OFFSET:
-			urbs_end = ia64_get_user_rbs_end(target, pt, &cfm);
-			if (write_access) {
-				if (((cfm ^ *data) & PFM_MASK) != 0) {
-					if (in_syscall(pt))
-						convert_to_non_syscall(target,
-								       pt,
-								       cfm);
-					pt->cr_ifs = ((pt->cr_ifs & ~PFM_MASK)
-						      | (*data & PFM_MASK));
-				}
-			} else
-				*data = cfm;
-			return 0;
-		case ELF_CR_IPSR_OFFSET:
-			if (write_access) {
-				unsigned long tmp = *data;
-				/* psr.ri==3 is a reserved value: SDM 2:25 */
-				if ((tmp & IA64_PSR_RI) == IA64_PSR_RI)
-					tmp &= ~IA64_PSR_RI;
-				pt->cr_ipsr = ((tmp & IPSR_MASK)
-					       | (pt->cr_ipsr & ~IPSR_MASK));
-			} else
-				*data = (pt->cr_ipsr & IPSR_MASK);
-			return 0;
-		}
-	} else if (addr == ELF_NAT_OFFSET)
-		return access_nat_bits(target, pt, info,
-				       data, write_access);
-	else if (addr == ELF_PR_OFFSET)
-		ptr = &pt->pr;
-	else
-		return -1;
-
-	if (write_access)
-		*ptr = *data;
-	else
-		*data = *ptr;
-
-	return 0;
-}
-
-static int
-access_elf_reg(struct task_struct *target, struct unw_frame_info *info,
-		unsigned long addr, unsigned long *data, int write_access)
-{
-	if (addr >= ELF_GR_OFFSET(1) && addr <= ELF_GR_OFFSET(31))
-		return access_elf_gpreg(target, info, addr, data, write_access);
-	else if (addr >= ELF_BR_OFFSET(0) && addr <= ELF_BR_OFFSET(7))
-		return access_elf_breg(target, info, addr, data, write_access);
-	else
-		return access_elf_areg(target, info, addr, data, write_access);
-}
-
-struct regset_membuf {
-	struct membuf to;
-	int ret;
-};
-
-static void do_gpregs_get(struct unw_frame_info *info, void *arg)
-{
-	struct regset_membuf *dst = arg;
-	struct membuf to = dst->to;
-	unsigned int n;
-	elf_greg_t reg;
-
-	if (unw_unwind_to_user(info) < 0)
-		return;
-
-	/*
-	 * coredump format:
-	 *      r0-r31
-	 *      NaT bits (for r0-r31; bit N == 1 iff rN is a NaT)
-	 *      predicate registers (p0-p63)
-	 *      b0-b7
-	 *      ip cfm user-mask
-	 *      ar.rsc ar.bsp ar.bspstore ar.rnat
-	 *      ar.ccv ar.unat ar.fpsr ar.pfs ar.lc ar.ec
-	 */
-
-
-	/* Skip r0 */
-	membuf_zero(&to, 8);
-	for (n = 8; to.left && n < ELF_AR_END_OFFSET; n += 8) {
-		if (access_elf_reg(info->task, info, n, &reg, 0) < 0) {
-			dst->ret = -EIO;
-			return;
-		}
-		membuf_store(&to, reg);
-	}
-}
-
-static void do_gpregs_set(struct unw_frame_info *info, void *arg)
-{
-	struct regset_getset *dst = arg;
-
-	if (unw_unwind_to_user(info) < 0)
-		return;
-
-	if (!dst->count)
-		return;
-	/* Skip r0 */
-	if (dst->pos < ELF_GR_OFFSET(1)) {
-		dst->ret = user_regset_copyin_ignore(&dst->pos, &dst->count,
-						       &dst->u.set.kbuf,
-						       &dst->u.set.ubuf,
-						       0, ELF_GR_OFFSET(1));
-		if (dst->ret)
-			return;
-	}
-
-	while (dst->count && dst->pos < ELF_AR_END_OFFSET) {
-		unsigned int n, from, to;
-		elf_greg_t tmp[16];
-
-		from = dst->pos;
-		to = from + sizeof(tmp);
-		if (to > ELF_AR_END_OFFSET)
-			to = ELF_AR_END_OFFSET;
-		/* get up to 16 values */
-		dst->ret = user_regset_copyin(&dst->pos, &dst->count,
-				&dst->u.set.kbuf, &dst->u.set.ubuf, tmp,
-				from, to);
-		if (dst->ret)
-			return;
-		/* now copy them into registers */
-		for (n = 0; from < dst->pos; from += sizeof(elf_greg_t), n++)
-			if (access_elf_reg(dst->target, info, from,
-						&tmp[n], 1) < 0) {
-				dst->ret = -EIO;
-				return;
-			}
-	}
-}
-
-#define ELF_FP_OFFSET(i)	(i * sizeof(elf_fpreg_t))
-
-static void do_fpregs_get(struct unw_frame_info *info, void *arg)
-{
-	struct task_struct *task = info->task;
-	struct regset_membuf *dst = arg;
-	struct membuf to = dst->to;
-	elf_fpreg_t reg;
-	unsigned int n;
-
-	if (unw_unwind_to_user(info) < 0)
-		return;
-
-	/* Skip pos 0 and 1 */
-	membuf_zero(&to, 2 * sizeof(elf_fpreg_t));
-
-	/* fr2-fr31 */
-	for (n = 2; to.left && n < 32; n++) {
-		if (unw_get_fr(info, n, &reg)) {
-			dst->ret = -EIO;
-			return;
-		}
-		membuf_write(&to, &reg, sizeof(reg));
-	}
-
-	/* fph */
-	if (!to.left)
-		return;
-
-	ia64_flush_fph(task);
-	if (task->thread.flags & IA64_THREAD_FPH_VALID)
-		membuf_write(&to, &task->thread.fph, 96 * sizeof(reg));
-	else
-		membuf_zero(&to, 96 * sizeof(reg));
-}
-
-static void do_fpregs_set(struct unw_frame_info *info, void *arg)
-{
-	struct regset_getset *dst = arg;
-	elf_fpreg_t fpreg, tmp[30];
-	int index, start, end;
-
-	if (unw_unwind_to_user(info) < 0)
-		return;
-
-	/* Skip pos 0 and 1 */
-	if (dst->count > 0 && dst->pos < ELF_FP_OFFSET(2)) {
-		dst->ret = user_regset_copyin_ignore(&dst->pos, &dst->count,
-						       &dst->u.set.kbuf,
-						       &dst->u.set.ubuf,
-						       0, ELF_FP_OFFSET(2));
-		if (dst->count == 0 || dst->ret)
-			return;
-	}
-
-	/* fr2-fr31 */
-	if (dst->count > 0 && dst->pos < ELF_FP_OFFSET(32)) {
-		start = dst->pos;
-		end = min(((unsigned int)ELF_FP_OFFSET(32)),
-			 dst->pos + dst->count);
-		dst->ret = user_regset_copyin(&dst->pos, &dst->count,
-				&dst->u.set.kbuf, &dst->u.set.ubuf, tmp,
-				ELF_FP_OFFSET(2), ELF_FP_OFFSET(32));
-		if (dst->ret)
-			return;
-
-		if (start & 0xF) { /* only write high part */
-			if (unw_get_fr(info, start / sizeof(elf_fpreg_t),
-					 &fpreg)) {
-				dst->ret = -EIO;
-				return;
-			}
-			tmp[start / sizeof(elf_fpreg_t) - 2].u.bits[0]
-				= fpreg.u.bits[0];
-			start &= ~0xFUL;
-		}
-		if (end & 0xF) { /* only write low part */
-			if (unw_get_fr(info, end / sizeof(elf_fpreg_t),
-					&fpreg)) {
-				dst->ret = -EIO;
-				return;
-			}
-			tmp[end / sizeof(elf_fpreg_t) - 2].u.bits[1]
-				= fpreg.u.bits[1];
-			end = (end + 0xF) & ~0xFUL;
-		}
-
-		for ( ;	start < end ; start += sizeof(elf_fpreg_t)) {
-			index = start / sizeof(elf_fpreg_t);
-			if (unw_set_fr(info, index, tmp[index - 2])) {
-				dst->ret = -EIO;
-				return;
-			}
-		}
-		if (dst->ret || dst->count == 0)
-			return;
-	}
-
-	/* fph */
-	if (dst->count > 0 && dst->pos < ELF_FP_OFFSET(128)) {
-		ia64_sync_fph(dst->target);
-		dst->ret = user_regset_copyin(&dst->pos, &dst->count,
-						&dst->u.set.kbuf,
-						&dst->u.set.ubuf,
-						&dst->target->thread.fph,
-						ELF_FP_OFFSET(32), -1);
-	}
-}
-
-static void
-unwind_and_call(void (*call)(struct unw_frame_info *, void *),
-	       struct task_struct *target, void *data)
-{
-	if (target == current)
-		unw_init_running(call, data);
-	else {
-		struct unw_frame_info info;
-		memset(&info, 0, sizeof(info));
-		unw_init_from_blocked_task(&info, target);
-		(*call)(&info, data);
-	}
-}
-
-static int
-do_regset_call(void (*call)(struct unw_frame_info *, void *),
-	       struct task_struct *target,
-	       const struct user_regset *regset,
-	       unsigned int pos, unsigned int count,
-	       const void *kbuf, const void __user *ubuf)
-{
-	struct regset_getset info = { .target = target, .regset = regset,
-				 .pos = pos, .count = count,
-				 .u.set = { .kbuf = kbuf, .ubuf = ubuf },
-				 .ret = 0 };
-	unwind_and_call(call, target, &info);
-	return info.ret;
-}
-
-static int
-gpregs_get(struct task_struct *target,
-	   const struct user_regset *regset,
-	   struct membuf to)
-{
-	struct regset_membuf info = {.to = to};
-	unwind_and_call(do_gpregs_get, target, &info);
-	return info.ret;
-}
-
-static int gpregs_set(struct task_struct *target,
-		const struct user_regset *regset,
-		unsigned int pos, unsigned int count,
-		const void *kbuf, const void __user *ubuf)
-{
-	return do_regset_call(do_gpregs_set, target, regset, pos, count,
-		kbuf, ubuf);
-}
-
-static void do_gpregs_writeback(struct unw_frame_info *info, void *arg)
-{
-	do_sync_rbs(info, ia64_sync_user_rbs);
-}
-
-/*
- * This is called to write back the register backing store.
- * ptrace does this before it stops, so that a tracer reading the user
- * memory after the thread stops will get the current register data.
- */
-static int
-gpregs_writeback(struct task_struct *target,
-		 const struct user_regset *regset,
-		 int now)
-{
-	if (test_and_set_tsk_thread_flag(target, TIF_RESTORE_RSE))
-		return 0;
-	set_notify_resume(target);
-	return do_regset_call(do_gpregs_writeback, target, regset, 0, 0,
-		NULL, NULL);
-}
-
-static int
-fpregs_active(struct task_struct *target, const struct user_regset *regset)
-{
-	return (target->thread.flags & IA64_THREAD_FPH_VALID) ? 128 : 32;
-}
-
-static int fpregs_get(struct task_struct *target,
-		const struct user_regset *regset,
-		struct membuf to)
-{
-	struct regset_membuf info = {.to = to};
-	unwind_and_call(do_fpregs_get, target, &info);
-	return info.ret;
-}
-
-static int fpregs_set(struct task_struct *target,
-		const struct user_regset *regset,
-		unsigned int pos, unsigned int count,
-		const void *kbuf, const void __user *ubuf)
-{
-	return do_regset_call(do_fpregs_set, target, regset, pos, count,
-		kbuf, ubuf);
-}
-
-static int
-access_uarea(struct task_struct *child, unsigned long addr,
-	      unsigned long *data, int write_access)
-{
-	unsigned int pos = -1; /* an invalid value */
-	unsigned long *ptr, regnum;
-
-	if ((addr & 0x7) != 0) {
-		dprintk("ptrace: unaligned register address 0x%lx\n", addr);
-		return -1;
-	}
-	if ((addr >= PT_NAT_BITS + 8 && addr < PT_F2) ||
-		(addr >= PT_R7 + 8 && addr < PT_B1) ||
-		(addr >= PT_AR_LC + 8 && addr < PT_CR_IPSR) ||
-		(addr >= PT_AR_SSD + 8 && addr < PT_DBR)) {
-		dprintk("ptrace: rejecting access to register "
-					"address 0x%lx\n", addr);
-		return -1;
-	}
-
-	switch (addr) {
-	case PT_F32 ... (PT_F127 + 15):
-		pos = addr - PT_F32 + ELF_FP_OFFSET(32);
-		break;
-	case PT_F2 ... (PT_F5 + 15):
-		pos = addr - PT_F2 + ELF_FP_OFFSET(2);
-		break;
-	case PT_F10 ... (PT_F31 + 15):
-		pos = addr - PT_F10 + ELF_FP_OFFSET(10);
-		break;
-	case PT_F6 ... (PT_F9 + 15):
-		pos = addr - PT_F6 + ELF_FP_OFFSET(6);
-		break;
-	}
-
-	if (pos != -1) {
-		unsigned reg = pos / sizeof(elf_fpreg_t);
-		int which_half = (pos / sizeof(unsigned long)) & 1;
-
-		if (reg < 32) { /* fr2-fr31 */
-			struct unw_frame_info info;
-			elf_fpreg_t fpreg;
-
-			memset(&info, 0, sizeof(info));
-			unw_init_from_blocked_task(&info, child);
-			if (unw_unwind_to_user(&info) < 0)
-				return 0;
-
-			if (unw_get_fr(&info, reg, &fpreg))
-				return -1;
-			if (write_access) {
-				fpreg.u.bits[which_half] = *data;
-				if (unw_set_fr(&info, reg, fpreg))
-					return -1;
-			} else {
-				*data = fpreg.u.bits[which_half];
-			}
-		} else { /* fph */
-			elf_fpreg_t *p = &child->thread.fph[reg - 32];
-			unsigned long *bits = &p->u.bits[which_half];
-
-			ia64_sync_fph(child);
-			if (write_access)
-				*bits = *data;
-			else if (child->thread.flags & IA64_THREAD_FPH_VALID)
-				*data = *bits;
-			else
-				*data = 0;
-		}
-		return 0;
-	}
-
-	switch (addr) {
-	case PT_NAT_BITS:
-		pos = ELF_NAT_OFFSET;
-		break;
-	case PT_R4 ... PT_R7:
-		pos = addr - PT_R4 + ELF_GR_OFFSET(4);
-		break;
-	case PT_B1 ... PT_B5:
-		pos = addr - PT_B1 + ELF_BR_OFFSET(1);
-		break;
-	case PT_AR_EC:
-		pos = ELF_AR_EC_OFFSET;
-		break;
-	case PT_AR_LC:
-		pos = ELF_AR_LC_OFFSET;
-		break;
-	case PT_CR_IPSR:
-		pos = ELF_CR_IPSR_OFFSET;
-		break;
-	case PT_CR_IIP:
-		pos = ELF_CR_IIP_OFFSET;
-		break;
-	case PT_CFM:
-		pos = ELF_CFM_OFFSET;
-		break;
-	case PT_AR_UNAT:
-		pos = ELF_AR_UNAT_OFFSET;
-		break;
-	case PT_AR_PFS:
-		pos = ELF_AR_PFS_OFFSET;
-		break;
-	case PT_AR_RSC:
-		pos = ELF_AR_RSC_OFFSET;
-		break;
-	case PT_AR_RNAT:
-		pos = ELF_AR_RNAT_OFFSET;
-		break;
-	case PT_AR_BSPSTORE:
-		pos = ELF_AR_BSPSTORE_OFFSET;
-		break;
-	case PT_PR:
-		pos = ELF_PR_OFFSET;
-		break;
-	case PT_B6:
-		pos = ELF_BR_OFFSET(6);
-		break;
-	case PT_AR_BSP:
-		pos = ELF_AR_BSP_OFFSET;
-		break;
-	case PT_R1 ... PT_R3:
-		pos = addr - PT_R1 + ELF_GR_OFFSET(1);
-		break;
-	case PT_R12 ... PT_R15:
-		pos = addr - PT_R12 + ELF_GR_OFFSET(12);
-		break;
-	case PT_R8 ... PT_R11:
-		pos = addr - PT_R8 + ELF_GR_OFFSET(8);
-		break;
-	case PT_R16 ... PT_R31:
-		pos = addr - PT_R16 + ELF_GR_OFFSET(16);
-		break;
-	case PT_AR_CCV:
-		pos = ELF_AR_CCV_OFFSET;
-		break;
-	case PT_AR_FPSR:
-		pos = ELF_AR_FPSR_OFFSET;
-		break;
-	case PT_B0:
-		pos = ELF_BR_OFFSET(0);
-		break;
-	case PT_B7:
-		pos = ELF_BR_OFFSET(7);
-		break;
-	case PT_AR_CSD:
-		pos = ELF_AR_CSD_OFFSET;
-		break;
-	case PT_AR_SSD:
-		pos = ELF_AR_SSD_OFFSET;
-		break;
-	}
-
-	if (pos != -1) {
-		struct unw_frame_info info;
-
-		memset(&info, 0, sizeof(info));
-		unw_init_from_blocked_task(&info, child);
-		if (unw_unwind_to_user(&info) < 0)
-			return 0;
-
-		return access_elf_reg(child, &info, pos, data, write_access);
-	}
-
-	/* access debug registers */
-	if (addr >= PT_IBR) {
-		regnum = (addr - PT_IBR) >> 3;
-		ptr = &child->thread.ibr[0];
-	} else {
-		regnum = (addr - PT_DBR) >> 3;
-		ptr = &child->thread.dbr[0];
-	}
-
-	if (regnum >= 8) {
-		dprintk("ptrace: rejecting access to register "
-				"address 0x%lx\n", addr);
-		return -1;
-	}
-
-	if (!(child->thread.flags & IA64_THREAD_DBG_VALID)) {
-		child->thread.flags |= IA64_THREAD_DBG_VALID;
-		memset(child->thread.dbr, 0,
-				sizeof(child->thread.dbr));
-		memset(child->thread.ibr, 0,
-				sizeof(child->thread.ibr));
-	}
-
-	ptr += regnum;
-
-	if ((regnum & 1) && write_access) {
-		/* don't let the user set kernel-level breakpoints: */
-		*ptr = *data & ~(7UL << 56);
-		return 0;
-	}
-	if (write_access)
-		*ptr = *data;
-	else
-		*data = *ptr;
-	return 0;
-}
-
-static const struct user_regset native_regsets[] = {
-	{
-		.core_note_type = NT_PRSTATUS,
-		.n = ELF_NGREG,
-		.size = sizeof(elf_greg_t), .align = sizeof(elf_greg_t),
-		.regset_get = gpregs_get, .set = gpregs_set,
-		.writeback = gpregs_writeback
-	},
-	{
-		.core_note_type = NT_PRFPREG,
-		.n = ELF_NFPREG,
-		.size = sizeof(elf_fpreg_t), .align = sizeof(elf_fpreg_t),
-		.regset_get = fpregs_get, .set = fpregs_set, .active = fpregs_active
-	},
-};
-
-static const struct user_regset_view user_ia64_view = {
-	.name = "ia64",
-	.e_machine = EM_IA_64,
-	.regsets = native_regsets, .n = ARRAY_SIZE(native_regsets)
-};
-
-const struct user_regset_view *task_user_regset_view(struct task_struct *tsk)
-{
-	return &user_ia64_view;
-}
-
-struct syscall_get_args {
-	unsigned int i;
-	unsigned int n;
-	unsigned long *args;
-	struct pt_regs *regs;
-};
-
-static void syscall_get_args_cb(struct unw_frame_info *info, void *data)
-{
-	struct syscall_get_args *args = data;
-	struct pt_regs *pt = args->regs;
-	unsigned long *krbs, cfm, ndirty, nlocals, nouts;
-	int i, count;
-
-	if (unw_unwind_to_user(info) < 0)
-		return;
-
-	/*
-	 * We get here via a few paths:
-	 * - break instruction: cfm is shared with caller.
-	 *   syscall args are in out= regs, locals are non-empty.
-	 * - epsinstruction: cfm is set by br.call
-	 *   locals don't exist.
-	 *
-	 * For both cases arguments are reachable in cfm.sof - cfm.sol.
-	 * CFM: [ ... | sor: 17..14 | sol : 13..7 | sof : 6..0 ]
-	 */
-	cfm = pt->cr_ifs;
-	nlocals = (cfm >> 7) & 0x7f; /* aka sol */
-	nouts = (cfm & 0x7f) - nlocals; /* aka sof - sol */
-	krbs = (unsigned long *)info->task + IA64_RBS_OFFSET/8;
-	ndirty = ia64_rse_num_regs(krbs, krbs + (pt->loadrs >> 19));
-
-	count = 0;
-	if (in_syscall(pt))
-		count = min_t(int, args->n, nouts);
-
-	/* Iterate over outs. */
-	for (i = 0; i < count; i++) {
-		int j = ndirty + nlocals + i + args->i;
-		args->args[i] = *ia64_rse_skip_regs(krbs, j);
-	}
-
-	while (i < args->n) {
-		args->args[i] = 0;
-		i++;
-	}
-}
-
-void syscall_get_arguments(struct task_struct *task,
-	struct pt_regs *regs, unsigned long *args)
-{
-	struct syscall_get_args data = {
-		.i = 0,
-		.n = 6,
-		.args = args,
-		.regs = regs,
-	};
-
-	if (task == current)
-		unw_init_running(syscall_get_args_cb, &data);
-	else {
-		struct unw_frame_info ufi;
-		memset(&ufi, 0, sizeof(ufi));
-		unw_init_from_blocked_task(&ufi, task);
-		syscall_get_args_cb(&ufi, &data);
-	}
+	if (unlikely(current->audit_context))
+		audit_syscall_exit(current, regs.r8);
+
+	if (test_thread_flag(TIF_SYSCALL_TRACE)
+	    && (current->ptrace & PT_PTRACED))
+		syscall_trace();
 }

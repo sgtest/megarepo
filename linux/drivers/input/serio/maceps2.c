@@ -1,8 +1,11 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * SGI O2 MACE PS2 controller driver for linux
  *
  * Copyright (C) 2002 Vivien Chappelier
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation
  */
 #include <linux/module.h>
 #include <linux/init.h>
@@ -11,13 +14,14 @@
 #include <linux/interrupt.h>
 #include <linux/ioport.h>
 #include <linux/delay.h>
-#include <linux/platform_device.h>
+#include <linux/device.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/err.h>
 
 #include <asm/io.h>
 #include <asm/irq.h>
+#include <asm/system.h>
 #include <asm/ip32/mace.h>
 #include <asm/ip32/ip32_ints.h>
 
@@ -68,7 +72,8 @@ static int maceps2_write(struct serio *dev, unsigned char val)
 	return -1;
 }
 
-static irqreturn_t maceps2_interrupt(int irq, void *dev_id)
+static irqreturn_t maceps2_interrupt(int irq, void *dev_id,
+				     struct pt_regs *regs)
 {
 	struct serio *dev = dev_id;
 	struct mace_ps2port *port = ((struct maceps2_data *)dev->port_data)->port;
@@ -76,7 +81,7 @@ static irqreturn_t maceps2_interrupt(int irq, void *dev_id)
 
 	if (port->status & PS2_STATUS_RX_FULL) {
 		byte = port->rx;
-		serio_interrupt(dev, byte & 0xff, 0);
+		serio_interrupt(dev, byte & 0xff, 0, regs);
         }
 
 	return IRQ_HANDLED;
@@ -113,12 +118,13 @@ static void maceps2_close(struct serio *dev)
 }
 
 
-static struct serio *maceps2_allocate_port(int idx)
+static struct serio * __init maceps2_allocate_port(int idx)
 {
 	struct serio *serio;
 
-	serio = kzalloc(sizeof(struct serio), GFP_KERNEL);
+	serio = kmalloc(sizeof(struct serio), GFP_KERNEL);
 	if (serio) {
+		memset(serio, 0, sizeof(struct serio));
 		serio->id.type		= SERIO_8042;
 		serio->write		= maceps2_write;
 		serio->open		= maceps2_open;
@@ -132,13 +138,24 @@ static struct serio *maceps2_allocate_port(int idx)
 	return serio;
 }
 
-static int maceps2_probe(struct platform_device *dev)
+
+static int __init maceps2_init(void)
 {
+	maceps2_device = platform_device_register_simple("maceps2", -1, NULL, 0);
+	if (IS_ERR(maceps2_device))
+		return PTR_ERR(maceps2_device);
+
+	port_data[0].port = &mace->perif.ps2.keyb;
+	port_data[0].irq  = MACEISA_KEYB_IRQ;
+	port_data[1].port = &mace->perif.ps2.mouse;
+	port_data[1].irq  = MACEISA_MOUSE_IRQ;
+
 	maceps2_port[0] = maceps2_allocate_port(0);
 	maceps2_port[1] = maceps2_allocate_port(1);
 	if (!maceps2_port[0] || !maceps2_port[1]) {
 		kfree(maceps2_port[0]);
 		kfree(maceps2_port[1]);
+		platform_device_unregister(maceps2_device);
 		return -ENOMEM;
 	}
 
@@ -148,58 +165,11 @@ static int maceps2_probe(struct platform_device *dev)
 	return 0;
 }
 
-static int maceps2_remove(struct platform_device *dev)
+static void __exit maceps2_exit(void)
 {
 	serio_unregister_port(maceps2_port[0]);
 	serio_unregister_port(maceps2_port[1]);
-
-	return 0;
-}
-
-static struct platform_driver maceps2_driver = {
-	.driver		= {
-		.name	= "maceps2",
-	},
-	.probe		= maceps2_probe,
-	.remove		= maceps2_remove,
-};
-
-static int __init maceps2_init(void)
-{
-	int error;
-
-	error = platform_driver_register(&maceps2_driver);
-	if (error)
-		return error;
-
-	maceps2_device = platform_device_alloc("maceps2", -1);
-	if (!maceps2_device) {
-		error = -ENOMEM;
-		goto err_unregister_driver;
-	}
-
-	port_data[0].port = &mace->perif.ps2.keyb;
-	port_data[0].irq  = MACEISA_KEYB_IRQ;
-	port_data[1].port = &mace->perif.ps2.mouse;
-	port_data[1].irq  = MACEISA_MOUSE_IRQ;
-
-	error = platform_device_add(maceps2_device);
-	if (error)
-		goto err_free_device;
-
-	return 0;
-
- err_free_device:
-	platform_device_put(maceps2_device);
- err_unregister_driver:
-	platform_driver_unregister(&maceps2_driver);
-	return error;
-}
-
-static void __exit maceps2_exit(void)
-{
 	platform_device_unregister(maceps2_device);
-	platform_driver_unregister(&maceps2_driver);
 }
 
 module_init(maceps2_init);

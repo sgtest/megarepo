@@ -149,12 +149,12 @@ static struct pi_protocol aten = {
 
 static int __init aten_init(void)
 {
-	return paride_register(&aten);
+	return pi_register(&aten)-1;
 }
 
 static void __exit aten_exit(void)
 {
-	paride_unregister( &aten );
+	pi_unregister( &aten );
 }
 
 MODULE_LICENSE("GPL");

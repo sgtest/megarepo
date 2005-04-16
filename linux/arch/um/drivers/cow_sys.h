@@ -1,14 +1,14 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef __COW_SYS_H__
 #define __COW_SYS_H__
 
-#include <kern_util.h>
-#include <os.h>
-#include <um_malloc.h>
+#include "kern_util.h"
+#include "user_util.h"
+#include "os.h"
+#include "user.h"
 
 static inline void *cow_malloc(int size)
 {
-	return uml_kmalloc(size, UM_GFP_KERNEL);
+	return(um_kmalloc(size));
 }
 
 static inline void cow_free(void *ptr)
@@ -20,22 +20,29 @@ static inline void cow_free(void *ptr)
 
 static inline char *cow_strdup(char *str)
 {
-	return uml_strdup(str);
+	return(uml_strdup(str));
 }
 
-static inline int cow_seek_file(int fd, __u64 offset)
+static inline int cow_seek_file(int fd, unsigned long long offset)
 {
-	return os_seek_file(fd, offset);
+	return(os_seek_file(fd, offset));
 }
 
 static inline int cow_file_size(char *file, unsigned long long *size_out)
 {
-	return os_file_size(file, size_out);
+	return(os_file_size(file, size_out));
 }
 
-static inline int cow_write_file(int fd, void *buf, int size)
+static inline int cow_write_file(int fd, char *buf, int size)
 {
-	return os_write_file(fd, buf, size);
+	return(os_write_file(fd, buf, size));
 }
 
 #endif
+
+/*
+ * ---------------------------------------------------------------------------
+ * Local variables:
+ * c-file-style: "linux"
+ * End:
+ */

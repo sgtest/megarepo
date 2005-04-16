@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 #ifndef __SOUND_EMUX_SYNTH_H
 #define __SOUND_EMUX_SYNTH_H
 
@@ -6,55 +5,70 @@
  *  Defines for the Emu-series WaveTable chip
  *
  *  Copyright (C) 2000 Takashi Iwai <tiwai@suse.de>
+ *
+ *   This program is free software; you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation; either version 2 of the License, or
+ *   (at your option) any later version.
+ *
+ *   This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ *   You should have received a copy of the GNU General Public License
+ *   along with this program; if not, write to the Free Software
+ *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  */
 
-#include <sound/seq_kernel.h>
-#include <sound/seq_device.h>
-#include <sound/soundfont.h>
-#include <sound/seq_midi_emul.h>
-#include <sound/seq_oss.h>
-#include <sound/emux_legacy.h>
-#include <sound/seq_virmidi.h>
+#include "seq_kernel.h"
+#include "seq_device.h"
+#include "soundfont.h"
+#include "seq_midi_emul.h"
+#ifdef CONFIG_SND_SEQUENCER_OSS
+#include "seq_oss.h"
+#endif
+#include "emux_legacy.h"
+#include "seq_virmidi.h"
 
 /*
  * compile flags
  */
 #define SNDRV_EMUX_USE_RAW_EFFECT
 
-struct snd_emux;
-struct snd_emux_port;
-struct snd_emux_voice;
-struct snd_emux_effect_table;
+
+/*
+ * typedefs
+ */
+typedef struct snd_emux_effect_table snd_emux_effect_table_t;
+typedef struct snd_emux_port snd_emux_port_t;
+typedef struct snd_emux_voice snd_emux_voice_t;
+typedef struct snd_emux snd_emux_t;
+
 
 /*
  * operators
  */
-struct snd_emux_operators {
+typedef struct snd_emux_operators {
 	struct module *owner;
-	struct snd_emux_voice *(*get_voice)(struct snd_emux *emu,
-					    struct snd_emux_port *port);
-	int (*prepare)(struct snd_emux_voice *vp);
-	void (*trigger)(struct snd_emux_voice *vp);
-	void (*release)(struct snd_emux_voice *vp);
-	void (*update)(struct snd_emux_voice *vp, int update);
-	void (*terminate)(struct snd_emux_voice *vp);
-	void (*free_voice)(struct snd_emux_voice *vp);
-	void (*reset)(struct snd_emux *emu, int ch);
-	/* the first parameters are struct snd_emux */
-	int (*sample_new)(struct snd_emux *emu, struct snd_sf_sample *sp,
-			  struct snd_util_memhdr *hdr,
-			  const void __user *data, long count);
-	int (*sample_free)(struct snd_emux *emu, struct snd_sf_sample *sp,
-			   struct snd_util_memhdr *hdr);
-	void (*sample_reset)(struct snd_emux *emu);
-	int (*load_fx)(struct snd_emux *emu, int type, int arg,
-		       const void __user *data, long count);
-	void (*sysex)(struct snd_emux *emu, char *buf, int len, int parsed,
-		      struct snd_midi_channel_set *chset);
-#if IS_ENABLED(CONFIG_SND_SEQUENCER_OSS)
-	int (*oss_ioctl)(struct snd_emux *emu, int cmd, int p1, int p2);
+	snd_emux_voice_t *(*get_voice)(snd_emux_t *emu, snd_emux_port_t *port);
+	int (*prepare)(snd_emux_voice_t *vp);
+	void (*trigger)(snd_emux_voice_t *vp);
+	void (*release)(snd_emux_voice_t *vp);
+	void (*update)(snd_emux_voice_t *vp, int update);
+	void (*terminate)(snd_emux_voice_t *vp);
+	void (*free_voice)(snd_emux_voice_t *vp);
+	void (*reset)(snd_emux_t *emu, int ch);
+	/* the first parameters are snd_emux_t */
+	int (*sample_new)(snd_emux_t *emu, snd_sf_sample_t *sp, snd_util_memhdr_t *hdr, const void __user *data, long count);
+	int (*sample_free)(snd_emux_t *emu, snd_sf_sample_t *sp, snd_util_memhdr_t *hdr);
+	void (*sample_reset)(snd_emux_t *emu);
+	int (*load_fx)(snd_emux_t *emu, int type, int arg, const void __user *data, long count);
+	void (*sysex)(snd_emux_t *emu, char *buf, int len, int parsed, snd_midi_channel_set_t *chset);
+#ifdef CONFIG_SND_SEQUENCER_OSS
+	int (*oss_ioctl)(snd_emux_t *emu, int cmd, int p1, int p2);
 #endif
-};
+} snd_emux_operators_t;
 
 
 /*
@@ -76,46 +90,46 @@ struct snd_emux_operators {
  */
 struct snd_emux {
 
-	struct snd_card *card;	/* assigned card */
+	snd_card_t *card;	/* assigned card */
 
 	/* following should be initialized before registration */
 	int max_voices;		/* Number of voices */
 	int mem_size;		/* memory size (in byte) */
 	int num_ports;		/* number of ports to be created */
 	int pitch_shift;	/* pitch shift value (for Emu10k1) */
-	struct snd_emux_operators ops;	/* operators */
+	snd_emux_operators_t ops;	/* operators */
 	void *hw;		/* hardware */
 	unsigned long flags;	/* other conditions */
 	int midi_ports;		/* number of virtual midi devices */
 	int midi_devidx;	/* device offset of virtual midi */
 	unsigned int linear_panning: 1; /* panning is linear (sbawe = 1, emu10k1 = 0) */
 	int hwdep_idx;		/* hwdep device index */
-	struct snd_hwdep *hwdep;	/* hwdep device */
+	snd_hwdep_t *hwdep;	/* hwdep device */
 
 	/* private */
 	int num_voices;		/* current number of voices */
-	struct snd_sf_list *sflist;	/* root of SoundFont list */
-	struct snd_emux_voice *voices;	/* Voices (EMU 'channel') */
+	snd_sf_list_t *sflist;	/* root of SoundFont list */
+	snd_emux_voice_t *voices;	/* Voices (EMU 'channel') */
 	int use_time;	/* allocation counter */
 	spinlock_t voice_lock;	/* Lock for voice access */
-	struct mutex register_mutex;
+	struct semaphore register_mutex;
 	int client;		/* For the sequencer client */
 	int ports[SNDRV_EMUX_MAX_PORTS];	/* The ports for this device */
-	struct snd_emux_port *portptrs[SNDRV_EMUX_MAX_PORTS];
+	snd_emux_port_t *portptrs[SNDRV_EMUX_MAX_PORTS];
 	int used;	/* use counter */
 	char *name;	/* name of the device (internal) */
-	struct snd_rawmidi **vmidi;
+	snd_rawmidi_t **vmidi;
 	struct timer_list tlist;	/* for pending note-offs */
 	int timer_active;
 
-	struct snd_util_memhdr *memhdr;	/* memory chunk information */
+	snd_util_memhdr_t *memhdr;	/* memory chunk information */
 
-#ifdef CONFIG_SND_PROC_FS
-	struct snd_info_entry *proc;
+#ifdef CONFIG_PROC_FS
+	snd_info_entry_t *proc;
 #endif
 
-#if IS_ENABLED(CONFIG_SND_SEQUENCER_OSS)
-	struct snd_seq_device *oss_synth;
+#ifdef CONFIG_SND_SEQUENCER_OSS
+	snd_seq_device_t *oss_synth;
 #endif
 };
 
@@ -125,18 +139,18 @@ struct snd_emux {
  */
 struct snd_emux_port {
 
-	struct snd_midi_channel_set chset;
-	struct snd_emux *emu;
+	snd_midi_channel_set_t chset;
+	snd_emux_t *emu;
 
 	char port_mode;			/* operation mode */
 	int volume_atten;		/* emuX raw attenuation */
 	unsigned long drum_flags;	/* drum bitmaps */
 	int ctrls[EMUX_MD_END];		/* control parameters */
 #ifdef SNDRV_EMUX_USE_RAW_EFFECT
-	struct snd_emux_effect_table *effect;
+	snd_emux_effect_table_t *effect;
 #endif
-#if IS_ENABLED(CONFIG_SND_SEQUENCER_OSS)
-	struct snd_seq_oss_arg *oss_arg;
+#ifdef CONFIG_SND_SEQUENCER_OSS
+	snd_seq_oss_arg_t *oss_arg;
 #endif
 };
 
@@ -165,16 +179,16 @@ struct snd_emux_voice {
 	unsigned char key;
 	unsigned char velocity;	/* Velocity of current note */
 
-	struct snd_sf_zone *zone;	/* Zone assigned to this note */
+	snd_sf_zone_t *zone;	/* Zone assigned to this note */
 	void *block;		/* sample block pointer (optional) */
-	struct snd_midi_channel *chan;	/* Midi channel for this note */
-	struct snd_emux_port *port;	/* associated port */
-	struct snd_emux *emu;	/* assigned root info */
-	void *hw;		/* hardware pointer (emu8000 or emu10k1) */
+	snd_midi_channel_t *chan;	/* Midi channel for this note */
+	snd_emux_port_t *port;	/* associated port */
+	snd_emux_t *emu;	/* assigned root info */
+	void *hw;		/* hardware pointer (emu8000_t or emu10k1_t) */
 	unsigned long ontime;	/* jiffies at note triggered */
 	
 	/* Emu8k/Emu10k1 registers */
-	struct soundfont_voice_info reg;
+	soundfont_voice_info_t reg;
 
 	/* additional registers */
 	int avol;		/* volume attenuation */
@@ -215,15 +229,15 @@ struct snd_emux_effect_table {
 /*
  * prototypes - interface to Emu10k1 and Emu8k routines
  */
-int snd_emux_new(struct snd_emux **remu);
-int snd_emux_register(struct snd_emux *emu, struct snd_card *card, int index, char *name);
-int snd_emux_free(struct snd_emux *emu);
+int snd_emux_new(snd_emux_t **remu);
+int snd_emux_register(snd_emux_t *emu, snd_card_t *card, int index, char *name);
+int snd_emux_free(snd_emux_t *emu);
 
 /*
  * exported functions
  */
-void snd_emux_terminate_all(struct snd_emux *emu);
-void snd_emux_lock_voice(struct snd_emux *emu, int voice);
-void snd_emux_unlock_voice(struct snd_emux *emu, int voice);
+void snd_emux_terminate_all(snd_emux_t *emu);
+void snd_emux_lock_voice(snd_emux_t *emu, int voice);
+void snd_emux_unlock_voice(snd_emux_t *emu, int voice);
 
 #endif /* __SOUND_EMUX_SYNTH_H */

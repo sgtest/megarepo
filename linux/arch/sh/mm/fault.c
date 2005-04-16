@@ -1,504 +1,374 @@
-/*
- * Page fault handler for SH with an MMU.
+/* $Id: fault.c,v 1.14 2004/01/13 05:52:11 kkojima Exp $
  *
+ *  linux/arch/sh/mm/fault.c
  *  Copyright (C) 1999  Niibe Yutaka
- *  Copyright (C) 2003 - 2012  Paul Mundt
+ *  Copyright (C) 2003  Paul Mundt
  *
  *  Based on linux/arch/i386/mm/fault.c:
  *   Copyright (C) 1995  Linus Torvalds
- *
- * This file is subject to the terms and conditions of the GNU General Public
- * License.  See the file "COPYING" in the main directory of this archive
- * for more details.
  */
+
+#include <linux/signal.h>
+#include <linux/sched.h>
 #include <linux/kernel.h>
+#include <linux/errno.h>
+#include <linux/string.h>
+#include <linux/types.h>
+#include <linux/ptrace.h>
+#include <linux/mman.h>
 #include <linux/mm.h>
-#include <linux/sched/signal.h>
-#include <linux/hardirq.h>
-#include <linux/kprobes.h>
-#include <linux/perf_event.h>
-#include <linux/kdebug.h>
-#include <linux/uaccess.h>
-#include <asm/io_trapped.h>
+#include <linux/smp.h>
+#include <linux/smp_lock.h>
+#include <linux/interrupt.h>
+#include <linux/module.h>
+
+#include <asm/system.h>
+#include <asm/io.h>
+#include <asm/uaccess.h>
+#include <asm/pgalloc.h>
 #include <asm/mmu_context.h>
-#include <asm/tlbflush.h>
-#include <asm/traps.h>
+#include <asm/cacheflush.h>
+#include <asm/kgdb.h>
 
-static void
-force_sig_info_fault(int si_signo, int si_code, unsigned long address)
-{
-	force_sig_fault(si_signo, si_code, (void __user *)address);
-}
-
-/*
- * This is useful to dump out the page tables associated with
- * 'addr' in mm 'mm'.
- */
-static void show_pte(struct mm_struct *mm, unsigned long addr)
-{
-	pgd_t *pgd;
-
-	if (mm) {
-		pgd = mm->pgd;
-	} else {
-		pgd = get_TTB();
-
-		if (unlikely(!pgd))
-			pgd = swapper_pg_dir;
-	}
-
-	pr_alert("pgd = %p\n", pgd);
-	pgd += pgd_index(addr);
-	pr_alert("[%08lx] *pgd=%0*llx", addr, (u32)(sizeof(*pgd) * 2),
-		 (u64)pgd_val(*pgd));
-
-	do {
-		p4d_t *p4d;
-		pud_t *pud;
-		pmd_t *pmd;
-		pte_t *pte;
-
-		if (pgd_none(*pgd))
-			break;
-
-		if (pgd_bad(*pgd)) {
-			pr_cont("(bad)");
-			break;
-		}
-
-		p4d = p4d_offset(pgd, addr);
-		if (PTRS_PER_P4D != 1)
-			pr_cont(", *p4d=%0*Lx", (u32)(sizeof(*p4d) * 2),
-			        (u64)p4d_val(*p4d));
-
-		if (p4d_none(*p4d))
-			break;
-
-		if (p4d_bad(*p4d)) {
-			pr_cont("(bad)");
-			break;
-		}
-
-		pud = pud_offset(p4d, addr);
-		if (PTRS_PER_PUD != 1)
-			pr_cont(", *pud=%0*llx", (u32)(sizeof(*pud) * 2),
-				(u64)pud_val(*pud));
-
-		if (pud_none(*pud))
-			break;
-
-		if (pud_bad(*pud)) {
-			pr_cont("(bad)");
-			break;
-		}
-
-		pmd = pmd_offset(pud, addr);
-		if (PTRS_PER_PMD != 1)
-			pr_cont(", *pmd=%0*llx", (u32)(sizeof(*pmd) * 2),
-				(u64)pmd_val(*pmd));
-
-		if (pmd_none(*pmd))
-			break;
-
-		if (pmd_bad(*pmd)) {
-			pr_cont("(bad)");
-			break;
-		}
-
-		/* We must not map this if we have highmem enabled */
-		if (PageHighMem(pfn_to_page(pmd_val(*pmd) >> PAGE_SHIFT)))
-			break;
-
-		pte = pte_offset_kernel(pmd, addr);
-		pr_cont(", *pte=%0*llx", (u32)(sizeof(*pte) * 2),
-			(u64)pte_val(*pte));
-	} while (0);
-
-	pr_cont("\n");
-}
-
-static inline pmd_t *vmalloc_sync_one(pgd_t *pgd, unsigned long address)
-{
-	unsigned index = pgd_index(address);
-	pgd_t *pgd_k;
-	p4d_t *p4d, *p4d_k;
-	pud_t *pud, *pud_k;
-	pmd_t *pmd, *pmd_k;
-
-	pgd += index;
-	pgd_k = init_mm.pgd + index;
-
-	if (!pgd_present(*pgd_k))
-		return NULL;
-
-	p4d = p4d_offset(pgd, address);
-	p4d_k = p4d_offset(pgd_k, address);
-	if (!p4d_present(*p4d_k))
-		return NULL;
-
-	pud = pud_offset(p4d, address);
-	pud_k = pud_offset(p4d_k, address);
-	if (!pud_present(*pud_k))
-		return NULL;
-
-	if (!pud_present(*pud))
-	    set_pud(pud, *pud_k);
-
-	pmd = pmd_offset(pud, address);
-	pmd_k = pmd_offset(pud_k, address);
-	if (!pmd_present(*pmd_k))
-		return NULL;
-
-	if (!pmd_present(*pmd))
-		set_pmd(pmd, *pmd_k);
-	else {
-		/*
-		 * The page tables are fully synchronised so there must
-		 * be another reason for the fault. Return NULL here to
-		 * signal that we have not taken care of the fault.
-		 */
-		BUG_ON(pmd_page(*pmd) != pmd_page(*pmd_k));
-		return NULL;
-	}
-
-	return pmd_k;
-}
-
-#ifdef CONFIG_SH_STORE_QUEUES
-#define __FAULT_ADDR_LIMIT	P3_ADDR_MAX
-#else
-#define __FAULT_ADDR_LIMIT	VMALLOC_END
-#endif
-
-/*
- * Handle a fault on the vmalloc or module mapping area
- */
-static noinline int vmalloc_fault(unsigned long address)
-{
-	pgd_t *pgd_k;
-	pmd_t *pmd_k;
-	pte_t *pte_k;
-
-	/* Make sure we are in vmalloc/module/P3 area: */
-	if (!(address >= VMALLOC_START && address < __FAULT_ADDR_LIMIT))
-		return -1;
-
-	/*
-	 * Synchronize this task's top level page-table
-	 * with the 'reference' page table.
-	 *
-	 * Do _not_ use "current" here. We might be inside
-	 * an interrupt in the middle of a task switch..
-	 */
-	pgd_k = get_TTB();
-	pmd_k = vmalloc_sync_one(pgd_k, address);
-	if (!pmd_k)
-		return -1;
-
-	pte_k = pte_offset_kernel(pmd_k, address);
-	if (!pte_present(*pte_k))
-		return -1;
-
-	return 0;
-}
-
-static void
-show_fault_oops(struct pt_regs *regs, unsigned long address)
-{
-	if (!oops_may_print())
-		return;
-
-	pr_alert("BUG: unable to handle kernel %s at %08lx\n",
-		 address < PAGE_SIZE ? "NULL pointer dereference"
-				     : "paging request",
-		 address);
-	pr_alert("PC:");
-	printk_address(regs->pc, 1);
-
-	show_pte(NULL, address);
-}
-
-static noinline void
-no_context(struct pt_regs *regs, unsigned long error_code,
-	   unsigned long address)
-{
-	/* Are we prepared to handle this kernel fault?  */
-	if (fixup_exception(regs))
-		return;
-
-	if (handle_trapped_io(regs, address))
-		return;
-
-	/*
-	 * Oops. The kernel tried to access some bad page. We'll have to
-	 * terminate things with extreme prejudice.
-	 */
-	bust_spinlocks(1);
-
-	show_fault_oops(regs, address);
-
-	die("Oops", regs, error_code);
-}
-
-static void
-__bad_area_nosemaphore(struct pt_regs *regs, unsigned long error_code,
-		       unsigned long address, int si_code)
-{
-	/* User mode accesses just cause a SIGSEGV */
-	if (user_mode(regs)) {
-		/*
-		 * It's possible to have interrupts off here:
-		 */
-		local_irq_enable();
-
-		force_sig_info_fault(SIGSEGV, si_code, address);
-
-		return;
-	}
-
-	no_context(regs, error_code, address);
-}
-
-static noinline void
-bad_area_nosemaphore(struct pt_regs *regs, unsigned long error_code,
-		     unsigned long address)
-{
-	__bad_area_nosemaphore(regs, error_code, address, SEGV_MAPERR);
-}
-
-static void
-__bad_area(struct pt_regs *regs, unsigned long error_code,
-	   unsigned long address, int si_code)
-{
-	struct mm_struct *mm = current->mm;
-
-	/*
-	 * Something tried to access memory that isn't in our memory map..
-	 * Fix it, but check if it's kernel or user first..
-	 */
-	mmap_read_unlock(mm);
-
-	__bad_area_nosemaphore(regs, error_code, address, si_code);
-}
-
-static noinline void
-bad_area(struct pt_regs *regs, unsigned long error_code, unsigned long address)
-{
-	__bad_area(regs, error_code, address, SEGV_MAPERR);
-}
-
-static noinline void
-bad_area_access_error(struct pt_regs *regs, unsigned long error_code,
-		      unsigned long address)
-{
-	__bad_area(regs, error_code, address, SEGV_ACCERR);
-}
-
-static void
-do_sigbus(struct pt_regs *regs, unsigned long error_code, unsigned long address)
-{
-	struct task_struct *tsk = current;
-	struct mm_struct *mm = tsk->mm;
-
-	mmap_read_unlock(mm);
-
-	/* Kernel mode? Handle exceptions or die: */
-	if (!user_mode(regs))
-		no_context(regs, error_code, address);
-
-	force_sig_info_fault(SIGBUS, BUS_ADRERR, address);
-}
-
-static noinline int
-mm_fault_error(struct pt_regs *regs, unsigned long error_code,
-	       unsigned long address, vm_fault_t fault)
-{
-	/*
-	 * Pagefault was interrupted by SIGKILL. We have no reason to
-	 * continue pagefault.
-	 */
-	if (fault_signal_pending(fault, regs)) {
-		if (!user_mode(regs))
-			no_context(regs, error_code, address);
-		return 1;
-	}
-
-	/* Release mmap_lock first if necessary */
-	if (!(fault & VM_FAULT_RETRY))
-		mmap_read_unlock(current->mm);
-
-	if (!(fault & VM_FAULT_ERROR))
-		return 0;
-
-	if (fault & VM_FAULT_OOM) {
-		/* Kernel mode? Handle exceptions or die: */
-		if (!user_mode(regs)) {
-			no_context(regs, error_code, address);
-			return 1;
-		}
-
-		/*
-		 * We ran out of memory, call the OOM killer, and return the
-		 * userspace (which will retry the fault, or kill us if we got
-		 * oom-killed):
-		 */
-		pagefault_out_of_memory();
-	} else {
-		if (fault & VM_FAULT_SIGBUS)
-			do_sigbus(regs, error_code, address);
-		else if (fault & VM_FAULT_SIGSEGV)
-			bad_area(regs, error_code, address);
-		else
-			BUG();
-	}
-
-	return 1;
-}
-
-static inline int access_error(int error_code, struct vm_area_struct *vma)
-{
-	if (error_code & FAULT_CODE_WRITE) {
-		/* write, present and write, not present: */
-		if (unlikely(!(vma->vm_flags & VM_WRITE)))
-			return 1;
-		return 0;
-	}
-
-	/* ITLB miss on NX page */
-	if (unlikely((error_code & FAULT_CODE_ITLB) &&
-		     !(vma->vm_flags & VM_EXEC)))
-		return 1;
-
-	/* read, not present: */
-	if (unlikely(!vma_is_accessible(vma)))
-		return 1;
-
-	return 0;
-}
-
-static int fault_in_kernel_space(unsigned long address)
-{
-	return address >= TASK_SIZE;
-}
+extern void die(const char *,struct pt_regs *,long);
 
 /*
  * This routine handles page faults.  It determines the address,
  * and the problem, and then passes it off to one of the appropriate
  * routines.
  */
-asmlinkage void __kprobes do_page_fault(struct pt_regs *regs,
-					unsigned long error_code,
-					unsigned long address)
+asmlinkage void do_page_fault(struct pt_regs *regs, unsigned long writeaccess,
+			      unsigned long address)
 {
-	unsigned long vec;
 	struct task_struct *tsk;
 	struct mm_struct *mm;
 	struct vm_area_struct * vma;
-	vm_fault_t fault;
-	unsigned int flags = FAULT_FLAG_DEFAULT;
+	unsigned long page;
+
+#ifdef CONFIG_SH_KGDB
+	if (kgdb_nofault && kgdb_bus_err_hook)
+		kgdb_bus_err_hook();
+#endif
 
 	tsk = current;
 	mm = tsk->mm;
-	vec = lookup_exception_vector();
 
 	/*
-	 * We fault-in kernel-space virtual memory on-demand. The
-	 * 'reference' page table is init_mm.pgd.
-	 *
-	 * NOTE! We MUST NOT take any locks for this case. We may
-	 * be in an interrupt or a critical region, and should
-	 * only copy the information from the master page table,
-	 * nothing more.
+	 * If we're in an interrupt or have no user
+	 * context, we must not take the fault..
 	 */
-	if (unlikely(fault_in_kernel_space(address))) {
-		if (vmalloc_fault(address) >= 0)
-			return;
-		if (kprobe_page_fault(regs, vec))
-			return;
+	if (in_atomic() || !mm)
+		goto no_context;
 
-		bad_area_nosemaphore(regs, error_code, address);
-		return;
-	}
-
-	if (unlikely(kprobe_page_fault(regs, vec)))
-		return;
-
-	/* Only enable interrupts if they were on before the fault */
-	if ((regs->sr & SR_IMASK) != SR_IMASK)
-		local_irq_enable();
-
-	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, regs, address);
-
-	/*
-	 * If we're in an interrupt, have no user context or are running
-	 * with pagefaults disabled then we must not take the fault:
-	 */
-	if (unlikely(faulthandler_disabled() || !mm)) {
-		bad_area_nosemaphore(regs, error_code, address);
-		return;
-	}
-
-retry:
-	mmap_read_lock(mm);
+	down_read(&mm->mmap_sem);
 
 	vma = find_vma(mm, address);
-	if (unlikely(!vma)) {
-		bad_area(regs, error_code, address);
-		return;
-	}
-	if (likely(vma->vm_start <= address))
+	if (!vma)
+		goto bad_area;
+	if (vma->vm_start <= address)
 		goto good_area;
-	if (unlikely(!(vma->vm_flags & VM_GROWSDOWN))) {
-		bad_area(regs, error_code, address);
-		return;
-	}
-	if (unlikely(expand_stack(vma, address))) {
-		bad_area(regs, error_code, address);
-		return;
-	}
-
-	/*
-	 * Ok, we have a good vm_area for this memory access, so
-	 * we can handle it..
-	 */
+	if (!(vma->vm_flags & VM_GROWSDOWN))
+		goto bad_area;
+	if (expand_stack(vma, address))
+		goto bad_area;
+/*
+ * Ok, we have a good vm_area for this memory access, so
+ * we can handle it..
+ */
 good_area:
-	if (unlikely(access_error(error_code, vma))) {
-		bad_area_access_error(regs, error_code, address);
-		return;
+	if (writeaccess) {
+		if (!(vma->vm_flags & VM_WRITE))
+			goto bad_area;
+	} else {
+		if (!(vma->vm_flags & (VM_READ | VM_EXEC)))
+			goto bad_area;
 	}
-
-	set_thread_fault_code(error_code);
-
-	if (user_mode(regs))
-		flags |= FAULT_FLAG_USER;
-	if (error_code & FAULT_CODE_WRITE)
-		flags |= FAULT_FLAG_WRITE;
 
 	/*
 	 * If for any reason at all we couldn't handle the fault,
 	 * make sure we exit gracefully rather than endlessly redo
 	 * the fault.
 	 */
-	fault = handle_mm_fault(vma, address, flags, regs);
-
-	if (unlikely(fault & (VM_FAULT_RETRY | VM_FAULT_ERROR)))
-		if (mm_fault_error(regs, error_code, address, fault))
-			return;
-
-	/* The fault is fully completed (including releasing mmap lock) */
-	if (fault & VM_FAULT_COMPLETED)
-		return;
-
-	if (fault & VM_FAULT_RETRY) {
-		flags |= FAULT_FLAG_TRIED;
-
-		/*
-		 * No need to mmap_read_unlock(mm) as we would
-		 * have already released it in __lock_page_or_retry
-		 * in mm/filemap.c.
-		 */
-		goto retry;
+survive:
+	switch (handle_mm_fault(mm, vma, address, writeaccess)) {
+		case VM_FAULT_MINOR:
+			tsk->min_flt++;
+			break;
+		case VM_FAULT_MAJOR:
+			tsk->maj_flt++;
+			break;
+		case VM_FAULT_SIGBUS:
+			goto do_sigbus;
+		case VM_FAULT_OOM:
+			goto out_of_memory;
+		default:
+			BUG();
 	}
 
-	mmap_read_unlock(mm);
+	up_read(&mm->mmap_sem);
+	return;
+
+/*
+ * Something tried to access memory that isn't in our memory map..
+ * Fix it, but check if it's kernel or user first..
+ */
+bad_area:
+	up_read(&mm->mmap_sem);
+
+	if (user_mode(regs)) {
+		tsk->thread.address = address;
+		tsk->thread.error_code = writeaccess;
+		force_sig(SIGSEGV, tsk);
+		return;
+	}
+
+no_context:
+	/* Are we prepared to handle this kernel fault?  */
+	if (fixup_exception(regs))
+		return;
+
+/*
+ * Oops. The kernel tried to access some bad page. We'll have to
+ * terminate things with extreme prejudice.
+ *
+ */
+	if (address < PAGE_SIZE)
+		printk(KERN_ALERT "Unable to handle kernel NULL pointer dereference");
+	else
+		printk(KERN_ALERT "Unable to handle kernel paging request");
+	printk(" at virtual address %08lx\n", address);
+	printk(KERN_ALERT "pc = %08lx\n", regs->pc);
+	asm volatile("mov.l	%1, %0"
+		     : "=r" (page)
+		     : "m" (__m(MMU_TTB)));
+	if (page) {
+		page = ((unsigned long *) page)[address >> 22];
+		printk(KERN_ALERT "*pde = %08lx\n", page);
+		if (page & _PAGE_PRESENT) {
+			page &= PAGE_MASK;
+			address &= 0x003ff000;
+			page = ((unsigned long *) __va(page))[address >> PAGE_SHIFT];
+			printk(KERN_ALERT "*pte = %08lx\n", page);
+		}
+	}
+	die("Oops", regs, writeaccess);
+	do_exit(SIGKILL);
+
+/*
+ * We ran out of memory, or some other thing happened to us that made
+ * us unable to handle the page fault gracefully.
+ */
+out_of_memory:
+	up_read(&mm->mmap_sem);
+	if (current->pid == 1) {
+		yield();
+		down_read(&mm->mmap_sem);
+		goto survive;
+	}
+	printk("VM: killing process %s\n", tsk->comm);
+	if (user_mode(regs))
+		do_exit(SIGKILL);
+	goto no_context;
+
+do_sigbus:
+	up_read(&mm->mmap_sem);
+
+	/*
+	 * Send a sigbus, regardless of whether we were in kernel
+	 * or user mode.
+	 */
+	tsk->thread.address = address;
+	tsk->thread.error_code = writeaccess;
+	tsk->thread.trap_no = 14;
+	force_sig(SIGBUS, tsk);
+
+	/* Kernel mode? Handle exceptions or die */
+	if (!user_mode(regs))
+		goto no_context;
+}
+
+/*
+ * Called with interrupt disabled.
+ */
+asmlinkage int __do_page_fault(struct pt_regs *regs, unsigned long writeaccess,
+			       unsigned long address)
+{
+	unsigned long addrmax = P4SEG;
+	pgd_t *dir;
+	pmd_t *pmd;
+	pte_t *pte;
+	pte_t entry;
+
+#ifdef CONFIG_SH_KGDB
+	if (kgdb_nofault && kgdb_bus_err_hook)
+		kgdb_bus_err_hook();
+#endif
+
+#ifdef CONFIG_SH_STORE_QUEUES
+	addrmax = P4SEG_STORE_QUE + 0x04000000;
+#endif
+
+	if (address >= P3SEG && address < addrmax)
+		dir = pgd_offset_k(address);
+	else if (address >= TASK_SIZE)
+		return 1;
+	else if (!current->mm)
+		return 1;
+	else
+		dir = pgd_offset(current->mm, address);
+
+	pmd = pmd_offset(dir, address);
+	if (pmd_none(*pmd))
+		return 1;
+	if (pmd_bad(*pmd)) {
+		pmd_ERROR(*pmd);
+		pmd_clear(pmd);
+		return 1;
+	}
+	pte = pte_offset_kernel(pmd, address);
+	entry = *pte;
+	if (pte_none(entry) || pte_not_present(entry)
+	    || (writeaccess && !pte_write(entry)))
+		return 1;
+
+	if (writeaccess)
+		entry = pte_mkdirty(entry);
+	entry = pte_mkyoung(entry);
+
+#ifdef CONFIG_CPU_SH4
+	/*
+	 * ITLB is not affected by "ldtlb" instruction.
+	 * So, we need to flush the entry by ourselves.
+	 */
+
+	{
+		unsigned long flags;
+		local_irq_save(flags);
+		__flush_tlb_page(get_asid(), address&PAGE_MASK);
+		local_irq_restore(flags);
+	}
+#endif
+
+	set_pte(pte, entry);
+	update_mmu_cache(NULL, address, entry);
+
+	return 0;
+}
+
+void flush_tlb_page(struct vm_area_struct *vma, unsigned long page)
+{
+	if (vma->vm_mm && vma->vm_mm->context != NO_CONTEXT) {
+		unsigned long flags;
+		unsigned long asid;
+		unsigned long saved_asid = MMU_NO_ASID;
+
+		asid = vma->vm_mm->context & MMU_CONTEXT_ASID_MASK;
+		page &= PAGE_MASK;
+
+		local_irq_save(flags);
+		if (vma->vm_mm != current->mm) {
+			saved_asid = get_asid();
+			set_asid(asid);
+		}
+		__flush_tlb_page(asid, page);
+		if (saved_asid != MMU_NO_ASID)
+			set_asid(saved_asid);
+		local_irq_restore(flags);
+	}
+}
+
+void flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
+		     unsigned long end)
+{
+	struct mm_struct *mm = vma->vm_mm;
+
+	if (mm->context != NO_CONTEXT) {
+		unsigned long flags;
+		int size;
+
+		local_irq_save(flags);
+		size = (end - start + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
+		if (size > (MMU_NTLB_ENTRIES/4)) { /* Too many TLB to flush */
+			mm->context = NO_CONTEXT;
+			if (mm == current->mm)
+				activate_context(mm);
+		} else {
+			unsigned long asid = mm->context&MMU_CONTEXT_ASID_MASK;
+			unsigned long saved_asid = MMU_NO_ASID;
+
+			start &= PAGE_MASK;
+			end += (PAGE_SIZE - 1);
+			end &= PAGE_MASK;
+			if (mm != current->mm) {
+				saved_asid = get_asid();
+				set_asid(asid);
+			}
+			while (start < end) {
+				__flush_tlb_page(asid, start);
+				start += PAGE_SIZE;
+			}
+			if (saved_asid != MMU_NO_ASID)
+				set_asid(saved_asid);
+		}
+		local_irq_restore(flags);
+	}
+}
+
+void flush_tlb_kernel_range(unsigned long start, unsigned long end)
+{
+	unsigned long flags;
+	int size;
+
+	local_irq_save(flags);
+	size = (end - start + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
+	if (size > (MMU_NTLB_ENTRIES/4)) { /* Too many TLB to flush */
+		flush_tlb_all();
+	} else {
+		unsigned long asid = init_mm.context&MMU_CONTEXT_ASID_MASK;
+		unsigned long saved_asid = get_asid();
+
+		start &= PAGE_MASK;
+		end += (PAGE_SIZE - 1);
+		end &= PAGE_MASK;
+		set_asid(asid);
+		while (start < end) {
+			__flush_tlb_page(asid, start);
+			start += PAGE_SIZE;
+		}
+		set_asid(saved_asid);
+	}
+	local_irq_restore(flags);
+}
+
+void flush_tlb_mm(struct mm_struct *mm)
+{
+	/* Invalidate all TLB of this process. */
+	/* Instead of invalidating each TLB, we get new MMU context. */
+	if (mm->context != NO_CONTEXT) {
+		unsigned long flags;
+
+		local_irq_save(flags);
+		mm->context = NO_CONTEXT;
+		if (mm == current->mm)
+			activate_context(mm);
+		local_irq_restore(flags);
+	}
+}
+
+void flush_tlb_all(void)
+{
+	unsigned long flags, status;
+
+	/*
+	 * Flush all the TLB.
+	 *
+	 * Write to the MMU control register's bit:
+	 * 	TF-bit for SH-3, TI-bit for SH-4.
+	 *      It's same position, bit #2.
+	 */
+	local_irq_save(flags);
+	status = ctrl_inl(MMUCR);
+	status |= 0x04;		
+	ctrl_outl(status, MMUCR);
+	local_irq_restore(flags);
 }

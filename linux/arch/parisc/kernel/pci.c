@@ -1,4 +1,5 @@
-/*
+/* $Id: pci.c,v 1.6 2000/01/29 00:12:05 grundler Exp $
+ *
  * This file is subject to the terms and conditions of the GNU General Public
  * License.  See the file "COPYING" in the main directory of this archive
  * for more details.
@@ -8,14 +9,18 @@
  * Copyright (C) 1999-2001 Hewlett-Packard Company
  * Copyright (C) 1999-2001 Grant Grundler
  */
+#include <linux/config.h>
 #include <linux/eisa.h>
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/pci.h>
+#include <linux/slab.h>
 #include <linux/types.h>
 
 #include <asm/io.h>
+#include <asm/system.h>
+#include <asm/cache.h>		/* for L1_CACHE_BYTES */
 #include <asm/superio.h>
 
 #define DEBUG_RESOURCES 0
@@ -34,14 +39,26 @@
 #define DBG_RES(x...)
 #endif
 
-struct pci_port_ops *pci_port __ro_after_init;
-struct pci_bios_ops *pci_bios __ro_after_init;
+/* To be used as: mdelay(pci_post_reset_delay);
+ *
+ * post_reset is the time the kernel should stall to prevent anyone from
+ * accessing the PCI bus once #RESET is de-asserted. 
+ * PCI spec somewhere says 1 second but with multi-PCI bus systems,
+ * this makes the boot time much longer than necessary.
+ * 20ms seems to work for all the HP PCI implementations to date.
+ *
+ * XXX: turn into a #defined constant in <asm/pci.h> ?
+ */
+int pci_post_reset_delay = 50;
 
-static int pci_hba_count __ro_after_init;
+struct pci_port_ops *pci_port;
+struct pci_bios_ops *pci_bios;
+
+int pci_hba_count = 0;
 
 /* parisc_pci_hba used by pci_port->in/out() ops to lookup bus data.  */
 #define PCI_HBA_MAX 32
-static struct pci_hba_data *parisc_pci_hba[PCI_HBA_MAX] __ro_after_init;
+struct pci_hba_data *parisc_pci_hba[PCI_HBA_MAX];
 
 
 /********************************************************************
@@ -109,10 +126,6 @@ static int __init pcibios_init(void)
 	} else {
 		printk(KERN_WARNING "pci_bios != NULL but init() is!\n");
 	}
-
-	/* Set the CLS for PCI as early as possible. */
-	pci_cache_line_size = pci_dfl_cache_line_size;
-
 	return 0;
 }
 
@@ -127,6 +140,11 @@ void pcibios_fixup_bus(struct pci_bus *bus)
 	}
 }
 
+
+char *pcibios_setup(char *str)
+{
+	return str;
+}
 
 /*
  * Called by pci_set_master() - a driver interface.
@@ -156,35 +174,90 @@ void pcibios_set_master(struct pci_dev *dev)
 	** upper byte is PCI_LATENCY_TIMER.
 	*/
 	pci_write_config_word(dev, PCI_CACHE_LINE_SIZE,
-			      (0x80 << 8) | pci_cache_line_size);
+				(0x80 << 8) | (L1_CACHE_BYTES / sizeof(u32)));
 }
 
-/*
- * pcibios_init_bridge() initializes cache line and default latency
- * for pci controllers and pci-pci bridges
- */
-void __ref pcibios_init_bridge(struct pci_dev *dev)
+
+void __init pcibios_init_bus(struct pci_bus *bus)
 {
-	unsigned short bridge_ctl, bridge_ctl_new;
+	struct pci_dev *dev = bus->self;
+	unsigned short bridge_ctl;
 
 	/* We deal only with pci controllers and pci-pci bridges. */
 	if (!dev || (dev->class >> 8) != PCI_CLASS_BRIDGE_PCI)
 		return;
 
 	/* PCI-PCI bridge - set the cache line and default latency
-	 * (32) for primary and secondary buses.
-	 */
+	   (32) for primary and secondary buses. */
 	pci_write_config_byte(dev, PCI_SEC_LATENCY_TIMER, 32);
 
 	pci_read_config_word(dev, PCI_BRIDGE_CONTROL, &bridge_ctl);
-
-	bridge_ctl_new = bridge_ctl | PCI_BRIDGE_CTL_PARITY |
-		PCI_BRIDGE_CTL_SERR | PCI_BRIDGE_CTL_MASTER_ABORT;
-	dev_info(&dev->dev, "Changing bridge control from 0x%08x to 0x%08x\n",
-		bridge_ctl, bridge_ctl_new);
-
-	pci_write_config_word(dev, PCI_BRIDGE_CONTROL, bridge_ctl_new);
+	bridge_ctl |= PCI_BRIDGE_CTL_PARITY | PCI_BRIDGE_CTL_SERR;
+	pci_write_config_word(dev, PCI_BRIDGE_CONTROL, bridge_ctl);
 }
+
+
+/* KLUGE: Link the child and parent resources - generic PCI didn't */
+static void
+pcibios_link_hba_resources( struct resource *hba_res, struct resource *r)
+{
+	if (!r->parent) {
+		printk(KERN_EMERG "PCI: Tell willy he's wrong\n");
+		r->parent = hba_res;
+
+		/* reverse link is harder *sigh*  */
+		if (r->parent->child) {
+			if (r->parent->sibling) {
+				struct resource *next = r->parent->sibling;
+				while (next->sibling)
+					 next = next->sibling;
+				next->sibling = r;
+			} else {
+				r->parent->sibling = r;
+			}
+		} else
+			r->parent->child = r;
+	}
+}
+
+/* called by drivers/pci/setup-bus.c:pci_setup_bridge().  */
+void __devinit pcibios_resource_to_bus(struct pci_dev *dev,
+		struct pci_bus_region *region, struct resource *res)
+{
+	struct pci_bus *bus = dev->bus;
+	struct pci_hba_data *hba = HBA_DATA(bus->bridge->platform_data);
+
+	if (res->flags & IORESOURCE_IO) {
+		/*
+		** I/O space may see busnumbers here. Something
+		** in the form of 0xbbxxxx where bb is the bus num
+		** and xxxx is the I/O port space address.
+		** Remaining address translation are done in the
+		** PCI Host adapter specific code - ie dino_out8.
+		*/
+		region->start = PCI_PORT_ADDR(res->start);
+		region->end   = PCI_PORT_ADDR(res->end);
+	} else if (res->flags & IORESOURCE_MEM) {
+		/* Convert MMIO addr to PCI addr (undo global virtualization) */
+		region->start = PCI_BUS_ADDR(hba, res->start);
+		region->end   = PCI_BUS_ADDR(hba, res->end);
+	}
+
+	DBG_RES("pcibios_resource_to_bus(%02x %s [%lx,%lx])\n",
+		bus->number, res->flags & IORESOURCE_IO ? "IO" : "MEM",
+		region->start, region->end);
+
+	/* KLUGE ALERT
+	** if this resource isn't linked to a "parent", then it seems
+	** to be a child of the HBA - lets link it in.
+	*/
+	pcibios_link_hba_resources(&hba->io_space, bus->resource[0]);
+	pcibios_link_hba_resources(&hba->lmmio_space, bus->resource[1]);
+}
+
+#ifdef CONFIG_HOTPLUG
+EXPORT_SYMBOL(pcibios_resource_to_bus);
+#endif
 
 /*
  * pcibios align resources() is called every time generic PCI code
@@ -195,10 +268,10 @@ void __ref pcibios_init_bridge(struct pci_dev *dev)
  * Since we are just checking candidates, don't use any fields other
  * than res->start.
  */
-resource_size_t pcibios_align_resource(void *data, const struct resource *res,
-				resource_size_t size, resource_size_t alignment)
+void pcibios_align_resource(void *data, struct resource *res,
+				unsigned long size, unsigned long alignment)
 {
-	resource_size_t mask, align, start = res->start;
+	unsigned long mask, align;
 
 	DBG_RES("pcibios_align_resource(%s, (%p) [%lx,%lx]/%x, 0x%lx, 0x%lx)\n",
 		pci_name(((struct pci_dev *) data)),
@@ -210,11 +283,12 @@ resource_size_t pcibios_align_resource(void *data, const struct resource *res,
 
 	/* Align to largest of MIN or input size */
 	mask = max(alignment, align) - 1;
-	start += mask;
-	start &= ~mask;
+	res->start += mask;
+	res->start &= ~mask;
 
-	return start;
+	/* The caller updates the end field, we don't.  */
 }
+
 
 /*
  * A driver is enabling the device.  We make sure that all the appropriate
@@ -226,15 +300,23 @@ resource_size_t pcibios_align_resource(void *data, const struct resource *res,
  */
 int pcibios_enable_device(struct pci_dev *dev, int mask)
 {
-	int err;
-	u16 cmd, old_cmd;
-
-	err = pci_enable_resources(dev, mask);
-	if (err < 0)
-		return err;
+	u16 cmd;
+	int idx;
 
 	pci_read_config_word(dev, PCI_COMMAND, &cmd);
-	old_cmd = cmd;
+
+	for (idx = 0; idx < DEVICE_COUNT_RESOURCE; idx++) {
+		struct resource *r = &dev->resource[idx];
+
+		/* only setup requested resources */
+		if (!(mask & (1<<idx)))
+			continue;
+
+		if (r->flags & IORESOURCE_IO)
+			cmd |= PCI_COMMAND_IO;
+		if (r->flags & IORESOURCE_MEM)
+			cmd |= PCI_COMMAND_MEMORY;
+	}
 
 	cmd |= (PCI_COMMAND_SERR | PCI_COMMAND_PARITY);
 
@@ -243,12 +325,8 @@ int pcibios_enable_device(struct pci_dev *dev, int mask)
 	if (dev->bus->bridge_ctl & PCI_BRIDGE_CTL_FAST_BACK)
 		cmd |= PCI_COMMAND_FAST_BACK;
 #endif
-
-	if (cmd != old_cmd) {
-		dev_info(&dev->dev, "enabling SERR and PARITY (%04x -> %04x)\n",
-			old_cmd, cmd);
-		pci_write_config_word(dev, PCI_COMMAND, cmd);
-	}
+	DBGC("PCIBIOS: Enabling device %s cmd 0x%04x\n", pci_name(dev), cmd);
+	pci_write_config_word(dev, PCI_COMMAND, cmd);
 	return 0;
 }
 

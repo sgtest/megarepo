@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0 */
 /*
  * include/linux/mpage.h
  *
@@ -10,14 +9,23 @@
  * (And no, it doesn't do the #ifdef __MPAGE_H thing, and it doesn't do
  * nested includes.  Get it right in the .c file).
  */
-#ifdef CONFIG_BLOCK
 
 struct writeback_control;
-struct readahead_control;
+typedef int (writepage_t)(struct page *page, struct writeback_control *wbc);
 
-void mpage_readahead(struct readahead_control *, get_block_t get_block);
-int mpage_read_folio(struct folio *folio, get_block_t get_block);
+int mpage_readpages(struct address_space *mapping, struct list_head *pages,
+				unsigned nr_pages, get_block_t get_block);
+int mpage_readpage(struct page *page, get_block_t get_block);
 int mpage_writepages(struct address_space *mapping,
 		struct writeback_control *wbc, get_block_t get_block);
+int mpage_writepage(struct page *page, get_block_t *get_block,
+		struct writeback_control *wbc);
+int __mpage_writepages(struct address_space *mapping,
+		struct writeback_control *wbc, get_block_t get_block,
+		writepage_t writepage);
 
-#endif
+static inline int
+generic_writepages(struct address_space *mapping, struct writeback_control *wbc)
+{
+	return mpage_writepages(mapping, wbc, NULL);
+}

@@ -1,65 +1,85 @@
 /*
- * Copyright (C) 2004 - 2007  Paul Mundt
+ * arch/sh/mm/consistent.c
+ *
+ * Copyright (C) 2004  Paul Mundt
  *
  * This file is subject to the terms and conditions of the GNU General Public
  * License.  See the file "COPYING" in the main directory of this archive
  * for more details.
  */
 #include <linux/mm.h>
-#include <linux/init.h>
-#include <linux/platform_device.h>
 #include <linux/dma-mapping.h>
-#include <linux/io.h>
+#include <asm/io.h>
 
-static int __init memchunk_setup(char *str)
+void *consistent_alloc(int gfp, size_t size, dma_addr_t *handle)
 {
-	return 1; /* accept anything that begins with "memchunk." */
-}
-__setup("memchunk.", memchunk_setup);
+	struct page *page, *end, *free;
+	void *ret;
+	int order;
 
-static void __init memchunk_cmdline_override(char *name, unsigned long *sizep)
-{
-	char *p = boot_command_line;
-	int k = strlen(name);
+	size = PAGE_ALIGN(size);
+	order = get_order(size);
 
-	while ((p = strstr(p, "memchunk."))) {
-		p += 9; /* strlen("memchunk.") */
-		if (!strncmp(name, p, k) && p[k] == '=') {
-			p += k + 1;
-			*sizep = memparse(p, NULL);
-			pr_info("%s: forcing memory chunk size to 0x%08lx\n",
-				name, *sizep);
-			break;
+	page = alloc_pages(gfp, order);
+	if (!page)
+		return NULL;
+
+	ret = page_address(page);
+	*handle = virt_to_phys(ret);
+
+	/*
+	 * We must flush the cache before we pass it on to the device
+	 */
+	dma_cache_wback_inv(ret, size);
+
+	page = virt_to_page(ret);
+	free = page + (size >> PAGE_SHIFT);
+	end  = page + (1 << order);
+
+	while (++page < end) {
+		set_page_count(page, 1);
+
+		/* Free any unused pages */
+		if (page >= free) {
+			__free_page(page);
 		}
 	}
+
+	return P2SEGADDR(ret);
 }
 
-int __init platform_resource_setup_memory(struct platform_device *pdev,
-					  char *name, unsigned long memsize)
+void consistent_free(void *vaddr, size_t size)
 {
-	struct resource *r;
-	dma_addr_t dma_handle;
-	void *buf;
+	unsigned long addr = P1SEGADDR((unsigned long)vaddr);
+	struct page *page=virt_to_page(addr);
+	int num_pages=(size+PAGE_SIZE-1) >> PAGE_SHIFT;
+	int i;
 
-	r = pdev->resource + pdev->num_resources - 1;
-	if (r->flags) {
-		pr_warn("%s: unable to find empty space for resource\n", name);
-		return -EINVAL;
+	for(i=0;i<num_pages;i++) {
+		__free_page((page+i));
 	}
-
-	memchunk_cmdline_override(name, &memsize);
-	if (!memsize)
-		return 0;
-
-	buf = dma_alloc_coherent(&pdev->dev, memsize, &dma_handle, GFP_KERNEL);
-	if (!buf) {
-		pr_warn("%s: unable to allocate memory\n", name);
-		return -ENOMEM;
-	}
-
-	r->flags = IORESOURCE_MEM;
-	r->start = dma_handle;
-	r->end = r->start + memsize - 1;
-	r->name = name;
-	return 0;
 }
+
+void consistent_sync(void *vaddr, size_t size, int direction)
+{
+	void * p1addr = (void*) P1SEGADDR((unsigned long)vaddr);
+
+	switch (direction) {
+	case DMA_FROM_DEVICE:		/* invalidate only */
+		dma_cache_inv(p1addr, size);
+		break;
+	case DMA_TO_DEVICE:		/* writeback only */
+		dma_cache_wback(p1addr, size);
+		break;
+	case DMA_BIDIRECTIONAL:		/* writeback and invalidate */
+		dma_cache_wback_inv(p1addr, size);
+		break;
+	default:
+		BUG();
+	}
+}
+
+EXPORT_SYMBOL(consistent_alloc);
+EXPORT_SYMBOL(consistent_free);
+EXPORT_SYMBOL(consistent_sync);
+

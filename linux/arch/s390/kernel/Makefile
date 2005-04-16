@@ -1,82 +1,31 @@
-# SPDX-License-Identifier: GPL-2.0
 #
 # Makefile for the linux kernel.
 #
 
-ifdef CONFIG_FUNCTION_TRACER
+EXTRA_AFLAGS	:= -traditional
 
-# Do not trace tracer code
-CFLAGS_REMOVE_ftrace.o		= $(CC_FLAGS_FTRACE)
+obj-y	:=  bitmap.o traps.o time.o process.o \
+            setup.o sys_s390.o ptrace.o signal.o cpcmd.o ebcdic.o \
+            semaphore.o s390_ext.o debug.o profile.o irq.o
 
-# Do not trace early setup code
-CFLAGS_REMOVE_early.o		= $(CC_FLAGS_FTRACE)
+extra-$(CONFIG_ARCH_S390_31)	+= head.o 
+extra-$(CONFIG_ARCH_S390X)	+= head64.o 
+extra-y				+= init_task.o vmlinux.lds
 
-endif
+obj-$(CONFIG_MODULES)		+= s390_ksyms.o module.o
+obj-$(CONFIG_SMP)		+= smp.o
 
-GCOV_PROFILE_early.o		:= n
-KCOV_INSTRUMENT_early.o		:= n
-UBSAN_SANITIZE_early.o		:= n
-KASAN_SANITIZE_ipl.o		:= n
-KASAN_SANITIZE_machine_kexec.o	:= n
+obj-$(CONFIG_S390_SUPPORT)	+= compat_linux.o compat_signal.o \
+					compat_ioctl.o compat_wrapper.o \
+					compat_exec_domain.o
+obj-$(CONFIG_BINFMT_ELF32)	+= binfmt_elf32.o
+
+obj-$(CONFIG_ARCH_S390_31)	+= entry.o reipl.o
+obj-$(CONFIG_ARCH_S390X)	+= entry64.o reipl64.o
+
+obj-$(CONFIG_VIRT_TIMER)	+= vtime.o
 
 #
-# Passing null pointers is ok for smp code, since we access the lowcore here.
+# This is just to get the dependencies...
 #
-CFLAGS_smp.o		:= -Wno-nonnull
-
-#
-# Disable tailcall optimizations for stack / callchain walking functions
-# since this might generate broken code when accessing register 15 and
-# passing its content to other functions.
-#
-CFLAGS_stacktrace.o	+= -fno-optimize-sibling-calls
-CFLAGS_dumpstack.o	+= -fno-optimize-sibling-calls
-CFLAGS_unwind_bc.o	+= -fno-optimize-sibling-calls
-
-obj-y	:= traps.o time.o process.o earlypgm.o early.o setup.o idle.o vtime.o
-obj-y	+= processor.o syscall.o ptrace.o signal.o cpcmd.o ebcdic.o nmi.o
-obj-y	+= debug.o irq.o ipl.o dis.o diag.o vdso.o cpufeature.o
-obj-y	+= sysinfo.o lgr.o os_info.o machine_kexec.o
-obj-y	+= runtime_instr.o cache.o fpu.o dumpstack.o guarded_storage.o sthyi.o
-obj-y	+= entry.o reipl.o relocate_kernel.o kdebugfs.o alternative.o
-obj-y	+= nospec-branch.o ipl_vmparm.o machine_kexec_reloc.o unwind_bc.o
-obj-y	+= smp.o text_amode31.o stacktrace.o
-
-extra-y				+= head64.o vmlinux.lds
-
-obj-$(CONFIG_SYSFS)		+= nospec-sysfs.o
-CFLAGS_REMOVE_nospec-branch.o	+= $(CC_FLAGS_EXPOLINE)
-
-obj-$(CONFIG_MODULES)		+= module.o
-obj-$(CONFIG_SCHED_TOPOLOGY)	+= topology.o
-obj-$(CONFIG_NUMA)		+= numa.o
-obj-$(CONFIG_AUDIT)		+= audit.o
-compat-obj-$(CONFIG_AUDIT)	+= compat_audit.o
-obj-$(CONFIG_COMPAT)		+= compat_linux.o compat_signal.o
-obj-$(CONFIG_COMPAT)		+= $(compat-obj-y)
-obj-$(CONFIG_EARLY_PRINTK)	+= early_printk.o
-obj-$(CONFIG_KPROBES)		+= kprobes.o
-obj-$(CONFIG_KPROBES)		+= kprobes_insn_page.o
-obj-$(CONFIG_KPROBES)		+= mcount.o
-obj-$(CONFIG_FUNCTION_TRACER)	+= ftrace.o
-obj-$(CONFIG_FUNCTION_TRACER)	+= mcount.o
-obj-$(CONFIG_CRASH_DUMP)	+= crash_dump.o
-obj-$(CONFIG_UPROBES)		+= uprobes.o
-obj-$(CONFIG_JUMP_LABEL)	+= jump_label.o
-
-obj-$(CONFIG_KEXEC_FILE)	+= machine_kexec_file.o kexec_image.o
-obj-$(CONFIG_KEXEC_FILE)	+= kexec_elf.o
-
-obj-$(CONFIG_IMA_SECURE_AND_OR_TRUSTED_BOOT)	+= ima_arch.o
-
-obj-$(CONFIG_PERF_EVENTS)	+= perf_event.o perf_cpum_cf_common.o
-obj-$(CONFIG_PERF_EVENTS)	+= perf_cpum_cf.o perf_cpum_sf.o
-obj-$(CONFIG_PERF_EVENTS)	+= perf_cpum_cf_events.o perf_regs.o
-obj-$(CONFIG_PERF_EVENTS)	+= perf_pai_crypto.o
-
-obj-$(CONFIG_TRACEPOINTS)	+= trace.o
-obj-$(findstring y, $(CONFIG_PROTECTED_VIRTUALIZATION_GUEST) $(CONFIG_PGSTE))	+= uv.o
-
-# vdso
-obj-y				+= vdso64/
-obj-$(CONFIG_COMPAT)		+= vdso32/
+binfmt_elf32.o:	$(TOPDIR)/fs/binfmt_elf.c

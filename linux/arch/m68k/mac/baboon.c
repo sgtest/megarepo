@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
 /*
  * Baboon Custom IC Management
  *
@@ -9,14 +8,28 @@
 
 #include <linux/types.h>
 #include <linux/kernel.h>
-#include <linux/irq.h>
+#include <linux/mm.h>
+#include <linux/delay.h>
+#include <linux/init.h>
+#include <linux/ide.h>
 
+#include <asm/traps.h>
+#include <asm/bootinfo.h>
 #include <asm/macintosh.h>
 #include <asm/macints.h>
 #include <asm/mac_baboon.h>
 
-int baboon_present;
-static volatile struct baboon *baboon;
+/* #define DEBUG_BABOON */
+/* #define DEBUG_IRQS */
+
+int baboon_present,baboon_active;
+volatile struct baboon *baboon;
+
+irqreturn_t baboon_irq(int, void *, struct pt_regs *);
+
+#if 0
+extern int macide_ack_intr(struct ata_channel *);
+#endif
 
 /*
  * Baboon initialization.
@@ -32,31 +45,9 @@ void __init baboon_init(void)
 
 	baboon = (struct baboon *) BABOON_BASE;
 	baboon_present = 1;
+	baboon_active = 0;
 
-	pr_debug("Baboon detected at %p\n", baboon);
-}
-
-/*
- * Baboon interrupt handler.
- * XXX how do you clear a pending IRQ? is it even necessary?
- */
-
-static void baboon_irq(struct irq_desc *desc)
-{
-	short events, irq_bit;
-	int irq_num;
-
-	events = baboon->mb_ifr & 0x07;
-	irq_num = IRQ_BABOON_0;
-	irq_bit = 1;
-	do {
-		if (events & irq_bit) {
-			events &= ~irq_bit;
-			generic_handle_irq(irq_num);
-		}
-		++irq_num;
-		irq_bit <<= 1;
-	} while (events);
+	printk("Baboon detected at %p\n", baboon);
 }
 
 /*
@@ -65,24 +56,71 @@ static void baboon_irq(struct irq_desc *desc)
 
 void __init baboon_register_interrupts(void)
 {
-	irq_set_chained_handler(IRQ_NUBUS_C, baboon_irq);
+	request_irq(IRQ_NUBUS_C, baboon_irq, IRQ_FLG_LOCK|IRQ_FLG_FAST,
+		    "baboon", (void *) baboon);
 }
 
 /*
- * The means for masking individual Baboon interrupts remains a mystery.
- * However, since we only use the IDE IRQ, we can just enable/disable all
- * Baboon interrupts. If/when we handle more than one Baboon IRQ, we must
- * either figure out how to mask them individually or else implement the
- * same workaround that's used for NuBus slots (see nubus_disabled and
- * via_nubus_irq_shutdown).
+ * Baboon interrupt handler. This works a lot like a VIA.
  */
 
-void baboon_irq_enable(int irq)
+irqreturn_t baboon_irq(int irq, void *dev_id, struct pt_regs *regs)
 {
-	mac_irq_enable(irq_get_irq_data(IRQ_NUBUS_C));
+	int irq_bit,i;
+	unsigned char events;
+
+#ifdef DEBUG_IRQS
+	printk("baboon_irq: mb_control %02X mb_ifr %02X mb_status %02X active %02X\n",
+		(uint) baboon->mb_control, (uint) baboon->mb_ifr,
+		(uint) baboon->mb_status,  baboon_active);
+#endif
+
+	if (!(events = baboon->mb_ifr & 0x07))
+		return IRQ_NONE;
+
+	for (i = 0, irq_bit = 1 ; i < 3 ; i++, irq_bit <<= 1) {
+	        if (events & irq_bit/* & baboon_active*/) {
+			baboon_active &= ~irq_bit;
+			mac_do_irq_list(IRQ_BABOON_0 + i, regs);
+			baboon_active |= irq_bit;
+			baboon->mb_ifr &= ~irq_bit;
+		}
+	}
+#if 0
+	if (baboon->mb_ifr & 0x02) macide_ack_intr(NULL);
+	/* for now we need to smash all interrupts */
+	baboon->mb_ifr &= ~events;
+#endif
+	return IRQ_HANDLED;
 }
 
-void baboon_irq_disable(int irq)
+void baboon_irq_enable(int irq) {
+	int irq_idx	= IRQ_IDX(irq);
+
+#ifdef DEBUG_IRQUSE
+	printk("baboon_irq_enable(%d)\n", irq);
+#endif
+	baboon_active |= (1 << irq_idx);
+}
+
+void baboon_irq_disable(int irq) {
+	int irq_idx	= IRQ_IDX(irq);
+
+#ifdef DEBUG_IRQUSE
+	printk("baboon_irq_disable(%d)\n", irq);
+#endif
+	baboon_active &= ~(1 << irq_idx);
+}
+
+void baboon_irq_clear(int irq) {
+	int irq_idx	= IRQ_IDX(irq);
+
+	baboon->mb_ifr &= ~(1 << irq_idx);
+}
+
+int baboon_irq_pending(int irq)
 {
-	mac_irq_disable(irq_get_irq_data(IRQ_NUBUS_C));
+	int irq_idx	= IRQ_IDX(irq);
+
+	return baboon->mb_ifr & (1 << irq_idx);
 }

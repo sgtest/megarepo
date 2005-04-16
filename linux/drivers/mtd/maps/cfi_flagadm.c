@@ -1,6 +1,8 @@
 /*
- *  Copyright Â© 2001 Flaga hf. Medical Devices, KÃ¡ri DavÃ­Ã°sson <kd@flaga.is>
+ *  Copyright © 2001 Flaga hf. Medical Devices, Kári Davíðsson <kd@flaga.is>
  *
+ *  $Id: cfi_flagadm.c,v 1.14 2004/11/04 13:24:14 gleixner Exp $
+ *  
  *  This program is free software; you can redistribute  it and/or modify it
  *  under  the terms of  the GNU General  Public License as published by the
  *  Free Software Foundation;  either version 2 of the  License, or (at your
@@ -33,14 +35,14 @@
 
 
 /* We split the flash chip up into four parts.
- * 1: bootloader first 128k			(0x00000000 - 0x0001FFFF) size 0x020000
+ * 1: bootloader firts 128k			(0x00000000 - 0x0001FFFF) size 0x020000
  * 2: kernel 640k					(0x00020000 - 0x000BFFFF) size 0x0A0000
  * 3: compressed 1536k root ramdisk	(0x000C0000 - 0x0023FFFF) size 0x180000
  * 4: writeable diskpartition (jffs)(0x00240000 - 0x003FFFFF) size 0x1C0000
  */
 
 #define FLASH_PHYS_ADDR 0x40000000
-#define FLASH_SIZE 0x400000
+#define FLASH_SIZE 0x400000  
 
 #define FLASH_PARTITION0_ADDR 0x00000000
 #define FLASH_PARTITION0_SIZE 0x00020000
@@ -55,13 +57,13 @@
 #define FLASH_PARTITION3_SIZE 0x001C0000
 
 
-static struct map_info flagadm_map = {
+struct map_info flagadm_map = {
 		.name =		"FlagaDM flash device",
 		.size =		FLASH_SIZE,
 		.bankwidth =	2,
 };
 
-static const struct mtd_partition flagadm_parts[] = {
+struct mtd_partition flagadm_parts[] = {
 	{
 		.name =		"Bootloader",
 		.offset	=	FLASH_PARTITION0_ADDR,
@@ -77,22 +79,22 @@ static const struct mtd_partition flagadm_parts[] = {
 		.offset =	FLASH_PARTITION2_ADDR,
 		.size =		FLASH_PARTITION2_SIZE
 	},
-	{
-		.name =		"Persistent storage",
+	{	
+		.name =		"Persistant storage",
 		.offset =	FLASH_PARTITION3_ADDR,
 		.size =		FLASH_PARTITION3_SIZE
 	}
 };
 
-#define PARTITION_COUNT ARRAY_SIZE(flagadm_parts)
+#define PARTITION_COUNT (sizeof(flagadm_parts)/sizeof(struct mtd_partition))
 
 static struct mtd_info *mymtd;
 
-static int __init init_flagadm(void)
-{
+int __init init_flagadm(void)
+{	
 	printk(KERN_NOTICE "FlagaDM flash device: %x at %x\n",
 			FLASH_SIZE, FLASH_PHYS_ADDR);
-
+	
 	flagadm_map.phys = FLASH_PHYS_ADDR;
 	flagadm_map.virt = ioremap(FLASH_PHYS_ADDR,
 					FLASH_SIZE);
@@ -107,24 +109,24 @@ static int __init init_flagadm(void)
 	mymtd = do_map_probe("cfi_probe", &flagadm_map);
 	if (mymtd) {
 		mymtd->owner = THIS_MODULE;
-		mtd_device_register(mymtd, flagadm_parts, PARTITION_COUNT);
+		add_mtd_partitions(mymtd, flagadm_parts, PARTITION_COUNT);
 		printk(KERN_NOTICE "FlagaDM flash device initialized\n");
 		return 0;
 	}
 
-	iounmap((void __iomem *)flagadm_map.virt);
+	iounmap((void *)flagadm_map.virt);
 	return -ENXIO;
 }
 
 static void __exit cleanup_flagadm(void)
 {
 	if (mymtd) {
-		mtd_device_unregister(mymtd);
+		del_mtd_partitions(mymtd);
 		map_destroy(mymtd);
 	}
 	if (flagadm_map.virt) {
-		iounmap((void __iomem *)flagadm_map.virt);
-		flagadm_map.virt = NULL;
+		iounmap((void *)flagadm_map.virt);
+		flagadm_map.virt = 0;
 	}
 }
 
@@ -133,5 +135,5 @@ module_exit(cleanup_flagadm);
 
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("KÃ¡ri DavÃ­Ã°sson <kd@flaga.is>");
+MODULE_AUTHOR("Kári Davíðsson <kd@flaga.is>");
 MODULE_DESCRIPTION("MTD map driver for Flaga digital module");

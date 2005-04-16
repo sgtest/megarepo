@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * fs/direct-io.c
  *
@@ -6,11 +5,11 @@
  *
  * O_DIRECT
  *
- * 04Jul2002	Andrew Morton
+ * 04Jul2002	akpm@zip.com.au
  *		Initial version
  * 11Sep2002	janetinc@us.ibm.com
  * 		added readv/writev support.
- * 29Oct2002	Andrew Morton
+ * 29Oct2002	akpm@zip.com.au
  *		rewrote bio_add_page() support.
  * 30Oct2002	pbadari@us.ibm.com
  *		added support for non-aligned IO.
@@ -28,7 +27,6 @@
 #include <linux/slab.h>
 #include <linux/highmem.h>
 #include <linux/pagemap.h>
-#include <linux/task_io_accounting_ops.h>
 #include <linux/bio.h>
 #include <linux/wait.h>
 #include <linux/err.h>
@@ -36,22 +34,13 @@
 #include <linux/buffer_head.h>
 #include <linux/rwsem.h>
 #include <linux/uio.h>
-#include <linux/atomic.h>
-#include <linux/prefetch.h>
-
-#include "internal.h"
+#include <asm/atomic.h>
 
 /*
  * How many user pages to map in one call to get_user_pages().  This determines
- * the size of a structure in the slab cache
+ * the size of a structure on the stack.
  */
 #define DIO_PAGES	64
-
-/*
- * Flags for dio_complete()
- */
-#define DIO_COMPLETE_ASYNC		0x01	/* This is async IO */
-#define DIO_COMPLETE_INVALIDATE		0x02	/* Can invalidate pages */
 
 /*
  * This code generally works in units of "dio_blocks".  A dio_block is
@@ -63,12 +52,21 @@
  *
  * If blkfactor is zero then the user's request was aligned to the filesystem's
  * blocksize.
+ *
+ * lock_type is DIO_LOCKING for regular files on direct-IO-naive filesystems.
+ * This determines whether we need to do the fancy locking which prevents
+ * direct-IO from being able to read uninitialised disk blocks.  If its zero
+ * (blockdev) this locking is not done, and if it is DIO_OWN_LOCKING i_sem is
+ * not held for the entire direct write (taken briefly, initially, during a
+ * direct read though, but its never held for the duration of a direct-IO).
  */
 
-/* dio_state only used in the submission path */
-
-struct dio_submit {
+struct dio {
+	/* BIO submission state */
 	struct bio *bio;		/* bio under assembly */
+	struct inode *inode;
+	int rw;
+	int lock_type;			/* doesn't change */
 	unsigned blkbits;		/* doesn't change */
 	unsigned blkfactor;		/* When we're using an alignment which
 					   is finer than the filesystem's soft
@@ -79,19 +77,20 @@ struct dio_submit {
 					   been performed at the start of a
 					   write */
 	int pages_in_io;		/* approximate total IO pages */
+	size_t	size;			/* total request size (doesn't change)*/
 	sector_t block_in_file;		/* Current offset into the underlying
 					   file in dio_block units. */
 	unsigned blocks_available;	/* At block_in_file.  changes */
-	int reap_counter;		/* rate limit reaping */
 	sector_t final_block_in_request;/* doesn't change */
+	unsigned first_block_in_page;	/* doesn't change, Used only once */
 	int boundary;			/* prev block is at a boundary */
-	get_block_t *get_block;		/* block mapping function */
-	dio_submit_t *submit_io;	/* IO submition function */
-
-	loff_t logical_offset_in_bio;	/* current first logical block in bio */
+	int reap_counter;		/* rate limit reaping */
+	get_blocks_t *get_blocks;	/* block mapping function */
+	dio_iodone_t *end_io;		/* IO completion function */
 	sector_t final_block_in_bio;	/* current final block in bio + 1 */
 	sector_t next_block_for_io;	/* next block to be put under IO,
 					   in dio_blocks units */
+	struct buffer_head map_bh;	/* last get_blocks() result */
 
 	/*
 	 * Deferred addition of a page to the dio.  These variables are
@@ -102,78 +101,66 @@ struct dio_submit {
 	unsigned cur_page_offset;	/* Offset into it, in bytes */
 	unsigned cur_page_len;		/* Nr of bytes at cur_page_offset */
 	sector_t cur_page_block;	/* Where it starts */
-	loff_t cur_page_fs_offset;	/* Offset in file */
 
-	struct iov_iter *iter;
+	/*
+	 * Page fetching state. These variables belong to dio_refill_pages().
+	 */
+	int curr_page;			/* changes */
+	int total_pages;		/* doesn't change */
+	unsigned long curr_user_address;/* changes */
+
 	/*
 	 * Page queue.  These variables belong to dio_refill_pages() and
 	 * dio_get_page().
 	 */
+	struct page *pages[DIO_PAGES];	/* page buffer */
 	unsigned head;			/* next page to process */
 	unsigned tail;			/* last valid page + 1 */
-	size_t from, to;
-};
-
-/* dio_state communicated between submission path and end_io */
-struct dio {
-	int flags;			/* doesn't change */
-	blk_opf_t opf;			/* request operation type and flags */
-	struct gendisk *bio_disk;
-	struct inode *inode;
-	loff_t i_size;			/* i_size when submitted */
-	dio_iodone_t *end_io;		/* IO completion function */
-
-	void *private;			/* copy from map_bh.b_private */
+	int page_errors;		/* errno from get_user_pages() */
 
 	/* BIO completion state */
 	spinlock_t bio_lock;		/* protects BIO fields below */
-	int page_errors;		/* errno from get_user_pages() */
-	int is_async;			/* is IO async ? */
-	bool defer_completion;		/* defer AIO completion to workqueue? */
-	bool should_dirty;		/* if pages should be dirtied */
-	int io_error;			/* IO error in completion path */
-	unsigned long refcount;		/* direct_io_worker() and bios */
+	int bio_count;			/* nr bios to be completed */
+	int bios_in_flight;		/* nr bios in flight */
 	struct bio *bio_list;		/* singly linked via bi_private */
 	struct task_struct *waiter;	/* waiting task (NULL if none) */
 
 	/* AIO related stuff */
 	struct kiocb *iocb;		/* kiocb */
+	int is_async;			/* is IO async ? */
 	ssize_t result;                 /* IO result */
-
-	/*
-	 * pages[] (and any fields placed after it) are not zeroed out at
-	 * allocation time.  Don't add new fields after pages[] unless you
-	 * wish that they not be zeroed.
-	 */
-	union {
-		struct page *pages[DIO_PAGES];	/* page buffer */
-		struct work_struct complete_work;/* deferred AIO completion */
-	};
-} ____cacheline_aligned_in_smp;
-
-static struct kmem_cache *dio_cache __read_mostly;
+};
 
 /*
  * How many pages are in the queue?
  */
-static inline unsigned dio_pages_present(struct dio_submit *sdio)
+static inline unsigned dio_pages_present(struct dio *dio)
 {
-	return sdio->tail - sdio->head;
+	return dio->tail - dio->head;
 }
 
 /*
  * Go grab and pin some userspace pages.   Typically we'll get 64 at a time.
  */
-static inline int dio_refill_pages(struct dio *dio, struct dio_submit *sdio)
+static int dio_refill_pages(struct dio *dio)
 {
-	const enum req_op dio_op = dio->opf & REQ_OP_MASK;
-	ssize_t ret;
+	int ret;
+	int nr_pages;
 
-	ret = iov_iter_get_pages(sdio->iter, dio->pages, LONG_MAX, DIO_PAGES,
-				&sdio->from);
+	nr_pages = min(dio->total_pages - dio->curr_page, DIO_PAGES);
+	down_read(&current->mm->mmap_sem);
+	ret = get_user_pages(
+		current,			/* Task for fault acounting */
+		current->mm,			/* whose pages? */
+		dio->curr_user_address,		/* Where from? */
+		nr_pages,			/* How many pages? */
+		dio->rw == READ,		/* Write to memory? */
+		0,				/* force (?) */
+		&dio->pages[0],
+		NULL);				/* vmas */
+	up_read(&current->mm->mmap_sem);
 
-	if (ret < 0 && sdio->blocks_available && dio_op == REQ_OP_WRITE) {
-		struct page *page = ZERO_PAGE(0);
+	if (ret < 0 && dio->blocks_available && (dio->rw == WRITE)) {
 		/*
 		 * A memory fault, but the filesystem has some outstanding
 		 * mapped blocks.  We need to use those blocks up to avoid
@@ -181,23 +168,21 @@ static inline int dio_refill_pages(struct dio *dio, struct dio_submit *sdio)
 		 */
 		if (dio->page_errors == 0)
 			dio->page_errors = ret;
-		get_page(page);
-		dio->pages[0] = page;
-		sdio->head = 0;
-		sdio->tail = 1;
-		sdio->from = 0;
-		sdio->to = PAGE_SIZE;
-		return 0;
+		dio->pages[0] = ZERO_PAGE(dio->curr_user_address);
+		dio->head = 0;
+		dio->tail = 1;
+		ret = 0;
+		goto out;
 	}
 
 	if (ret >= 0) {
-		iov_iter_advance(sdio->iter, ret);
-		ret += sdio->from;
-		sdio->head = 0;
-		sdio->tail = (ret + PAGE_SIZE - 1) / PAGE_SIZE;
-		sdio->to = ((ret - 1) & (PAGE_SIZE - 1)) + 1;
-		return 0;
+		dio->curr_user_address += ret * PAGE_SIZE;
+		dio->curr_page += ret;
+		dio->head = 0;
+		dio->tail = ret;
+		ret = 0;
 	}
+out:
 	return ret;	
 }
 
@@ -207,164 +192,88 @@ static inline int dio_refill_pages(struct dio *dio, struct dio_submit *sdio)
  * decent number of pages, less frequently.  To provide nicer use of the
  * L1 cache.
  */
-static inline struct page *dio_get_page(struct dio *dio,
-					struct dio_submit *sdio)
+static struct page *dio_get_page(struct dio *dio)
 {
-	if (dio_pages_present(sdio) == 0) {
+	if (dio_pages_present(dio) == 0) {
 		int ret;
 
-		ret = dio_refill_pages(dio, sdio);
+		ret = dio_refill_pages(dio);
 		if (ret)
 			return ERR_PTR(ret);
-		BUG_ON(dio_pages_present(sdio) == 0);
+		BUG_ON(dio_pages_present(dio) == 0);
 	}
-	return dio->pages[sdio->head];
+	return dio->pages[dio->head++];
 }
 
 /*
- * dio_complete() - called when all DIO BIO I/O has been completed
- *
- * This drops i_dio_count, lets interested parties know that a DIO operation
- * has completed, and calculates the resulting return code for the operation.
- *
- * It lets the filesystem know if it registered an interest earlier via
- * get_block.  Pass the private field of the map buffer_head so that
- * filesystems can use it to hold additional state between get_block calls and
- * dio_complete.
+ * Called when all DIO BIO I/O has been completed - let the filesystem
+ * know, if it registered an interest earlier via get_blocks.  Pass the
+ * private field of the map buffer_head so that filesystems can use it
+ * to hold additional state between get_blocks calls and dio_complete.
  */
-static ssize_t dio_complete(struct dio *dio, ssize_t ret, unsigned int flags)
+static void dio_complete(struct dio *dio, loff_t offset, ssize_t bytes)
 {
-	const enum req_op dio_op = dio->opf & REQ_OP_MASK;
-	loff_t offset = dio->iocb->ki_pos;
-	ssize_t transferred = 0;
-	int err;
-
-	/*
-	 * AIO submission can race with bio completion to get here while
-	 * expecting to have the last io completed by bio completion.
-	 * In that case -EIOCBQUEUED is in fact not an error we want
-	 * to preserve through this call.
-	 */
-	if (ret == -EIOCBQUEUED)
-		ret = 0;
-
-	if (dio->result) {
-		transferred = dio->result;
-
-		/* Check for short read case */
-		if (dio_op == REQ_OP_READ &&
-		    ((offset + transferred) > dio->i_size))
-			transferred = dio->i_size - offset;
-		/* ignore EFAULT if some IO has been done */
-		if (unlikely(ret == -EFAULT) && transferred)
-			ret = 0;
-	}
-
-	if (ret == 0)
-		ret = dio->page_errors;
-	if (ret == 0)
-		ret = dio->io_error;
-	if (ret == 0)
-		ret = transferred;
-
-	if (dio->end_io) {
-		// XXX: ki_pos??
-		err = dio->end_io(dio->iocb, offset, ret, dio->private);
-		if (err)
-			ret = err;
-	}
-
-	/*
-	 * Try again to invalidate clean pages which might have been cached by
-	 * non-direct readahead, or faulted in by get_user_pages() if the source
-	 * of the write was an mmap'ed region of the file we're writing.  Either
-	 * one is a pretty crazy thing to do, so we don't support it 100%.  If
-	 * this invalidation fails, tough, the write still worked...
-	 *
-	 * And this page cache invalidation has to be after dio->end_io(), as
-	 * some filesystems convert unwritten extents to real allocations in
-	 * end_io() when necessary, otherwise a racing buffer read would cache
-	 * zeros from unwritten extents.
-	 */
-	if (flags & DIO_COMPLETE_INVALIDATE &&
-	    ret > 0 && dio_op == REQ_OP_WRITE &&
-	    dio->inode->i_mapping->nrpages) {
-		err = invalidate_inode_pages2_range(dio->inode->i_mapping,
-					offset >> PAGE_SHIFT,
-					(offset + ret - 1) >> PAGE_SHIFT);
-		if (err)
-			dio_warn_stale_pagecache(dio->iocb->ki_filp);
-	}
-
-	inode_dio_end(dio->inode);
-
-	if (flags & DIO_COMPLETE_ASYNC) {
-		/*
-		 * generic_write_sync expects ki_pos to have been updated
-		 * already, but the submission path only does this for
-		 * synchronous I/O.
-		 */
-		dio->iocb->ki_pos += transferred;
-
-		if (ret > 0 && dio_op == REQ_OP_WRITE)
-			ret = generic_write_sync(dio->iocb, ret);
-		dio->iocb->ki_complete(dio->iocb, ret);
-	}
-
-	kmem_cache_free(dio_cache, dio);
-	return ret;
+	if (dio->end_io && dio->result)
+		dio->end_io(dio->inode, offset, bytes, dio->map_bh.b_private);
+	if (dio->lock_type == DIO_LOCKING)
+		up_read(&dio->inode->i_alloc_sem);
 }
 
-static void dio_aio_complete_work(struct work_struct *work)
+/*
+ * Called when a BIO has been processed.  If the count goes to zero then IO is
+ * complete and we can signal this to the AIO layer.
+ */
+static void finished_one_bio(struct dio *dio)
 {
-	struct dio *dio = container_of(work, struct dio, complete_work);
+	unsigned long flags;
 
-	dio_complete(dio, 0, DIO_COMPLETE_ASYNC | DIO_COMPLETE_INVALIDATE);
+	spin_lock_irqsave(&dio->bio_lock, flags);
+	if (dio->bio_count == 1) {
+		if (dio->is_async) {
+			/*
+			 * Last reference to the dio is going away.
+			 * Drop spinlock and complete the DIO.
+			 */
+			spin_unlock_irqrestore(&dio->bio_lock, flags);
+			dio_complete(dio, dio->block_in_file << dio->blkbits,
+					dio->result);
+			/* Complete AIO later if falling back to buffered i/o */
+			if (dio->result == dio->size ||
+				((dio->rw == READ) && dio->result)) {
+				aio_complete(dio->iocb, dio->result, 0);
+				kfree(dio);
+				return;
+			} else {
+				/*
+				 * Falling back to buffered
+				 */
+				spin_lock_irqsave(&dio->bio_lock, flags);
+				dio->bio_count--;
+				if (dio->waiter)
+					wake_up_process(dio->waiter);
+				spin_unlock_irqrestore(&dio->bio_lock, flags);
+				return;
+			}
+		}
+	}
+	dio->bio_count--;
+	spin_unlock_irqrestore(&dio->bio_lock, flags);
 }
 
-static blk_status_t dio_bio_complete(struct dio *dio, struct bio *bio);
-
+static int dio_bio_complete(struct dio *dio, struct bio *bio);
 /*
  * Asynchronous IO callback. 
  */
-static void dio_bio_end_aio(struct bio *bio)
+static int dio_bio_end_aio(struct bio *bio, unsigned int bytes_done, int error)
 {
 	struct dio *dio = bio->bi_private;
-	const enum req_op dio_op = dio->opf & REQ_OP_MASK;
-	unsigned long remaining;
-	unsigned long flags;
-	bool defer_completion = false;
+
+	if (bio->bi_size)
+		return 1;
 
 	/* cleanup the bio */
 	dio_bio_complete(dio, bio);
-
-	spin_lock_irqsave(&dio->bio_lock, flags);
-	remaining = --dio->refcount;
-	if (remaining == 1 && dio->waiter)
-		wake_up_process(dio->waiter);
-	spin_unlock_irqrestore(&dio->bio_lock, flags);
-
-	if (remaining == 0) {
-		/*
-		 * Defer completion when defer_completion is set or
-		 * when the inode has pages mapped and this is AIO write.
-		 * We need to invalidate those pages because there is a
-		 * chance they contain stale data in the case buffered IO
-		 * went in between AIO submission and completion into the
-		 * same region.
-		 */
-		if (dio->result)
-			defer_completion = dio->defer_completion ||
-					   (dio_op == REQ_OP_WRITE &&
-					    dio->inode->i_mapping->nrpages);
-		if (defer_completion) {
-			INIT_WORK(&dio->complete_work, dio_aio_complete_work);
-			queue_work(dio->inode->i_sb->s_dio_done_wq,
-				   &dio->complete_work);
-		} else {
-			dio_complete(dio, 0, DIO_COMPLETE_ASYNC);
-		}
-	}
+	return 0;
 }
 
 /*
@@ -374,117 +283,100 @@ static void dio_bio_end_aio(struct bio *bio)
  * During I/O bi_private points at the dio.  After I/O, bi_private is used to
  * implement a singly-linked list of completed BIOs, at dio->bio_list.
  */
-static void dio_bio_end_io(struct bio *bio)
+static int dio_bio_end_io(struct bio *bio, unsigned int bytes_done, int error)
 {
 	struct dio *dio = bio->bi_private;
 	unsigned long flags;
 
+	if (bio->bi_size)
+		return 1;
+
 	spin_lock_irqsave(&dio->bio_lock, flags);
 	bio->bi_private = dio->bio_list;
 	dio->bio_list = bio;
-	if (--dio->refcount == 1 && dio->waiter)
+	dio->bios_in_flight--;
+	if (dio->waiter && dio->bios_in_flight == 0)
 		wake_up_process(dio->waiter);
 	spin_unlock_irqrestore(&dio->bio_lock, flags);
+	return 0;
 }
 
-static inline void
-dio_bio_alloc(struct dio *dio, struct dio_submit *sdio,
-	      struct block_device *bdev,
-	      sector_t first_sector, int nr_vecs)
+static int
+dio_bio_alloc(struct dio *dio, struct block_device *bdev,
+		sector_t first_sector, int nr_vecs)
 {
 	struct bio *bio;
 
-	/*
-	 * bio_alloc() is guaranteed to return a bio when allowed to sleep and
-	 * we request a valid number of vectors.
-	 */
-	bio = bio_alloc(bdev, nr_vecs, dio->opf, GFP_KERNEL);
-	bio->bi_iter.bi_sector = first_sector;
+	bio = bio_alloc(GFP_KERNEL, nr_vecs);
+	if (bio == NULL)
+		return -ENOMEM;
+
+	bio->bi_bdev = bdev;
+	bio->bi_sector = first_sector;
 	if (dio->is_async)
 		bio->bi_end_io = dio_bio_end_aio;
 	else
 		bio->bi_end_io = dio_bio_end_io;
-	sdio->bio = bio;
-	sdio->logical_offset_in_bio = sdio->cur_page_fs_offset;
+
+	dio->bio = bio;
+	return 0;
 }
 
 /*
  * In the AIO read case we speculatively dirty the pages before starting IO.
  * During IO completion, any of these pages which happen to have been written
  * back will be redirtied by bio_check_pages_dirty().
- *
- * bios hold a dio reference between submit_bio and ->end_io.
  */
-static inline void dio_bio_submit(struct dio *dio, struct dio_submit *sdio)
+static void dio_bio_submit(struct dio *dio)
 {
-	const enum req_op dio_op = dio->opf & REQ_OP_MASK;
-	struct bio *bio = sdio->bio;
+	struct bio *bio = dio->bio;
 	unsigned long flags;
 
 	bio->bi_private = dio;
-	/* don't account direct I/O as memory stall */
-	bio_clear_flag(bio, BIO_WORKINGSET);
-
 	spin_lock_irqsave(&dio->bio_lock, flags);
-	dio->refcount++;
+	dio->bio_count++;
+	dio->bios_in_flight++;
 	spin_unlock_irqrestore(&dio->bio_lock, flags);
-
-	if (dio->is_async && dio_op == REQ_OP_READ && dio->should_dirty)
+	if (dio->is_async && dio->rw == READ)
 		bio_set_pages_dirty(bio);
+	submit_bio(dio->rw, bio);
 
-	dio->bio_disk = bio->bi_bdev->bd_disk;
-
-	if (sdio->submit_io)
-		sdio->submit_io(bio, dio->inode, sdio->logical_offset_in_bio);
-	else
-		submit_bio(bio);
-
-	sdio->bio = NULL;
-	sdio->boundary = 0;
-	sdio->logical_offset_in_bio = 0;
+	dio->bio = NULL;
+	dio->boundary = 0;
 }
 
 /*
  * Release any resources in case of a failure
  */
-static inline void dio_cleanup(struct dio *dio, struct dio_submit *sdio)
+static void dio_cleanup(struct dio *dio)
 {
-	while (sdio->head < sdio->tail)
-		put_page(dio->pages[sdio->head++]);
+	while (dio_pages_present(dio))
+		page_cache_release(dio_get_page(dio));
 }
 
 /*
- * Wait for the next BIO to complete.  Remove it and return it.  NULL is
- * returned once all BIOs have been completed.  This must only be called once
- * all bios have been issued so that dio->refcount can only decrease.  This
- * requires that the caller hold a reference on the dio.
+ * Wait for the next BIO to complete.  Remove it and return it.
  */
 static struct bio *dio_await_one(struct dio *dio)
 {
 	unsigned long flags;
-	struct bio *bio = NULL;
+	struct bio *bio;
 
 	spin_lock_irqsave(&dio->bio_lock, flags);
-
-	/*
-	 * Wait as long as the list is empty and there are bios in flight.  bio
-	 * completion drops the count, maybe adds to the list, and wakes while
-	 * holding the bio_lock so we don't need set_current_state()'s barrier
-	 * and can call it after testing our condition.
-	 */
-	while (dio->refcount > 1 && dio->bio_list == NULL) {
-		__set_current_state(TASK_UNINTERRUPTIBLE);
-		dio->waiter = current;
-		spin_unlock_irqrestore(&dio->bio_lock, flags);
-		blk_io_schedule();
-		/* wake up sets us TASK_RUNNING */
-		spin_lock_irqsave(&dio->bio_lock, flags);
-		dio->waiter = NULL;
+	while (dio->bio_list == NULL) {
+		set_current_state(TASK_UNINTERRUPTIBLE);
+		if (dio->bio_list == NULL) {
+			dio->waiter = current;
+			spin_unlock_irqrestore(&dio->bio_lock, flags);
+			blk_run_address_space(dio->inode->i_mapping);
+			io_schedule();
+			spin_lock_irqsave(&dio->bio_lock, flags);
+			dio->waiter = NULL;
+		}
+		set_current_state(TASK_RUNNING);
 	}
-	if (dio->bio_list) {
-		bio = dio->bio_list;
-		dio->bio_list = bio->bi_private;
-	}
+	bio = dio->bio_list;
+	dio->bio_list = bio->bi_private;
 	spin_unlock_irqrestore(&dio->bio_lock, flags);
 	return bio;
 }
@@ -492,43 +384,55 @@ static struct bio *dio_await_one(struct dio *dio)
 /*
  * Process one completed BIO.  No locks are held.
  */
-static blk_status_t dio_bio_complete(struct dio *dio, struct bio *bio)
+static int dio_bio_complete(struct dio *dio, struct bio *bio)
 {
-	blk_status_t err = bio->bi_status;
-	const enum req_op dio_op = dio->opf & REQ_OP_MASK;
-	bool should_dirty = dio_op == REQ_OP_READ && dio->should_dirty;
+	const int uptodate = test_bit(BIO_UPTODATE, &bio->bi_flags);
+	struct bio_vec *bvec = bio->bi_io_vec;
+	int page_no;
 
-	if (err) {
-		if (err == BLK_STS_AGAIN && (bio->bi_opf & REQ_NOWAIT))
-			dio->io_error = -EAGAIN;
-		else
-			dio->io_error = -EIO;
-	}
+	if (!uptodate)
+		dio->result = -EIO;
 
-	if (dio->is_async && should_dirty) {
+	if (dio->is_async && dio->rw == READ) {
 		bio_check_pages_dirty(bio);	/* transfers ownership */
 	} else {
-		bio_release_pages(bio, should_dirty);
+		for (page_no = 0; page_no < bio->bi_vcnt; page_no++) {
+			struct page *page = bvec[page_no].bv_page;
+
+			if (dio->rw == READ && !PageCompound(page))
+				set_page_dirty_lock(page);
+			page_cache_release(page);
+		}
 		bio_put(bio);
 	}
-	return err;
+	finished_one_bio(dio);
+	return uptodate ? 0 : -EIO;
 }
 
 /*
- * Wait on and process all in-flight BIOs.  This must only be called once
- * all bios have been issued so that the refcount can only decrease.
- * This just waits for all bios to make it through dio_bio_complete.  IO
- * errors are propagated through dio->io_error and should be propagated via
- * dio_complete().
+ * Wait on and process all in-flight BIOs.
  */
-static void dio_await_completion(struct dio *dio)
+static int dio_await_completion(struct dio *dio)
 {
-	struct bio *bio;
-	do {
-		bio = dio_await_one(dio);
-		if (bio)
-			dio_bio_complete(dio, bio);
-	} while (bio);
+	int ret = 0;
+
+	if (dio->bio)
+		dio_bio_submit(dio);
+
+	/*
+	 * The bio_lock is not held for the read of bio_count.
+	 * This is ok since it is the dio_bio_complete() that changes
+	 * bio_count.
+	 */
+	while (dio->bio_count) {
+		struct bio *bio = dio_await_one(dio);
+		int ret2;
+
+		ret2 = dio_bio_complete(dio, bio);
+		if (ret == 0)
+			ret = ret2;
+	}
+	return ret;
 }
 
 /*
@@ -538,11 +442,11 @@ static void dio_await_completion(struct dio *dio)
  *
  * This also helps to limit the peak amount of pinned userspace memory.
  */
-static inline int dio_bio_reap(struct dio *dio, struct dio_submit *sdio)
+static int dio_bio_reap(struct dio *dio)
 {
 	int ret = 0;
 
-	if (sdio->reap_counter++ >= 64) {
+	if (dio->reap_counter++ >= 64) {
 		while (dio->bio_list) {
 			unsigned long flags;
 			struct bio *bio;
@@ -552,60 +456,24 @@ static inline int dio_bio_reap(struct dio *dio, struct dio_submit *sdio)
 			bio = dio->bio_list;
 			dio->bio_list = bio->bi_private;
 			spin_unlock_irqrestore(&dio->bio_lock, flags);
-			ret2 = blk_status_to_errno(dio_bio_complete(dio, bio));
+			ret2 = dio_bio_complete(dio, bio);
 			if (ret == 0)
 				ret = ret2;
 		}
-		sdio->reap_counter = 0;
+		dio->reap_counter = 0;
 	}
 	return ret;
 }
 
 /*
- * Create workqueue for deferred direct IO completions. We allocate the
- * workqueue when it's first needed. This avoids creating workqueue for
- * filesystems that don't need it and also allows us to create the workqueue
- * late enough so the we can include s_id in the name of the workqueue.
- */
-int sb_init_dio_done_wq(struct super_block *sb)
-{
-	struct workqueue_struct *old;
-	struct workqueue_struct *wq = alloc_workqueue("dio/%s",
-						      WQ_MEM_RECLAIM, 0,
-						      sb->s_id);
-	if (!wq)
-		return -ENOMEM;
-	/*
-	 * This has to be atomic as more DIOs can race to create the workqueue
-	 */
-	old = cmpxchg(&sb->s_dio_done_wq, NULL, wq);
-	/* Someone created workqueue before us? Free ours... */
-	if (old)
-		destroy_workqueue(wq);
-	return 0;
-}
-
-static int dio_set_defer_completion(struct dio *dio)
-{
-	struct super_block *sb = dio->inode->i_sb;
-
-	if (dio->defer_completion)
-		return 0;
-	dio->defer_completion = true;
-	if (!sb->s_dio_done_wq)
-		return sb_init_dio_done_wq(sb);
-	return 0;
-}
-
-/*
  * Call into the fs to map some more disk blocks.  We record the current number
- * of available blocks at sdio->blocks_available.  These are in units of the
- * fs blocksize, i_blocksize(inode).
+ * of available blocks at dio->blocks_available.  These are in units of the
+ * fs blocksize, (1 << inode->i_blkbits).
  *
  * The fs is allowed to map lots of blocks at once.  If it wants to do that,
  * it uses the passed inode-relative block number as the file offset, as usual.
  *
- * get_block() is passed the number of i_blkbits-sized blocks which direct_io
+ * get_blocks() is passed the number of i_blkbits-sized blocks which direct_io
  * has remaining to do.  The fs should not map more than this number of blocks.
  *
  * If the fs has mapped a lot of blocks, it should populate bh->b_size to
@@ -618,19 +486,17 @@ static int dio_set_defer_completion(struct dio *dio)
  * In the case of filesystem holes: the fs may return an arbitrarily-large
  * hole by returning an appropriate value in b_size and by clearing
  * buffer_mapped().  However the direct-io code will only process holes one
- * block at a time - it will repeatedly call get_block() as it walks the hole.
+ * block at a time - it will repeatedly call get_blocks() as it walks the hole.
  */
-static int get_more_blocks(struct dio *dio, struct dio_submit *sdio,
-			   struct buffer_head *map_bh)
+static int get_more_blocks(struct dio *dio)
 {
-	const enum req_op dio_op = dio->opf & REQ_OP_MASK;
 	int ret;
+	struct buffer_head *map_bh = &dio->map_bh;
 	sector_t fs_startblk;	/* Into file, in filesystem-sized blocks */
-	sector_t fs_endblk;	/* Into file, in filesystem-sized blocks */
 	unsigned long fs_count;	/* Number of filesystem-sized blocks */
+	unsigned long dio_count;/* Number of dio_block-sized blocks */
+	unsigned long blkmask;
 	int create;
-	unsigned int i_blkbits = sdio->blkbits + sdio->blkfactor;
-	loff_t i_size;
 
 	/*
 	 * If there was a memory error and we've overwritten all the
@@ -638,41 +504,32 @@ static int get_more_blocks(struct dio *dio, struct dio_submit *sdio,
 	 */
 	ret = dio->page_errors;
 	if (ret == 0) {
-		BUG_ON(sdio->block_in_file >= sdio->final_block_in_request);
-		fs_startblk = sdio->block_in_file >> sdio->blkfactor;
-		fs_endblk = (sdio->final_block_in_request - 1) >>
-					sdio->blkfactor;
-		fs_count = fs_endblk - fs_startblk + 1;
-
 		map_bh->b_state = 0;
-		map_bh->b_size = fs_count << i_blkbits;
+		map_bh->b_size = 0;
+		BUG_ON(dio->block_in_file >= dio->final_block_in_request);
+		fs_startblk = dio->block_in_file >> dio->blkfactor;
+		dio_count = dio->final_block_in_request - dio->block_in_file;
+		fs_count = dio_count >> dio->blkfactor;
+		blkmask = (1 << dio->blkfactor) - 1;
+		if (dio_count & blkmask)	
+			fs_count++;
 
-		/*
-		 * For writes that could fill holes inside i_size on a
-		 * DIO_SKIP_HOLES filesystem we forbid block creations: only
-		 * overwrites are permitted. We will return early to the caller
-		 * once we see an unmapped buffer head returned, and the caller
-		 * will fall back to buffered I/O.
-		 *
-		 * Otherwise the decision is left to the get_blocks method,
-		 * which may decide to handle it or also return an unmapped
-		 * buffer head.
-		 */
-		create = dio_op == REQ_OP_WRITE;
-		if (dio->flags & DIO_SKIP_HOLES) {
-			i_size = i_size_read(dio->inode);
-			if (i_size && fs_startblk <= (i_size - 1) >> i_blkbits)
+		create = dio->rw == WRITE;
+		if (dio->lock_type == DIO_LOCKING) {
+			if (dio->block_in_file < (i_size_read(dio->inode) >>
+							dio->blkbits))
 				create = 0;
+		} else if (dio->lock_type == DIO_NO_LOCKING) {
+			create = 0;
 		}
-
-		ret = (*sdio->get_block)(dio->inode, fs_startblk,
+		/*
+		 * For writes inside i_size we forbid block creations: only
+		 * overwrites are permitted.  We fall back to buffered writes
+		 * at a higher level for inside-i_size block-instantiating
+		 * writes.
+		 */
+		ret = (*dio->get_blocks)(dio->inode, fs_startblk, fs_count,
 						map_bh, create);
-
-		/* Store for completion */
-		dio->private = map_bh->b_private;
-
-		if (ret == 0 && buffer_defer_completion(map_bh))
-			ret = dio_set_defer_completion(dio);
 	}
 	return ret;
 }
@@ -680,20 +537,19 @@ static int get_more_blocks(struct dio *dio, struct dio_submit *sdio,
 /*
  * There is no bio.  Make one now.
  */
-static inline int dio_new_bio(struct dio *dio, struct dio_submit *sdio,
-		sector_t start_sector, struct buffer_head *map_bh)
+static int dio_new_bio(struct dio *dio, sector_t start_sector)
 {
 	sector_t sector;
 	int ret, nr_pages;
 
-	ret = dio_bio_reap(dio, sdio);
+	ret = dio_bio_reap(dio);
 	if (ret)
 		goto out;
-	sector = start_sector << (sdio->blkbits - 9);
-	nr_pages = bio_max_segs(sdio->pages_in_io);
+	sector = start_sector << (dio->blkbits - 9);
+	nr_pages = min(dio->pages_in_io, bio_get_nr_vecs(dio->map_bh.b_bdev));
 	BUG_ON(nr_pages <= 0);
-	dio_bio_alloc(dio, sdio, map_bh->b_bdev, sector, nr_pages);
-	sdio->boundary = 0;
+	ret = dio_bio_alloc(dio, dio->map_bh.b_bdev, sector, nr_pages);
+	dio->boundary = 0;
 out:
 	return ret;
 }
@@ -705,21 +561,21 @@ out:
  *
  * Return zero on success.  Non-zero means the caller needs to start a new BIO.
  */
-static inline int dio_bio_add_page(struct dio_submit *sdio)
+static int dio_bio_add_page(struct dio *dio)
 {
 	int ret;
 
-	ret = bio_add_page(sdio->bio, sdio->cur_page,
-			sdio->cur_page_len, sdio->cur_page_offset);
-	if (ret == sdio->cur_page_len) {
+	ret = bio_add_page(dio->bio, dio->cur_page,
+			dio->cur_page_len, dio->cur_page_offset);
+	if (ret == dio->cur_page_len) {
 		/*
 		 * Decrement count only, if we are done with this page
 		 */
-		if ((sdio->cur_page_len + sdio->cur_page_offset) == PAGE_SIZE)
-			sdio->pages_in_io--;
-		get_page(sdio->cur_page);
-		sdio->final_block_in_bio = sdio->cur_page_block +
-			(sdio->cur_page_len >> sdio->blkbits);
+		if ((dio->cur_page_len + dio->cur_page_offset) == PAGE_SIZE)
+			dio->pages_in_io--;
+		page_cache_get(dio->cur_page);
+		dio->final_block_in_bio = dio->cur_page_block +
+			(dio->cur_page_len >> dio->blkbits);
 		ret = 0;
 	} else {
 		ret = 1;
@@ -737,46 +593,35 @@ static inline int dio_bio_add_page(struct dio_submit *sdio)
  * The caller of this function is responsible for removing cur_page from the
  * dio, and for dropping the refcount which came from that presence.
  */
-static inline int dio_send_cur_page(struct dio *dio, struct dio_submit *sdio,
-		struct buffer_head *map_bh)
+static int dio_send_cur_page(struct dio *dio)
 {
 	int ret = 0;
 
-	if (sdio->bio) {
-		loff_t cur_offset = sdio->cur_page_fs_offset;
-		loff_t bio_next_offset = sdio->logical_offset_in_bio +
-			sdio->bio->bi_iter.bi_size;
-
+	if (dio->bio) {
 		/*
-		 * See whether this new request is contiguous with the old.
-		 *
-		 * Btrfs cannot handle having logically non-contiguous requests
-		 * submitted.  For example if you have
-		 *
-		 * Logical:  [0-4095][HOLE][8192-12287]
-		 * Physical: [0-4095]      [4096-8191]
-		 *
-		 * We cannot submit those pages together as one BIO.  So if our
-		 * current logical offset in the file does not equal what would
-		 * be the next logical offset in the bio, submit the bio we
-		 * have.
+		 * See whether this new request is contiguous with the old
 		 */
-		if (sdio->final_block_in_bio != sdio->cur_page_block ||
-		    cur_offset != bio_next_offset)
-			dio_bio_submit(dio, sdio);
+		if (dio->final_block_in_bio != dio->cur_page_block)
+			dio_bio_submit(dio);
+		/*
+		 * Submit now if the underlying fs is about to perform a
+		 * metadata read
+		 */
+		if (dio->boundary)
+			dio_bio_submit(dio);
 	}
 
-	if (sdio->bio == NULL) {
-		ret = dio_new_bio(dio, sdio, sdio->cur_page_block, map_bh);
+	if (dio->bio == NULL) {
+		ret = dio_new_bio(dio, dio->cur_page_block);
 		if (ret)
 			goto out;
 	}
 
-	if (dio_bio_add_page(sdio) != 0) {
-		dio_bio_submit(dio, sdio);
-		ret = dio_new_bio(dio, sdio, sdio->cur_page_block, map_bh);
+	if (dio_bio_add_page(dio) != 0) {
+		dio_bio_submit(dio);
+		ret = dio_new_bio(dio, dio->cur_page_block);
 		if (ret == 0) {
-			ret = dio_bio_add_page(sdio);
+			ret = dio_bio_add_page(dio);
 			BUG_ON(ret != 0);
 		}
 	}
@@ -801,63 +646,69 @@ out:
  * If that doesn't work out then we put the old page into the bio and add this
  * page to the dio instead.
  */
-static inline int
-submit_page_section(struct dio *dio, struct dio_submit *sdio, struct page *page,
-		    unsigned offset, unsigned len, sector_t blocknr,
-		    struct buffer_head *map_bh)
+static int
+submit_page_section(struct dio *dio, struct page *page,
+		unsigned offset, unsigned len, sector_t blocknr)
 {
-	const enum req_op dio_op = dio->opf & REQ_OP_MASK;
 	int ret = 0;
-	int boundary = sdio->boundary;	/* dio_send_cur_page may clear it */
-
-	if (dio_op == REQ_OP_WRITE) {
-		/*
-		 * Read accounting is performed in submit_bio()
-		 */
-		task_io_account_write(len);
-	}
 
 	/*
 	 * Can we just grow the current page's presence in the dio?
 	 */
-	if (sdio->cur_page == page &&
-	    sdio->cur_page_offset + sdio->cur_page_len == offset &&
-	    sdio->cur_page_block +
-	    (sdio->cur_page_len >> sdio->blkbits) == blocknr) {
-		sdio->cur_page_len += len;
+	if (	(dio->cur_page == page) &&
+		(dio->cur_page_offset + dio->cur_page_len == offset) &&
+		(dio->cur_page_block +
+			(dio->cur_page_len >> dio->blkbits) == blocknr)) {
+		dio->cur_page_len += len;
+
+		/*
+		 * If dio->boundary then we want to schedule the IO now to
+		 * avoid metadata seeks.
+		 */
+		if (dio->boundary) {
+			ret = dio_send_cur_page(dio);
+			page_cache_release(dio->cur_page);
+			dio->cur_page = NULL;
+		}
 		goto out;
 	}
 
 	/*
 	 * If there's a deferred page already there then send it.
 	 */
-	if (sdio->cur_page) {
-		ret = dio_send_cur_page(dio, sdio, map_bh);
-		put_page(sdio->cur_page);
-		sdio->cur_page = NULL;
+	if (dio->cur_page) {
+		ret = dio_send_cur_page(dio);
+		page_cache_release(dio->cur_page);
+		dio->cur_page = NULL;
 		if (ret)
-			return ret;
+			goto out;
 	}
 
-	get_page(page);		/* It is in dio */
-	sdio->cur_page = page;
-	sdio->cur_page_offset = offset;
-	sdio->cur_page_len = len;
-	sdio->cur_page_block = blocknr;
-	sdio->cur_page_fs_offset = sdio->block_in_file << sdio->blkbits;
+	page_cache_get(page);		/* It is in dio */
+	dio->cur_page = page;
+	dio->cur_page_offset = offset;
+	dio->cur_page_len = len;
+	dio->cur_page_block = blocknr;
 out:
-	/*
-	 * If boundary then we want to schedule the IO now to
-	 * avoid metadata seeks.
-	 */
-	if (boundary) {
-		ret = dio_send_cur_page(dio, sdio, map_bh);
-		if (sdio->bio)
-			dio_bio_submit(dio, sdio);
-		put_page(sdio->cur_page);
-		sdio->cur_page = NULL;
-	}
 	return ret;
+}
+
+/*
+ * Clean any dirty buffers in the blockdev mapping which alias newly-created
+ * file blocks.  Only called for S_ISREG files - blockdevs do not set
+ * buffer_new
+ */
+static void clean_blockdev_aliases(struct dio *dio)
+{
+	unsigned i;
+	unsigned nblocks;
+
+	nblocks = dio->map_bh.b_size >> dio->inode->i_blkbits;
+
+	for (i = 0; i < nblocks; i++) {
+		unmap_underlying_metadata(dio->map_bh.b_bdev,
+					dio->map_bh.b_blocknr + i);
+	}
 }
 
 /*
@@ -869,20 +720,19 @@ out:
  * `end' is zero if we're doing the start of the IO, 1 at the end of the
  * IO.
  */
-static inline void dio_zero_block(struct dio *dio, struct dio_submit *sdio,
-		int end, struct buffer_head *map_bh)
+static void dio_zero_block(struct dio *dio, int end)
 {
 	unsigned dio_blocks_per_fs_block;
 	unsigned this_chunk_blocks;	/* In dio_blocks */
 	unsigned this_chunk_bytes;
 	struct page *page;
 
-	sdio->start_zero_done = 1;
-	if (!sdio->blkfactor || !buffer_new(map_bh))
+	dio->start_zero_done = 1;
+	if (!dio->blkfactor || !buffer_new(&dio->map_bh))
 		return;
 
-	dio_blocks_per_fs_block = 1 << sdio->blkfactor;
-	this_chunk_blocks = sdio->block_in_file & (dio_blocks_per_fs_block - 1);
+	dio_blocks_per_fs_block = 1 << dio->blkfactor;
+	this_chunk_blocks = dio->block_in_file & (dio_blocks_per_fs_block - 1);
 
 	if (!this_chunk_blocks)
 		return;
@@ -894,14 +744,14 @@ static inline void dio_zero_block(struct dio *dio, struct dio_submit *sdio,
 	if (end) 
 		this_chunk_blocks = dio_blocks_per_fs_block - this_chunk_blocks;
 
-	this_chunk_bytes = this_chunk_blocks << sdio->blkbits;
+	this_chunk_bytes = this_chunk_blocks << dio->blkbits;
 
-	page = ZERO_PAGE(0);
-	if (submit_page_section(dio, sdio, page, 0, this_chunk_bytes,
-				sdio->next_block_for_io, map_bh))
+	page = ZERO_PAGE(dio->curr_user_address);
+	if (submit_page_section(dio, page, 0, this_chunk_bytes, 
+				dio->next_block_for_io))
 		return;
 
-	sdio->next_block_for_io += this_chunk_blocks;
+	dio->next_block_for_io += this_chunk_blocks;
 }
 
 /*
@@ -913,70 +763,65 @@ static inline void dio_zero_block(struct dio *dio, struct dio_submit *sdio,
  * happily perform page-sized but 512-byte aligned IOs.  It is important that
  * blockdev IO be able to have fine alignment and large sizes.
  *
- * So what we do is to permit the ->get_block function to populate bh.b_size
+ * So what we do is to permit the ->get_blocks function to populate bh.b_size
  * with the size of IO which is permitted at this offset and this i_blkbits.
  *
  * For best results, the blockdev should be set up with 512-byte i_blkbits and
- * it should set b_size to PAGE_SIZE or more inside get_block().  This gives
+ * it should set b_size to PAGE_SIZE or more inside get_blocks().  This gives
  * fine alignment but still allows this function to work in PAGE_SIZE units.
  */
-static int do_direct_IO(struct dio *dio, struct dio_submit *sdio,
-			struct buffer_head *map_bh)
+static int do_direct_IO(struct dio *dio)
 {
-	const enum req_op dio_op = dio->opf & REQ_OP_MASK;
-	const unsigned blkbits = sdio->blkbits;
-	const unsigned i_blkbits = blkbits + sdio->blkfactor;
+	const unsigned blkbits = dio->blkbits;
+	const unsigned blocks_per_page = PAGE_SIZE >> blkbits;
+	struct page *page;
+	unsigned block_in_page;
+	struct buffer_head *map_bh = &dio->map_bh;
 	int ret = 0;
 
-	while (sdio->block_in_file < sdio->final_block_in_request) {
-		struct page *page;
-		size_t from, to;
+	/* The I/O can start at any block offset within the first page */
+	block_in_page = dio->first_block_in_page;
 
-		page = dio_get_page(dio, sdio);
+	while (dio->block_in_file < dio->final_block_in_request) {
+		page = dio_get_page(dio);
 		if (IS_ERR(page)) {
 			ret = PTR_ERR(page);
 			goto out;
 		}
-		from = sdio->head ? 0 : sdio->from;
-		to = (sdio->head == sdio->tail - 1) ? sdio->to : PAGE_SIZE;
-		sdio->head++;
 
-		while (from < to) {
+		while (block_in_page < blocks_per_page) {
+			unsigned offset_in_page = block_in_page << blkbits;
 			unsigned this_chunk_bytes;	/* # of bytes mapped */
 			unsigned this_chunk_blocks;	/* # of blocks */
 			unsigned u;
 
-			if (sdio->blocks_available == 0) {
+			if (dio->blocks_available == 0) {
 				/*
 				 * Need to go and map some more disk
 				 */
 				unsigned long blkmask;
 				unsigned long dio_remainder;
 
-				ret = get_more_blocks(dio, sdio, map_bh);
+				ret = get_more_blocks(dio);
 				if (ret) {
-					put_page(page);
+					page_cache_release(page);
 					goto out;
 				}
 				if (!buffer_mapped(map_bh))
 					goto do_holes;
 
-				sdio->blocks_available =
-						map_bh->b_size >> blkbits;
-				sdio->next_block_for_io =
-					map_bh->b_blocknr << sdio->blkfactor;
-				if (buffer_new(map_bh)) {
-					clean_bdev_aliases(
-						map_bh->b_bdev,
-						map_bh->b_blocknr,
-						map_bh->b_size >> i_blkbits);
-				}
+				dio->blocks_available =
+						map_bh->b_size >> dio->blkbits;
+				dio->next_block_for_io =
+					map_bh->b_blocknr << dio->blkfactor;
+				if (buffer_new(map_bh))
+					clean_blockdev_aliases(dio);
 
-				if (!sdio->blkfactor)
+				if (!dio->blkfactor)
 					goto do_holes;
 
-				blkmask = (1 << sdio->blkfactor) - 1;
-				dio_remainder = (sdio->block_in_file & blkmask);
+				blkmask = (1 << dio->blkfactor) - 1;
+				dio_remainder = (dio->block_in_file & blkmask);
 
 				/*
 				 * If we are at the start of IO and that IO
@@ -990,36 +835,33 @@ static int do_direct_IO(struct dio *dio, struct dio_submit *sdio,
 				 * on-disk
 				 */
 				if (!buffer_new(map_bh))
-					sdio->next_block_for_io += dio_remainder;
-				sdio->blocks_available -= dio_remainder;
+					dio->next_block_for_io += dio_remainder;
+				dio->blocks_available -= dio_remainder;
 			}
 do_holes:
 			/* Handle holes */
 			if (!buffer_mapped(map_bh)) {
-				loff_t i_size_aligned;
+				char *kaddr;
 
 				/* AKPM: eargh, -ENOTBLK is a hack */
-				if (dio_op == REQ_OP_WRITE) {
-					put_page(page);
+				if (dio->rw == WRITE) {
+					page_cache_release(page);
 					return -ENOTBLK;
 				}
 
-				/*
-				 * Be sure to account for a partial block as the
-				 * last block in the file
-				 */
-				i_size_aligned = ALIGN(i_size_read(dio->inode),
-							1 << blkbits);
-				if (sdio->block_in_file >=
-						i_size_aligned >> blkbits) {
+				if (dio->block_in_file >=
+					i_size_read(dio->inode)>>blkbits) {
 					/* We hit eof */
-					put_page(page);
+					page_cache_release(page);
 					goto out;
 				}
-				zero_user(page, from, 1 << blkbits);
-				sdio->block_in_file++;
-				from += 1 << blkbits;
-				dio->result += 1 << blkbits;
+				kaddr = kmap_atomic(page, KM_USER0);
+				memset(kaddr + (block_in_page << blkbits),
+						0, 1 << blkbits);
+				flush_dcache_page(page);
+				kunmap_atomic(kaddr, KM_USER0);
+				dio->block_in_file++;
+				block_in_page++;
 				goto next_block;
 			}
 
@@ -1028,322 +870,389 @@ do_holes:
 			 * is finer than the underlying fs, go check to see if
 			 * we must zero out the start of this block.
 			 */
-			if (unlikely(sdio->blkfactor && !sdio->start_zero_done))
-				dio_zero_block(dio, sdio, 0, map_bh);
+			if (unlikely(dio->blkfactor && !dio->start_zero_done))
+				dio_zero_block(dio, 0);
 
 			/*
 			 * Work out, in this_chunk_blocks, how much disk we
 			 * can add to this page
 			 */
-			this_chunk_blocks = sdio->blocks_available;
-			u = (to - from) >> blkbits;
+			this_chunk_blocks = dio->blocks_available;
+			u = (PAGE_SIZE - offset_in_page) >> blkbits;
 			if (this_chunk_blocks > u)
 				this_chunk_blocks = u;
-			u = sdio->final_block_in_request - sdio->block_in_file;
+			u = dio->final_block_in_request - dio->block_in_file;
 			if (this_chunk_blocks > u)
 				this_chunk_blocks = u;
 			this_chunk_bytes = this_chunk_blocks << blkbits;
 			BUG_ON(this_chunk_bytes == 0);
 
-			if (this_chunk_blocks == sdio->blocks_available)
-				sdio->boundary = buffer_boundary(map_bh);
-			ret = submit_page_section(dio, sdio, page,
-						  from,
-						  this_chunk_bytes,
-						  sdio->next_block_for_io,
-						  map_bh);
+			dio->boundary = buffer_boundary(map_bh);
+			ret = submit_page_section(dio, page, offset_in_page,
+				this_chunk_bytes, dio->next_block_for_io);
 			if (ret) {
-				put_page(page);
+				page_cache_release(page);
 				goto out;
 			}
-			sdio->next_block_for_io += this_chunk_blocks;
+			dio->next_block_for_io += this_chunk_blocks;
 
-			sdio->block_in_file += this_chunk_blocks;
-			from += this_chunk_bytes;
-			dio->result += this_chunk_bytes;
-			sdio->blocks_available -= this_chunk_blocks;
+			dio->block_in_file += this_chunk_blocks;
+			block_in_page += this_chunk_blocks;
+			dio->blocks_available -= this_chunk_blocks;
 next_block:
-			BUG_ON(sdio->block_in_file > sdio->final_block_in_request);
-			if (sdio->block_in_file == sdio->final_block_in_request)
+			if (dio->block_in_file > dio->final_block_in_request)
+				BUG();
+			if (dio->block_in_file == dio->final_block_in_request)
 				break;
 		}
 
 		/* Drop the ref which was taken in get_user_pages() */
-		put_page(page);
+		page_cache_release(page);
+		block_in_page = 0;
 	}
 out:
 	return ret;
 }
 
-static inline int drop_refcount(struct dio *dio)
-{
-	int ret2;
-	unsigned long flags;
-
-	/*
-	 * Sync will always be dropping the final ref and completing the
-	 * operation.  AIO can if it was a broken operation described above or
-	 * in fact if all the bios race to complete before we get here.  In
-	 * that case dio_complete() translates the EIOCBQUEUED into the proper
-	 * return code that the caller will hand to ->complete().
-	 *
-	 * This is managed by the bio_lock instead of being an atomic_t so that
-	 * completion paths can drop their ref and use the remaining count to
-	 * decide to wake the submission path atomically.
-	 */
-	spin_lock_irqsave(&dio->bio_lock, flags);
-	ret2 = --dio->refcount;
-	spin_unlock_irqrestore(&dio->bio_lock, flags);
-	return ret2;
-}
-
 /*
- * This is a library function for use by filesystem drivers.
- *
- * The locking rules are governed by the flags parameter:
- *  - if the flags value contains DIO_LOCKING we use a fancy locking
- *    scheme for dumb filesystems.
- *    For writes this function is called under i_mutex and returns with
- *    i_mutex held, for reads, i_mutex is not held on entry, but it is
- *    taken and dropped again before returning.
- *  - if the flags value does NOT contain DIO_LOCKING we don't use any
- *    internal locking but rather rely on the filesystem to synchronize
- *    direct I/O reads/writes versus each other and truncate.
- *
- * To help with locking against truncate we incremented the i_dio_count
- * counter before starting direct I/O, and decrement it once we are done.
- * Truncate can wait for it to reach zero to provide exclusion.  It is
- * expected that filesystem provide exclusion between new direct I/O
- * and truncates.  For DIO_LOCKING filesystems this is done by i_mutex,
- * but other filesystems need to take care of this on their own.
- *
- * NOTE: if you pass "sdio" to anything by pointer make sure that function
- * is always inlined. Otherwise gcc is unable to split the structure into
- * individual fields and will generate much worse code. This is important
- * for the whole file.
+ * Releases both i_sem and i_alloc_sem
  */
-ssize_t __blockdev_direct_IO(struct kiocb *iocb, struct inode *inode,
-		struct block_device *bdev, struct iov_iter *iter,
-		get_block_t get_block, dio_iodone_t end_io,
-		dio_submit_t submit_io, int flags)
+static ssize_t
+direct_io_worker(int rw, struct kiocb *iocb, struct inode *inode, 
+	const struct iovec *iov, loff_t offset, unsigned long nr_segs, 
+	unsigned blkbits, get_blocks_t get_blocks, dio_iodone_t end_io,
+	struct dio *dio)
 {
-	unsigned i_blkbits = READ_ONCE(inode->i_blkbits);
-	unsigned blkbits = i_blkbits;
-	unsigned blocksize_mask = (1 << blkbits) - 1;
-	ssize_t retval = -EINVAL;
-	const size_t count = iov_iter_count(iter);
-	loff_t offset = iocb->ki_pos;
-	const loff_t end = offset + count;
-	struct dio *dio;
-	struct dio_submit sdio = { 0, };
-	struct buffer_head map_bh = { 0, };
-	struct blk_plug plug;
-	unsigned long align = offset | iov_iter_alignment(iter);
+	unsigned long user_addr; 
+	int seg;
+	ssize_t ret = 0;
+	ssize_t ret2;
+	size_t bytes;
 
-	/*
-	 * Avoid references to bdev if not absolutely needed to give
-	 * the early prefetch in the caller enough time.
-	 */
-
-	/* watch out for a 0 len io from a tricksy fs */
-	if (iov_iter_rw(iter) == READ && !count)
-		return 0;
-
-	dio = kmem_cache_alloc(dio_cache, GFP_KERNEL);
-	if (!dio)
-		return -ENOMEM;
-	/*
-	 * Believe it or not, zeroing out the page array caused a .5%
-	 * performance regression in a database benchmark.  So, we take
-	 * care to only zero out what's needed.
-	 */
-	memset(dio, 0, offsetof(struct dio, pages));
-
-	dio->flags = flags;
-	if (dio->flags & DIO_LOCKING && iov_iter_rw(iter) == READ) {
-		/* will be released by direct_io_worker */
-		inode_lock(inode);
-	}
-
-	/* Once we sampled i_size check for reads beyond EOF */
-	dio->i_size = i_size_read(inode);
-	if (iov_iter_rw(iter) == READ && offset >= dio->i_size) {
-		retval = 0;
-		goto fail_dio;
-	}
-
-	if (align & blocksize_mask) {
-		if (bdev)
-			blkbits = blksize_bits(bdev_logical_block_size(bdev));
-		blocksize_mask = (1 << blkbits) - 1;
-		if (align & blocksize_mask)
-			goto fail_dio;
-	}
-
-	if (dio->flags & DIO_LOCKING && iov_iter_rw(iter) == READ) {
-		struct address_space *mapping = iocb->ki_filp->f_mapping;
-
-		retval = filemap_write_and_wait_range(mapping, offset, end - 1);
-		if (retval)
-			goto fail_dio;
-	}
-
-	/*
-	 * For file extending writes updating i_size before data writeouts
-	 * complete can expose uninitialized blocks in dumb filesystems.
-	 * In that case we need to wait for I/O completion even if asked
-	 * for an asynchronous write.
-	 */
-	if (is_sync_kiocb(iocb))
-		dio->is_async = false;
-	else if (iov_iter_rw(iter) == WRITE && end > i_size_read(inode))
-		dio->is_async = false;
-	else
-		dio->is_async = true;
-
+	dio->bio = NULL;
 	dio->inode = inode;
-	if (iov_iter_rw(iter) == WRITE) {
-		dio->opf = REQ_OP_WRITE | REQ_SYNC | REQ_IDLE;
-		if (iocb->ki_flags & IOCB_NOWAIT)
-			dio->opf |= REQ_NOWAIT;
-	} else {
-		dio->opf = REQ_OP_READ;
-	}
+	dio->rw = rw;
+	dio->blkbits = blkbits;
+	dio->blkfactor = inode->i_blkbits - blkbits;
+	dio->start_zero_done = 0;
+	dio->size = 0;
+	dio->block_in_file = offset >> blkbits;
+	dio->blocks_available = 0;
+	dio->cur_page = NULL;
 
-	/*
-	 * For AIO O_(D)SYNC writes we need to defer completions to a workqueue
-	 * so that we can call ->fsync.
-	 */
-	if (dio->is_async && iov_iter_rw(iter) == WRITE) {
-		retval = 0;
-		if (iocb_is_dsync(iocb))
-			retval = dio_set_defer_completion(dio);
-		else if (!dio->inode->i_sb->s_dio_done_wq) {
-			/*
-			 * In case of AIO write racing with buffered read we
-			 * need to defer completion. We can't decide this now,
-			 * however the workqueue needs to be initialized here.
-			 */
-			retval = sb_init_dio_done_wq(dio->inode->i_sb);
-		}
-		if (retval)
-			goto fail_dio;
-	}
-
-	/*
-	 * Will be decremented at I/O completion time.
-	 */
-	inode_dio_begin(inode);
-
-	retval = 0;
-	sdio.blkbits = blkbits;
-	sdio.blkfactor = i_blkbits - blkbits;
-	sdio.block_in_file = offset >> blkbits;
-
-	sdio.get_block = get_block;
+	dio->boundary = 0;
+	dio->reap_counter = 0;
+	dio->get_blocks = get_blocks;
 	dio->end_io = end_io;
-	sdio.submit_io = submit_io;
-	sdio.final_block_in_bio = -1;
-	sdio.next_block_for_io = -1;
+	dio->map_bh.b_private = NULL;
+	dio->final_block_in_bio = -1;
+	dio->next_block_for_io = -1;
 
+	dio->page_errors = 0;
+	dio->result = 0;
 	dio->iocb = iocb;
 
+	/*
+	 * BIO completion state.
+	 *
+	 * ->bio_count starts out at one, and we decrement it to zero after all
+	 * BIOs are submitted.  This to avoid the situation where a really fast
+	 * (or synchronous) device could take the count to zero while we're
+	 * still submitting BIOs.
+	 */
+	dio->bio_count = 1;
+	dio->bios_in_flight = 0;
 	spin_lock_init(&dio->bio_lock);
-	dio->refcount = 1;
-
-	dio->should_dirty = iter_is_iovec(iter) && iov_iter_rw(iter) == READ;
-	sdio.iter = iter;
-	sdio.final_block_in_request = end >> blkbits;
+	dio->bio_list = NULL;
+	dio->waiter = NULL;
 
 	/*
 	 * In case of non-aligned buffers, we may need 2 more
 	 * pages since we need to zero out first and last block.
 	 */
-	if (unlikely(sdio.blkfactor))
-		sdio.pages_in_io = 2;
+	if (unlikely(dio->blkfactor))
+		dio->pages_in_io = 2;
+	else
+		dio->pages_in_io = 0;
 
-	sdio.pages_in_io += iov_iter_npages(iter, INT_MAX);
+	for (seg = 0; seg < nr_segs; seg++) {
+		user_addr = (unsigned long)iov[seg].iov_base;
+		dio->pages_in_io +=
+			((user_addr+iov[seg].iov_len +PAGE_SIZE-1)/PAGE_SIZE
+				- user_addr/PAGE_SIZE);
+	}
 
-	blk_start_plug(&plug);
+	for (seg = 0; seg < nr_segs; seg++) {
+		user_addr = (unsigned long)iov[seg].iov_base;
+		dio->size += bytes = iov[seg].iov_len;
 
-	retval = do_direct_IO(dio, &sdio, &map_bh);
-	if (retval)
-		dio_cleanup(dio, &sdio);
+		/* Index into the first page of the first block */
+		dio->first_block_in_page = (user_addr & ~PAGE_MASK) >> blkbits;
+		dio->final_block_in_request = dio->block_in_file +
+						(bytes >> blkbits);
+		/* Page fetching state */
+		dio->head = 0;
+		dio->tail = 0;
+		dio->curr_page = 0;
 
-	if (retval == -ENOTBLK) {
+		dio->total_pages = 0;
+		if (user_addr & (PAGE_SIZE-1)) {
+			dio->total_pages++;
+			bytes -= PAGE_SIZE - (user_addr & (PAGE_SIZE - 1));
+		}
+		dio->total_pages += (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+		dio->curr_user_address = user_addr;
+	
+		ret = do_direct_IO(dio);
+
+		dio->result += iov[seg].iov_len -
+			((dio->final_block_in_request - dio->block_in_file) <<
+					blkbits);
+
+		if (ret) {
+			dio_cleanup(dio);
+			break;
+		}
+	} /* end iovec loop */
+
+	if (ret == -ENOTBLK && rw == WRITE) {
 		/*
 		 * The remaining part of the request will be
-		 * handled by buffered I/O when we return
+		 * be handled by buffered I/O when we return
 		 */
-		retval = 0;
+		ret = 0;
 	}
 	/*
 	 * There may be some unwritten disk at the end of a part-written
 	 * fs-block-sized block.  Go zero that now.
 	 */
-	dio_zero_block(dio, &sdio, 1, &map_bh);
+	dio_zero_block(dio, 1);
 
-	if (sdio.cur_page) {
-		ssize_t ret2;
-
-		ret2 = dio_send_cur_page(dio, &sdio, &map_bh);
-		if (retval == 0)
-			retval = ret2;
-		put_page(sdio.cur_page);
-		sdio.cur_page = NULL;
+	if (dio->cur_page) {
+		ret2 = dio_send_cur_page(dio);
+		if (ret == 0)
+			ret = ret2;
+		page_cache_release(dio->cur_page);
+		dio->cur_page = NULL;
 	}
-	if (sdio.bio)
-		dio_bio_submit(dio, &sdio);
-
-	blk_finish_plug(&plug);
+	if (dio->bio)
+		dio_bio_submit(dio);
 
 	/*
 	 * It is possible that, we return short IO due to end of file.
 	 * In that case, we need to release all the pages we got hold on.
 	 */
-	dio_cleanup(dio, &sdio);
+	dio_cleanup(dio);
 
 	/*
 	 * All block lookups have been performed. For READ requests
-	 * we can let i_mutex go now that its achieved its purpose
+	 * we can let i_sem go now that its achieved its purpose
 	 * of protecting us from looking up uninitialized blocks.
 	 */
-	if (iov_iter_rw(iter) == READ && (dio->flags & DIO_LOCKING))
-		inode_unlock(dio->inode);
+	if ((rw == READ) && (dio->lock_type == DIO_LOCKING))
+		up(&dio->inode->i_sem);
 
 	/*
-	 * The only time we want to leave bios in flight is when a successful
-	 * partial aio read or full aio write have been setup.  In that case
-	 * bio completion will call aio_complete.  The only time it's safe to
-	 * call aio_complete is when we return -EIOCBQUEUED, so we key on that.
-	 * This had *better* be the only place that raises -EIOCBQUEUED.
+	 * OK, all BIOs are submitted, so we can decrement bio_count to truly
+	 * reflect the number of to-be-processed BIOs.
 	 */
-	BUG_ON(retval == -EIOCBQUEUED);
-	if (dio->is_async && retval == 0 && dio->result &&
-	    (iov_iter_rw(iter) == READ || dio->result == count))
-		retval = -EIOCBQUEUED;
-	else
-		dio_await_completion(dio);
+	if (dio->is_async) {
+		int should_wait = 0;
 
-	if (drop_refcount(dio) == 0) {
-		retval = dio_complete(dio, retval, DIO_COMPLETE_INVALIDATE);
-	} else
-		BUG_ON(retval != -EIOCBQUEUED);
+		if (dio->result < dio->size && rw == WRITE) {
+			dio->waiter = current;
+			should_wait = 1;
+		}
+		if (ret == 0)
+			ret = dio->result;
+		finished_one_bio(dio);		/* This can free the dio */
+		blk_run_address_space(inode->i_mapping);
+		if (should_wait) {
+			unsigned long flags;
+			/*
+			 * Wait for already issued I/O to drain out and
+			 * release its references to user-space pages
+			 * before returning to fallback on buffered I/O
+			 */
 
-	return retval;
+			spin_lock_irqsave(&dio->bio_lock, flags);
+			set_current_state(TASK_UNINTERRUPTIBLE);
+			while (dio->bio_count) {
+				spin_unlock_irqrestore(&dio->bio_lock, flags);
+				io_schedule();
+				spin_lock_irqsave(&dio->bio_lock, flags);
+				set_current_state(TASK_UNINTERRUPTIBLE);
+			}
+			spin_unlock_irqrestore(&dio->bio_lock, flags);
+			set_current_state(TASK_RUNNING);
+			kfree(dio);
+		}
+	} else {
+		ssize_t transferred = 0;
 
-fail_dio:
-	if (dio->flags & DIO_LOCKING && iov_iter_rw(iter) == READ)
-		inode_unlock(inode);
+		finished_one_bio(dio);
+		ret2 = dio_await_completion(dio);
+		if (ret == 0)
+			ret = ret2;
+		if (ret == 0)
+			ret = dio->page_errors;
+		if (dio->result) {
+			loff_t i_size = i_size_read(inode);
 
-	kmem_cache_free(dio_cache, dio);
+			transferred = dio->result;
+			/*
+			 * Adjust the return value if the read crossed a
+			 * non-block-aligned EOF.
+			 */
+			if (rw == READ && (offset + transferred > i_size))
+				transferred = i_size - offset;
+		}
+		dio_complete(dio, offset, transferred);
+		if (ret == 0)
+			ret = transferred;
+
+		/* We could have also come here on an AIO file extend */
+		if (!is_sync_kiocb(iocb) && rw == WRITE &&
+		    ret >= 0 && dio->result == dio->size)
+			/*
+			 * For AIO writes where we have completed the
+			 * i/o, we have to mark the the aio complete.
+			 */
+			aio_complete(iocb, ret, 0);
+		kfree(dio);
+	}
+	return ret;
+}
+
+/*
+ * This is a library function for use by filesystem drivers.
+ * The locking rules are governed by the dio_lock_type parameter.
+ *
+ * DIO_NO_LOCKING (no locking, for raw block device access)
+ * For writes, i_sem is not held on entry; it is never taken.
+ *
+ * DIO_LOCKING (simple locking for regular files)
+ * For writes we are called under i_sem and return with i_sem held, even though
+ * it is internally dropped.
+ * For reads, i_sem is not held on entry, but it is taken and dropped before
+ * returning.
+ *
+ * DIO_OWN_LOCKING (filesystem provides synchronisation and handling of
+ *	uninitialised data, allowing parallel direct readers and writers)
+ * For writes we are called without i_sem, return without it, never touch it.
+ * For reads, i_sem is held on entry and will be released before returning.
+ *
+ * Additional i_alloc_sem locking requirements described inline below.
+ */
+ssize_t
+__blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
+	struct block_device *bdev, const struct iovec *iov, loff_t offset, 
+	unsigned long nr_segs, get_blocks_t get_blocks, dio_iodone_t end_io,
+	int dio_lock_type)
+{
+	int seg;
+	size_t size;
+	unsigned long addr;
+	unsigned blkbits = inode->i_blkbits;
+	unsigned bdev_blkbits = 0;
+	unsigned blocksize_mask = (1 << blkbits) - 1;
+	ssize_t retval = -EINVAL;
+	loff_t end = offset;
+	struct dio *dio;
+	int reader_with_isem = (rw == READ && dio_lock_type == DIO_OWN_LOCKING);
+
+	if (rw & WRITE)
+		current->flags |= PF_SYNCWRITE;
+
+	if (bdev)
+		bdev_blkbits = blksize_bits(bdev_hardsect_size(bdev));
+
+	if (offset & blocksize_mask) {
+		if (bdev)
+			 blkbits = bdev_blkbits;
+		blocksize_mask = (1 << blkbits) - 1;
+		if (offset & blocksize_mask)
+			goto out;
+	}
+
+	/* Check the memory alignment.  Blocks cannot straddle pages */
+	for (seg = 0; seg < nr_segs; seg++) {
+		addr = (unsigned long)iov[seg].iov_base;
+		size = iov[seg].iov_len;
+		end += size;
+		if ((addr & blocksize_mask) || (size & blocksize_mask))  {
+			if (bdev)
+				 blkbits = bdev_blkbits;
+			blocksize_mask = (1 << blkbits) - 1;
+			if ((addr & blocksize_mask) || (size & blocksize_mask))  
+				goto out;
+		}
+	}
+
+	dio = kmalloc(sizeof(*dio), GFP_KERNEL);
+	retval = -ENOMEM;
+	if (!dio)
+		goto out;
+
+	/*
+	 * For block device access DIO_NO_LOCKING is used,
+	 *	neither readers nor writers do any locking at all
+	 * For regular files using DIO_LOCKING,
+	 *	readers need to grab i_sem and i_alloc_sem
+	 *	writers need to grab i_alloc_sem only (i_sem is already held)
+	 * For regular files using DIO_OWN_LOCKING,
+	 *	neither readers nor writers take any locks here
+	 *	(i_sem is already held and release for writers here)
+	 */
+	dio->lock_type = dio_lock_type;
+	if (dio_lock_type != DIO_NO_LOCKING) {
+		/* watch out for a 0 len io from a tricksy fs */
+		if (rw == READ && end > offset) {
+			struct address_space *mapping;
+
+			mapping = iocb->ki_filp->f_mapping;
+			if (dio_lock_type != DIO_OWN_LOCKING) {
+				down(&inode->i_sem);
+				reader_with_isem = 1;
+			}
+
+			retval = filemap_write_and_wait_range(mapping, offset,
+							      end - 1);
+			if (retval) {
+				kfree(dio);
+				goto out;
+			}
+
+			if (dio_lock_type == DIO_OWN_LOCKING) {
+				up(&inode->i_sem);
+				reader_with_isem = 0;
+			}
+		}
+
+		if (dio_lock_type == DIO_LOCKING)
+			down_read(&inode->i_alloc_sem);
+	}
+
+	/*
+	 * For file extending writes updating i_size before data
+	 * writeouts complete can expose uninitialized blocks. So
+	 * even for AIO, we need to wait for i/o to complete before
+	 * returning in this case.
+	 */
+	dio->is_async = !is_sync_kiocb(iocb) && !((rw == WRITE) &&
+		(end > i_size_read(inode)));
+
+	retval = direct_io_worker(rw, iocb, inode, iov, offset,
+				nr_segs, blkbits, get_blocks, end_io, dio);
+
+	if (rw == READ && dio_lock_type == DIO_LOCKING)
+		reader_with_isem = 0;
+
+out:
+	if (reader_with_isem)
+		up(&inode->i_sem);
+	if (rw & WRITE)
+		current->flags &= ~PF_SYNCWRITE;
 	return retval;
 }
 EXPORT_SYMBOL(__blockdev_direct_IO);
-
-static __init int dio_init(void)
-{
-	dio_cache = KMEM_CACHE(dio, SLAB_PANIC);
-	return 0;
-}
-module_init(dio_init)
