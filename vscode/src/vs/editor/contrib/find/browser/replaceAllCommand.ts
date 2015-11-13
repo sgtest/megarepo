@@ -2,36 +2,32 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+'use strict';
 
-import { Range } from 'vs/editor/common/core/range';
-import { Selection } from 'vs/editor/common/core/selection';
-import { ICommand, ICursorStateComputerData, IEditOperationBuilder } from 'vs/editor/common/editorCommon';
-import { ITextModel } from 'vs/editor/common/model';
+import EditorCommon = require('vs/editor/common/editorCommon');
+import {Range} from 'vs/editor/common/core/range';
+import {Selection} from 'vs/editor/common/core/selection';
 
 interface IEditOperation {
-	range: Range;
-	text: string;
+	range:EditorCommon.IEditorRange;
+	text:string;
 }
 
-export class ReplaceAllCommand implements ICommand {
+export class ReplaceAllCommand implements EditorCommon.ICommand {
 
-	private readonly _editorSelection: Selection;
-	private _trackedEditorSelectionId: string | null;
-	private readonly _ranges: Range[];
-	private readonly _replaceStrings: string[];
+	private _ranges: EditorCommon.IEditorRange[];
+	private _replaceStrings: string[];
 
-	constructor(editorSelection: Selection, ranges: Range[], replaceStrings: string[]) {
-		this._editorSelection = editorSelection;
+	constructor(ranges: EditorCommon.IEditorRange[], replaceStrings:string[]) {
 		this._ranges = ranges;
 		this._replaceStrings = replaceStrings;
-		this._trackedEditorSelectionId = null;
 	}
 
-	public getEditOperations(model: ITextModel, builder: IEditOperationBuilder): void {
+	public getEditOperations(model:EditorCommon.ITokenizedModel, builder:EditorCommon.IEditOperationBuilder): void {
 		if (this._ranges.length > 0) {
 			// Collect all edit operations
-			let ops: IEditOperation[] = [];
-			for (let i = 0; i < this._ranges.length; i++) {
+			var ops:IEditOperation[] = [];
+			for (var i = 0; i < this._ranges.length; i++) {
 				ops.push({
 					range: this._ranges[i],
 					text: this._replaceStrings[i]
@@ -44,9 +40,9 @@ export class ReplaceAllCommand implements ICommand {
 			});
 
 			// Merge operations that touch each other
-			let resultOps: IEditOperation[] = [];
-			let previousOp = ops[0];
-			for (let i = 1; i < ops.length; i++) {
+			var resultOps:IEditOperation[] = [];
+			var previousOp = ops[0];
+			for (var i = 1; i < ops.length; i++) {
 				if (previousOp.range.endLineNumber === ops[i].range.startLineNumber && previousOp.range.endColumn === ops[i].range.startColumn) {
 					// These operations are one after another and can be merged
 					previousOp.range = previousOp.range.plusRange(ops[i].range);
@@ -58,15 +54,20 @@ export class ReplaceAllCommand implements ICommand {
 			}
 			resultOps.push(previousOp);
 
-			for (const op of resultOps) {
-				builder.addEditOperation(op.range, op.text);
+			for (var i = 0; i < resultOps.length; i++) {
+				builder.addEditOperation(resultOps[i].range, resultOps[i].text);
 			}
 		}
-
-		this._trackedEditorSelectionId = builder.trackSelection(this._editorSelection);
 	}
 
-	public computeCursorState(model: ITextModel, helper: ICursorStateComputerData): Selection {
-		return helper.getTrackedSelection(this._trackedEditorSelectionId!);
+	public computeCursorState(model:EditorCommon.ITokenizedModel, helper: EditorCommon.ICursorStateComputerData): EditorCommon.IEditorSelection {
+		var inverseEditOperations = helper.getInverseEditOperations();
+		var srcRange = inverseEditOperations[inverseEditOperations.length - 1].range;
+		return Selection.createSelection(
+			srcRange.endLineNumber,
+			srcRange.endColumn,
+			srcRange.endLineNumber,
+			srcRange.endColumn
+		);
 	}
 }

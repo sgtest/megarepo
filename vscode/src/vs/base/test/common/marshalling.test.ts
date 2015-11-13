@@ -2,37 +2,49 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+'use strict';
+
 import * as assert from 'assert';
-import { parse, stringify } from 'vs/base/common/marshalling';
-import { URI } from 'vs/base/common/uri';
+import { IMarshallingContribution, marshallObject, demarshallObject } from 'vs/base/common/marshalling';
+
+class ObjWithRegExp {
+
+	public member:RegExp;
+
+	constructor(something:RegExp) {
+		this.member = something;
+	}
+}
 
 suite('Marshalling', () => {
+	test('bug #17587:[plugin] Language plugin can\'t define a TokenTypeClassificationSupport#wordDefinition', () => {
 
-	test('RegExp', () => {
-		let value = /foo/img;
-		let raw = stringify(value);
-		let clone = <RegExp>parse(raw);
+		var simpleMarshallingContrib: IMarshallingContribution = {
+			canSerialize: (obj:any) => {
+				return obj instanceof ObjWithRegExp;
+			},
+			serialize: (obj:any, serialize:(obj:any)=>any) => {
+				return {
+					$ObjWithRegExp: true,
+					member: serialize(obj.member)
+				};
+			},
+			canDeserialize: (obj:any) => {
+				return (obj.$ObjWithRegExp === true);
+			},
+			deserialize: (obj:any, deserialize:(obj:any)=>any) => {
+				return new ObjWithRegExp(deserialize(obj.member));
+			}
+		};
 
-		assert.strictEqual(value.source, clone.source);
-		assert.strictEqual(value.global, clone.global);
-		assert.strictEqual(value.ignoreCase, clone.ignoreCase);
-		assert.strictEqual(value.multiline, clone.multiline);
-	});
+		var initial = new ObjWithRegExp(/test/g);
+		var transported = <ObjWithRegExp>demarshallObject(marshallObject(initial, simpleMarshallingContrib), simpleMarshallingContrib);
 
-	test('URI', () => {
-		const value = URI.from({ scheme: 'file', authority: 'server', path: '/shares/c#files', query: 'q', fragment: 'f' });
-		const raw = stringify(value);
-		const clone = <URI>parse(raw);
-
-		assert.strictEqual(value.scheme, clone.scheme);
-		assert.strictEqual(value.authority, clone.authority);
-		assert.strictEqual(value.path, clone.path);
-		assert.strictEqual(value.query, clone.query);
-		assert.strictEqual(value.fragment, clone.fragment);
-	});
-
-	test('Bug 16793:# in folder name => mirror models get out of sync', () => {
-		const uri1 = URI.file('C:\\C#\\file.txt');
-		assert.strictEqual(parse(stringify(uri1)).toString(), uri1.toString());
+		assert(transported instanceof ObjWithRegExp);
+		assert(transported.member instanceof RegExp);
+		assert.equal(transported.member.source, 'test');
+		assert.equal(transported.member.global, true);
+		assert.equal(transported.member.ignoreCase, false);
+		assert.equal(transported.member.multiline, false);
 	});
 });

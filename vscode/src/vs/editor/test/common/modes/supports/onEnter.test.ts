@@ -2,28 +2,55 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
-import * as assert from 'assert';
-import { CharacterPair, IndentAction } from 'vs/editor/common/languages/languageConfiguration';
-import { OnEnterSupport } from 'vs/editor/common/languages/supports/onEnter';
-import { javascriptOnEnterRules } from 'vs/editor/test/common/modes/supports/javascriptOnEnterRules';
-import { EditorAutoIndentStrategy } from 'vs/editor/common/config/editorOptions';
+'use strict';
+
+import assert = require('assert');
+import {IIndentationRules, IBracketPair, OnEnterSupport} from 'vs/editor/common/modes/supports/onEnter';
+import {IndentAction} from 'vs/editor/common/modes';
 
 suite('OnEnter', () => {
 
+	test('uses indentationRules', () => {
+		var support = new OnEnterSupport(null, {
+			indentationRules: {
+				decreaseIndentPattern: /^\s*((?!\S.*\/[*]).*[*]\/\s*)?[})\]]|^\s*(case\b.*|default):\s*(\/\/.*|\/[*].*[*]\/\s*)?$/,
+				increaseIndentPattern: /(\{[^}"']*|\([^)"']*|\[[^\]"']*|^\s*(\{\}|\(\)|\[\]|(case\b.*|default):))\s*(\/\/.*|\/[*].*[*]\/\s*)?$/,
+				indentNextLinePattern: /^\s*(for|while|if|else)\b(?!.*[;{}]\s*(\/\/.*|\/[*].*[*]\/\s*)?$)/,
+				unIndentedLinePattern: /^(?!.*([;{}]|\S:)\s*(\/\/.*|\/[*].*[*]\/\s*)?$)(?!.*(\{[^}"']*|\([^)"']*|\[[^\]"']*|^\s*(\{\}|\(\)|\[\]|(case\b.*|default):))\s*(\/\/.*|\/[*].*[*]\/\s*)?$)(?!^\s*((?!\S.*\/[*]).*[*]\/\s*)?[})\]]|^\s*(case\b.*|default):\s*(\/\/.*|\/[*].*[*]\/\s*)?$)(?!^\s*(for|while|if|else)\b(?!.*[;{}]\s*(\/\/.*|\/[*].*[*]\/\s*)?$))/
+			}
+		});
+
+		var testIndentAction = (oneLineAboveText:string, beforeText:string, afterText:string, expected:IndentAction) => {
+			var actual = support._actualOnEnter(oneLineAboveText, beforeText, afterText);
+			if (expected === IndentAction.None) {
+				assert.equal(actual, null);
+			} else {
+				assert.equal(actual.indentAction, expected);
+			}
+		};
+
+		testIndentAction('', 'case', '', IndentAction.None);
+		testIndentAction('', 'case:', '', IndentAction.Indent);
+		testIndentAction('', 'if (true) {', '', IndentAction.Indent);
+		testIndentAction('', 'if (true)', '', IndentAction.Indent);
+		testIndentAction('', ' ', '}', IndentAction.Outdent);
+		testIndentAction('if(true)', '\treturn false', '', IndentAction.Outdent);
+	});
+
 	test('uses brackets', () => {
-		let brackets: CharacterPair[] = [
-			['(', ')'],
-			['begin', 'end']
+		var brackets: IBracketPair[] = [
+			{ open:'(', close:')' },
+			{ open:'begin', close:'end' }
 		];
-		let support = new OnEnterSupport({
+		var support = new OnEnterSupport(null, {
 			brackets: brackets
 		});
-		let testIndentAction = (beforeText: string, afterText: string, expected: IndentAction) => {
-			let actual = support.onEnter(EditorAutoIndentStrategy.Advanced, '', beforeText, afterText);
+		var testIndentAction = (beforeText:string, afterText:string, expected:IndentAction) => {
+			var actual = support._actualOnEnter('', beforeText, afterText);
 			if (expected === IndentAction.None) {
-				assert.strictEqual(actual, null);
+				assert.equal(actual, null);
 			} else {
-				assert.strictEqual(actual!.indentAction, expected);
+				assert.equal(actual.indentAction, expected);
 			}
 		};
 
@@ -47,143 +74,77 @@ suite('OnEnter', () => {
 		testIndentAction('begin', '', IndentAction.Indent);
 	});
 
-
-	test('Issue #121125: onEnterRules with global modifier', () => {
-		const support = new OnEnterSupport({
-			onEnterRules: [
+	test('uses regExpRules', () => {
+		var support = new OnEnterSupport(null, {
+			regExpRules: [
 				{
-					action: {
-						appendText: '/// ',
-						indentAction: IndentAction.Outdent
-					},
-					beforeText: /^\s*\/{3}.*$/gm
+					beforeText: /^\s*\/\*\*(?!\/)([^\*]|\*(?!\/))*$/,
+					afterText: /^\s*\*\/$/,
+					action: { indentAction: IndentAction.IndentOutdent, appendText: ' * ' }
+				},
+				{
+					beforeText: /^\s*\/\*\*(?!\/)([^\*]|\*(?!\/))*$/,
+					action: { indentAction: IndentAction.None, appendText: ' * ' }
+				},
+				{
+					beforeText: /^(\t|(\ \ ))*\ \*\ ([^\*]|\*(?!\/))*$/,
+					action: { indentAction: IndentAction.None, appendText: '* ' }
+				},
+				{
+					beforeText: /^(\t|(\ \ ))*\ \*\/\s*$/,
+					action: { indentAction: IndentAction.None, removeText: 1 }
 				}
 			]
 		});
-
-		let testIndentAction = (previousLineText: string, beforeText: string, afterText: string, expectedIndentAction: IndentAction | null, expectedAppendText: string | null, removeText: number = 0) => {
-			let actual = support.onEnter(EditorAutoIndentStrategy.Advanced, previousLineText, beforeText, afterText);
+		var testIndentAction = (beforeText:string, afterText:string, expectedIndentAction:IndentAction, expectedAppendText:string, removeText:number = 0) => {
+			var actual = support._actualOnEnter('', beforeText, afterText);
 			if (expectedIndentAction === null) {
-				assert.strictEqual(actual, null, 'isNull:' + beforeText);
+				assert.equal(actual, null, 'isNull:' + beforeText);
 			} else {
-				assert.strictEqual(actual !== null, true, 'isNotNull:' + beforeText);
-				assert.strictEqual(actual!.indentAction, expectedIndentAction, 'indentAction:' + beforeText);
+				assert.equal(actual !== null, true, 'isNotNull:' + beforeText);
+				assert.equal(actual.indentAction, expectedIndentAction, 'indentAction:' + beforeText);
 				if (expectedAppendText !== null) {
-					assert.strictEqual(actual!.appendText, expectedAppendText, 'appendText:' + beforeText);
+					assert.equal(actual.appendText, expectedAppendText, 'appendText:' + beforeText);
 				}
 				if (removeText !== 0) {
-					assert.strictEqual(actual!.removeText, removeText, 'removeText:' + beforeText);
+					assert.equal(actual.removeText, removeText, 'removeText:' + beforeText);
 				}
 			}
 		};
 
-		testIndentAction('/// line', '/// line', '', IndentAction.Outdent, '/// ');
-		testIndentAction('/// line', '/// line', '', IndentAction.Outdent, '/// ');
-	});
-
-	test('uses regExpRules', () => {
-		let support = new OnEnterSupport({
-			onEnterRules: javascriptOnEnterRules
-		});
-		let testIndentAction = (previousLineText: string, beforeText: string, afterText: string, expectedIndentAction: IndentAction | null, expectedAppendText: string | null, removeText: number = 0) => {
-			let actual = support.onEnter(EditorAutoIndentStrategy.Advanced, previousLineText, beforeText, afterText);
-			if (expectedIndentAction === null) {
-				assert.strictEqual(actual, null, 'isNull:' + beforeText);
-			} else {
-				assert.strictEqual(actual !== null, true, 'isNotNull:' + beforeText);
-				assert.strictEqual(actual!.indentAction, expectedIndentAction, 'indentAction:' + beforeText);
-				if (expectedAppendText !== null) {
-					assert.strictEqual(actual!.appendText, expectedAppendText, 'appendText:' + beforeText);
-				}
-				if (removeText !== 0) {
-					assert.strictEqual(actual!.removeText, removeText, 'removeText:' + beforeText);
-				}
-			}
-		};
-
-		testIndentAction('', '\t/**', ' */', IndentAction.IndentOutdent, ' * ');
-		testIndentAction('', '\t/**', '', IndentAction.None, ' * ');
-		testIndentAction('', '\t/** * / * / * /', '', IndentAction.None, ' * ');
-		testIndentAction('', '\t/** /*', '', IndentAction.None, ' * ');
-		testIndentAction('', '/**', '', IndentAction.None, ' * ');
-		testIndentAction('', '\t/**/', '', null, null);
-		testIndentAction('', '\t/***/', '', null, null);
-		testIndentAction('', '\t/*******/', '', null, null);
-		testIndentAction('', '\t/** * * * * */', '', null, null);
-		testIndentAction('', '\t/** */', '', null, null);
-		testIndentAction('', '\t/** asdfg */', '', null, null);
-		testIndentAction('', '\t/* asdfg */', '', null, null);
-		testIndentAction('', '\t/* asdfg */', '', null, null);
-		testIndentAction('', '\t/** asdfg */', '', null, null);
-		testIndentAction('', '*/', '', null, null);
-		testIndentAction('', '\t/*', '', null, null);
-		testIndentAction('', '\t*', '', null, null);
-
-		testIndentAction('\t/**', '\t *', '', IndentAction.None, '* ');
-		testIndentAction('\t * something', '\t *', '', IndentAction.None, '* ');
-		testIndentAction('\t *', '\t *', '', IndentAction.None, '* ');
-
-		testIndentAction('', '\t */', '', IndentAction.None, null, 1);
-		testIndentAction('', '\t * */', '', IndentAction.None, null, 1);
-		testIndentAction('', '\t * * / * / * / */', '', null, null);
-
-		testIndentAction('\t/**', '\t * ', '', IndentAction.None, '* ');
-		testIndentAction('\t * something', '\t * ', '', IndentAction.None, '* ');
-		testIndentAction('\t *', '\t * ', '', IndentAction.None, '* ');
-
-		testIndentAction('/**', ' * ', '', IndentAction.None, '* ');
-		testIndentAction(' * something', ' * ', '', IndentAction.None, '* ');
-		testIndentAction(' *', ' * asdfsfagadfg', '', IndentAction.None, '* ');
-
-		testIndentAction('/**', ' * asdfsfagadfg * * * ', '', IndentAction.None, '* ');
-		testIndentAction(' * something', ' * asdfsfagadfg * * * ', '', IndentAction.None, '* ');
-		testIndentAction(' *', ' * asdfsfagadfg * * * ', '', IndentAction.None, '* ');
-
-		testIndentAction('/**', ' * /*', '', IndentAction.None, '* ');
-		testIndentAction(' * something', ' * /*', '', IndentAction.None, '* ');
-		testIndentAction(' *', ' * /*', '', IndentAction.None, '* ');
-
-		testIndentAction('/**', ' * asdfsfagadfg * / * / * /', '', IndentAction.None, '* ');
-		testIndentAction(' * something', ' * asdfsfagadfg * / * / * /', '', IndentAction.None, '* ');
-		testIndentAction(' *', ' * asdfsfagadfg * / * / * /', '', IndentAction.None, '* ');
-
-		testIndentAction('/**', ' * asdfsfagadfg * / * / * /*', '', IndentAction.None, '* ');
-		testIndentAction(' * something', ' * asdfsfagadfg * / * / * /*', '', IndentAction.None, '* ');
-		testIndentAction(' *', ' * asdfsfagadfg * / * / * /*', '', IndentAction.None, '* ');
-
-		testIndentAction('', ' */', '', IndentAction.None, null, 1);
-		testIndentAction(' */', ' * test() {', '', IndentAction.Indent, null, 0);
-		testIndentAction('', '\t */', '', IndentAction.None, null, 1);
-		testIndentAction('', '\t\t */', '', IndentAction.None, null, 1);
-		testIndentAction('', '   */', '', IndentAction.None, null, 1);
-		testIndentAction('', '     */', '', IndentAction.None, null, 1);
-		testIndentAction('', '\t     */', '', IndentAction.None, null, 1);
-		testIndentAction('', ' *--------------------------------------------------------------------------------------------*/', '', IndentAction.None, null, 1);
-
-		// issue #43469
-		testIndentAction('class A {', '    * test() {', '', IndentAction.Indent, null, 0);
-		testIndentAction('', '    * test() {', '', IndentAction.Indent, null, 0);
-		testIndentAction('    ', '    * test() {', '', IndentAction.Indent, null, 0);
-		testIndentAction('class A {', '  * test() {', '', IndentAction.Indent, null, 0);
-		testIndentAction('', '  * test() {', '', IndentAction.Indent, null, 0);
-		testIndentAction('  ', '  * test() {', '', IndentAction.Indent, null, 0);
-	});
-
-	test('issue #141816', () => {
-		let support = new OnEnterSupport({
-			onEnterRules: javascriptOnEnterRules
-		});
-		let testIndentAction = (beforeText: string, afterText: string, expected: IndentAction) => {
-			let actual = support.onEnter(EditorAutoIndentStrategy.Advanced, '', beforeText, afterText);
-			if (expected === IndentAction.None) {
-				assert.strictEqual(actual, null);
-			} else {
-				assert.strictEqual(actual!.indentAction, expected);
-			}
-		};
-
-		testIndentAction('const r = /{/;', '', IndentAction.None);
-		testIndentAction('const r = /{[0-9]/;', '', IndentAction.None);
-		testIndentAction('const r = /[a-zA-Z]{/;', '', IndentAction.None);
+		testIndentAction('\t/**', ' */', IndentAction.IndentOutdent, ' * ');
+		testIndentAction('\t/**', '', IndentAction.None, ' * ');
+		testIndentAction('\t/** * / * / * /', '', IndentAction.None, ' * ');
+		testIndentAction('\t/** /*', '', IndentAction.None, ' * ');
+		testIndentAction('/**', '', IndentAction.None, ' * ');
+		testIndentAction('\t/**/', '', null, null);
+		testIndentAction('\t/***/', '', null, null);
+		testIndentAction('\t/*******/', '', null, null);
+		testIndentAction('\t/** * * * * */', '', null, null);
+		testIndentAction('\t/** */', '', null, null);
+		testIndentAction('\t/** asdfg */', '', null, null);
+		testIndentAction('\t/* asdfg */', '', null, null);
+		testIndentAction('\t/* asdfg */', '', null, null);
+		testIndentAction('\t/** asdfg */', '', null, null);
+		testIndentAction('*/', '', null, null);
+		testIndentAction('\t/*', '', null, null);
+		testIndentAction('\t*', '', null, null);
+		testIndentAction('\t *', '', null, null);
+		testIndentAction('\t */', '', IndentAction.None, null, 1);
+		testIndentAction('\t * */', '', null, null);
+		testIndentAction('\t * * / * / * / */', '', null, null);
+		testIndentAction('\t * ', '', IndentAction.None, '* ');
+		testIndentAction(' * ', '', IndentAction.None, '* ');
+		testIndentAction(' * asdfsfagadfg', '', IndentAction.None, '* ');
+		testIndentAction(' * asdfsfagadfg * * * ', '', IndentAction.None, '* ');
+		testIndentAction(' * /*', '', IndentAction.None, '* ');
+		testIndentAction(' * asdfsfagadfg * / * / * /', '', IndentAction.None, '* ');
+		testIndentAction(' * asdfsfagadfg * / * / * /*', '', IndentAction.None, '* ');
+		testIndentAction(' */', '', IndentAction.None, null, 1);
+		testIndentAction('\t */', '', IndentAction.None, null, 1);
+		testIndentAction('\t\t */', '', IndentAction.None, null, 1);
+		testIndentAction('   */', '', IndentAction.None, null, 1);
+		testIndentAction('     */', '', IndentAction.None, null, 1);
+		testIndentAction('\t     */', '', IndentAction.None, null, 1);
 	});
 });

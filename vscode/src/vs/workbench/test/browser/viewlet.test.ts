@@ -3,54 +3,43 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+'use strict';
+
 import * as assert from 'assert';
-import { Registry } from 'vs/platform/registry/common/platform';
-import { PaneCompositeDescriptor, Extensions, PaneCompositeRegistry, PaneComposite } from 'vs/workbench/browser/panecomposite';
-import { isFunction } from 'vs/base/common/types';
+import * as Platform from 'vs/platform/platform';
+import {Viewlet, ViewletDescriptor, Extensions} from 'vs/workbench/browser/viewlet';
+import * as Types from 'vs/base/common/types';
 
-suite('Viewlets', () => {
+suite("Workbench Viewlet", () => {
 
-	class TestViewlet extends PaneComposite {
-
-		constructor() {
-			super('id', null!, null!, null!, null!, null!, null!, null!);
-		}
-
-		override layout(dimension: any): void {
-			throw new Error('Method not implemented.');
-		}
-
-		createViewPaneContainer() { return null!; }
-	}
-
-	test('ViewletDescriptor API', function () {
-		let d = PaneCompositeDescriptor.create(TestViewlet, 'id', 'name', 'class', 5);
-		assert.strictEqual(d.id, 'id');
-		assert.strictEqual(d.name, 'name');
-		assert.strictEqual(d.cssClass, 'class');
+	test("ViewletDescriptor API", function() {
+		let d = new ViewletDescriptor("moduleId", "ctorName", "id", "name", "class", 5);
+		assert.strictEqual(d.id, "id");
+		assert.strictEqual(d.name, "name");
+		assert.strictEqual(d.cssClass, "class");
 		assert.strictEqual(d.order, 5);
 	});
 
-	test('Editor Aware ViewletDescriptor API', function () {
-		let d = PaneCompositeDescriptor.create(TestViewlet, 'id', 'name', 'class', 5);
-		assert.strictEqual(d.id, 'id');
-		assert.strictEqual(d.name, 'name');
+	test("Editor Aware ViewletDescriptor API", function() {
+		let d = new ViewletDescriptor("moduleId", "ctorName", "id", "name", "class", 5);
+		assert.strictEqual(d.id, "id");
+		assert.strictEqual(d.name, "name");
 
-		d = PaneCompositeDescriptor.create(TestViewlet, 'id', 'name', 'class', 5);
-		assert.strictEqual(d.id, 'id');
-		assert.strictEqual(d.name, 'name');
+		d = new ViewletDescriptor("moduleId", "ctorName", "id", "name", "class", 5);
+		assert.strictEqual(d.id, "id");
+		assert.strictEqual(d.name, "name");
 	});
 
-	test('Viewlet extension point and registration', function () {
-		assert(isFunction(Registry.as<PaneCompositeRegistry>(Extensions.Viewlets).registerPaneComposite));
-		assert(isFunction(Registry.as<PaneCompositeRegistry>(Extensions.Viewlets).getPaneComposite));
-		assert(isFunction(Registry.as<PaneCompositeRegistry>(Extensions.Viewlets).getPaneComposites));
+	test("Viewlet extension point and registration", function() {
+		assert(Types.isFunction(Platform.Registry.as(Extensions.Viewlets).registerViewlet));
+		assert(Types.isFunction(Platform.Registry.as(Extensions.Viewlets).getViewlet));
+		assert(Types.isFunction(Platform.Registry.as(Extensions.Viewlets).getViewlets));
 
-		let oldCount = Registry.as<PaneCompositeRegistry>(Extensions.Viewlets).getPaneComposites().length;
-		let d = PaneCompositeDescriptor.create(TestViewlet, 'reg-test-id', 'name');
-		Registry.as<PaneCompositeRegistry>(Extensions.Viewlets).registerPaneComposite(d);
+		let oldCount = Platform.Registry.as(Extensions.Viewlets).getViewlets().length;
+		let d = new ViewletDescriptor("moduleId", "ctorName", "reg-test-id", "name");
+		Platform.Registry.as(Extensions.Viewlets).registerViewlet(d);
 
-		assert(d === Registry.as<PaneCompositeRegistry>(Extensions.Viewlets).getPaneComposite('reg-test-id'));
-		assert.strictEqual(oldCount + 1, Registry.as<PaneCompositeRegistry>(Extensions.Viewlets).getPaneComposites().length);
+		assert(d === Platform.Registry.as(Extensions.Viewlets).getViewlet("reg-test-id"));
+		assert.equal(oldCount + 1, Platform.Registry.as(Extensions.Viewlets).getViewlets().length);
 	});
 });

@@ -2,795 +2,512 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+'use strict';
 
-import 'vs/css!./viewLines';
-import * as platform from 'vs/base/common/platform';
-import { FastDomNode } from 'vs/base/browser/fastDomNode';
-import { RunOnceScheduler } from 'vs/base/common/async';
-import { applyFontInfo } from 'vs/editor/browser/config/domFontInfo';
-import { IVisibleLinesHost, VisibleLinesCollection } from 'vs/editor/browser/view/viewLayer';
-import { PartFingerprint, PartFingerprints, ViewPart } from 'vs/editor/browser/view/viewPart';
-import { DomReadingContext, ViewLine, ViewLineOptions } from 'vs/editor/browser/viewParts/lines/viewLine';
-import { Position } from 'vs/editor/common/core/position';
-import { Range } from 'vs/editor/common/core/range';
-import { Selection } from 'vs/editor/common/core/selection';
-import { ScrollType } from 'vs/editor/common/editorCommon';
-import { IViewLines, LineVisibleRanges, VisibleRanges, HorizontalPosition, HorizontalRange } from 'vs/editor/browser/view/renderingContext';
-import { ViewContext } from 'vs/editor/common/viewModel/viewContext';
-import * as viewEvents from 'vs/editor/common/viewEvents';
-import { ViewportData } from 'vs/editor/common/viewLayout/viewLinesViewportData';
-import { Viewport } from 'vs/editor/common/viewModel';
-import { EditorOption } from 'vs/editor/common/config/editorOptions';
-import { Constants } from 'vs/base/common/uint';
-import { MOUSE_CURSOR_TEXT_CSS_CLASS_NAME } from 'vs/base/browser/ui/mouseCursor/mouseCursor';
+import Browser = require('vs/base/browser/browser');
+import DomUtils = require('vs/base/browser/dom');
+import Schedulers = require('vs/base/common/async');
 
-class LastRenderedData {
+import {createLine, IViewLineData} from 'vs/editor/browser/viewParts/lines/viewLine';
+import {IVisibleLineData, ViewLayer} from 'vs/editor/browser/view/viewLayer';
+import EditorBrowser = require('vs/editor/browser/editorBrowser');
+import EditorCommon = require('vs/editor/common/editorCommon');
+import {Range} from 'vs/editor/common/core/range';
 
-	private _currentVisibleRange: Range;
+export class ViewLines extends ViewLayer {
 
-	constructor() {
-		this._currentVisibleRange = new Range(1, 1, 1, 1);
-	}
-
-	public getCurrentVisibleRange(): Range {
-		return this._currentVisibleRange;
-	}
-
-	public setCurrentVisibleRange(currentVisibleRange: Range): void {
-		this._currentVisibleRange = currentVisibleRange;
-	}
-}
-
-class HorizontalRevealRangeRequest {
-	public readonly type = 'range';
-	public readonly minLineNumber: number;
-	public readonly maxLineNumber: number;
-
-	constructor(
-		public readonly minimalReveal: boolean,
-		public readonly lineNumber: number,
-		public readonly startColumn: number,
-		public readonly endColumn: number,
-		public readonly startScrollTop: number,
-		public readonly stopScrollTop: number,
-		public readonly scrollType: ScrollType
-	) {
-		this.minLineNumber = lineNumber;
-		this.maxLineNumber = lineNumber;
-	}
-}
-
-class HorizontalRevealSelectionsRequest {
-	public readonly type = 'selections';
-	public readonly minLineNumber: number;
-	public readonly maxLineNumber: number;
-
-	constructor(
-		public readonly minimalReveal: boolean,
-		public readonly selections: Selection[],
-		public readonly startScrollTop: number,
-		public readonly stopScrollTop: number,
-		public readonly scrollType: ScrollType
-	) {
-		let minLineNumber = selections[0].startLineNumber;
-		let maxLineNumber = selections[0].endLineNumber;
-		for (let i = 1, len = selections.length; i < len; i++) {
-			const selection = selections[i];
-			minLineNumber = Math.min(minLineNumber, selection.startLineNumber);
-			maxLineNumber = Math.max(maxLineNumber, selection.endLineNumber);
-		}
-		this.minLineNumber = minLineNumber;
-		this.maxLineNumber = maxLineNumber;
-	}
-}
-
-type HorizontalRevealRequest = HorizontalRevealRangeRequest | HorizontalRevealSelectionsRequest;
-
-export class ViewLines extends ViewPart implements IVisibleLinesHost<ViewLine>, IViewLines {
 	/**
-	 * Adds this amount of pixels to the right of lines (no-one wants to type near the edge of the viewport)
+	 * Width to extends a line to render the line feed at the end of the line
 	 */
-	private static readonly HORIZONTAL_EXTRA_PX = 30;
+	private static LINE_FEED_WIDTH = 10;
 
-	private readonly _linesContent: FastDomNode<HTMLElement>;
-	private readonly _textRangeRestingSpot: HTMLElement;
-	private readonly _visibleLines: VisibleLinesCollection<ViewLine>;
-	private readonly domNode: FastDomNode<HTMLElement>;
+	/**
+	 * Adds this ammount of pixels to the right of lines (no-one wants to type near the edge of the viewport)
+	 */
+	private static HORIZONTAL_EXTRA_PX = 30;
 
-	// --- config
-	private _lineHeight: number;
-	private _typicalHalfwidthCharacterWidth: number;
-	private _isViewportWrapping: boolean;
-	private _revealHorizontalRightPadding: number;
-	private _horizontalScrollbarHeight: number;
-	private _cursorSurroundingLines: number;
-	private _cursorSurroundingLinesStyle: 'default' | 'all';
-	private _canUseLayerHinting: boolean;
-	private _viewLineOptions: ViewLineOptions;
+	private _layoutProvider:EditorBrowser.ILayoutProvider;
+	_lines:IViewLineData[];
+
+	public textRangeRestingSpot:HTMLElement;
 
 	// --- width
 	private _maxLineWidth: number;
-	private readonly _asyncUpdateLineWidths: RunOnceScheduler;
-	private readonly _asyncCheckMonospaceFontAssumptions: RunOnceScheduler;
+	private _asyncUpdateLineWidths: Schedulers.RunOnceScheduler;
 
-	private _horizontalRevealRequest: HorizontalRevealRequest | null;
-	private readonly _lastRenderedData: LastRenderedData;
+	private _currentVisibleRange: EditorCommon.IEditorRange;
 
-	constructor(context: ViewContext, linesContent: FastDomNode<HTMLElement>) {
+	private _lastCursorRevealRangeHorizontallyEvent:EditorCommon.IViewRevealRangeEvent;
+	private _bigNumbersDelta: number;
+
+	constructor(context:EditorBrowser.IViewContext, layoutProvider:EditorBrowser.ILayoutProvider) {
 		super(context);
-		this._linesContent = linesContent;
-		this._textRangeRestingSpot = document.createElement('div');
-		this._visibleLines = new VisibleLinesCollection(this);
-		this.domNode = this._visibleLines.domNode;
-
-		const conf = this._context.configuration;
-		const options = this._context.configuration.options;
-		const fontInfo = options.get(EditorOption.fontInfo);
-		const wrappingInfo = options.get(EditorOption.wrappingInfo);
-		const layoutInfo = options.get(EditorOption.layoutInfo);
-
-		this._lineHeight = options.get(EditorOption.lineHeight);
-		this._typicalHalfwidthCharacterWidth = fontInfo.typicalHalfwidthCharacterWidth;
-		this._isViewportWrapping = wrappingInfo.isViewportWrapping;
-		this._revealHorizontalRightPadding = options.get(EditorOption.revealHorizontalRightPadding);
-		this._horizontalScrollbarHeight = layoutInfo.horizontalScrollbarHeight;
-		this._cursorSurroundingLines = options.get(EditorOption.cursorSurroundingLines);
-		this._cursorSurroundingLinesStyle = options.get(EditorOption.cursorSurroundingLinesStyle);
-		this._canUseLayerHinting = !options.get(EditorOption.disableLayerHinting);
-		this._viewLineOptions = new ViewLineOptions(conf, this._context.theme.type);
-
-		PartFingerprints.write(this.domNode, PartFingerprint.ViewLines);
-		this.domNode.setClassName(`view-lines ${MOUSE_CURSOR_TEXT_CSS_CLASS_NAME}`);
-		applyFontInfo(this.domNode, fontInfo);
+		this._layoutProvider = layoutProvider;
+		this.domNode.className = EditorBrowser.ClassNames.VIEW_LINES;
 
 		// --- width & height
 		this._maxLineWidth = 0;
-		this._asyncUpdateLineWidths = new RunOnceScheduler(() => {
-			this._updateLineWidthsSlow();
+		this._asyncUpdateLineWidths = new Schedulers.RunOnceScheduler(() => {
+			this._updateLineWidths();
 		}, 200);
-		this._asyncCheckMonospaceFontAssumptions = new RunOnceScheduler(() => {
-			this._checkMonospaceFontAssumptions();
-		}, 2000);
 
-		this._lastRenderedData = new LastRenderedData();
+		this._currentVisibleRange = new Range(1, 1, 1, 1);
+		this._bigNumbersDelta = 0;
 
-		this._horizontalRevealRequest = null;
+		this._lastCursorRevealRangeHorizontallyEvent = null;
+		this.textRangeRestingSpot = document.createElement('div');
+		this.textRangeRestingSpot.className = 'textRangeRestingSpot';
+
+		this._hasVerticalScroll = true;
+		this._hasHorizontalScroll = true;
 	}
 
-	public override dispose(): void {
+	public dispose(): void {
 		this._asyncUpdateLineWidths.dispose();
-		this._asyncCheckMonospaceFontAssumptions.dispose();
+		this._layoutProvider = null;
 		super.dispose();
 	}
 
-	public getDomNode(): FastDomNode<HTMLElement> {
-		return this.domNode;
-	}
-
-	// ---- begin IVisibleLinesHost
-
-	public createVisibleLine(): ViewLine {
-		return new ViewLine(this._viewLineOptions);
-	}
-
-	// ---- end IVisibleLinesHost
-
 	// ---- begin view event handlers
 
-	public override onConfigurationChanged(e: viewEvents.ViewConfigurationChangedEvent): boolean {
-		this._visibleLines.onConfigurationChanged(e);
-		if (e.hasChanged(EditorOption.wrappingInfo)) {
+	public onConfigurationChanged(e:EditorCommon.IConfigurationChangedEvent): boolean {
+		var shouldRender = super.onConfigurationChanged(e);
+		if (e.wrappingInfo) {
 			this._maxLineWidth = 0;
 		}
-
-		const options = this._context.configuration.options;
-		const fontInfo = options.get(EditorOption.fontInfo);
-		const wrappingInfo = options.get(EditorOption.wrappingInfo);
-		const layoutInfo = options.get(EditorOption.layoutInfo);
-
-		this._lineHeight = options.get(EditorOption.lineHeight);
-		this._typicalHalfwidthCharacterWidth = fontInfo.typicalHalfwidthCharacterWidth;
-		this._isViewportWrapping = wrappingInfo.isViewportWrapping;
-		this._revealHorizontalRightPadding = options.get(EditorOption.revealHorizontalRightPadding);
-		this._horizontalScrollbarHeight = layoutInfo.horizontalScrollbarHeight;
-		this._cursorSurroundingLines = options.get(EditorOption.cursorSurroundingLines);
-		this._cursorSurroundingLinesStyle = options.get(EditorOption.cursorSurroundingLinesStyle);
-		this._canUseLayerHinting = !options.get(EditorOption.disableLayerHinting);
-		applyFontInfo(this.domNode, fontInfo);
-
-		this._onOptionsMaybeChanged();
-
-		if (e.hasChanged(EditorOption.layoutInfo)) {
-			this._maxLineWidth = 0;
-		}
-
-		return true;
+		return shouldRender;
 	}
-	private _onOptionsMaybeChanged(): boolean {
-		const conf = this._context.configuration;
 
-		const newViewLineOptions = new ViewLineOptions(conf, this._context.theme.type);
-		if (!this._viewLineOptions.equals(newViewLineOptions)) {
-			this._viewLineOptions = newViewLineOptions;
-
-			const startLineNumber = this._visibleLines.getStartLineNumber();
-			const endLineNumber = this._visibleLines.getEndLineNumber();
-			for (let lineNumber = startLineNumber; lineNumber <= endLineNumber; lineNumber++) {
-				const line = this._visibleLines.getVisibleLine(lineNumber);
-				line.onOptionsChanged(this._viewLineOptions);
-			}
-			return true;
-		}
-
-		return false;
-	}
-	public override onCursorStateChanged(e: viewEvents.ViewCursorStateChangedEvent): boolean {
-		const rendStartLineNumber = this._visibleLines.getStartLineNumber();
-		const rendEndLineNumber = this._visibleLines.getEndLineNumber();
-		let r = false;
-		for (let lineNumber = rendStartLineNumber; lineNumber <= rendEndLineNumber; lineNumber++) {
-			r = this._visibleLines.getVisibleLine(lineNumber).onSelectionChanged() || r;
-		}
-		return r;
-	}
-	public override onDecorationsChanged(e: viewEvents.ViewDecorationsChangedEvent): boolean {
-		if (true/*e.inlineDecorationsChanged*/) {
-			const rendStartLineNumber = this._visibleLines.getStartLineNumber();
-			const rendEndLineNumber = this._visibleLines.getEndLineNumber();
-			for (let lineNumber = rendStartLineNumber; lineNumber <= rendEndLineNumber; lineNumber++) {
-				this._visibleLines.getVisibleLine(lineNumber).onDecorationsChanged();
-			}
-		}
-		return true;
-	}
-	public override onFlushed(e: viewEvents.ViewFlushedEvent): boolean {
-		const shouldRender = this._visibleLines.onFlushed(e);
+	public onLayoutChanged(layoutInfo:EditorCommon.IEditorLayoutInfo): boolean {
+		var shouldRender = super.onLayoutChanged(layoutInfo);
 		this._maxLineWidth = 0;
 		return shouldRender;
 	}
-	public override onLinesChanged(e: viewEvents.ViewLinesChangedEvent): boolean {
-		return this._visibleLines.onLinesChanged(e);
-	}
-	public override onLinesDeleted(e: viewEvents.ViewLinesDeletedEvent): boolean {
-		return this._visibleLines.onLinesDeleted(e);
-	}
-	public override onLinesInserted(e: viewEvents.ViewLinesInsertedEvent): boolean {
-		return this._visibleLines.onLinesInserted(e);
-	}
-	public override onRevealRangeRequest(e: viewEvents.ViewRevealRangeRequestEvent): boolean {
-		// Using the future viewport here in order to handle multiple
-		// incoming reveal range requests that might all desire to be animated
-		const desiredScrollTop = this._computeScrollTopToRevealRange(this._context.viewLayout.getFutureViewport(), e.source, e.minimalReveal, e.range, e.selections, e.verticalType);
 
-		if (desiredScrollTop === -1) {
-			// marker to abort the reveal range request
-			return false;
+	public onModelFlushed(): boolean {
+		var shouldRender = super.onModelFlushed();
+		this._maxLineWidth = 0;
+		return shouldRender;
+	}
+
+	public onScrollWidthChanged(scrollWidth:number): boolean {
+		DomUtils.StyleMutator.setWidth(this.domNode, scrollWidth);
+		return false;
+	}
+
+	public onModelDecorationsChanged(e:EditorCommon.IViewDecorationsChangedEvent): boolean {
+		var shouldRender = super.onModelDecorationsChanged(e);
+		for (var i = 0; i < this._lines.length; i++) {
+			this._lines[i].onModelDecorationsChanged();
 		}
+		return shouldRender || true;
+	}
 
-		// validate the new desired scroll top
-		let newScrollPosition = this._context.viewLayout.validateScrollPosition({ scrollTop: desiredScrollTop });
+	public onCursorRevealRange(e:EditorCommon.IViewRevealRangeEvent): boolean {
+		var newScrollTop = this._computeScrollTopToRevealRange(this._layoutProvider.getCurrentViewport(), e.range, e.verticalType);
 
 		if (e.revealHorizontal) {
-			if (e.range && e.range.startLineNumber !== e.range.endLineNumber) {
-				// Two or more lines? => scroll to base (That's how you see most of the two lines)
-				newScrollPosition = {
-					scrollTop: newScrollPosition.scrollTop,
-					scrollLeft: 0
-				};
-			} else if (e.range) {
-				// We don't necessarily know the horizontal offset of this range since the line might not be in the view...
-				this._horizontalRevealRequest = new HorizontalRevealRangeRequest(e.minimalReveal, e.range.startLineNumber, e.range.startColumn, e.range.endColumn, this._context.viewLayout.getCurrentScrollTop(), newScrollPosition.scrollTop, e.scrollType);
-			} else if (e.selections && e.selections.length > 0) {
-				this._horizontalRevealRequest = new HorizontalRevealSelectionsRequest(e.minimalReveal, e.selections, this._context.viewLayout.getCurrentScrollTop(), newScrollPosition.scrollTop, e.scrollType);
-			}
-		} else {
-			this._horizontalRevealRequest = null;
+			this._lastCursorRevealRangeHorizontallyEvent = e;
 		}
 
-		const scrollTopDelta = Math.abs(this._context.viewLayout.getCurrentScrollTop() - newScrollPosition.scrollTop);
-		const scrollType = (scrollTopDelta <= this._lineHeight ? ScrollType.Immediate : e.scrollType);
-		this._context.viewModel.viewLayout.setScrollPosition(newScrollPosition, scrollType);
+		this._layoutProvider.setScrollTop(newScrollTop);
 
 		return true;
 	}
-	public override onScrollChanged(e: viewEvents.ViewScrollChangedEvent): boolean {
-		if (this._horizontalRevealRequest && e.scrollLeftChanged) {
-			// cancel any outstanding horizontal reveal request if someone else scrolls horizontally.
-			this._horizontalRevealRequest = null;
-		}
-		if (this._horizontalRevealRequest && e.scrollTopChanged) {
-			const min = Math.min(this._horizontalRevealRequest.startScrollTop, this._horizontalRevealRequest.stopScrollTop);
-			const max = Math.max(this._horizontalRevealRequest.startScrollTop, this._horizontalRevealRequest.stopScrollTop);
-			if (e.scrollTop < min || e.scrollTop > max) {
-				// cancel any outstanding horizontal reveal request if someone else scrolls vertically.
-				this._horizontalRevealRequest = null;
-			}
-		}
-		this.domNode.setWidth(e.scrollWidth);
-		return this._visibleLines.onScrollChanged(e) || true;
-	}
 
-	public override onTokensChanged(e: viewEvents.ViewTokensChangedEvent): boolean {
-		return this._visibleLines.onTokensChanged(e);
-	}
-	public override onZonesChanged(e: viewEvents.ViewZonesChangedEvent): boolean {
-		this._context.viewModel.viewLayout.setMaxLineWidth(this._maxLineWidth);
-		return this._visibleLines.onZonesChanged(e);
-	}
-	public override onThemeChanged(e: viewEvents.ViewThemeChangedEvent): boolean {
-		return this._onOptionsMaybeChanged();
+	private _hasVerticalScroll = false;
+	private _hasHorizontalScroll = false;
+	public onScrollChanged(e:EditorCommon.IScrollEvent): boolean {
+		this._hasVerticalScroll = this._hasVerticalScroll || e.vertical;
+		this._hasHorizontalScroll = this._hasHorizontalScroll || e.horizontal;
+		return super.onScrollChanged(e);
 	}
 
 	// ---- end view event handlers
 
 	// ----------- HELPERS FOR OTHERS
 
-	public getPositionFromDOMInfo(spanNode: HTMLElement, offset: number): Position | null {
-		const viewLineDomNode = this._getViewLineDomNode(spanNode);
-		if (viewLineDomNode === null) {
-			// Couldn't find view line node
-			return null;
-		}
-		const lineNumber = this._getLineNumberFor(viewLineDomNode);
+	public getPositionFromDOMInfo(spanNode:HTMLElement, offset:number): EditorCommon.IPosition {
+		var lineNumber = this._getLineNumberFromDOMInfo(spanNode);
 
 		if (lineNumber === -1) {
-			// Couldn't find view line node
+			// Couldn't find span node
 			return null;
 		}
 
-		if (lineNumber < 1 || lineNumber > this._context.viewModel.getLineCount()) {
+		if (lineNumber < 1 || lineNumber > this._context.model.getLineCount()) {
 			// lineNumber is outside range
 			return null;
 		}
 
-		if (this._context.viewModel.getLineMaxColumn(lineNumber) === 1) {
+		if (this._context.model.getLineMaxColumn(lineNumber) === 1) {
 			// Line is empty
-			return new Position(lineNumber, 1);
+			return {
+				lineNumber: lineNumber,
+				column: 1
+			};
 		}
 
-		const rendStartLineNumber = this._visibleLines.getStartLineNumber();
-		const rendEndLineNumber = this._visibleLines.getEndLineNumber();
-		if (lineNumber < rendStartLineNumber || lineNumber > rendEndLineNumber) {
+		var lineIndex = lineNumber - this._rendLineNumberStart;
+		if (lineIndex < 0 || lineIndex >= this._lines.length) {
 			// Couldn't find line
 			return null;
 		}
 
-		let column = this._visibleLines.getVisibleLine(lineNumber).getColumnOfNodeOffset(lineNumber, spanNode, offset);
-		const minColumn = this._context.viewModel.getLineMinColumn(lineNumber);
+		var column = this._lines[lineIndex].getColumnOfNodeOffset(lineNumber, spanNode, offset);
+		var minColumn = this._context.model.getLineMinColumn(lineNumber);
 		if (column < minColumn) {
 			column = minColumn;
 		}
-		return new Position(lineNumber, column);
+		return {
+			lineNumber: lineNumber,
+			column: column
+		};
 	}
 
-	private _getViewLineDomNode(node: HTMLElement | null): HTMLElement | null {
-		while (node && node.nodeType === 1) {
-			if (node.className === ViewLine.CLASS_NAME) {
-				return node;
+	private _getLineNumberFromDOMInfo(spanNode:HTMLElement): number {
+		while (spanNode && spanNode.nodeType === 1) {
+			if (spanNode.className === EditorBrowser.ClassNames.VIEW_LINE) {
+				return parseInt(spanNode.getAttribute('lineNumber'), 10);
 			}
-			node = node.parentElement;
-		}
-		return null;
-	}
-
-	/**
-	 * @returns the line number of this view line dom node.
-	 */
-	private _getLineNumberFor(domNode: HTMLElement): number {
-		const startLineNumber = this._visibleLines.getStartLineNumber();
-		const endLineNumber = this._visibleLines.getEndLineNumber();
-		for (let lineNumber = startLineNumber; lineNumber <= endLineNumber; lineNumber++) {
-			const line = this._visibleLines.getVisibleLine(lineNumber);
-			if (domNode === line.getDomNode()) {
-				return lineNumber;
-			}
+			spanNode = spanNode.parentElement;
 		}
 		return -1;
 	}
 
 	public getLineWidth(lineNumber: number): number {
-		const rendStartLineNumber = this._visibleLines.getStartLineNumber();
-		const rendEndLineNumber = this._visibleLines.getEndLineNumber();
-		if (lineNumber < rendStartLineNumber || lineNumber > rendEndLineNumber) {
-			// Couldn't find line
+		var lineIndex = lineNumber - this._rendLineNumberStart;
+		if (lineIndex < 0 || lineIndex >= this._lines.length) {
 			return -1;
 		}
 
-		return this._visibleLines.getVisibleLine(lineNumber).getWidth();
+		return this._lines[lineIndex].getWidth();
 	}
 
-	public linesVisibleRangesForRange(_range: Range, includeNewLines: boolean): LineVisibleRanges[] | null {
-		if (this.shouldRender()) {
+	public linesVisibleRangesForRange(range:EditorCommon.IRange, includeNewLines:boolean): EditorBrowser.ILineVisibleRanges[] {
+		if (this.shouldRender) {
 			// Cannot read from the DOM because it is dirty
 			// i.e. the model & the dom are out of sync, so I'd be reading something stale
 			return null;
 		}
 
-		const originalEndLineNumber = _range.endLineNumber;
-		const range = Range.intersectRanges(_range, this._lastRenderedData.getCurrentVisibleRange());
+		var originalEndLineNumber = range.endLineNumber;
+		range = Range.intersectRanges(range, this._currentVisibleRange);
 		if (!range) {
 			return null;
 		}
 
-		let visibleRanges: LineVisibleRanges[] = [], visibleRangesLen = 0;
-		const domReadingContext = new DomReadingContext(this.domNode.domNode, this._textRangeRestingSpot);
+		var visibleRangesForLine:EditorBrowser.IVisibleRange[],
+			visibleRanges:EditorBrowser.ILineVisibleRanges[] = [],
+			lineNumber:number,
+			lineIndex:number,
+			startColumn:number,
+			endColumn:number;
 
-		let nextLineModelLineNumber: number = 0;
+		var boundingClientRect = this.domNode.getBoundingClientRect();
+		var clientRectDeltaTop = boundingClientRect.top;
+		var clientRectDeltaLeft = boundingClientRect.left;
+
+		var currentLineModelLineNumber:number,
+			nextLineModelLineNumber:number;
+
 		if (includeNewLines) {
-			nextLineModelLineNumber = this._context.viewModel.coordinatesConverter.convertViewPositionToModelPosition(new Position(range.startLineNumber, 1)).lineNumber;
+			nextLineModelLineNumber = this._context.model.convertViewPositionToModelPosition(range.startLineNumber, 1).lineNumber;
 		}
 
-		const rendStartLineNumber = this._visibleLines.getStartLineNumber();
-		const rendEndLineNumber = this._visibleLines.getEndLineNumber();
-		for (let lineNumber = range.startLineNumber; lineNumber <= range.endLineNumber; lineNumber++) {
+		for (lineNumber = range.startLineNumber; lineNumber <= range.endLineNumber; lineNumber++) {
+			lineIndex = lineNumber - this._rendLineNumberStart;
 
-			if (lineNumber < rendStartLineNumber || lineNumber > rendEndLineNumber) {
+			if (lineIndex < 0 || lineIndex >= this._lines.length) {
 				continue;
 			}
 
-			const startColumn = lineNumber === range.startLineNumber ? range.startColumn : 1;
-			const endColumn = lineNumber === range.endLineNumber ? range.endColumn : this._context.viewModel.getLineMaxColumn(lineNumber);
-			const visibleRangesForLine = this._visibleLines.getVisibleLine(lineNumber).getVisibleRangesForRange(lineNumber, startColumn, endColumn, domReadingContext);
+			startColumn = lineNumber === range.startLineNumber ? range.startColumn : 1;
+			endColumn = lineNumber === range.endLineNumber ? range.endColumn : this._context.model.getLineMaxColumn(lineNumber);
+			visibleRangesForLine = this._lines[lineIndex].getVisibleRangesForRange(lineNumber, startColumn, endColumn, clientRectDeltaTop, 0, clientRectDeltaLeft, this.textRangeRestingSpot);
 
-			if (!visibleRangesForLine) {
-				continue;
-			}
+			if (visibleRangesForLine && visibleRangesForLine.length > 0) {
+				if (includeNewLines && lineNumber < originalEndLineNumber) {
+					currentLineModelLineNumber = nextLineModelLineNumber;
+					nextLineModelLineNumber = this._context.model.convertViewPositionToModelPosition(lineNumber + 1, 1).lineNumber;
 
-			if (includeNewLines && lineNumber < originalEndLineNumber) {
-				const currentLineModelLineNumber = nextLineModelLineNumber;
-				nextLineModelLineNumber = this._context.viewModel.coordinatesConverter.convertViewPositionToModelPosition(new Position(lineNumber + 1, 1)).lineNumber;
-
-				if (currentLineModelLineNumber !== nextLineModelLineNumber) {
-					visibleRangesForLine.ranges[visibleRangesForLine.ranges.length - 1].width += this._typicalHalfwidthCharacterWidth;
+					if (currentLineModelLineNumber !== nextLineModelLineNumber) {
+						visibleRangesForLine[visibleRangesForLine.length - 1].width += ViewLines.LINE_FEED_WIDTH;
+					}
 				}
-			}
 
-			visibleRanges[visibleRangesLen++] = new LineVisibleRanges(visibleRangesForLine.outsideRenderedLine, lineNumber, HorizontalRange.from(visibleRangesForLine.ranges));
+				visibleRanges.push({
+					lineNumber: lineNumber,
+					ranges: visibleRangesForLine
+				});
+			}
 		}
 
-		if (visibleRangesLen === 0) {
+		if (visibleRanges.length === 0) {
 			return null;
 		}
 
 		return visibleRanges;
 	}
 
-	private _visibleRangesForLineRange(lineNumber: number, startColumn: number, endColumn: number): VisibleRanges | null {
-		if (this.shouldRender()) {
+	public visibleRangesForRange2(range:EditorCommon.IRange, deltaTop:number, correctionTop:number, includeNewLines:boolean): EditorBrowser.IVisibleRange[] {
+
+		if (this.shouldRender) {
 			// Cannot read from the DOM because it is dirty
 			// i.e. the model & the dom are out of sync, so I'd be reading something stale
 			return null;
 		}
 
-		if (lineNumber < this._visibleLines.getStartLineNumber() || lineNumber > this._visibleLines.getEndLineNumber()) {
+		var originalEndLineNumber = range.endLineNumber;
+		range = Range.intersectRanges(range, this._currentVisibleRange);
+		if (!range) {
 			return null;
 		}
 
-		return this._visibleLines.getVisibleLine(lineNumber).getVisibleRangesForRange(lineNumber, startColumn, endColumn, new DomReadingContext(this.domNode.domNode, this._textRangeRestingSpot));
-	}
+		var visibleRangesForLine:EditorBrowser.IVisibleRange[],
+			visibleRanges:EditorBrowser.IVisibleRange[] = [],
+			lineNumber:number,
+			adjustedLineNumberVerticalOffset:number,
+			lineIndex:number,
+			startColumn:number,
+			endColumn:number,
+			lineHeight = this._context.configuration.editor.lineHeight;
 
-	public visibleRangeForPosition(position: Position): HorizontalPosition | null {
-		const visibleRanges = this._visibleRangesForLineRange(position.lineNumber, position.column, position.column);
-		if (!visibleRanges) {
+		var boundingClientRect = this.domNode.getBoundingClientRect();
+		var clientRectDeltaTop = boundingClientRect.top;
+		var clientRectDeltaLeft = boundingClientRect.left;
+
+		var currentLineModelLineNumber:number,
+			nextLineModelLineNumber:number;
+
+		if (includeNewLines) {
+			nextLineModelLineNumber = this._context.model.convertViewPositionToModelPosition(range.startLineNumber, 1).lineNumber;
+		}
+
+		for (lineNumber = range.startLineNumber; lineNumber <= range.endLineNumber; lineNumber++) {
+			lineIndex = lineNumber - this._rendLineNumberStart;
+
+			if (lineIndex < 0 || lineIndex >= this._lines.length) {
+				continue;
+			}
+
+			startColumn = lineNumber === range.startLineNumber ? range.startColumn : 1;
+			endColumn = lineNumber === range.endLineNumber ? range.endColumn : this._context.model.getLineMaxColumn(lineNumber);
+			visibleRangesForLine = this._lines[lineIndex].getVisibleRangesForRange(lineNumber, startColumn, endColumn, clientRectDeltaTop, correctionTop, clientRectDeltaLeft, this.textRangeRestingSpot);
+
+
+			if (visibleRangesForLine && visibleRangesForLine.length > 0) {
+				adjustedLineNumberVerticalOffset = this._layoutProvider.getVerticalOffsetForLineNumber(lineNumber) - this._bigNumbersDelta + deltaTop;
+				for (var i = 0, len = visibleRangesForLine.length; i < len; i++) {
+					// Ranges must be positioned at lineHeight increments
+					// (overcome WebKit Range.getClientRects() rounding to integers)
+					visibleRangesForLine[i].top = adjustedLineNumberVerticalOffset;
+					visibleRangesForLine[i].height = lineHeight;
+				}
+				if (includeNewLines && lineNumber < originalEndLineNumber) {
+					currentLineModelLineNumber = nextLineModelLineNumber;
+					nextLineModelLineNumber = this._context.model.convertViewPositionToModelPosition(lineNumber + 1, 1).lineNumber;
+
+					if (currentLineModelLineNumber !== nextLineModelLineNumber) {
+						visibleRangesForLine[visibleRangesForLine.length - 1].width += ViewLines.LINE_FEED_WIDTH;
+					}
+				}
+
+				visibleRanges = visibleRanges.concat(visibleRangesForLine);
+			}
+		}
+
+		if (visibleRanges.length === 0) {
 			return null;
 		}
-		return new HorizontalPosition(visibleRanges.outsideRenderedLine, visibleRanges.ranges[0].left);
+
+		return visibleRanges;
 	}
 
 	// --- implementation
 
-	public updateLineWidths(): void {
-		this._updateLineWidths(false);
+	_createLine(): IVisibleLineData {
+		return createLine(this._context);
 	}
 
-	/**
-	 * Updates the max line width if it is fast to compute.
-	 * Returns true if all lines were taken into account.
-	 * Returns false if some lines need to be reevaluated (in a slow fashion).
-	 */
-	private _updateLineWidthsFast(): boolean {
-		return this._updateLineWidths(true);
-	}
+	private _renderAndUpdateLineHeights(linesViewportData: EditorCommon.IViewLinesViewportData): void {
+		super._renderLines(linesViewportData);
 
-	private _updateLineWidthsSlow(): void {
-		this._updateLineWidths(false);
-	}
+		// Update internal current visible range
+		this._currentVisibleRange = new Range(
+			0 + this._rendLineNumberStart,
+			1,
+			this._lines.length - 1 + this._rendLineNumberStart,
+			this._context.model.getLineMaxColumn(this._lines.length - 1 + this._rendLineNumberStart)
+		);
 
-	private _updateLineWidths(fast: boolean): boolean {
-		const rendStartLineNumber = this._visibleLines.getStartLineNumber();
-		const rendEndLineNumber = this._visibleLines.getEndLineNumber();
 
-		let localMaxLineWidth = 1;
-		let allWidthsComputed = true;
-		for (let lineNumber = rendStartLineNumber; lineNumber <= rendEndLineNumber; lineNumber++) {
-			const visibleLine = this._visibleLines.getVisibleLine(lineNumber);
+		if (this._lastCursorRevealRangeHorizontallyEvent) {
+			var newScrollLeft = this._computeScrollLeftToRevealRange(this._lastCursorRevealRangeHorizontallyEvent.range);
+			this._lastCursorRevealRangeHorizontallyEvent = null;
 
-			if (fast && !visibleLine.getWidthIsFast()) {
-				// Cannot compute width in a fast way for this line
-				allWidthsComputed = false;
-				continue;
+			var isViewportWrapping = this._context.configuration.editor.wrappingInfo.isViewportWrapping;
+			if (!isViewportWrapping) {
+				this._ensureMaxLineWidth(newScrollLeft.maxHorizontalOffset);
 			}
 
-			localMaxLineWidth = Math.max(localMaxLineWidth, visibleLine.getWidth());
+			this._layoutProvider.setScrollLeft(newScrollLeft.scrollLeft);
 		}
+	}
 
-		if (allWidthsComputed && rendStartLineNumber === 1 && rendEndLineNumber === this._context.viewModel.getLineCount()) {
-			// we know the max line width for all the lines
-			this._maxLineWidth = 0;
+	private _updateLineWidths(): void {
+		var i:number,
+			localMaxLineWidth = 1,
+			widthInPx:number;
+
+		// Read line widths
+		for (i = 0; i < this._lines.length; i++) {
+			widthInPx = this._lines[i].getWidth();
+			localMaxLineWidth = Math.max(localMaxLineWidth, widthInPx);
 		}
 
 		this._ensureMaxLineWidth(localMaxLineWidth);
-
-		return allWidthsComputed;
 	}
 
-	private _checkMonospaceFontAssumptions(): void {
-		// Problems with monospace assumptions are more apparent for longer lines,
-		// as small rounding errors start to sum up, so we will select the longest
-		// line for a closer inspection
-		let longestLineNumber = -1;
-		let longestWidth = -1;
-		const rendStartLineNumber = this._visibleLines.getStartLineNumber();
-		const rendEndLineNumber = this._visibleLines.getEndLineNumber();
-		for (let lineNumber = rendStartLineNumber; lineNumber <= rendEndLineNumber; lineNumber++) {
-			const visibleLine = this._visibleLines.getVisibleLine(lineNumber);
-			if (visibleLine.needsMonospaceFontCheck()) {
-				const lineWidth = visibleLine.getWidth();
-				if (lineWidth > longestWidth) {
-					longestWidth = lineWidth;
-					longestLineNumber = lineNumber;
-				}
-			}
-		}
+	public render(): EditorCommon.IViewLinesViewportData {
 
-		if (longestLineNumber === -1) {
-			return;
-		}
+		var linesViewportData = this._layoutProvider.getLinesViewportData();
+		this._bigNumbersDelta = linesViewportData.bigNumbersDelta;
 
-		if (!this._visibleLines.getVisibleLine(longestLineNumber).monospaceAssumptionsAreValid()) {
-			for (let lineNumber = rendStartLineNumber; lineNumber <= rendEndLineNumber; lineNumber++) {
-				const visibleLine = this._visibleLines.getVisibleLine(lineNumber);
-				visibleLine.onMonospaceAssumptionsInvalidated();
-			}
-		}
-	}
+		if (this.shouldRender) {
+			this.shouldRender = false;
 
-	public prepareRender(): void {
-		throw new Error('Not supported');
-	}
+			this._renderAndUpdateLineHeights(linesViewportData);
 
-	public render(): void {
-		throw new Error('Not supported');
-	}
-
-	public renderText(viewportData: ViewportData): void {
-		// (1) render lines - ensures lines are in the DOM
-		this._visibleLines.renderLines(viewportData);
-		this._lastRenderedData.setCurrentVisibleRange(viewportData.visibleRange);
-		this.domNode.setWidth(this._context.viewLayout.getScrollWidth());
-		this.domNode.setHeight(Math.min(this._context.viewLayout.getScrollHeight(), 1000000));
-
-		// (2) compute horizontal scroll position:
-		//  - this must happen after the lines are in the DOM since it might need a line that rendered just now
-		//  - it might change `scrollWidth` and `scrollLeft`
-		if (this._horizontalRevealRequest) {
-
-			const horizontalRevealRequest = this._horizontalRevealRequest;
-
-			// Check that we have the line that contains the horizontal range in the viewport
-			if (viewportData.startLineNumber <= horizontalRevealRequest.minLineNumber && horizontalRevealRequest.maxLineNumber <= viewportData.endLineNumber) {
-
-				this._horizontalRevealRequest = null;
-
-				// allow `visibleRangesForRange2` to work
-				this.onDidRender();
-
-				// compute new scroll position
-				const newScrollLeft = this._computeScrollLeftToReveal(horizontalRevealRequest);
-
-				if (newScrollLeft) {
-					if (!this._isViewportWrapping) {
-						// ensure `scrollWidth` is large enough
-						this._ensureMaxLineWidth(newScrollLeft.maxHorizontalOffset);
-					}
-					// set `scrollLeft`
-					this._context.viewModel.viewLayout.setScrollPosition({
-						scrollLeft: newScrollLeft.scrollLeft
-					}, horizontalRevealRequest.scrollType);
-				}
-			}
-		}
-
-		// Update max line width (not so important, it is just so the horizontal scrollbar doesn't get too small)
-		if (!this._updateLineWidthsFast()) {
-			// Computing the width of some lines would be slow => delay it
+			// Update max line width (not so important, it is just so the horizontal scrollbar doesn't get too small)
 			this._asyncUpdateLineWidths.schedule();
 		}
 
-		if (platform.isLinux && !this._asyncCheckMonospaceFontAssumptions.isScheduled()) {
-			const rendStartLineNumber = this._visibleLines.getStartLineNumber();
-			const rendEndLineNumber = this._visibleLines.getEndLineNumber();
-			for (let lineNumber = rendStartLineNumber; lineNumber <= rendEndLineNumber; lineNumber++) {
-				const visibleLine = this._visibleLines.getVisibleLine(lineNumber);
-				if (visibleLine.needsMonospaceFontCheck()) {
-					this._asyncCheckMonospaceFontAssumptions.schedule();
-					break;
+		if (this._hasVerticalScroll || this._hasHorizontalScroll) {
+			if (Browser.canUseTranslate3d) {
+				var transform = 'translate3d(' + -this._layoutProvider.getScrollLeft() + 'px, ' + linesViewportData.visibleRangesDeltaTop + 'px, 0px)';
+				DomUtils.StyleMutator.setTransform(<HTMLElement>this.domNode.parentNode, transform);
+			} else {
+				if (this._hasVerticalScroll) {
+					DomUtils.StyleMutator.setTop(<HTMLElement>this.domNode.parentNode, linesViewportData.visibleRangesDeltaTop);
+				}
+				if (this._hasHorizontalScroll) {
+					DomUtils.StyleMutator.setLeft(<HTMLElement>this.domNode.parentNode, -this._layoutProvider.getScrollLeft());
 				}
 			}
+			this._hasVerticalScroll = false;
+			this._hasHorizontalScroll = false;
 		}
 
-		// (3) handle scrolling
-		this._linesContent.setLayerHinting(this._canUseLayerHinting);
-		this._linesContent.setContain('strict');
-		const adjustedScrollTop = this._context.viewLayout.getCurrentScrollTop() - viewportData.bigNumbersDelta;
-		this._linesContent.setTop(-adjustedScrollTop);
-		this._linesContent.setLeft(-this._context.viewLayout.getCurrentScrollLeft());
+		DomUtils.StyleMutator.setWidth(this.domNode, this._layoutProvider.getScrollWidth());
+		DomUtils.StyleMutator.setHeight(this.domNode, Math.min(this._layoutProvider.getTotalHeight(), 1000000));
+
+		linesViewportData.visibleRange = this._currentVisibleRange;
+
+		return linesViewportData;
 	}
 
 	// --- width
 
 	private _ensureMaxLineWidth(lineWidth: number): void {
-		const iLineWidth = Math.ceil(lineWidth);
-		if (this._maxLineWidth < iLineWidth) {
-			this._maxLineWidth = iLineWidth;
-			this._context.viewModel.viewLayout.setMaxLineWidth(this._maxLineWidth);
+		if (this._maxLineWidth < lineWidth) {
+			this._maxLineWidth = lineWidth;
+			this._layoutProvider.onMaxLineWidthChanged(this._maxLineWidth);
 		}
 	}
 
-	private _computeScrollTopToRevealRange(viewport: Viewport, source: string | null | undefined, minimalReveal: boolean, range: Range | null, selections: Selection[] | null, verticalType: viewEvents.VerticalRevealType): number {
-		const viewportStartY = viewport.top;
-		const viewportHeight = viewport.height;
-		const viewportEndY = viewportStartY + viewportHeight;
-		let boxIsSingleRange: boolean;
-		let boxStartY: number;
-		let boxEndY: number;
+	private _computeScrollTopToRevealRange(viewport:EditorCommon.IViewport, range: EditorCommon.IEditorRange, verticalType: EditorCommon.VerticalRevealType): number {
+		var viewportStartY = viewport.top,
+			viewportHeight = viewport.height,
+			viewportEndY = viewportStartY + viewportHeight,
+			boxStartY:number,
+			boxEndY:number;
 
-		if (selections && selections.length > 0) {
-			let minLineNumber = selections[0].startLineNumber;
-			let maxLineNumber = selections[0].endLineNumber;
-			for (let i = 1, len = selections.length; i < len; i++) {
-				const selection = selections[i];
-				minLineNumber = Math.min(minLineNumber, selection.startLineNumber);
-				maxLineNumber = Math.max(maxLineNumber, selection.endLineNumber);
-			}
-			boxIsSingleRange = false;
-			boxStartY = this._context.viewLayout.getVerticalOffsetForLineNumber(minLineNumber);
-			boxEndY = this._context.viewLayout.getVerticalOffsetForLineNumber(maxLineNumber) + this._lineHeight;
-		} else if (range) {
-			boxIsSingleRange = true;
-			boxStartY = this._context.viewLayout.getVerticalOffsetForLineNumber(range.startLineNumber);
-			boxEndY = this._context.viewLayout.getVerticalOffsetForLineNumber(range.endLineNumber) + this._lineHeight;
-		} else {
-			return -1;
+		// Have a box that includes one extra line height (for the horizontal scrollbar)
+		boxStartY = this._layoutProvider.getVerticalOffsetForLineNumber(range.startLineNumber);
+		boxEndY = this._layoutProvider.getVerticalOffsetForLineNumber(range.endLineNumber) + this._layoutProvider.heightInPxForLine(range.endLineNumber);
+		if (verticalType === EditorCommon.VerticalRevealType.Simple) {
+			// Reveal one line more for the arrow down case, when the last line would be covered by the scrollbar
+			boxEndY += this._context.configuration.editor.lineHeight;
 		}
 
-		const shouldIgnoreScrollOff = (source === 'mouse' || minimalReveal) && this._cursorSurroundingLinesStyle === 'default';
+		var newScrollTop: number;
 
-		if (!shouldIgnoreScrollOff) {
-			const context = Math.min((viewportHeight / this._lineHeight) / 2, this._cursorSurroundingLines);
-			boxStartY -= context * this._lineHeight;
-			boxEndY += Math.max(0, (context - 1)) * this._lineHeight;
-		} else {
-			if (!minimalReveal) {
-				// Reveal one more line above (this case is hit when dragging)
-				boxStartY -= this._lineHeight;
-			}
-		}
-
-		if (verticalType === viewEvents.VerticalRevealType.Simple || verticalType === viewEvents.VerticalRevealType.Bottom) {
-			// Reveal one line more when the last line would be covered by the scrollbar - arrow down case or revealing a line explicitly at bottom
-			boxEndY += (minimalReveal ? this._horizontalScrollbarHeight : this._lineHeight);
-		}
-
-		let newScrollTop: number;
-
-		if (boxEndY - boxStartY > viewportHeight) {
-			// the box is larger than the viewport ... scroll to its top
-			if (!boxIsSingleRange) {
-				// do not reveal multiple cursors if there are more than fit the viewport
-				return -1;
-			}
-			newScrollTop = boxStartY;
-		} else if (verticalType === viewEvents.VerticalRevealType.NearTop || verticalType === viewEvents.VerticalRevealType.NearTopIfOutsideViewport) {
-			if (verticalType === viewEvents.VerticalRevealType.NearTopIfOutsideViewport && viewportStartY <= boxStartY && boxEndY <= viewportEndY) {
-				// Box is already in the viewport... do nothing
-				newScrollTop = viewportStartY;
-			} else {
-				// We want a gap that is 20% of the viewport, but with a minimum of 5 lines
-				const desiredGapAbove = Math.max(5 * this._lineHeight, viewportHeight * 0.2);
-				// Try to scroll just above the box with the desired gap
-				const desiredScrollTop = boxStartY - desiredGapAbove;
-				// But ensure that the box is not pushed out of viewport
-				const minScrollTop = boxEndY - viewportHeight;
-				newScrollTop = Math.max(minScrollTop, desiredScrollTop);
-			}
-		} else if (verticalType === viewEvents.VerticalRevealType.Center || verticalType === viewEvents.VerticalRevealType.CenterIfOutsideViewport) {
-			if (verticalType === viewEvents.VerticalRevealType.CenterIfOutsideViewport && viewportStartY <= boxStartY && boxEndY <= viewportEndY) {
+		if (verticalType === EditorCommon.VerticalRevealType.Center || verticalType === EditorCommon.VerticalRevealType.CenterIfOutsideViewport) {
+			if (verticalType === EditorCommon.VerticalRevealType.CenterIfOutsideViewport && viewportStartY <= boxStartY && boxEndY <= viewportEndY) {
 				// Box is already in the viewport... do nothing
 				newScrollTop = viewportStartY;
 			} else {
 				// Box is outside the viewport... center it
-				const boxMiddleY = (boxStartY + boxEndY) / 2;
-				newScrollTop = Math.max(0, boxMiddleY - viewportHeight / 2);
+				var boxMiddleY = (boxStartY + boxEndY) / 2;
+				newScrollTop = Math.max(0, boxMiddleY - viewportHeight/2);
 			}
 		} else {
-			newScrollTop = this._computeMinimumScrolling(viewportStartY, viewportEndY, boxStartY, boxEndY, verticalType === viewEvents.VerticalRevealType.Top, verticalType === viewEvents.VerticalRevealType.Bottom);
+			newScrollTop = this._computeMinimumScrolling(viewportStartY, viewportEndY, boxStartY, boxEndY);
 		}
 
 		return newScrollTop;
 	}
 
-	private _computeScrollLeftToReveal(horizontalRevealRequest: HorizontalRevealRequest): { scrollLeft: number; maxHorizontalOffset: number } | null {
+	private _computeScrollLeftToRevealRange(range: EditorCommon.IEditorRange): { scrollLeft: number; maxHorizontalOffset: number; } {
 
-		const viewport = this._context.viewLayout.getCurrentViewport();
-		const viewportStartX = viewport.left;
-		const viewportEndX = viewportStartX + viewport.width;
+		var maxHorizontalOffset = 0;
 
-		let boxStartX = Constants.MAX_SAFE_SMALL_INTEGER;
-		let boxEndX = 0;
-		if (horizontalRevealRequest.type === 'range') {
-			const visibleRanges = this._visibleRangesForLineRange(horizontalRevealRequest.lineNumber, horizontalRevealRequest.startColumn, horizontalRevealRequest.endColumn);
-			if (!visibleRanges) {
-				return null;
+		if (range.startLineNumber !== range.endLineNumber) {
+			// Two or more lines? => scroll to base (That's how you see most of the two lines)
+			return {
+				scrollLeft: 0,
+				maxHorizontalOffset: maxHorizontalOffset
+			};
+		}
+
+		var viewport = this._layoutProvider.getCurrentViewport(),
+			viewportStartX = viewport.left,
+			viewportEndX = viewportStartX + viewport.width;
+
+		var visibleRanges = this.visibleRangesForRange2(range, 0, 0, false),
+			boxStartX = Number.MAX_VALUE,
+			boxEndX = 0;
+
+		if (!visibleRanges) {
+			// Unknown
+			return {
+				scrollLeft: viewportStartX,
+				maxHorizontalOffset: maxHorizontalOffset
+			};
+		}
+
+		var i:number,
+			visibleRange:EditorBrowser.IVisibleRange;
+
+		for (i = 0; i < visibleRanges.length; i++) {
+			visibleRange = visibleRanges[i];
+			if (visibleRange.left < boxStartX) {
+				boxStartX = visibleRange.left;
 			}
-			for (const visibleRange of visibleRanges.ranges) {
-				boxStartX = Math.min(boxStartX, Math.round(visibleRange.left));
-				boxEndX = Math.max(boxEndX, Math.round(visibleRange.left + visibleRange.width));
-			}
-		} else {
-			for (const selection of horizontalRevealRequest.selections) {
-				if (selection.startLineNumber !== selection.endLineNumber) {
-					return null;
-				}
-				const visibleRanges = this._visibleRangesForLineRange(selection.startLineNumber, selection.startColumn, selection.endColumn);
-				if (!visibleRanges) {
-					return null;
-				}
-				for (const visibleRange of visibleRanges.ranges) {
-					boxStartX = Math.min(boxStartX, Math.round(visibleRange.left));
-					boxEndX = Math.max(boxEndX, Math.round(visibleRange.left + visibleRange.width));
-				}
+			if (visibleRange.left + visibleRange.width > boxEndX) {
+				boxEndX = visibleRange.left + visibleRange.width;
 			}
 		}
 
-		if (!horizontalRevealRequest.minimalReveal) {
-			boxStartX = Math.max(0, boxStartX - ViewLines.HORIZONTAL_EXTRA_PX);
-			boxEndX += this._revealHorizontalRightPadding;
-		}
+		maxHorizontalOffset = boxEndX;
 
-		if (horizontalRevealRequest.type === 'selections' && boxEndX - boxStartX > viewport.width) {
-			return null;
-		}
+		boxStartX = Math.max(0, boxStartX - ViewLines.HORIZONTAL_EXTRA_PX);
+		boxEndX += this._context.configuration.editor.revealHorizontalRightPadding;
 
-		const newScrollLeft = this._computeMinimumScrolling(viewportStartX, viewportEndX, boxStartX, boxEndX);
+		var newScrollLeft = this._computeMinimumScrolling(viewportStartX, viewportEndX, boxStartX, boxEndX);
 		return {
 			scrollLeft: newScrollLeft,
-			maxHorizontalOffset: boxEndX
+			maxHorizontalOffset: maxHorizontalOffset
 		};
 	}
 
-	private _computeMinimumScrolling(viewportStart: number, viewportEnd: number, boxStart: number, boxEnd: number, revealAtStart?: boolean, revealAtEnd?: boolean): number {
-		viewportStart = viewportStart | 0;
-		viewportEnd = viewportEnd | 0;
-		boxStart = boxStart | 0;
-		boxEnd = boxEnd | 0;
-		revealAtStart = !!revealAtStart;
-		revealAtEnd = !!revealAtEnd;
-
-		const viewportLength = viewportEnd - viewportStart;
-		const boxLength = boxEnd - boxStart;
+	private _computeMinimumScrolling(viewportStart: number, viewportEnd: number, boxStart: number, boxEnd: number): number {
+		var viewportLength = viewportEnd - viewportStart,
+			boxLength = boxEnd - boxStart;
 
 		if (boxLength < viewportLength) {
 			// The box would fit in the viewport
-
-			if (revealAtStart) {
-				return boxStart;
-			}
-
-			if (revealAtEnd) {
-				return Math.max(0, boxEnd - viewportLength);
-			}
-
 			if (boxStart < viewportStart) {
 				// The box is above the viewport
 				return boxStart;

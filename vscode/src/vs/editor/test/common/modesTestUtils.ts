@@ -2,34 +2,94 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+'use strict';
 
-import { LineTokens } from 'vs/editor/common/tokens/lineTokens';
-import { MetadataConsts, StandardTokenType } from 'vs/editor/common/languages';
-import { ScopedLineTokens, createScopedLineTokens } from 'vs/editor/common/languages/supports';
-import { LanguageIdCodec } from 'vs/editor/common/services/languagesRegistry';
+import modes = require('vs/editor/common/modes');
+import {Arrays} from 'vs/editor/common/core/arrays';
+
+export function createMockMode(id:string, wordRegExp:RegExp = null):modes.IMode {
+	var tokenTypeClassificationSupport: modes.ITokenTypeClassificationSupport;
+	if (wordRegExp) {
+		tokenTypeClassificationSupport = {
+			getWordDefinition: () => wordRegExp
+		};
+	}
+	return {
+		getId: () => id,
+		tokenTypeClassificationSupport: tokenTypeClassificationSupport
+	};
+}
 
 export interface TokenText {
 	text: string;
-	type: StandardTokenType;
+	type: string;
+	bracket?: modes.Bracket;
 }
 
-export function createFakeScopedLineTokens(rawTokens: TokenText[]): ScopedLineTokens {
-	let tokens = new Uint32Array(rawTokens.length << 1);
-	let line = '';
+export function createLineContextFromTokenText(tokens: TokenText[]): modes.ILineContext {
+	var line = '';
+	var processedTokens: modes.IToken[] = [];
 
-	for (let i = 0, len = rawTokens.length; i < len; i++) {
-		let rawToken = rawTokens[i];
-
-		let startOffset = line.length;
-		let metadata = (
-			(rawToken.type << MetadataConsts.TOKEN_TYPE_OFFSET)
-		) >>> 0;
-
-		tokens[(i << 1)] = startOffset;
-		tokens[(i << 1) + 1] = metadata;
-		line += rawToken.text;
+	var indexSoFar = 0;
+	for (var i = 0; i < tokens.length; ++i){
+		processedTokens.push({ startIndex: indexSoFar, type: tokens[i].type, bracket: (tokens[i].bracket ? tokens[i].bracket : modes.Bracket.None) });
+		line += tokens[i].text;
+		indexSoFar += tokens[i].text.length;
 	}
 
-	LineTokens.convertToEndOffset(tokens, line.length);
-	return createScopedLineTokens(new LineTokens(tokens, line, new LanguageIdCodec()), 0);
+	return new TestLineContext(line, processedTokens, null);
+}
+
+export function createLineContext(line:string, tokens:modes.ILineTokens): modes.ILineContext {
+	return new TestLineContext(line, tokens.tokens, tokens.modeTransitions);
+}
+
+class TestLineContext implements modes.ILineContext {
+
+	public modeTransitions: modes.IModeTransition[];
+	private _line:string;
+	private _tokens: modes.IToken[];
+
+	constructor(line:string, tokens: modes.IToken[], modeTransitions:modes.IModeTransition[]) {
+		this.modeTransitions = modeTransitions;
+		this._line = line;
+		this._tokens = tokens;
+	}
+
+	public getLineContent(): string {
+		return this._line;
+	}
+
+	public getTokenCount(): number {
+		return this._tokens.length;
+	}
+
+	public getTokenStartIndex(tokenIndex:number): number {
+		return this._tokens[tokenIndex].startIndex;
+	}
+
+	public getTokenEndIndex(tokenIndex:number): number {
+		if (tokenIndex + 1 < this._tokens.length) {
+			return this._tokens[tokenIndex + 1].startIndex;
+		}
+		return this._line.length;
+	}
+
+	public getTokenType(tokenIndex:number): string {
+		return this._tokens[tokenIndex].type;
+	}
+
+	public getTokenBracket(tokenIndex:number): modes.Bracket {
+		return this._tokens[tokenIndex].bracket;
+	}
+
+	public findIndexOfOffset(offset:number): number {
+		return Arrays.findIndexInSegmentsArray(this._tokens, offset);
+	}
+
+	public getTokenText(tokenIndex:number): string {
+		var startIndex = this._tokens[tokenIndex].startIndex;
+		var endIndex = tokenIndex + 1 < this._tokens.length ? this._tokens[tokenIndex + 1].startIndex : this._line.length;
+		return this._line.substring(startIndex, endIndex);
+	}
 }

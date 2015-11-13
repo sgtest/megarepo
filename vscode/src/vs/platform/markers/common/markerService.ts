@@ -2,346 +2,308 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+'use strict';
 
-import { isFalsyOrEmpty, isNonEmptyArray } from 'vs/base/common/arrays';
-import { DebounceEmitter } from 'vs/base/common/event';
-import { Iterable } from 'vs/base/common/iterator';
-import { IDisposable } from 'vs/base/common/lifecycle';
-import { ResourceMap } from 'vs/base/common/map';
-import { Schemas } from 'vs/base/common/network';
-import { URI } from 'vs/base/common/uri';
-import { IMarker, IMarkerData, IMarkerService, IResourceMarker, MarkerSeverity, MarkerStatistics } from './markers';
+import network = require('vs/base/common/network');
+import arrays = require('vs/base/common/arrays');
+import strings = require('vs/base/common/strings');
+import collections = require('vs/base/common/collections');
+import URI from 'vs/base/common/uri';
+import Event, {Emitter} from 'vs/base/common/event';
+import Severity from 'vs/base/common/severity';
+import {IThreadService, IThreadSynchronizableObject} from 'vs/platform/thread/common/thread';
+import {MainThreadAttr} from 'vs/platform/thread/common/threadService';
 
-class DoubleResourceMap<V>{
+import {IMarkerService, IMarkerData, MarkerType, IResourceMarker, IMarker, MarkerStatistics} from './markers';
 
-	private _byResource = new ResourceMap<Map<string, V>>();
-	private _byOwner = new Map<string, ResourceMap<V>>();
+interface Key {
+	owner: string;
+	resource: network.URL;
+}
 
-	set(resource: URI, owner: string, value: V) {
-		let ownerMap = this._byResource.get(resource);
-		if (!ownerMap) {
-			ownerMap = new Map();
-			this._byResource.set(resource, ownerMap);
-		}
-		ownerMap.set(owner, value);
+module Key {
 
-		let resourceMap = this._byOwner.get(owner);
-		if (!resourceMap) {
-			resourceMap = new ResourceMap();
-			this._byOwner.set(owner, resourceMap);
-		}
-		resourceMap.set(resource, value);
+	export function fromValue(value: string): Key {
+		var regexp = /^(.*)→(.*)$/.exec(value);
+		return {
+			owner: regexp[1],
+			resource: network.URL.fromValue(regexp[2])
+		};
 	}
 
-	get(resource: URI, owner: string): V | undefined {
-		let ownerMap = this._byResource.get(resource);
-		return ownerMap?.get(owner);
+	export function valueOf(k: Key): string {
+		return k.owner + '→' + k.resource;
 	}
 
-	delete(resource: URI, owner: string): boolean {
-		let removedA = false;
-		let removedB = false;
-		let ownerMap = this._byResource.get(resource);
-		if (ownerMap) {
-			removedA = ownerMap.delete(owner);
-		}
-		let resourceMap = this._byOwner.get(owner);
-		if (resourceMap) {
-			removedB = resourceMap.delete(resource);
-		}
-		if (removedA !== removedB) {
-			throw new Error('illegal state');
-		}
-		return removedA && removedB;
+	var _selectorPattern = '^({0})→({1})$';
+
+	export function selector(owner?: string, resource?: URI): RegExp {
+		return new RegExp(strings.format(_selectorPattern, owner ? strings.escapeRegExpCharacters(owner) : '.*', resource ? strings.escapeRegExpCharacters(resource.toString()) : '.*'));
 	}
 
-	values(key?: URI | string): Iterable<V> {
-		if (typeof key === 'string') {
-			return this._byOwner.get(key)?.values() ?? Iterable.empty();
-		}
-		if (URI.isUri(key)) {
-			return this._byResource.get(key)?.values() ?? Iterable.empty();
-		}
-
-		return Iterable.map(Iterable.concat(...this._byOwner.values()), map => map[1]);
+	export function raw(owner: string, resource: URI): string {
+		return owner + '→' + resource;
 	}
 }
 
-class MarkerStats implements MarkerStatistics {
-
-	errors: number = 0;
-	infos: number = 0;
-	warnings: number = 0;
-	unknowns: number = 0;
-
-	private readonly _data = new ResourceMap<MarkerStatistics>();
-	private readonly _service: IMarkerService;
-	private readonly _subscription: IDisposable;
-
-	constructor(service: IMarkerService) {
-		this._service = service;
-		this._subscription = service.onMarkerChanged(this._update, this);
-	}
-
-	dispose(): void {
-		this._subscription.dispose();
-	}
-
-	private _update(resources: readonly URI[]): void {
-		for (const resource of resources) {
-			const oldStats = this._data.get(resource);
-			if (oldStats) {
-				this._substract(oldStats);
-			}
-			const newStats = this._resourceStats(resource);
-			this._add(newStats);
-			this._data.set(resource, newStats);
-		}
-	}
-
-	private _resourceStats(resource: URI): MarkerStatistics {
-		const result: MarkerStatistics = { errors: 0, warnings: 0, infos: 0, unknowns: 0 };
-
-		// TODO this is a hack
-		if (resource.scheme === Schemas.inMemory || resource.scheme === Schemas.walkThrough || resource.scheme === Schemas.walkThroughSnippet) {
-			return result;
-		}
-
-		for (const { severity } of this._service.read({ resource })) {
-			if (severity === MarkerSeverity.Error) {
-				result.errors += 1;
-			} else if (severity === MarkerSeverity.Warning) {
-				result.warnings += 1;
-			} else if (severity === MarkerSeverity.Info) {
-				result.infos += 1;
-			} else {
-				result.unknowns += 1;
-			}
-		}
-
-		return result;
-	}
-
-	private _substract(op: MarkerStatistics) {
-		this.errors -= op.errors;
-		this.warnings -= op.warnings;
-		this.infos -= op.infos;
-		this.unknowns -= op.unknowns;
-	}
-
-	private _add(op: MarkerStatistics) {
-		this.errors += op.errors;
-		this.warnings += op.warnings;
-		this.infos += op.infos;
-		this.unknowns += op.unknowns;
-	}
+export interface MarkerData {
+	[k: string]: IMarkerData[]
 }
 
-export class MarkerService implements IMarkerService {
+export class MarkerService implements IMarkerService, IThreadSynchronizableObject<MarkerData> {
+	public serviceId = IMarkerService;
+	private _data: { [k: string]: IMarkerData[] };
+	private _stats: MarkerStatistics;
+	private _onMarkerChanged: Emitter<URI[]>;
 
-	declare readonly _serviceBrand: undefined;
-
-	private readonly _onMarkerChanged = new DebounceEmitter<readonly URI[]>({
-		delay: 0,
-		merge: MarkerService._merge
-	});
-
-	readonly onMarkerChanged = this._onMarkerChanged.event;
-
-	private readonly _data = new DoubleResourceMap<IMarker[]>();
-	private readonly _stats = new MarkerStats(this);
-
-	dispose(): void {
-		this._stats.dispose();
-		this._onMarkerChanged.dispose();
+	constructor(threadService: IThreadService) {
+		this._data = Object.create(null);
+		this._stats = this._emptyStats();
+		this._onMarkerChanged = new Emitter<URI[]>();
+		threadService.registerInstance(this);
 	}
 
-	getStatistics(): MarkerStatistics {
+	// ---- IThreadSynchronizableObject ------------------------------
+
+	public getId():string {
+		return '__markerService';
+	}
+
+	public getSerializableState():MarkerData {
+		return this._data;
+	}
+
+	public setData(data: MarkerData):void {
+		this._data = data;
+	}
+
+	public getStatistics(): MarkerStatistics {
 		return this._stats;
 	}
 
-	remove(owner: string, resources: URI[]): void {
-		for (const resource of resources || []) {
-			this.changeOne(owner, resource, []);
-		}
+	// ---- Threading attributes to invoke functions everywhere ------
+
+	static $changeOne = MainThreadAttr(MarkerService, MarkerService.prototype.changeOne);
+	static $changeAll = MainThreadAttr(MarkerService, MarkerService.prototype.changeAll);
+
+	// ---- IMarkerService ------------------------------------------
+
+	public get onMarkerChanged(): Event<URI[]> {
+		return this._onMarkerChanged ? this._onMarkerChanged.event : null;
 	}
 
-	changeOne(owner: string, resource: URI, markerData: IMarkerData[]): void {
-
-		if (isFalsyOrEmpty(markerData)) {
-			// remove marker for this (owner,resource)-tuple
-			const removed = this._data.delete(resource, owner);
-			if (removed) {
-				this._onMarkerChanged.fire([resource]);
-			}
-
-		} else {
-			// insert marker for this (owner,resource)-tuple
-			const markers: IMarker[] = [];
-			for (const data of markerData) {
-				const marker = MarkerService._toMarker(owner, resource, data);
-				if (marker) {
-					markers.push(marker);
-				}
-			}
-			this._data.set(resource, owner, markers);
+	public changeOne(owner: string, resource: network.URL, markers: IMarkerData[]): void {
+		if (this._doChangeOne(owner, resource, markers)) {
 			this._onMarkerChanged.fire([resource]);
 		}
 	}
 
-	private static _toMarker(owner: string, resource: URI, data: IMarkerData): IMarker | undefined {
-		let {
-			code, severity,
-			message, source,
-			startLineNumber, startColumn, endLineNumber, endColumn,
-			relatedInformation,
-			tags,
-		} = data;
-
-		if (!message) {
-			return undefined;
+	public remove(owner: string, resources: URI[]): void {
+		if(arrays.isFalsyOrEmpty(resources)) {
+			return;
 		}
+		let changedResources: URI[];
+		for (let resource of resources) {
+			if (this._doChangeOne(owner, resource, undefined)) {
+				if (!changedResources) {
+					changedResources = [];
+				}
+				changedResources.push(resource);
+			}
+		}
+		if (changedResources) {
+			this._onMarkerChanged.fire(changedResources);
+		}
+	}
 
-		// santize data
-		startLineNumber = startLineNumber > 0 ? startLineNumber : 1;
-		startColumn = startColumn > 0 ? startColumn : 1;
-		endLineNumber = endLineNumber >= startLineNumber ? endLineNumber : startLineNumber;
-		endColumn = endColumn > 0 ? endColumn : startColumn;
+	private _doChangeOne(owner: string, resource: URI, markers: IMarkerData[]): boolean {
 
+		var key = Key.raw(owner, resource),
+			oldMarkers = this._data[key],
+			hasOldMarkers = !arrays.isFalsyOrEmpty(oldMarkers),
+			getsNewMarkers = !arrays.isFalsyOrEmpty(markers),
+			oldStats = this._computeStats(oldMarkers),
+			newStats = this._computeStats(markers);
+
+		if(!hasOldMarkers && !getsNewMarkers) {
+			return;
+		}
+		if (getsNewMarkers) {
+			this._data[key] = markers;
+		} else if (hasOldMarkers) {
+			delete this._data[key];
+		}
+		if (this._isStatRelevant(resource)) {
+			this._updateStatsMinus(oldStats);
+			this._updateStatsPlus(newStats);
+		}
+		return true;
+	}
+
+	public changeAll(owner: string, data: IResourceMarker[]): void {
+		var changedResources: { [n: string]: URI } = Object.create(null);
+
+		// remove and record old markers
+		var oldStats = this._emptyStats();
+		this._forEach(owner, undefined, undefined, -1, (e, r) => {
+			var resource = Key.fromValue(e.key).resource;
+			if (this._isStatRelevant(resource)) {
+				this._updateStatsPlus(oldStats, this._computeStats(e.value));
+			}
+			changedResources[resource.toString()] = resource;
+			r();
+		});
+		this._updateStatsMinus(oldStats);
+
+		// add and record new markers
+		if(!arrays.isFalsyOrEmpty(data)) {
+			var newStats = this._emptyStats();
+			data.forEach(d => {
+				changedResources[d.resource.toString()] = d.resource;
+				collections.lookupOrInsert(this._data, Key.raw(owner, d.resource), []).push(d.marker);
+				if (this._isStatRelevant(d.resource)) {
+					this._updateStatsMarker(newStats, d.marker);
+				}
+			});
+			this._updateStatsPlus(newStats);
+		}
+		this._onMarkerChanged.fire(collections.values(changedResources));
+	}
+
+	public read(filter: { owner?: string; resource?: URI; selector?: RegExp, take?: number; } = Object.create(null)): IMarker[] {
+		var ret: IMarker[] = [];
+		this._forEach(filter.owner, filter.resource, filter.selector, filter.take, entry => this._fromEntry(entry, ret));
+		return ret;
+	}
+
+	private _isStatRelevant(resource: URI): boolean {
+		//TODO@Dirk this is a hack
+		return resource.scheme !== network.schemas.inMemory;
+	}
+
+	private _forEach(owner: string, resource: URI, regexp: RegExp, take: number, callback: (entry: { key: string; value: IMarkerData[]; }, remove:Function) => any):void {
+		//TODO@Joh: be smart and use an index
+		var selector = regexp || Key.selector(owner, resource),
+			took = 0;
+
+		collections.forEach(this._data, (entry, remove) => {
+			if(selector.test(entry.key)) {
+				callback(entry, remove);
+				if(take > 0 && took++ >= take) {
+					return false;
+				}
+			}
+		});
+	}
+
+	private _fromEntry(entry: { key: string; value: IMarkerData[];}, bucket:IMarker[]):void {
+
+		var key = Key.fromValue(entry.key);
+
+		entry.value.forEach(data => {
+
+			// before reading, we sanitize the data
+			MarkerService._sanitize(data);
+
+			bucket.push({
+				owner: key.owner,
+				resource: key.resource,
+				code: data.code,
+				message: data.message,
+				severity: data.severity,
+				startLineNumber: data.startLineNumber,
+				startColumn: data.startColumn,
+				endLineNumber: data.endLineNumber,
+				endColumn: data.endColumn
+			});
+		});
+	}
+
+	private _computeStats(markers: IMarkerData[]): MarkerStatistics {
+		var errors = 0, warnings = 0, infos = 0, unknwons = 0;
+		if (markers) {
+			for(var i = 0; i < markers.length; i++) {
+				var marker = markers[i];
+				if (marker.severity) {
+					switch(marker.severity) {
+						case Severity.Error:
+							errors++;
+							break;
+						case Severity.Warning:
+							warnings++;
+							break;
+						case Severity.Info:
+							infos++;
+							break;
+						default:
+							unknwons++;
+							break;
+					}
+				} else {
+					unknwons++;
+				}
+			}
+		}
 		return {
-			resource,
-			owner,
-			code,
-			severity,
-			message,
-			source,
-			startLineNumber,
-			startColumn,
-			endLineNumber,
-			endColumn,
-			relatedInformation,
-			tags,
+			errors: errors,
+			warnings: warnings,
+			infos: infos,
+			unknwons: unknwons
 		};
 	}
 
-	changeAll(owner: string, data: IResourceMarker[]): void {
-		const changes: URI[] = [];
-
-		// remove old marker
-		const existing = this._data.values(owner);
-		if (existing) {
-			for (let data of existing) {
-				const first = Iterable.first(data);
-				if (first) {
-					changes.push(first.resource);
-					this._data.delete(first.resource, owner);
-				}
-			}
-		}
-
-		// add new markers
-		if (isNonEmptyArray(data)) {
-
-			// group by resource
-			const groups = new ResourceMap<IMarker[]>();
-			for (const { resource, marker: markerData } of data) {
-				const marker = MarkerService._toMarker(owner, resource, markerData);
-				if (!marker) {
-					// filter bad markers
-					continue;
-				}
-				const array = groups.get(resource);
-				if (!array) {
-					groups.set(resource, [marker]);
-					changes.push(resource);
-				} else {
-					array.push(marker);
-				}
-			}
-
-			// insert all
-			for (const [resource, value] of groups) {
-				this._data.set(resource, owner, value);
-			}
-		}
-
-		if (changes.length > 0) {
-			this._onMarkerChanged.fire(changes);
-		}
+	private _emptyStats(): MarkerStatistics {
+		return { errors: 0, warnings: 0, infos: 0, unknwons: 0 };
 	}
 
-	read(filter: { owner?: string; resource?: URI; severities?: number; take?: number } = Object.create(null)): IMarker[] {
-
-		let { owner, resource, severities, take } = filter;
-
-		if (!take || take < 0) {
-			take = -1;
+	private _updateStatsPlus(toAdd:MarkerStatistics): void;
+	private _updateStatsPlus(toUpdate:MarkerStatistics, toAdd:MarkerStatistics): void;
+	private _updateStatsPlus(toUpdate:MarkerStatistics, toAdd?:MarkerStatistics): void {
+		if (!toAdd) {
+			toAdd = toUpdate;
+			toUpdate = this._stats;
 		}
-
-		if (owner && resource) {
-			// exactly one owner AND resource
-			const data = this._data.get(resource, owner);
-			if (!data) {
-				return [];
-			} else {
-				const result: IMarker[] = [];
-				for (const marker of data) {
-					if (MarkerService._accept(marker, severities)) {
-						const newLen = result.push(marker);
-						if (take > 0 && newLen === take) {
-							break;
-						}
-					}
-				}
-				return result;
-			}
-
-		} else if (!owner && !resource) {
-			// all
-			const result: IMarker[] = [];
-			for (let markers of this._data.values()) {
-				for (let data of markers) {
-					if (MarkerService._accept(data, severities)) {
-						const newLen = result.push(data);
-						if (take > 0 && newLen === take) {
-							return result;
-						}
-					}
-				}
-			}
-			return result;
-
-		} else {
-			// of one resource OR owner
-			const iterable = this._data.values(resource ?? owner!);
-			const result: IMarker[] = [];
-			for (const markers of iterable) {
-				for (const data of markers) {
-					if (MarkerService._accept(data, severities)) {
-						const newLen = result.push(data);
-						if (take > 0 && newLen === take) {
-							return result;
-						}
-					}
-				}
-			}
-			return result;
-		}
+		toUpdate.errors += toAdd.errors;
+		toUpdate.warnings += toAdd.warnings;
+		toUpdate.infos += toAdd.infos;
+		toUpdate.unknwons += toAdd.unknwons;
 	}
 
-	private static _accept(marker: IMarker, severities?: number): boolean {
-		return severities === undefined || (severities & marker.severity) === marker.severity;
+	private _updateStatsMinus(toSubtract:MarkerStatistics): void;
+	private _updateStatsMinus(toUpdate:MarkerStatistics, toSubtract:MarkerStatistics): void;
+	private _updateStatsMinus(toUpdate:MarkerStatistics, toSubtract?:MarkerStatistics): void {
+		if (!toSubtract) {
+			toSubtract = toUpdate;
+			toUpdate = this._stats;
+		}
+		toUpdate.errors -= toSubtract.errors;
+		toUpdate.warnings -= toSubtract.warnings;
+		toUpdate.infos -= toSubtract.infos;
+		toUpdate.unknwons -= toSubtract.unknwons;
 	}
 
-	// --- event debounce logic
+	private _updateStatsMarker(toUpdate:MarkerStatistics, marker:IMarkerData): void {
+		switch(marker.severity) {
+			case Severity.Error:
+				toUpdate.errors++;
+				break;
+			case Severity.Warning:
+				toUpdate.warnings++;
+				break;
+			case Severity.Info:
+				toUpdate.infos++;
+				break;
+			default:
+				toUpdate.unknwons++;
+				break;
+		};
+	}
 
-	private static _merge(all: (readonly URI[])[]): URI[] {
-		const set = new ResourceMap<boolean>();
-		for (let array of all) {
-			for (let item of array) {
-				set.set(item, true);
-			}
-		}
-		return Array.from(set.keys());
+	private static _sanitize(data: IMarkerData): void {
+		data.code = data.code || null;
+		data.startLineNumber = data.startLineNumber > 0 ? data.startLineNumber : 1;
+		data.startColumn = data.startColumn > 0 ? data.startColumn : 1;
+		data.endLineNumber = data.endLineNumber >= data.startLineNumber ? data.endLineNumber : data.startLineNumber;
+		data.endColumn = data.endColumn > 0 ? data.endColumn : data.startColumn;
 	}
 }

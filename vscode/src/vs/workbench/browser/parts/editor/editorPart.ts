@@ -3,1205 +3,1076 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { IThemeService } from 'vs/platform/theme/common/themeService';
-import { Part } from 'vs/workbench/browser/part';
-import { Dimension, isAncestor, $, EventHelper, addDisposableGenericMouseDownListener } from 'vs/base/browser/dom';
-import { Event, Emitter, Relay } from 'vs/base/common/event';
-import { contrastBorder, editorBackground } from 'vs/platform/theme/common/colorRegistry';
-import { GroupDirection, IAddGroupOptions, GroupsArrangement, GroupOrientation, IMergeGroupOptions, MergeGroupMode, GroupsOrder, GroupLocation, IFindGroupScope, EditorGroupLayout, GroupLayoutArgument, IEditorGroupsService, IEditorSideGroup } from 'vs/workbench/services/editor/common/editorGroupsService';
-import { IInstantiationService } from 'vs/platform/instantiation/common/instantiation';
-import { IView, orthogonal, LayoutPriority, IViewSize, Direction, SerializableGrid, Sizing, ISerializedGrid, Orientation, GridBranchNode, isGridBranchNode, GridNode, createSerializedGrid, Grid } from 'vs/base/browser/ui/grid/grid';
-import { GroupIdentifier, EditorInputWithOptions, IEditorPartOptions, IEditorPartOptionsChangeEvent, GroupModelChangeKind } from 'vs/workbench/common/editor';
-import { EDITOR_GROUP_BORDER, EDITOR_PANE_BACKGROUND } from 'vs/workbench/common/theme';
-import { distinct, coalesce, firstOrDefault } from 'vs/base/common/arrays';
-import { IEditorGroupsAccessor, IEditorGroupView, getEditorPartOptions, impactsEditorPartOptions, IEditorPartCreationOptions } from 'vs/workbench/browser/parts/editor/editor';
-import { EditorGroupView } from 'vs/workbench/browser/parts/editor/editorGroupView';
-import { IConfigurationService, IConfigurationChangeEvent } from 'vs/platform/configuration/common/configuration';
-import { IDisposable, dispose, toDisposable, DisposableStore } from 'vs/base/common/lifecycle';
-import { IStorageService, StorageScope, StorageTarget } from 'vs/platform/storage/common/storage';
-import { ISerializedEditorGroupModel, isSerializedEditorGroupModel } from 'vs/workbench/common/editor/editorGroupModel';
-import { EditorDropTarget, IEditorDropTargetDelegate } from 'vs/workbench/browser/parts/editor/editorDropTarget';
-import { IEditorDropService } from 'vs/workbench/services/editor/browser/editorDropService';
-import { Color } from 'vs/base/common/color';
-import { CenteredViewLayout } from 'vs/base/browser/ui/centered/centeredViewLayout';
-import { onUnexpectedError } from 'vs/base/common/errors';
-import { Parts, IWorkbenchLayoutService, Position } from 'vs/workbench/services/layout/browser/layoutService';
-import { registerSingleton } from 'vs/platform/instantiation/common/extensions';
-import { assertIsDefined } from 'vs/base/common/types';
-import { IBoundarySashes } from 'vs/base/browser/ui/grid/gridview';
-import { CompositeDragAndDropObserver } from 'vs/workbench/browser/dnd';
-import { DeferredPromise, Promises } from 'vs/base/common/async';
-import { findGroup } from 'vs/workbench/services/editor/common/editorGroupFinder';
-import { SIDE_GROUP } from 'vs/workbench/services/editor/common/editorService';
+'use strict';
 
-interface IEditorPartUIState {
-	serializedGrid: ISerializedGrid;
-	activeGroup: GroupIdentifier;
-	mostRecentActiveGroups: GroupIdentifier[];
+import 'vs/css!./media/editorpart';
+import 'vs/workbench/browser/parts/editor/editor.contribution';
+import {TPromise, Promise} from 'vs/base/common/winjs.base';
+import {Registry} from 'vs/platform/platform';
+import timer = require('vs/base/common/timer');
+import {EventType} from 'vs/base/common/events';
+import {Dimension, Builder, $} from 'vs/base/browser/builder';
+import nls = require('vs/nls');
+import strings = require('vs/base/common/strings');
+import assert = require('vs/base/common/assert');
+import arrays = require('vs/base/common/arrays');
+import types = require('vs/base/common/types');
+import {IEditorViewState, IEditor} from 'vs/editor/common/editorCommon';
+import errors = require('vs/base/common/errors');
+import {Scope as MementoScope} from 'vs/workbench/common/memento';
+import {Scope, IActionBarRegistry, Extensions as ActionBarExtensions, prepareActions} from 'vs/workbench/browser/actionBarRegistry';
+import {IAction} from 'vs/base/common/actions';
+import {Part} from 'vs/workbench/browser/part';
+import {EventType as WorkbenchEventType, EditorEvent} from 'vs/workbench/browser/events';
+import {IEditorRegistry, Extensions as EditorExtensions, BaseEditor, IEditorInputActionContext, EditorDescriptor} from 'vs/workbench/browser/parts/editor/baseEditor';
+import {EditorInput, EditorOptions, TextEditorOptions} from 'vs/workbench/common/editor';
+import {BaseTextEditor} from 'vs/workbench/browser/parts/editor/textEditor';
+import {EventType as SideBySideEventType, SideBySideEditorControl, Rochade} from 'vs/workbench/browser/parts/editor/sideBySideEditorControl';
+import {WorkbenchProgressService} from 'vs/workbench/services/progress/browser/progressService';
+import {EditorArrangement} from 'vs/workbench/services/editor/common/editorService';
+import {IEditorPart} from 'vs/workbench/services/editor/browser/editorService';
+import {IPartService} from 'vs/workbench/services/part/common/partService';
+import {Position, POSITIONS} from 'vs/platform/editor/common/editor';
+import {IStorageService} from 'vs/platform/storage/common/storage';
+import {IEventService} from 'vs/platform/event/common/event';
+import {IInstantiationService} from 'vs/platform/instantiation/common/instantiation';
+import {IMessageService, IMessageWithAction, Severity} from 'vs/platform/message/common/message';
+import {ITelemetryService} from 'vs/platform/telemetry/common/telemetry';
+
+const EDITOR_STATE_STORAGE_KEY = 'editorpart.editorState';
+
+interface IEditorActions {
+	primary: IAction[];
+	secondary: IAction[];
 }
 
-class GridWidgetView<T extends IView> implements IView {
-
-	readonly element: HTMLElement = $('.grid-view-container');
-
-	get minimumWidth(): number { return this.gridWidget ? this.gridWidget.minimumWidth : 0; }
-	get maximumWidth(): number { return this.gridWidget ? this.gridWidget.maximumWidth : Number.POSITIVE_INFINITY; }
-	get minimumHeight(): number { return this.gridWidget ? this.gridWidget.minimumHeight : 0; }
-	get maximumHeight(): number { return this.gridWidget ? this.gridWidget.maximumHeight : Number.POSITIVE_INFINITY; }
-
-	private _onDidChange = new Relay<{ width: number; height: number } | undefined>();
-	readonly onDidChange = this._onDidChange.event;
-
-	private _gridWidget: Grid<T> | undefined;
-
-	get gridWidget(): Grid<T> | undefined {
-		return this._gridWidget;
-	}
-
-	set gridWidget(grid: Grid<T> | undefined) {
-		this.element.innerText = '';
-
-		if (grid) {
-			this.element.appendChild(grid.element);
-			this._onDidChange.input = grid.onDidChange;
-		} else {
-			this._onDidChange.input = Event.None;
-		}
-
-		this._gridWidget = grid;
-	}
-
-	layout(width: number, height: number, top: number, left: number): void {
-		if (this.gridWidget) {
-			this.gridWidget.layout(width, height, top, left);
-		}
-	}
-
-	dispose(): void {
-		this._onDidChange.dispose();
-	}
+interface IEditorStateEntry {
+	inputId: string;
+	inputValue: string;
+	hasFocus: boolean;
 }
 
-export class EditorPart extends Part implements IEditorGroupsService, IEditorGroupsAccessor, IEditorDropService {
+interface IEditorState {
+	editors: IEditorStateEntry[];
+	widthRatio: number[];
+}
 
-	declare readonly _serviceBrand: undefined;
+/**
+ * The editor part is the container for editors in the workbench. Based on the editor input being opened, it asks the registered
+ * editor for the given input to show the contents. The editor part supports up to 3 side-by-side editors.
+ */
+export class EditorPart extends Part implements IEditorPart {
+	private instantiationService: IInstantiationService;
+	private dimension: Dimension;
+	private sideBySideControl: SideBySideEditorControl;
+	private quickStartTimer: timer.ITimerEvent;
+	private memento: any;
 
-	private static readonly EDITOR_PART_UI_STATE_STORAGE_KEY = 'editorpart.state';
-	private static readonly EDITOR_PART_CENTERED_VIEW_STORAGE_KEY = 'editorpart.centeredview';
-
-	//#region Events
-
-	private readonly _onDidLayout = this._register(new Emitter<Dimension>());
-	readonly onDidLayout = this._onDidLayout.event;
-
-	private readonly _onDidChangeActiveGroup = this._register(new Emitter<IEditorGroupView>());
-	readonly onDidChangeActiveGroup = this._onDidChangeActiveGroup.event;
-
-	private readonly _onDidChangeGroupIndex = this._register(new Emitter<IEditorGroupView>());
-	readonly onDidChangeGroupIndex = this._onDidChangeGroupIndex.event;
-
-	private readonly _onDidChangeGroupLocked = this._register(new Emitter<IEditorGroupView>());
-	readonly onDidChangeGroupLocked = this._onDidChangeGroupLocked.event;
-
-	private readonly _onDidActivateGroup = this._register(new Emitter<IEditorGroupView>());
-	readonly onDidActivateGroup = this._onDidActivateGroup.event;
-
-	private readonly _onDidAddGroup = this._register(new Emitter<IEditorGroupView>());
-	readonly onDidAddGroup = this._onDidAddGroup.event;
-
-	private readonly _onDidRemoveGroup = this._register(new Emitter<IEditorGroupView>());
-	readonly onDidRemoveGroup = this._onDidRemoveGroup.event;
-
-	private readonly _onDidMoveGroup = this._register(new Emitter<IEditorGroupView>());
-	readonly onDidMoveGroup = this._onDidMoveGroup.event;
-
-	private readonly onDidSetGridWidget = this._register(new Emitter<{ width: number; height: number } | undefined>());
-
-	private readonly _onDidChangeSizeConstraints = this._register(new Relay<{ width: number; height: number } | undefined>());
-	readonly onDidChangeSizeConstraints = Event.any(this.onDidSetGridWidget.event, this._onDidChangeSizeConstraints.event);
-
-	private readonly _onDidChangeEditorPartOptions = this._register(new Emitter<IEditorPartOptionsChangeEvent>());
-	readonly onDidChangeEditorPartOptions = this._onDidChangeEditorPartOptions.event;
-
-	//#endregion
-
-	private readonly workspaceMemento = this.getMemento(StorageScope.WORKSPACE, StorageTarget.MACHINE);
-	private readonly globalMemento = this.getMemento(StorageScope.GLOBAL, StorageTarget.MACHINE);
-
-	private readonly groupViews = new Map<GroupIdentifier, IEditorGroupView>();
-	private mostRecentActiveGroups: GroupIdentifier[] = [];
-
-	private container: HTMLElement | undefined;
-
-	private centeredLayoutWidget!: CenteredViewLayout;
-
-	private gridWidget!: SerializableGrid<IEditorGroupView>;
-	private readonly gridWidgetView = this._register(new GridWidgetView<IEditorGroupView>());
+	// The following data structures are partitioned into array of Position as provided by Services.POSITION array
+	private visibleInputs: EditorInput[];
+	private visibleInputListeners: { (): void; }[];
+	private visibleEditors: BaseEditor[];
+	private visibleEditorListeners: { (): void; }[][];
+	private instantiatedEditors: BaseEditor[][];
+	private mapEditorToEditorContainers: { [editorId: string]: Builder; }[];
+	private mapActionsToEditors: { [editorId: string]: IEditorActions; }[];
+	private mapEditorLoadingPromiseToEditor: { [editorId: string]: TPromise<BaseEditor>; }[];
+	private mapEditorCreationPromiseToEditor: { [editorId: string]: TPromise<BaseEditor>; }[];
+	private editorOpenToken: number[];
+	private editorSetInputErrorCounter: number[];
 
 	constructor(
-		@IInstantiationService private readonly instantiationService: IInstantiationService,
-		@IThemeService themeService: IThemeService,
-		@IConfigurationService private readonly configurationService: IConfigurationService,
-		@IStorageService storageService: IStorageService,
-		@IWorkbenchLayoutService layoutService: IWorkbenchLayoutService
+		private messageService: IMessageService,
+		private eventService: IEventService,
+		private telemetryService: ITelemetryService,
+		private storageService: IStorageService,
+		private partService: IPartService,
+		id: string
 	) {
-		super(Parts.EDITOR_PART, { hasTitle: false }, themeService, storageService, layoutService);
+		super(id);
 
-		this.registerListeners();
-	}
+		this.visibleInputs = [];
+		this.visibleInputListeners = [];
+		this.visibleEditors = [];
 
-	private registerListeners(): void {
-		this._register(this.configurationService.onDidChangeConfiguration(e => this.onConfigurationUpdated(e)));
-		this._register(this.themeService.onDidFileIconThemeChange(() => this.handleChangedPartOptions()));
-	}
-
-	private onConfigurationUpdated(event: IConfigurationChangeEvent): void {
-		if (impactsEditorPartOptions(event)) {
-			this.handleChangedPartOptions();
-		}
-	}
-
-	private handleChangedPartOptions(): void {
-		const oldPartOptions = this._partOptions;
-		const newPartOptions = getEditorPartOptions(this.configurationService, this.themeService);
-
-		for (const enforcedPartOptions of this.enforcedPartOptions) {
-			Object.assign(newPartOptions, enforcedPartOptions); // check for overrides
+		this.editorOpenToken = [];
+		for (let i = 0; i < POSITIONS.length; i++) {
+			this.editorOpenToken[i] = 0;
 		}
 
-		this._partOptions = newPartOptions;
+		this.editorSetInputErrorCounter = [];
+		for (let i = 0; i < POSITIONS.length; i++) {
+			this.editorSetInputErrorCounter[i] = 0;
+		}
 
-		this._onDidChangeEditorPartOptions.fire({ oldPartOptions, newPartOptions });
+		this.visibleEditorListeners = this.createPositionArray(true);
+		this.instantiatedEditors = this.createPositionArray(true);
+
+		this.mapEditorToEditorContainers = this.createPositionArray(false);
+		this.mapActionsToEditors = this.createPositionArray(false);
+		this.mapEditorLoadingPromiseToEditor = this.createPositionArray(false);
+		this.mapEditorCreationPromiseToEditor = this.createPositionArray(false);
 	}
 
-	//#region IEditorGroupsService
+	public setInstantiationService(service: IInstantiationService): void {
+		this.instantiationService = service;
+	}
 
-	private enforcedPartOptions: IEditorPartOptions[] = [];
+	private createPositionArray(multiArray: boolean): any[] {
+		let array: any[] = [];
 
-	private _partOptions = getEditorPartOptions(this.configurationService, this.themeService);
-	get partOptions(): IEditorPartOptions { return this._partOptions; }
+		for (let i = 0; i < POSITIONS.length; i++) {
+			array[i] = multiArray ? [] : {};
+		}
 
-	enforcePartOptions(options: IEditorPartOptions): IDisposable {
-		this.enforcedPartOptions.push(options);
-		this.handleChangedPartOptions();
+		return array;
+	}
 
-		return toDisposable(() => {
-			this.enforcedPartOptions.splice(this.enforcedPartOptions.indexOf(options), 1);
-			this.handleChangedPartOptions();
+	public getActiveEditorInput(): EditorInput {
+		let lastActiveEditor = this.sideBySideControl.getActiveEditor();
+
+		return lastActiveEditor ? lastActiveEditor.input : null;
+	}
+
+	public getActiveEditor(): BaseEditor {
+		return this.sideBySideControl.getActiveEditor();
+	}
+
+	public getVisibleEditors(): BaseEditor[] {
+		return this.visibleEditors ? this.visibleEditors.filter((editor) => !!editor) : [];
+	}
+
+	public setEditors(inputs: EditorInput[], options?: EditorOptions[]): TPromise<BaseEditor[]> {
+		return this.closeEditors().then(() => {
+			return this.restoreEditorState(inputs, options);
 		});
 	}
 
-	private _contentDimension!: Dimension;
-	get contentDimension(): Dimension { return this._contentDimension; }
+	public openEditor(input?: EditorInput, options?: EditorOptions, sideBySide?: boolean): TPromise<BaseEditor>;
+	public openEditor(input?: EditorInput, options?: EditorOptions, position?: Position, widthRatios?: number[]): TPromise<BaseEditor>;
+	public openEditor(input?: EditorInput, options?: EditorOptions, arg3?: any, widthRatios?: number[]): TPromise<BaseEditor> {
 
-	private _activeGroup!: IEditorGroupView;
-	get activeGroup(): IEditorGroupView {
-		return this._activeGroup;
-	}
+		// Normalize some values
+		if (!input) { input = null; }
+		if (!options) { options = null; }
 
-	readonly sideGroup: IEditorSideGroup = {
-		openEditor: (editor, options) => {
-			const [group] = this.instantiationService.invokeFunction(accessor => findGroup(accessor, { editor, options }, SIDE_GROUP));
+		// Determine position to open editor in (left, center, right)
+		let position = this.findPosition(arg3, widthRatios);
 
-			return group.openEditor(editor, options);
+		// In case the position is invalid, return early. This can happen when the user tries to open a side editor
+		// when the maximum number of allowed editors is reached and no more side editor can be opened.
+		if (position === null) {
+			return TPromise.as<BaseEditor>(null);
 		}
-	};
 
-	get groups(): IEditorGroupView[] {
-		return Array.from(this.groupViews.values());
-	}
+		// Prevent bad UI issues by ignoring any attempt to open an editor if at the same time an editor is
+		// either creating or loading at this position. Not very nice, but helpful and typically should not cause issues.
+		if (Object.keys(this.mapEditorLoadingPromiseToEditor[position]).length > 0 || Object.keys(this.mapEditorCreationPromiseToEditor[position]).length > 0) {
+			return TPromise.as<BaseEditor>(null);
+		}
 
-	get count(): number {
-		return this.groupViews.size;
-	}
+		// Prevent bad UI issues by ignoring openEditor() calls while the user is dragging an editor
+		if (this.sideBySideControl.isDragging()) {
+			return TPromise.as<BaseEditor>(null);
+		}
 
-	get orientation(): GroupOrientation {
-		return (this.gridWidget && this.gridWidget.orientation === Orientation.VERTICAL) ? GroupOrientation.VERTICAL : GroupOrientation.HORIZONTAL;
-	}
+		// Emit early open event to allow for veto
+		let event = new EditorEvent(this.visibleEditors[position], this.visibleEditors[position] && this.visibleEditors[position].getId(), input, options, position);
+		this.emit(WorkbenchEventType.EDITOR_INPUT_OPENING, event);
+		if (event.isPrevented()) {
+			return TPromise.as<BaseEditor>(null);
+		}
 
-	private _isReady = false;
-	get isReady(): boolean { return this._isReady; }
+		// Do ref counting of this method
+		this.editorOpenToken[position]++;
+		let editorOpenToken = this.editorOpenToken[position];
 
-	private readonly whenReadyPromise = new DeferredPromise<void>();
-	readonly whenReady = this.whenReadyPromise.p;
+		// Log side by side use
+		if (input && position !== Position.LEFT) {
+			this.telemetryService.publicLog('workbenchSideEditorOpened', { position: position });
+		}
 
-	private readonly whenRestoredPromise = new DeferredPromise<void>();
-	readonly whenRestored = this.whenRestoredPromise.p;
+		// Determine options if the editor opens to the side by looking at same input already opened
+		if (input && position !== Position.LEFT) {
+			options = this.findSideOptions(input, options, position);
+		}
 
-	get hasRestorableState(): boolean {
-		return !!this.workspaceMemento[EditorPart.EDITOR_PART_UI_STATE_STORAGE_KEY];
-	}
+		// Remember as visible input for this position
+		this.visibleInputs[position] = input;
 
-	getGroups(order = GroupsOrder.CREATION_TIME): IEditorGroupView[] {
-		switch (order) {
-			case GroupsOrder.CREATION_TIME:
-				return this.groups;
+		// Dispose previous input listener if any
+		if (this.visibleInputListeners[position]) {
+			this.visibleInputListeners[position]();
+			this.visibleInputListeners[position] = null;
+		}
 
-			case GroupsOrder.MOST_RECENTLY_ACTIVE: {
-				const mostRecentActive = coalesce(this.mostRecentActiveGroups.map(groupId => this.getGroup(groupId)));
+		// Close editor when input provided and input gets disposed
+		if (input) {
+			this.visibleInputListeners[position] = input.addListener(EventType.DISPOSE, () => {
+				this.closeEditors(false, input).done(null, errors.onUnexpectedError);
+			});
+		}
 
-				// there can be groups that got never active, even though they exist. in this case
-				// make sure to just append them at the end so that all groups are returned properly
-				return distinct([...mostRecentActive, ...this.groups]);
+		// Close any opened editor at position if input is null
+		if (input === null) {
+			if (this.visibleEditors[position]) {
+
+				// Reset counter
+				this.editorSetInputErrorCounter[position] = 0;
+
+				// Emit Input-Changing Event
+				this.emit(WorkbenchEventType.EDITOR_INPUT_CHANGING, new EditorEvent(null, null, null, null, position));
+
+				// Hide Editor
+				return this.hideEditor(this.visibleEditors[position], position, true).then(() => {
+
+					// Emit Input-Changed Event
+					this.emit(WorkbenchEventType.EDITOR_INPUT_CHANGED, new EditorEvent(null, null, null, null, position));
+
+					// Focus next editor if there is still an active one left
+					let currentActiveEditor = this.sideBySideControl.getActiveEditor();
+					if (currentActiveEditor) {
+						return this.openEditor(currentActiveEditor.input, null, currentActiveEditor.position).then(() => {
+
+							// Explicitly trigger the focus changed handler because the side by side control will not trigger it unless
+							// the user is actively changing focus with the mouse from left to right.
+							this.onEditorFocusChanged();
+
+							return currentActiveEditor;
+						});
+					}
+
+					return TPromise.as<BaseEditor>(null);
+				});
 			}
-			case GroupsOrder.GRID_APPEARANCE: {
-				const views: IEditorGroupView[] = [];
-				if (this.gridWidget) {
-					this.fillGridNodes(views, this.gridWidget.getViews());
+
+			return TPromise.as<BaseEditor>(null);
+		}
+
+		// Lookup Editor and Assert
+		let editorDescriptor = (<IEditorRegistry>Registry.as(EditorExtensions.Editors)).getEditor(input);
+		assert.ok(editorDescriptor, strings.format('Can not find a registered editor for the input {0}', input));
+
+		// Progress Indication
+		let loadingPromise: TPromise<void> = TPromise.timeout(800).then(() => {
+			if (editorOpenToken === this.editorOpenToken[position] && this.partService.isCreated()) {
+				this.sideBySideControl.getProgressBar(position).infinite().getContainer().show();
+				this.sideBySideControl.setLoading(position, input);
+			}
+		});
+
+		// Handle Active Editor showing
+		let activeEditorHidePromise: TPromise<BaseEditor>;
+		if (this.visibleEditors[position]) {
+
+			// Editor can handle Input
+			if (editorDescriptor.describes(this.visibleEditors[position])) {
+
+				// If the editor is currently being created, join this process to avoid issues
+				let pendingEditorCreationPromise = this.mapEditorCreationPromiseToEditor[position][editorDescriptor.getId()];
+				if (!pendingEditorCreationPromise) {
+					pendingEditorCreationPromise = TPromise.as(null);
 				}
 
-				return views;
+				return pendingEditorCreationPromise.then(() => {
+					return this.setInput(this.visibleEditors[position], input, options, position, loadingPromise);
+				});
 			}
-		}
-	}
 
-	private fillGridNodes(target: IEditorGroupView[], node: GridBranchNode<IEditorGroupView> | GridNode<IEditorGroupView>): void {
-		if (isGridBranchNode(node)) {
-			node.children.forEach(child => this.fillGridNodes(target, child));
+			// Editor can not handle Input (Close this Editor)
+			activeEditorHidePromise = this.hideEditor(this.visibleEditors[position], position, false);
 		} else {
-			target.push(node.view);
-		}
-	}
-
-	getGroup(identifier: GroupIdentifier): IEditorGroupView | undefined {
-		return this.groupViews.get(identifier);
-	}
-
-	findGroup(scope: IFindGroupScope, source: IEditorGroupView | GroupIdentifier = this.activeGroup, wrap?: boolean): IEditorGroupView | undefined {
-
-		// by direction
-		if (typeof scope.direction === 'number') {
-			return this.doFindGroupByDirection(scope.direction, source, wrap);
+			activeEditorHidePromise = TPromise.as(null);
 		}
 
-		// by location
-		if (typeof scope.location === 'number') {
-			return this.doFindGroupByLocation(scope.location, source, wrap);
-		}
+		return activeEditorHidePromise.then(() => {
+			let timerEvent = timer.start(timer.Topic.WORKBENCH, strings.format('Creating Editor: {0}', editorDescriptor.getName()));
 
-		throw new Error('invalid arguments');
-	}
+			// We need the container for this editor now
+			let editorContainer = this.mapEditorToEditorContainers[position][editorDescriptor.getId()];
+			let newlyCreatedEditorContainerBuilder: Builder;
+			if (!editorContainer) {
 
-	private doFindGroupByDirection(direction: GroupDirection, source: IEditorGroupView | GroupIdentifier, wrap?: boolean): IEditorGroupView | undefined {
-		const sourceGroupView = this.assertGroupView(source);
+				// Build Container off-DOM
+				editorContainer = $().div({
+					'class': 'editor-container',
+					id: editorDescriptor.getId(),
+					'role': 'presentation',
+					'aria-label': nls.localize('editorAccessibleLabel', "Editor")
+				}, (div) => {
+					newlyCreatedEditorContainerBuilder = div;
+				});
 
-		// Find neighbours and sort by our MRU list
-		const neighbours = this.gridWidget.getNeighborViews(sourceGroupView, this.toGridViewDirection(direction), wrap);
-		neighbours.sort(((n1, n2) => this.mostRecentActiveGroups.indexOf(n1.id) - this.mostRecentActiveGroups.indexOf(n2.id)));
+				// Remember editor container
+				this.mapEditorToEditorContainers[position][editorDescriptor.getId()] = editorContainer;
+			}
 
-		return neighbours[0];
-	}
+			// Create or get editor from cache
+			let editor = this.getEditorFromCache(editorDescriptor, position);
+			let loadOrGetEditorPromise: TPromise<BaseEditor>;
+			if (editor === null) {
 
-	private doFindGroupByLocation(location: GroupLocation, source: IEditorGroupView | GroupIdentifier, wrap?: boolean): IEditorGroupView | undefined {
-		const sourceGroupView = this.assertGroupView(source);
-		const groups = this.getGroups(GroupsOrder.GRID_APPEARANCE);
-		const index = groups.indexOf(sourceGroupView);
-
-		switch (location) {
-			case GroupLocation.FIRST:
-				return groups[0];
-			case GroupLocation.LAST:
-				return groups[groups.length - 1];
-			case GroupLocation.NEXT: {
-				let nextGroup: IEditorGroupView | undefined = groups[index + 1];
-				if (!nextGroup && wrap) {
-					nextGroup = this.doFindGroupByLocation(GroupLocation.FIRST, source);
+				// Check if loading is pending from another openEditor
+				let pendingEditorLoad = this.mapEditorLoadingPromiseToEditor[position][editorDescriptor.getId()];
+				if (pendingEditorLoad) {
+					loadOrGetEditorPromise = pendingEditorLoad;
 				}
 
-				return nextGroup;
+				// Otherwise load
+				else {
+					let loaded = false;
+					loadOrGetEditorPromise = this.createEditor(editorDescriptor, newlyCreatedEditorContainerBuilder.getHTMLElement(), position).then((editor) => {
+						loaded = true;
+						this.instantiatedEditors[position].push(editor);
+						delete this.mapEditorLoadingPromiseToEditor[position][editorDescriptor.getId()];
+
+						return editor;
+					}, (error) => {
+						loaded = true;
+						delete this.mapEditorLoadingPromiseToEditor[position][editorDescriptor.getId()];
+
+						return Promise.wrapError(error);
+					});
+
+					if (!loaded) {
+						this.mapEditorLoadingPromiseToEditor[position][editorDescriptor.getId()] = loadOrGetEditorPromise;
+					}
+				}
+			} else {
+				loadOrGetEditorPromise = TPromise.as(editor);
 			}
-			case GroupLocation.PREVIOUS: {
-				let previousGroup: IEditorGroupView | undefined = groups[index - 1];
-				if (!previousGroup && wrap) {
-					previousGroup = this.doFindGroupByLocation(GroupLocation.LAST, source);
+
+			return loadOrGetEditorPromise.then((editor) => {
+
+				// Make sure that the user meanwhile did not open another editor
+				if (editorOpenToken !== this.editorOpenToken[position]) {
+					timerEvent.stop();
+
+					// Stop loading promise if any
+					loadingPromise.cancel();
+
+					return null;
 				}
 
-				return previousGroup;
+				// Remember Editor at position
+				this.visibleEditors[position] = editor;
+
+				// Register as Emitter to Workbench Bus
+				this.visibleEditorListeners[position].push(this.eventService.addEmitter(this.visibleEditors[position], this.visibleEditors[position].getId()));
+
+				let createEditorPromise: TPromise<BaseEditor>;
+				if (newlyCreatedEditorContainerBuilder) { // Editor created for the first time
+
+					// create editor
+					let created = false;
+					createEditorPromise = editor.create(newlyCreatedEditorContainerBuilder).then(() => {
+						created = true;
+						delete this.mapEditorCreationPromiseToEditor[position][editorDescriptor.getId()];
+					}, (error) => {
+						created = true;
+						delete this.mapEditorCreationPromiseToEditor[position][editorDescriptor.getId()];
+
+						return Promise.wrapError(error);
+					});
+
+					if (!created) {
+						this.mapEditorCreationPromiseToEditor[position][editorDescriptor.getId()] = createEditorPromise;
+					}
+				}
+
+				// Editor already exists but is hidden or pending to create
+				else {
+
+					// Check if create is pending from another openEditor
+					let pendingEditorCreate = this.mapEditorCreationPromiseToEditor[position][editorDescriptor.getId()];
+					if (pendingEditorCreate) {
+						createEditorPromise = pendingEditorCreate;
+					} else {
+						createEditorPromise = TPromise.as(null);
+					}
+				}
+
+				// Fill Content and Actions
+				return createEditorPromise.then(() => {
+
+					// Make sure that the user meanwhile did not open another editor
+					if (!this.visibleEditors[position] || editor.getId() !== this.visibleEditors[position].getId()) {
+						timerEvent.stop();
+
+						// Stop loading promise if any
+						loadingPromise.cancel();
+
+						return null;
+					}
+
+					// Show in side by side control
+					this.sideBySideControl.show(editor, editorContainer, position, options && options.preserveFocus, widthRatios);
+
+					// Indicate to editor that it is now visible
+					return editor.setVisible(true, position).then(() => {
+
+						// Make sure the editor is layed out
+						this.sideBySideControl.layout(position);
+
+						// Emit Editor-Opened Event
+						this.emit(WorkbenchEventType.EDITOR_OPENED, new EditorEvent(editor, editor.getId(), input, options, position));
+
+						timerEvent.stop();
+
+						// Set Input
+						return this.setInput(editor, input, options, position, loadingPromise);
+					});
+				}, (e: any) => this.showError(e));
+			});
+		});
+	}
+
+	public closeEditors(othersOnly?: boolean, input?: EditorInput): TPromise<void> {
+		let promises: Promise[] = [];
+
+		let editors = this.getVisibleEditors().reverse(); // start from the end to prevent layout to happen through rochade
+		for (let i = 0; i < editors.length; i++) {
+			let editor = editors[i];
+			if (othersOnly && this.getActiveEditor() === editor) {
+				continue;
+			}
+
+			if (!input || input === editor.input) {
+				promises.push(this.openEditor(null, null, editor.position));
+			}
+		}
+
+		return Promise.join(promises);
+	}
+
+	private findPosition(sideBySide?: boolean, widthRatios?: number[]): Position;
+	private findPosition(desiredPosition?: Position, widthRatios?: number[]): Position;
+	private findPosition(arg1?: any, widthRatios?: number[]): Position {
+
+		// With defined width ratios, always trust the provided position
+		if (widthRatios && types.isNumber(arg1)) {
+			return arg1;
+		}
+
+		// No editor open
+		let visibleEditors = this.getVisibleEditors();
+		let activeEditor = this.getActiveEditor();
+		if (visibleEditors.length === 0 || !activeEditor) {
+			return Position.LEFT; // can only be LEFT
+		}
+
+		// Position is unknown: pick last active or LEFT
+		if (types.isUndefinedOrNull(arg1) || arg1 === false) {
+			let lastActivePosition = this.sideBySideControl.getActivePosition();
+
+			return lastActivePosition || Position.LEFT;
+		}
+
+		// Position is sideBySide: Find position relative to active editor
+		if (arg1 === true) {
+			switch (activeEditor.position) {
+				case Position.LEFT:
+					return Position.CENTER;
+				case Position.CENTER:
+					return Position.RIGHT;
+				case Position.RIGHT:
+					return null; // Cannot open to the side of the right most editor
+			}
+
+			return null; // Prevent opening to the side
+		}
+
+		// Position is provided, validate it
+		if (arg1 === Position.RIGHT && visibleEditors.length === 1) {
+			return Position.CENTER;
+		}
+
+		return arg1;
+	}
+
+	private findSideOptions(input: EditorInput, options: EditorOptions, position: Position): EditorOptions {
+
+		// Return early if the input is already showing at the position
+		if (this.visibleEditors[position] && input.matches(this.visibleEditors[position].input)) {
+			return options;
+		}
+
+		// Return early if explicit text options are defined
+		if (options instanceof TextEditorOptions && (<TextEditorOptions>options).hasOptionsDefined()) {
+			return options;
+		}
+
+		// Otherwise try to copy viewstate over from an existing opened editor with same input
+		let viewState: IEditorViewState = null;
+		let editors = this.getVisibleEditors();
+		for (let i = 0; i < editors.length; i++) {
+			let editor = editors[i];
+
+			if (!(editor instanceof BaseTextEditor)) {
+				continue; // Only works with text editors
+			}
+
+			// Found a match
+			if (input.matches(editor.input)) {
+				let codeEditor = <IEditor>editor.getControl();
+				viewState = <IEditorViewState>codeEditor.saveViewState();
+
+				break;
+			}
+		}
+
+		// Found view state
+		if (viewState) {
+			let textEditorOptions: TextEditorOptions = null;
+
+			// Merge into existing text editor options if given
+			if (options instanceof TextEditorOptions) {
+				textEditorOptions = <TextEditorOptions>options;
+				textEditorOptions.viewState(viewState);
+
+				return textEditorOptions;
+			}
+
+			// Otherwise create new
+			textEditorOptions = new TextEditorOptions();
+			textEditorOptions.viewState(viewState);
+			if (options) {
+				textEditorOptions.forceOpen = options.forceOpen;
+				textEditorOptions.preserveFocus = options.preserveFocus;
+			}
+
+			return textEditorOptions;
+		}
+
+		return options;
+	}
+
+	private rochade(rochade: Rochade): void;
+	private rochade(from: Position, to: Position): void;
+	private rochade(arg1: any, arg2?: any): void {
+		if (types.isUndefinedOrNull(arg2)) {
+			let rochade = <Rochade>arg1;
+			switch (rochade) {
+				case Rochade.CENTER_TO_LEFT:
+					this.rochade(Position.CENTER, Position.LEFT);
+					break;
+				case Rochade.RIGHT_TO_CENTER:
+					this.rochade(Position.RIGHT, Position.CENTER);
+					break;
+				case Rochade.CENTER_AND_RIGHT_TO_LEFT:
+					this.rochade(Position.CENTER, Position.LEFT);
+					this.rochade(Position.RIGHT, Position.CENTER);
+					break;
+			}
+		} else {
+			let from = <Position>arg1;
+			let to = <Position>arg2;
+
+			this.doRochade(this.visibleInputs, from, to, null);
+			this.doRochade(this.visibleInputListeners, from, to, null);
+			this.doRochade(this.visibleEditors, from, to, null);
+			this.doRochade(this.editorOpenToken, from, to, null);
+			this.doRochade(this.mapEditorLoadingPromiseToEditor, from, to, {});
+			this.doRochade(this.mapEditorCreationPromiseToEditor, from, to, {});
+			this.doRochade(this.visibleEditorListeners, from, to, []);
+			this.doRochade(this.instantiatedEditors, from, to, []);
+			this.doRochade(this.mapEditorToEditorContainers, from, to, {});
+			this.doRochade(this.mapActionsToEditors, from, to, {});
+		}
+	}
+
+	private doRochade(array: any[], from: Position, to: Position, empty: any): void {
+		array[to] = array[from];
+		array[from] = empty;
+	}
+
+	public moveEditor(from: Position, to: Position): void {
+		if (!this.visibleEditors[from] || !this.visibleEditors[to] || from === to) {
+			return; // Ignore if we cannot move
+		}
+
+		// Move widgets
+		this.sideBySideControl.move(from, to);
+
+		// Move data structures
+		arrays.move(this.visibleInputs, from, to);
+		arrays.move(this.visibleInputListeners, from, to);
+		arrays.move(this.visibleEditors, from, to);
+		arrays.move(this.visibleEditorListeners, from, to);
+		arrays.move(this.editorOpenToken, from, to);
+		arrays.move(this.mapEditorLoadingPromiseToEditor, from, to);
+		arrays.move(this.mapEditorCreationPromiseToEditor, from, to);
+		arrays.move(this.instantiatedEditors, from, to);
+		arrays.move(this.mapEditorToEditorContainers, from, to);
+		arrays.move(this.mapActionsToEditors, from, to);
+
+		// Update all title areas
+		this.updateEditorTitleArea();
+
+		// Restore focus
+		let activeEditor = this.sideBySideControl.getActiveEditor();
+		this.openEditor(activeEditor.input, null, activeEditor.position).done(null, errors.onUnexpectedError);
+	}
+
+	public arrangeEditors(arrangement: EditorArrangement): void {
+		this.sideBySideControl.arrangeEditors(arrangement);
+	}
+
+	private setInput(editor: BaseEditor, input: EditorInput, options: EditorOptions, position: Position, loadingPromise: TPromise<void>): TPromise<BaseEditor> {
+
+		// Emit Input-/Options-Changed Event as appropiate
+		let oldInput = editor.getInput();
+		let oldOptions = editor.getOptions();
+		let inputChanged = (!oldInput || !oldInput.matches(input) || (options && options.forceOpen));
+		if (inputChanged) {
+			this.emit(WorkbenchEventType.EDITOR_INPUT_CHANGING, new EditorEvent(editor, editor.getId(), input, options, position));
+		} else if (!oldOptions || !oldOptions.matches(options)) {
+			this.emit(WorkbenchEventType.EDITOR_OPTIONS_CHANGING, new EditorEvent(editor, editor.getId(), input, options, position));
+		}
+
+		// Call into Editor
+		let timerEvent = timer.start(timer.Topic.WORKBENCH, strings.format('Set Editor Input: {0}', input.getName()));
+		return editor.setInput(input, options).then(() => {
+
+			// Reset counter
+			this.editorSetInputErrorCounter[position] = 0;
+
+			// Stop loading promise if any
+			loadingPromise.cancel();
+
+			// Make sure that the user meanwhile has not opened another input
+			if (this.visibleInputs[position] !== input) {
+				timerEvent.stop();
+
+				return editor;
+			}
+
+			// Focus (unless prevented)
+			if (!options || !options.preserveFocus) {
+				editor.focus();
+			}
+
+			// Progress Done
+			this.sideBySideControl.getProgressBar(position).done().getContainer().hide();
+
+			// Update Title Area if input changed
+			if (inputChanged) {
+				this.updateEditorTitleArea();
+			}
+
+			// Emit Input-Changed Event (if input changed)
+			if (inputChanged) {
+				this.emit(WorkbenchEventType.EDITOR_INPUT_CHANGED, new EditorEvent(editor, editor.getId(), input, options, position));
+			}
+
+			timerEvent.stop();
+
+			// Fullfill promise with Editor that is being used
+			return editor;
+		}, (e: any) => {
+
+			// Keep counter
+			this.editorSetInputErrorCounter[position]++;
+
+			// Stop loading promise if any
+			loadingPromise.cancel();
+
+			// Report error
+			this.onSetInputError(e, editor, input, options, position);
+
+			// Recover from this error by closing the editor if the attempt of setInput failed and we are not having any previous input
+			if (!oldInput && this.visibleInputs[position] === input && input) {
+				this.openEditor(null, null, position).done(null, errors.onUnexpectedError);
+			}
+
+			// We need to check our error counter here to prevent reentrant setInput() calls. If the workbench is in error state
+			// to the disk, opening a file would fail and we would try to open the previous file which would fail too. So we
+			// stop trying to open a previous file if we detect that we failed more than once already
+			else if (this.editorSetInputErrorCounter[position] > 1) {
+				this.openEditor(null, null, position).done(null, errors.onUnexpectedError);
+			}
+
+			// Otherwise if we had oldInput, properly restore it so that the active input points to the previous one
+			else if (oldInput) {
+				this.openEditor(oldInput, null, position).done(null, errors.onUnexpectedError);
+			}
+		});
+	}
+
+	private getEditorFromCache(editorDescriptor: EditorDescriptor, position: Position): BaseEditor {
+
+		// Check for existing instantiated editor
+		for (let i = 0; i < this.instantiatedEditors[position].length; i++) {
+			if (editorDescriptor.describes(this.instantiatedEditors[position][i])) {
+				return this.instantiatedEditors[position][i];
+			}
+		}
+
+		return null;
+	}
+
+	private createEditor(editorDescriptor: EditorDescriptor, editorDomNode: HTMLElement, position: Position): TPromise<BaseEditor> {
+		let services = {
+			progressService: new WorkbenchProgressService(this.eventService, this.sideBySideControl.getProgressBar(position), editorDescriptor.getId(), true)
+		};
+
+		let editorInstantiationService = this.instantiationService.createChild(services);
+
+		return editorInstantiationService.createInstance(editorDescriptor);
+	}
+
+	private hideEditor(editor: BaseEditor, position: Position, layoutAndRochade: boolean): TPromise<BaseEditor> {
+		let editorContainer = this.mapEditorToEditorContainers[position][editor.getId()];
+
+		// Hide in side by side control
+		let rochade = this.sideBySideControl.hide(editor, editorContainer, position, layoutAndRochade);
+
+		// Clear any running Progress
+		this.sideBySideControl.getProgressBar(position).stop().getContainer().hide();
+
+		// Clear Listeners
+		while (this.visibleEditorListeners[position].length) {
+			this.visibleEditorListeners[position].pop()();
+		}
+
+		// Indicate to Editor
+		editor.clearInput();
+		return editor.setVisible(false).then(() => {
+
+			// Clear active editor
+			this.visibleEditors[position] = null;
+
+			// Rochade as needed
+			this.rochade(rochade);
+
+			// Clear Title Area for Position
+			this.sideBySideControl.clearTitle(position);
+
+			// Emit Editor Closed Event
+			this.emit(WorkbenchEventType.EDITOR_CLOSED, new EditorEvent(editor, editor.getId(), null, null, position));
+
+			return editor;
+		});
+	}
+
+	private updateEditorTitleArea(): void {
+		let activePosition = this.sideBySideControl.getActivePosition();
+
+		// Update each position individually
+		for (let i = 0; i < POSITIONS.length; i++) {
+			let editor = this.visibleEditors[i];
+			let input = editor ? editor.input : null;
+
+			if (input && editor) {
+				this.doUpdateEditorTitleArea(editor, input, i, activePosition === i);
 			}
 		}
 	}
 
-	activateGroup(group: IEditorGroupView | GroupIdentifier): IEditorGroupView {
-		const groupView = this.assertGroupView(group);
-		this.doSetGroupActive(groupView);
+	private doUpdateEditorTitleArea(editor: BaseEditor, input: EditorInput, position: Position, isActive?: boolean): void {
+		let primaryActions: IAction[] = [];
+		let secondaryActions: IAction[] = [];
 
-		this._onDidActivateGroup.fire(groupView);
-		return groupView;
-	}
+		// Handle toolbar only if side is active
+		if (isActive) {
 
-	restoreGroup(group: IEditorGroupView | GroupIdentifier): IEditorGroupView {
-		const groupView = this.assertGroupView(group);
-		this.doRestoreGroup(groupView);
+			// Handle Editor Actions
+			let editorActions = this.mapActionsToEditors[position][editor.getId()];
+			if (!editorActions) {
+				editorActions = this.getEditorActionsForContext(editor, editor, position);
+				this.mapActionsToEditors[position][editor.getId()] = editorActions;
+			}
 
-		return groupView;
-	}
+			primaryActions.push(...editorActions.primary);
+			secondaryActions.push(...editorActions.secondary);
 
-	getSize(group: IEditorGroupView | GroupIdentifier): { width: number; height: number } {
-		const groupView = this.assertGroupView(group);
+			// Handle Editor Input Actions
+			let editorInputActions = this.getEditorActionsForContext({ input: input, editor: editor, position: position }, editor, position);
 
-		return this.gridWidget.getViewSize(groupView);
-	}
-
-	setSize(group: IEditorGroupView | GroupIdentifier, size: { width: number; height: number }): void {
-		const groupView = this.assertGroupView(group);
-
-		this.gridWidget.resizeView(groupView, size);
-	}
-
-	arrangeGroups(arrangement: GroupsArrangement, target = this.activeGroup): void {
-		if (this.count < 2) {
-			return; // require at least 2 groups to show
+			primaryActions.push(...editorInputActions.primary);
+			secondaryActions.push(...editorInputActions.secondary);
 		}
 
-		if (!this.gridWidget) {
-			return; // we have not been created yet
+		// Apply to title in side by side control
+		this.sideBySideControl.setTitle(position, input, prepareActions(primaryActions), prepareActions(secondaryActions), isActive);
+	}
+
+	private getEditorActionsForContext(context: BaseEditor, editor: BaseEditor, position: Position): IEditorActions;
+	private getEditorActionsForContext(context: IEditorInputActionContext, editor: BaseEditor, position: Position): IEditorActions;
+	private getEditorActionsForContext(context: any, editor: BaseEditor, position: Position): IEditorActions {
+		let primaryActions: IAction[] = [];
+		let secondaryActions: IAction[] = [];
+
+		// From Editor
+		if (context instanceof BaseEditor) {
+			primaryActions.push(...(<BaseEditor>context).getActions());
+			secondaryActions.push(...(<BaseEditor>context).getSecondaryActions());
 		}
 
-		switch (arrangement) {
-			case GroupsArrangement.EVEN:
-				this.gridWidget.distributeViewSizes();
-				break;
-			case GroupsArrangement.MINIMIZE_OTHERS:
-				this.gridWidget.maximizeViewSize(target);
-				break;
-			case GroupsArrangement.TOGGLE:
-				if (this.isGroupMaximized(target)) {
-					this.arrangeGroups(GroupsArrangement.EVEN);
+		// From Contributions
+		let actionBarRegistry = <IActionBarRegistry>Registry.as(ActionBarExtensions.Actionbar);
+		primaryActions.push(...actionBarRegistry.getActionBarActionsForContext(Scope.EDITOR, context));
+		secondaryActions.push(...actionBarRegistry.getSecondaryActionBarActionsForContext(Scope.EDITOR, context));
+
+		return {
+			primary: primaryActions,
+			secondary: secondaryActions
+		};
+	}
+
+	public createContentArea(parent: Builder): Builder {
+
+		// Content Container
+		let contentArea = $(parent)
+			.div()
+			.addClass('content');
+
+		// Side by Side Control
+		this.sideBySideControl = this.instantiationService.createInstance(SideBySideEditorControl, contentArea);
+		this.toUnbind.push(this.sideBySideControl.addListener(SideBySideEventType.EDITOR_FOCUS_CHANGED, () => { this.onEditorFocusChanged(); }));
+
+		// get settings
+		this.memento = this.getMemento(this.storageService, MementoScope.WORKSPACE);
+
+		return contentArea;
+	}
+
+	public restoreEditorState(inputsToOpen?: EditorInput[], options?: EditorOptions[]): TPromise<BaseEditor[]> {
+		let activeInput: EditorInput;
+		let inputsToRestore: EditorInput[];
+		let widthRatios: number[];
+
+		// Inputs are given, so just use them
+		if (inputsToOpen && inputsToOpen.length) {
+			if (inputsToOpen.length > 3) {
+				inputsToOpen = inputsToOpen.slice(inputsToOpen.length - 3); // make sure to reduce the array to the last 3 elements if n > 3
+			}
+
+			inputsToRestore = inputsToOpen;
+			widthRatios = (inputsToRestore.length === 3) ? [0.33, 0.33, 0.34] : (inputsToRestore.length === 2) ? [0.5, 0.5] : [1];
+		}
+
+		// Otherwise try to load from last session
+		else if (this.memento[EDITOR_STATE_STORAGE_KEY]) {
+			let editorState: IEditorState = this.memento[EDITOR_STATE_STORAGE_KEY];
+			if (editorState && editorState.editors) {
+
+				// Find inputs to restore
+				let registry = (<IEditorRegistry>Registry.as(EditorExtensions.Editors));
+				let inputs: EditorInput[] = [];
+
+				widthRatios = editorState.widthRatio;
+
+				for (let i = 0; i < editorState.editors.length; i++) {
+					let state = editorState.editors[i];
+					let factory = registry.getEditorInputFactory(state.inputId);
+					if (factory && types.isString(state.inputValue)) {
+						let input = factory.deserialize(this.instantiationService, state.inputValue);
+						if (input) {
+							if (state.hasFocus) {
+								activeInput = input;
+							}
+							inputs.push(input);
+						}
+					}
+				}
+
+				if (inputs.length) {
+					inputsToRestore = inputs;
+				}
+			}
+		}
+
+		// Do the restore
+		if (inputsToRestore && inputsToRestore.length) {
+
+			// Pick first input if we didnt find any active input from memento
+			if (!activeInput && inputsToRestore.length) {
+				activeInput = inputsToRestore[0];
+			}
+
+			// Reset width ratios if they dont match with the number of editors to restore
+			if (widthRatios && widthRatios.length !== inputsToRestore.length) {
+				widthRatios = inputsToRestore.length === 2 ? [0.5, 0.5] : null;
+			}
+
+			// Open editor inputs in parallel if any
+			let promises: Promise[] = [];
+			inputsToRestore.forEach((input, index) => {
+				let preserveFocus = (input !== activeInput);
+				let option: EditorOptions;
+				if (options && options[index]) {
+					option = options[index];
+					option.preserveFocus = preserveFocus;
 				} else {
-					this.arrangeGroups(GroupsArrangement.MINIMIZE_OTHERS);
+					option = EditorOptions.create({ preserveFocus: preserveFocus });
 				}
 
-				break;
-		}
-	}
-
-	private isGroupMaximized(targetGroup: IEditorGroupView): boolean {
-		for (const group of this.groups) {
-			if (group === targetGroup) {
-				continue; // ignore target group
-			}
-
-			if (!group.isMinimized) {
-				return false; // target cannot be maximized if one group is not minimized
-			}
-		}
-
-		return true;
-	}
-
-	setGroupOrientation(orientation: GroupOrientation): void {
-		if (!this.gridWidget) {
-			return; // we have not been created yet
-		}
-
-		const newOrientation = (orientation === GroupOrientation.HORIZONTAL) ? Orientation.HORIZONTAL : Orientation.VERTICAL;
-		if (this.gridWidget.orientation !== newOrientation) {
-			this.gridWidget.orientation = newOrientation;
-		}
-	}
-
-	applyLayout(layout: EditorGroupLayout): void {
-		const restoreFocus = this.shouldRestoreFocus(this.container);
-
-		// Determine how many groups we need overall
-		let layoutGroupsCount = 0;
-		function countGroups(groups: GroupLayoutArgument[]): void {
-			for (const group of groups) {
-				if (Array.isArray(group.groups)) {
-					countGroups(group.groups);
-				} else {
-					layoutGroupsCount++;
-				}
-			}
-		}
-		countGroups(layout.groups);
-
-		// If we currently have too many groups, merge them into the last one
-		let currentGroupViews = this.getGroups(GroupsOrder.GRID_APPEARANCE);
-		if (layoutGroupsCount < currentGroupViews.length) {
-			const lastGroupInLayout = currentGroupViews[layoutGroupsCount - 1];
-			currentGroupViews.forEach((group, index) => {
-				if (index >= layoutGroupsCount) {
-					this.mergeGroup(group, lastGroupInLayout);
-				}
+				promises.push(this.openEditor(input, option, index, widthRatios));
 			});
 
-			currentGroupViews = this.getGroups(GroupsOrder.GRID_APPEARANCE);
-		}
-
-		const activeGroup = this.activeGroup;
-
-		// Prepare grid descriptor to create new grid from
-		const gridDescriptor = createSerializedGrid({
-			orientation: this.toGridViewOrientation(
-				layout.orientation,
-				this.isTwoDimensionalGrid() ?
-					this.gridWidget.orientation :			// preserve original orientation for 2-dimensional grids
-					orthogonal(this.gridWidget.orientation) // otherwise flip (fix https://github.com/microsoft/vscode/issues/52975)
-			),
-			groups: layout.groups
-		});
-
-		// Recreate gridwidget with descriptor
-		this.doCreateGridControlWithState(gridDescriptor, activeGroup.id, currentGroupViews);
-
-		// Layout
-		this.doLayout(this._contentDimension, 0, 0);
-
-		// Update container
-		this.updateContainer();
-
-		// Events for groups that got added
-		for (const groupView of this.getGroups(GroupsOrder.GRID_APPEARANCE)) {
-			if (!currentGroupViews.includes(groupView)) {
-				this._onDidAddGroup.fire(groupView);
-			}
-		}
-
-		// Notify group index change given layout has changed
-		this.notifyGroupIndexChange();
-
-		// Restore focus as needed
-		if (restoreFocus) {
-			this._activeGroup.focus();
-		}
-	}
-
-	private shouldRestoreFocus(target: Element | undefined): boolean {
-		if (!target) {
-			return false;
-		}
-
-		const activeElement = document.activeElement;
-
-		if (activeElement === document.body) {
-			return true; // always restore focus if nothing is focused currently
-		}
-
-		// otherwise check for the active element being an ancestor of the target
-		return isAncestor(activeElement, target);
-	}
-
-	private isTwoDimensionalGrid(): boolean {
-		const views = this.gridWidget.getViews();
-		if (isGridBranchNode(views)) {
-			// the grid is 2-dimensional if any children
-			// of the grid is a branch node
-			return views.children.some(child => isGridBranchNode(child));
-		}
-
-		return false;
-	}
-
-	addGroup(location: IEditorGroupView | GroupIdentifier, direction: GroupDirection, options?: IAddGroupOptions): IEditorGroupView {
-		const locationView = this.assertGroupView(location);
-
-		const group = this.doAddGroup(locationView, direction);
-
-		if (options?.activate) {
-			this.doSetGroupActive(group);
-		}
-
-		return group;
-	}
-
-	private doAddGroup(locationView: IEditorGroupView, direction: GroupDirection, groupToCopy?: IEditorGroupView): IEditorGroupView {
-		const newGroupView = this.doCreateGroupView(groupToCopy);
-
-		// Add to grid widget
-		this.gridWidget.addView(
-			newGroupView,
-			this.getSplitSizingStyle(),
-			locationView,
-			this.toGridViewDirection(direction),
-		);
-
-		// Update container
-		this.updateContainer();
-
-		// Event
-		this._onDidAddGroup.fire(newGroupView);
-
-		// Notify group index change given a new group was added
-		this.notifyGroupIndexChange();
-
-		return newGroupView;
-	}
-
-	private getSplitSizingStyle(): Sizing {
-		return this._partOptions.splitSizing === 'split' ? Sizing.Split : Sizing.Distribute;
-	}
-
-	private doCreateGroupView(from?: IEditorGroupView | ISerializedEditorGroupModel | null): IEditorGroupView {
-
-		// Create group view
-		let groupView: IEditorGroupView;
-		if (from instanceof EditorGroupView) {
-			groupView = EditorGroupView.createCopy(from, this, this.count, this.instantiationService);
-		} else if (isSerializedEditorGroupModel(from)) {
-			groupView = EditorGroupView.createFromSerialized(from, this, this.count, this.instantiationService);
-		} else {
-			groupView = EditorGroupView.createNew(this, this.count, this.instantiationService);
-		}
-
-		// Keep in map
-		this.groupViews.set(groupView.id, groupView);
-
-		// Track focus
-		const groupDisposables = new DisposableStore();
-		groupDisposables.add(groupView.onDidFocus(() => {
-			this.doSetGroupActive(groupView);
-		}));
-
-		// Track group changes
-		groupDisposables.add(groupView.onDidModelChange(e => {
-			switch (e.kind) {
-				case GroupModelChangeKind.GROUP_LOCKED:
-					this._onDidChangeGroupLocked.fire(groupView);
-					break;
-				case GroupModelChangeKind.GROUP_INDEX:
-					this._onDidChangeGroupIndex.fire(groupView);
-					break;
-			}
-		}));
-
-		// Track active editor change after it occurred
-		groupDisposables.add(groupView.onDidActiveEditorChange(() => {
-			this.updateContainer();
-		}));
-
-		// Track dispose
-		Event.once(groupView.onWillDispose)(() => {
-			dispose(groupDisposables);
-			this.groupViews.delete(groupView.id);
-			this.doUpdateMostRecentActive(groupView);
-		});
-
-		return groupView;
-	}
-
-	private doSetGroupActive(group: IEditorGroupView): void {
-		if (this._activeGroup === group) {
-			return; // return if this is already the active group
-		}
-
-		const previousActiveGroup = this._activeGroup;
-		this._activeGroup = group;
-
-		// Update list of most recently active groups
-		this.doUpdateMostRecentActive(group, true);
-
-		// Mark previous one as inactive
-		if (previousActiveGroup) {
-			previousActiveGroup.setActive(false);
-		}
-
-		// Mark group as new active
-		group.setActive(true);
-
-		// Maximize the group if it is currently minimized
-		this.doRestoreGroup(group);
-
-		// Event
-		this._onDidChangeActiveGroup.fire(group);
-	}
-
-	private doRestoreGroup(group: IEditorGroupView): void {
-		if (this.gridWidget) {
-			const viewSize = this.gridWidget.getViewSize(group);
-			if (viewSize.width === group.minimumWidth || viewSize.height === group.minimumHeight) {
-				this.arrangeGroups(GroupsArrangement.MINIMIZE_OTHERS, group);
-			}
-		}
-	}
-
-	private doUpdateMostRecentActive(group: IEditorGroupView, makeMostRecentlyActive?: boolean): void {
-		const index = this.mostRecentActiveGroups.indexOf(group.id);
-
-		// Remove from MRU list
-		if (index !== -1) {
-			this.mostRecentActiveGroups.splice(index, 1);
-		}
-
-		// Add to front as needed
-		if (makeMostRecentlyActive) {
-			this.mostRecentActiveGroups.unshift(group.id);
-		}
-	}
-
-	private toGridViewDirection(direction: GroupDirection): Direction {
-		switch (direction) {
-			case GroupDirection.UP: return Direction.Up;
-			case GroupDirection.DOWN: return Direction.Down;
-			case GroupDirection.LEFT: return Direction.Left;
-			case GroupDirection.RIGHT: return Direction.Right;
-		}
-	}
-
-	private toGridViewOrientation(orientation: GroupOrientation, fallback: Orientation): Orientation {
-		if (typeof orientation === 'number') {
-			return orientation === GroupOrientation.HORIZONTAL ? Orientation.HORIZONTAL : Orientation.VERTICAL;
-		}
-
-		return fallback;
-	}
-
-	removeGroup(group: IEditorGroupView | GroupIdentifier): void {
-		const groupView = this.assertGroupView(group);
-		if (this.count === 1) {
-			return; // Cannot remove the last root group
-		}
-
-		// Remove empty group
-		if (groupView.isEmpty) {
-			return this.doRemoveEmptyGroup(groupView);
-		}
-
-		// Remove group with editors
-		this.doRemoveGroupWithEditors(groupView);
-	}
-
-	private doRemoveGroupWithEditors(groupView: IEditorGroupView): void {
-		const mostRecentlyActiveGroups = this.getGroups(GroupsOrder.MOST_RECENTLY_ACTIVE);
-
-		let lastActiveGroup: IEditorGroupView;
-		if (this._activeGroup === groupView) {
-			lastActiveGroup = mostRecentlyActiveGroups[1];
-		} else {
-			lastActiveGroup = mostRecentlyActiveGroups[0];
-		}
-
-		// Removing a group with editors should merge these editors into the
-		// last active group and then remove this group.
-		this.mergeGroup(groupView, lastActiveGroup);
-	}
-
-	private doRemoveEmptyGroup(groupView: IEditorGroupView): void {
-		const restoreFocus = this.shouldRestoreFocus(this.container);
-
-		// Activate next group if the removed one was active
-		if (this._activeGroup === groupView) {
-			const mostRecentlyActiveGroups = this.getGroups(GroupsOrder.MOST_RECENTLY_ACTIVE);
-			const nextActiveGroup = mostRecentlyActiveGroups[1]; // [0] will be the current group we are about to dispose
-			this.activateGroup(nextActiveGroup);
-		}
-
-		// Remove from grid widget & dispose
-		this.gridWidget.removeView(groupView, this.getSplitSizingStyle());
-		groupView.dispose();
-
-		// Restore focus if we had it previously (we run this after gridWidget.removeView() is called
-		// because removing a view can mean to reparent it and thus focus would be removed otherwise)
-		if (restoreFocus) {
-			this._activeGroup.focus();
-		}
-
-		// Notify group index change given a group was removed
-		this.notifyGroupIndexChange();
-
-		// Update container
-		this.updateContainer();
-
-		// Update locked state: clear when we are at just 1 group
-		if (this.count === 1) {
-			firstOrDefault(this.groups)?.lock(false);
-		}
-
-		// Event
-		this._onDidRemoveGroup.fire(groupView);
-	}
-
-	moveGroup(group: IEditorGroupView | GroupIdentifier, location: IEditorGroupView | GroupIdentifier, direction: GroupDirection): IEditorGroupView {
-		const sourceView = this.assertGroupView(group);
-		const targetView = this.assertGroupView(location);
-
-		if (sourceView.id === targetView.id) {
-			throw new Error('Cannot move group into its own');
-		}
-
-		const restoreFocus = this.shouldRestoreFocus(sourceView.element);
-
-		// Move through grid widget API
-		this.gridWidget.moveView(sourceView, this.getSplitSizingStyle(), targetView, this.toGridViewDirection(direction));
-
-		// Restore focus if we had it previously (we run this after gridWidget.removeView() is called
-		// because removing a view can mean to reparent it and thus focus would be removed otherwise)
-		if (restoreFocus) {
-			sourceView.focus();
-		}
-
-		// Event
-		this._onDidMoveGroup.fire(sourceView);
-
-		// Notify group index change given a group was moved
-		this.notifyGroupIndexChange();
-
-		return sourceView;
-	}
-
-	copyGroup(group: IEditorGroupView | GroupIdentifier, location: IEditorGroupView | GroupIdentifier, direction: GroupDirection): IEditorGroupView {
-		const groupView = this.assertGroupView(group);
-		const locationView = this.assertGroupView(location);
-
-		const restoreFocus = this.shouldRestoreFocus(groupView.element);
-
-		// Copy the group view
-		const copiedGroupView = this.doAddGroup(locationView, direction, groupView);
-
-		// Restore focus if we had it
-		if (restoreFocus) {
-			copiedGroupView.focus();
-		}
-
-		return copiedGroupView;
-	}
-
-	mergeGroup(group: IEditorGroupView | GroupIdentifier, target: IEditorGroupView | GroupIdentifier, options?: IMergeGroupOptions): IEditorGroupView {
-		const sourceView = this.assertGroupView(group);
-		const targetView = this.assertGroupView(target);
-
-		// Collect editors to move/copy
-		const editors: EditorInputWithOptions[] = [];
-		let index = (options && typeof options.index === 'number') ? options.index : targetView.count;
-		for (const editor of sourceView.editors) {
-			const inactive = !sourceView.isActive(editor) || this._activeGroup !== sourceView;
-			const sticky = sourceView.isSticky(editor);
-			const options = { index: !sticky ? index : undefined /* do not set index to preserve sticky flag */, inactive, preserveFocus: inactive };
-
-			editors.push({ editor, options });
-
-			index++;
-		}
-
-		// Move/Copy editors over into target
-		if (options?.mode === MergeGroupMode.COPY_EDITORS) {
-			sourceView.copyEditors(editors, targetView);
-		} else {
-			sourceView.moveEditors(editors, targetView);
-		}
-
-		// Remove source if the view is now empty and not already removed
-		if (sourceView.isEmpty && !sourceView.disposed /* could have been disposed already via workbench.editor.closeEmptyGroups setting */) {
-			this.removeGroup(sourceView);
-		}
-
-		return targetView;
-	}
-
-	mergeAllGroups(target = this.activeGroup): IEditorGroupView {
-		for (const group of this.getGroups(GroupsOrder.MOST_RECENTLY_ACTIVE)) {
-			if (group === target) {
-				continue; // keep target
-			}
-
-			this.mergeGroup(group, target);
-		}
-
-		return target;
-	}
-
-	private assertGroupView(group: IEditorGroupView | GroupIdentifier): IEditorGroupView {
-		let groupView: IEditorGroupView | undefined;
-		if (typeof group === 'number') {
-			groupView = this.getGroup(group);
-		} else {
-			groupView = group;
-		}
-
-		if (!groupView) {
-			throw new Error('Invalid editor group provided!');
-		}
-
-		return groupView;
-	}
-
-	//#endregion
-
-	//#region IEditorDropService
-
-	createEditorDropTarget(container: HTMLElement, delegate: IEditorDropTargetDelegate): IDisposable {
-		return this.instantiationService.createInstance(EditorDropTarget, this, container, delegate);
-	}
-
-	//#endregion
-
-	//#region Part
-
-	// TODO @sbatten @joao find something better to prevent editor taking over #79897
-	get minimumWidth(): number { return Math.min(this.centeredLayoutWidget.minimumWidth, this.layoutService.getMaximumEditorDimensions().width); }
-	get maximumWidth(): number { return this.centeredLayoutWidget.maximumWidth; }
-	get minimumHeight(): number { return Math.min(this.centeredLayoutWidget.minimumHeight, this.layoutService.getMaximumEditorDimensions().height); }
-	get maximumHeight(): number { return this.centeredLayoutWidget.maximumHeight; }
-
-	get snap(): boolean { return this.layoutService.getPanelAlignment() === 'center'; }
-
-	override get onDidChange(): Event<IViewSize | undefined> { return Event.any(this.centeredLayoutWidget.onDidChange, this.onDidSetGridWidget.event); }
-	readonly priority: LayoutPriority = LayoutPriority.High;
-
-	private get gridSeparatorBorder(): Color {
-		return this.theme.getColor(EDITOR_GROUP_BORDER) || this.theme.getColor(contrastBorder) || Color.transparent;
-	}
-
-	override updateStyles(): void {
-		const container = assertIsDefined(this.container);
-		container.style.backgroundColor = this.getColor(editorBackground) || '';
-
-		const separatorBorderStyle = { separatorBorder: this.gridSeparatorBorder, background: this.theme.getColor(EDITOR_PANE_BACKGROUND) || Color.transparent };
-		this.gridWidget.style(separatorBorderStyle);
-		this.centeredLayoutWidget.styles(separatorBorderStyle);
-	}
-
-	override createContentArea(parent: HTMLElement, options?: IEditorPartCreationOptions): HTMLElement {
-
-		// Container
-		this.element = parent;
-		this.container = document.createElement('div');
-		this.container.classList.add('content');
-		parent.appendChild(this.container);
-
-		// Grid control
-		this.doCreateGridControl(options);
-
-		// Centered layout widget
-		this.centeredLayoutWidget = this._register(new CenteredViewLayout(this.container, this.gridWidgetView, this.globalMemento[EditorPart.EDITOR_PART_CENTERED_VIEW_STORAGE_KEY]));
-
-		// Drag & Drop support
-		this.setupDragAndDropSupport(parent, this.container);
-
-		// Signal ready
-		this.whenReadyPromise.complete();
-		this._isReady = true;
-
-		// Signal restored
-		Promises.settled(this.groups.map(group => group.whenRestored)).finally(() => {
-			this.whenRestoredPromise.complete();
-		});
-
-		return this.container;
-	}
-
-	private setupDragAndDropSupport(parent: HTMLElement, container: HTMLElement): void {
-
-		// Editor drop target
-		this._register(this.createEditorDropTarget(container, Object.create(null)));
-
-		// No drop in the editor
-		const overlay = document.createElement('div');
-		overlay.classList.add('drop-block-overlay');
-		parent.appendChild(overlay);
-
-		// Hide the block if a mouse down event occurs #99065
-		this._register(addDisposableGenericMouseDownListener(overlay, () => overlay.classList.remove('visible')));
-
-		this._register(CompositeDragAndDropObserver.INSTANCE.registerTarget(this.element, {
-			onDragStart: e => overlay.classList.add('visible'),
-			onDragEnd: e => overlay.classList.remove('visible')
-		}));
-
-		let horizontalOpenerTimeout: any;
-		let verticalOpenerTimeout: any;
-		let lastOpenHorizontalPosition: Position | undefined;
-		let lastOpenVerticalPosition: Position | undefined;
-		const openPartAtPosition = (position: Position) => {
-			if (!this.layoutService.isVisible(Parts.PANEL_PART) && position === this.layoutService.getPanelPosition()) {
-				this.layoutService.setPartHidden(false, Parts.PANEL_PART);
-			} else if (!this.layoutService.isVisible(Parts.AUXILIARYBAR_PART) && position === (this.layoutService.getSideBarPosition() === Position.RIGHT ? Position.LEFT : Position.RIGHT)) {
-				this.layoutService.setPartHidden(false, Parts.AUXILIARYBAR_PART);
-			}
-		};
-
-		const clearAllTimeouts = () => {
-			if (horizontalOpenerTimeout) {
-				clearTimeout(horizontalOpenerTimeout);
-				horizontalOpenerTimeout = undefined;
-			}
-
-			if (verticalOpenerTimeout) {
-				clearTimeout(verticalOpenerTimeout);
-				verticalOpenerTimeout = undefined;
-			}
-		};
-
-		this._register(CompositeDragAndDropObserver.INSTANCE.registerTarget(overlay, {
-			onDragOver: e => {
-				EventHelper.stop(e.eventData, true);
-				if (e.eventData.dataTransfer) {
-					e.eventData.dataTransfer.dropEffect = 'none';
+			return Promise.join(promises).then(() => {
+
+				// Workaround for bad layout issue: If any of the editors fails to load, reset side by side by closing
+				// all editors. This fixes an issue where a side editor might show, but no editor to the left hand side.
+				if (this.getVisibleEditors().length !== inputsToRestore.length) {
+					this.closeEditors().done(null, errors.onUnexpectedError);
 				}
 
-				const boundingRect = overlay.getBoundingClientRect();
-
-				let openHorizontalPosition: Position | undefined = undefined;
-				let openVerticalPosition: Position | undefined = undefined;
-				const proximity = 100;
-				if (e.eventData.clientX < boundingRect.left + proximity) {
-					openHorizontalPosition = Position.LEFT;
-				}
-
-				if (e.eventData.clientX > boundingRect.right - proximity) {
-					openHorizontalPosition = Position.RIGHT;
-				}
-
-				if (e.eventData.clientY > boundingRect.bottom - proximity) {
-					openVerticalPosition = Position.BOTTOM;
-				}
-
-				if (horizontalOpenerTimeout && openHorizontalPosition !== lastOpenHorizontalPosition) {
-					clearTimeout(horizontalOpenerTimeout);
-					horizontalOpenerTimeout = undefined;
-				}
-
-				if (verticalOpenerTimeout && openVerticalPosition !== lastOpenVerticalPosition) {
-					clearTimeout(verticalOpenerTimeout);
-					verticalOpenerTimeout = undefined;
-				}
-
-				if (!horizontalOpenerTimeout && openHorizontalPosition !== undefined) {
-					lastOpenHorizontalPosition = openHorizontalPosition;
-					horizontalOpenerTimeout = setTimeout(() => openPartAtPosition(openHorizontalPosition!), 200);
-				}
-
-				if (!verticalOpenerTimeout && openVerticalPosition !== undefined) {
-					lastOpenVerticalPosition = openVerticalPosition;
-					verticalOpenerTimeout = setTimeout(() => openPartAtPosition(openVerticalPosition!), 200);
-				}
-			},
-			onDragLeave: () => clearAllTimeouts(),
-			onDragEnd: () => clearAllTimeouts(),
-			onDrop: () => clearAllTimeouts()
-		}));
-	}
-
-	centerLayout(active: boolean): void {
-		this.centeredLayoutWidget.activate(active);
-
-		this._activeGroup.focus();
-	}
-
-	isLayoutCentered(): boolean {
-		if (this.centeredLayoutWidget) {
-			return this.centeredLayoutWidget.isActive();
+				// Full layout side by side
+				this.sideBySideControl.layout(this.dimension);
+			});
 		}
 
-		return false;
+		return TPromise.as(null);
 	}
 
-	private doCreateGridControl(options?: IEditorPartCreationOptions): void {
+	private onEditorFocusChanged(): void {
 
-		// Grid Widget (with previous UI state)
-		let restoreError = false;
-		if (!options || options.restorePreviousState) {
-			restoreError = !this.doCreateGridControlWithPreviousState();
+		// Emit as editor input change event so that clients get aware of new active editor
+		let activeEditor = this.sideBySideControl.getActiveEditor();
+		if (activeEditor) {
+			this.emit(WorkbenchEventType.EDITOR_INPUT_CHANGING, new EditorEvent(activeEditor, activeEditor.getId(), activeEditor.input, null, activeEditor.position));
+			this.emit(WorkbenchEventType.EDITOR_INPUT_CHANGED, new EditorEvent(activeEditor, activeEditor.getId(), activeEditor.input, null, activeEditor.position));
 		}
 
-		// Grid Widget (no previous UI state or failed to restore)
-		if (!this.gridWidget || restoreError) {
-			const initialGroup = this.doCreateGroupView();
-			this.doSetGridWidget(new SerializableGrid(initialGroup));
-
-			// Ensure a group is active
-			this.doSetGroupActive(initialGroup);
-		}
-
-		// Update container
-		this.updateContainer();
-
-		// Notify group index change we created the entire grid
-		this.notifyGroupIndexChange();
+		// Update Title Area
+		this.updateEditorTitleArea();
 	}
 
-	private doCreateGridControlWithPreviousState(): boolean {
-		const uiState: IEditorPartUIState = this.workspaceMemento[EditorPart.EDITOR_PART_UI_STATE_STORAGE_KEY];
-		if (uiState?.serializedGrid) {
-			try {
+	public layout(dimension: Dimension): Dimension[] {
 
-				// MRU
-				this.mostRecentActiveGroups = uiState.mostRecentActiveGroups;
+		// Pass to super
+		let sizes = super.layout(dimension);
 
-				// Grid Widget
-				this.doCreateGridControlWithState(uiState.serializedGrid, uiState.activeGroup);
+		// Pass to Side by Side Control
+		this.dimension = sizes[1];
+		this.sideBySideControl.layout(this.dimension);
 
-				// Ensure last active group has focus
-				this._activeGroup.focus();
-			} catch (error) {
-
-				// Log error
-				onUnexpectedError(new Error(`Error restoring editor grid widget: ${error} (with state: ${JSON.stringify(uiState)})`));
-
-				// Clear any state we have from the failing restore
-				this.groupViews.forEach(group => group.dispose());
-				this.groupViews.clear();
-				this.mostRecentActiveGroups = [];
-
-				return false; // failure
-			}
-		}
-
-		return true; // success
+		return sizes;
 	}
 
-	private doCreateGridControlWithState(serializedGrid: ISerializedGrid, activeGroupId: GroupIdentifier, editorGroupViewsToReuse?: IEditorGroupView[]): void {
+	private onSetInputError(e: any, editor: BaseEditor, input: EditorInput, options: EditorOptions, position: Position): void {
 
-		// Determine group views to reuse if any
-		let reuseGroupViews: IEditorGroupView[];
-		if (editorGroupViewsToReuse) {
-			reuseGroupViews = editorGroupViewsToReuse.slice(0); // do not modify original array
-		} else {
-			reuseGroupViews = [];
-		}
+		// only show an error if this was not us restoring previous error state
+		if (this.partService.isCreated() && !errors.isPromiseCanceledError(e)) {
+			let errorMessage = nls.localize('editorOpenError', "Unable to open '{0}': {1}.", input.getName(), errors.toErrorMessage(e));
 
-		// Create new
-		const groupViews: IEditorGroupView[] = [];
-		const gridWidget = SerializableGrid.deserialize(serializedGrid, {
-			fromJSON: (serializedEditorGroup: ISerializedEditorGroupModel | null) => {
-				let groupView: IEditorGroupView;
-				if (reuseGroupViews.length > 0) {
-					groupView = reuseGroupViews.shift()!;
-				} else {
-					groupView = this.doCreateGroupView(serializedEditorGroup);
-				}
-
-				groupViews.push(groupView);
-
-				if (groupView.id === activeGroupId) {
-					this.doSetGroupActive(groupView);
-				}
-
-				return groupView;
-			}
-		}, { styles: { separatorBorder: this.gridSeparatorBorder } });
-
-		// If the active group was not found when restoring the grid
-		// make sure to make at least one group active. We always need
-		// an active group.
-		if (!this._activeGroup) {
-			this.doSetGroupActive(groupViews[0]);
-		}
-
-		// Validate MRU group views matches grid widget state
-		if (this.mostRecentActiveGroups.some(groupId => !this.getGroup(groupId))) {
-			this.mostRecentActiveGroups = groupViews.map(group => group.id);
-		}
-
-		// Set it
-		this.doSetGridWidget(gridWidget);
-	}
-
-	private doSetGridWidget(gridWidget: SerializableGrid<IEditorGroupView>): void {
-		let boundarySashes: IBoundarySashes = {};
-
-		if (this.gridWidget) {
-			boundarySashes = this.gridWidget.boundarySashes;
-			this.gridWidget.dispose();
-		}
-
-		this.gridWidget = gridWidget;
-		this.gridWidget.boundarySashes = boundarySashes;
-		this.gridWidgetView.gridWidget = gridWidget;
-
-		this._onDidChangeSizeConstraints.input = gridWidget.onDidChange;
-
-		this.onDidSetGridWidget.fire(undefined);
-	}
-
-	private updateContainer(): void {
-		const container = assertIsDefined(this.container);
-		container.classList.toggle('empty', this.isEmpty);
-	}
-
-	private notifyGroupIndexChange(): void {
-		this.getGroups(GroupsOrder.GRID_APPEARANCE).forEach((group, index) => group.notifyIndexChanged(index));
-	}
-
-	private get isEmpty(): boolean {
-		return this.count === 1 && this._activeGroup.isEmpty;
-	}
-
-	setBoundarySashes(sashes: IBoundarySashes): void {
-		this.gridWidget.boundarySashes = sashes;
-		this.centeredLayoutWidget.boundarySashes = sashes;
-	}
-
-	override layout(width: number, height: number, top: number, left: number): void {
-
-		// Layout contents
-		const contentAreaSize = super.layoutContents(width, height).contentSize;
-
-		// Layout editor container
-		this.doLayout(Dimension.lift(contentAreaSize), top, left);
-	}
-
-	private doLayout(dimension: Dimension, top: number, left: number): void {
-		this._contentDimension = dimension;
-
-		// Layout Grid
-		this.centeredLayoutWidget.layout(this._contentDimension.width, this._contentDimension.height, top, left);
-
-		// Event
-		this._onDidLayout.fire(dimension);
-	}
-
-	protected override saveState(): void {
-
-		// Persist grid UI state
-		if (this.gridWidget) {
-			const uiState: IEditorPartUIState = {
-				serializedGrid: this.gridWidget.serialize(),
-				activeGroup: this._activeGroup.id,
-				mostRecentActiveGroups: this.mostRecentActiveGroups
-			};
-
-			if (this.isEmpty) {
-				delete this.workspaceMemento[EditorPart.EDITOR_PART_UI_STATE_STORAGE_KEY];
+			let error: any;
+			if (e && (<IMessageWithAction>e).actions && (<IMessageWithAction>e).actions.length) {
+				error = errors.create(errorMessage, { actions: (<IMessageWithAction>e).actions }); // Support error actions from thrower
 			} else {
-				this.workspaceMemento[EditorPart.EDITOR_PART_UI_STATE_STORAGE_KEY] = uiState;
+				error = errorMessage;
+			}
+
+			this.showError(error);
+		}
+
+		this.sideBySideControl.getProgressBar(position).done().getContainer().hide();
+		this.emit(WorkbenchEventType.EDITOR_SET_INPUT_ERROR, new EditorEvent(editor, editor.getId(), input, options, position));
+	}
+
+	private showError(e: any): () => void {
+		return this.messageService.show(Severity.Error, types.isString(e) ? new Error(e) : e);
+	}
+
+	public shutdown(): void {
+
+		// Persist Editor State
+		this.saveEditorState();
+
+		// Unload all Instantiated Editors
+		for (let i = 0; i < this.instantiatedEditors.length; i++) {
+			for (let j = 0; j < this.instantiatedEditors[i].length; j++) {
+				this.instantiatedEditors[i][j].shutdown();
 			}
 		}
 
-		// Persist centered view state
-		if (this.centeredLayoutWidget) {
-			const centeredLayoutState = this.centeredLayoutWidget.state;
-			if (this.centeredLayoutWidget.isDefault(centeredLayoutState)) {
-				delete this.globalMemento[EditorPart.EDITOR_PART_CENTERED_VIEW_STORAGE_KEY];
-			} else {
-				this.globalMemento[EditorPart.EDITOR_PART_CENTERED_VIEW_STORAGE_KEY] = centeredLayoutState;
+		// Pass to super
+		super.shutdown();
+	}
+
+	private saveEditorState(): void {
+		let registry = (<IEditorRegistry>Registry.as(EditorExtensions.Editors));
+		let editors = this.getVisibleEditors();
+		let activeEditor = this.getActiveEditor();
+
+		let widthRatios = this.sideBySideControl.getWidthRatios();
+		let editorState: IEditorState = { editors: [], widthRatio: widthRatios };
+		this.memento[EDITOR_STATE_STORAGE_KEY] = editorState;
+
+		// For each visible editor
+		for (let i = 0; i < editors.length; i++) {
+			let editor = editors[i];
+			let input = editor.input;
+
+			// Serialize through factory
+			if (input) {
+				let factory = registry.getEditorInputFactory(input.getId());
+				if (factory) {
+					let serialized = factory.serialize(input);
+					editorState.editors.push({
+						inputId: input.getId(),
+						inputValue: serialized,
+						hasFocus: activeEditor === editor
+					});
+				}
+			}
+		}
+	}
+
+	public dispose(): void {
+		this.mapEditorToEditorContainers = null;
+		this.mapActionsToEditors = null;
+
+		// Reset Tokens
+		this.editorOpenToken = [];
+		for (let i = 0; i < POSITIONS.length; i++) {
+			this.editorOpenToken[i] = 0;
+		}
+
+		// Widgets
+		this.sideBySideControl.dispose();
+
+		// Editor listeners
+		for (let i = 0; i < this.visibleEditorListeners.length; i++) {
+			while (this.visibleEditorListeners[i].length) {
+				this.visibleEditorListeners[i].pop()();
 			}
 		}
 
-		super.saveState();
-	}
+		// Input listeners
+		for (let i = 0; i < this.visibleInputListeners.length; i++) {
+			let listener = this.visibleInputListeners[i];
+			if (listener) {
+				listener();
+			}
 
-	toJSON(): object {
-		return {
-			type: Parts.EDITOR_PART
-		};
-	}
+			this.visibleInputListeners = [];
+		}
 
-	override dispose(): void {
+		// Pass to active editors
+		this.visibleEditors.forEach((editor) => {
+			if (editor) {
+				editor.dispose();
+			}
+		});
 
-		// Forward to all groups
-		this.groupViews.forEach(group => group.dispose());
-		this.groupViews.clear();
+		// Pass to instantiated editors
+		for (var i = 0; i < this.instantiatedEditors.length; i++) {
+			for (var j = 0; j < this.instantiatedEditors[i].length; j++) {
+				if (this.visibleEditors.some((editor) => editor === this.instantiatedEditors[i][j])) {
+					continue;
+				}
 
-		// Grid widget
-		this.gridWidget?.dispose();
+				this.instantiatedEditors[i][j].dispose();
+			}
+		}
 
+		this.visibleEditors = null;
+		this.visibleInputs = null;
+
+		// Pass to super
 		super.dispose();
 	}
-
-	//#endregion
 }
-
-class EditorDropService implements IEditorDropService {
-
-	declare readonly _serviceBrand: undefined;
-
-	constructor(@IEditorGroupsService private readonly editorPart: EditorPart) { }
-
-	createEditorDropTarget(container: HTMLElement, delegate: IEditorDropTargetDelegate): IDisposable {
-		return this.editorPart.createEditorDropTarget(container, delegate);
-	}
-}
-
-registerSingleton(IEditorGroupsService, EditorPart);
-registerSingleton(IEditorDropService, EditorDropService);

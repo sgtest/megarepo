@@ -2,85 +2,77 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+'use strict';
 
-import { Disposable } from 'vs/base/common/lifecycle';
-import { IDimension } from 'vs/editor/common/core/dimension';
-import { Emitter, Event } from 'vs/base/common/event';
+import Lifecycle = require('vs/base/common/lifecycle');
+import EditorBrowser = require('vs/editor/browser/editorBrowser');
+import EditorCommon = require('vs/editor/common/editorCommon');
 
-export class ElementSizeObserver extends Disposable {
+export class ElementSizeObserver implements Lifecycle.IDisposable {
 
-	private _onDidChange = this._register(new Emitter<void>());
-	public readonly onDidChange: Event<void> = this._onDidChange.event;
+	private referenceDomElement:HTMLElement;
+	private measureReferenceDomElementToken:number;
+	private changeCallback:()=>void;
+	private width:number;
+	private height:number;
 
-	private readonly _referenceDomElement: HTMLElement | null;
-	private _width: number;
-	private _height: number;
-	private _resizeObserver: ResizeObserver | null;
-
-	constructor(referenceDomElement: HTMLElement | null, dimension: IDimension | undefined) {
-		super();
-		this._referenceDomElement = referenceDomElement;
-		this._width = -1;
-		this._height = -1;
-		this._resizeObserver = null;
-		this.measureReferenceDomElement(false, dimension);
-	}
-
-	public override dispose(): void {
-		this.stopObserving();
-		super.dispose();
+	constructor(referenceDomElement:HTMLElement, changeCallback:()=>void) {
+		this.referenceDomElement = referenceDomElement;
+		this.changeCallback = changeCallback;
+		this.measureReferenceDomElementToken = -1;
+		this.width = -1;
+		this.height = -1;
+		this.measureReferenceDomElement(false);
 	}
 
 	public getWidth(): number {
-		return this._width;
+		return this.width;
 	}
 
 	public getHeight(): number {
-		return this._height;
+		return this.height;
+	}
+
+	public dispose(): void {
+		this.stopObserving();
 	}
 
 	public startObserving(): void {
-		if (!this._resizeObserver && this._referenceDomElement) {
-			this._resizeObserver = new ResizeObserver((entries) => {
-				if (entries && entries[0] && entries[0].contentRect) {
-					this.observe({ width: entries[0].contentRect.width, height: entries[0].contentRect.height });
-				} else {
-					this.observe();
-				}
-			});
-			this._resizeObserver.observe(this._referenceDomElement);
+		if (this.measureReferenceDomElementToken === -1) {
+			this.measureReferenceDomElementToken = window.setInterval(() => this.measureReferenceDomElement(true), 100);
 		}
 	}
 
 	public stopObserving(): void {
-		if (this._resizeObserver) {
-			this._resizeObserver.disconnect();
-			this._resizeObserver = null;
+		if (this.measureReferenceDomElementToken !== -1) {
+			window.clearInterval(this.measureReferenceDomElementToken);
+			this.measureReferenceDomElementToken = -1;
 		}
 	}
 
-	public observe(dimension?: IDimension): void {
+	public observe(dimension?:EditorCommon.IDimension): void {
 		this.measureReferenceDomElement(true, dimension);
 	}
 
-	private measureReferenceDomElement(emitEvent: boolean, dimension?: IDimension): void {
-		let observedWidth = 0;
-		let observedHeight = 0;
+	private measureReferenceDomElement(callChangeCallback:boolean, dimension?:EditorCommon.IDimension): void {
+		var observedWidth = 0;
+		var observedHeight = 0;
 		if (dimension) {
 			observedWidth = dimension.width;
 			observedHeight = dimension.height;
-		} else if (this._referenceDomElement) {
-			observedWidth = this._referenceDomElement.clientWidth;
-			observedHeight = this._referenceDomElement.clientHeight;
+		} else if (this.referenceDomElement) {
+			observedWidth = this.referenceDomElement.clientWidth;
+			observedHeight = this.referenceDomElement.clientHeight;
 		}
 		observedWidth = Math.max(5, observedWidth);
 		observedHeight = Math.max(5, observedHeight);
-		if (this._width !== observedWidth || this._height !== observedHeight) {
-			this._width = observedWidth;
-			this._height = observedHeight;
-			if (emitEvent) {
-				this._onDidChange.fire();
+		if (this.width !== observedWidth || this.height !== observedHeight) {
+			this.width = observedWidth;
+			this.height = observedHeight;
+			if (callChangeCallback) {
+				this.changeCallback();
 			}
 		}
 	}
+
 }

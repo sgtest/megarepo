@@ -1,31 +1,15 @@
 {
-	"extends": "./tsconfig.base.json",
 	"compilerOptions": {
+		"module": "amd",
+		"noImplicitAny": false,
 		"removeComments": false,
 		"preserveConstEnums": true,
+		"target": "ES5",
 		"sourceMap": false,
-		"outDir": "../out/vs",
-		"target": "es2020",
-		"types": [
-			"keytar",
-			"mocha",
-			"semver",
-			"sinon",
-			"winreg",
-			"trusted-types",
-			"wicg-file-system-access"
-		],
-		"plugins": [
-			{
-				"name": "tsec",
-				"exemptionConfig": "./tsec.exemptions.json"
-			}
-		]
+		"experimentalDecorators": true
 	},
-	"include": [
-		"./typings",
-		"./vs",
-		"vscode-dts/vscode.proposed.*.d.ts",
-		"vscode-dts/vscode.d.ts"
+	"exclude": [
+		"vs/languages/typescript/common/lib/lib.es6.d.ts",
+		"vs/languages/typescript/common/lib/lib.d.ts"
 	]
 }

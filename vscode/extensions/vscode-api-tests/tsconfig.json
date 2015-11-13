@@ -1,14 +1,12 @@
 {
-	"extends": "../tsconfig.base.json",
 	"compilerOptions": {
-		"outDir": "./out",
-		"types": [
-			"node"
-		]
+		"module": "commonjs",
+		"target": "ES5",
+		"outDir": "out",
+		"noLib": true,
+		"sourceMap": true
 	},
-	"include": [
-		"src/**/*",
-		"../../src/vscode-dts/vscode.d.ts",
-		"../../src/vscode-dts/vscode.proposed.*.d.ts"
+	"exclude": [
+		"node_modules"
 	]
 }

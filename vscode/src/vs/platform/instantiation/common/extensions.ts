@@ -2,22 +2,34 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+'use strict';
 
-import { SyncDescriptor } from './descriptors';
-import { BrandedService, ServiceIdentifier } from './instantiation';
+import {SyncDescriptor} from './descriptors';
+import {ServiceIdentifier, INewConstructorSignature0} from './instantiation';
+import {Graph} from 'vs/base/common/graph';
+import {Registry}  from 'vs/platform/platform';
 
-const _registry: [ServiceIdentifier<any>, SyncDescriptor<any>][] = [];
+export const Services = 'di.services';
 
-export function registerSingleton<T, Services extends BrandedService[]>(id: ServiceIdentifier<T>, ctor: new (...services: Services) => T, supportsDelayedInstantiation?: boolean): void;
-export function registerSingleton<T, Services extends BrandedService[]>(id: ServiceIdentifier<T>, descriptor: SyncDescriptor<any>): void;
-export function registerSingleton<T, Services extends BrandedService[]>(id: ServiceIdentifier<T>, ctorOrDescriptor: { new(...services: Services): T } | SyncDescriptor<any>, supportsDelayedInstantiation?: boolean): void {
-	if (!(ctorOrDescriptor instanceof SyncDescriptor)) {
-		ctorOrDescriptor = new SyncDescriptor<T>(ctorOrDescriptor as new (...args: any[]) => T, [], supportsDelayedInstantiation);
-	}
-
-	_registry.push([id, ctorOrDescriptor]);
+export interface IServiceContribution<T> {
+	id: ServiceIdentifier<T>;
+	descriptor:SyncDescriptor<T>
 }
 
-export function getSingletonServiceDescriptors(): [ServiceIdentifier<any>, SyncDescriptor<any>][] {
+const _registry: IServiceContribution<any>[] = [];
+
+export function registerSingleton<T>(id: ServiceIdentifier<T>, ctor: INewConstructorSignature0<T>):void {
+	_registry.push({ id, descriptor: new SyncDescriptor<T>(ctor) });
+}
+
+export function getServices(): IServiceContribution<any>[] {
 	return _registry;
 }
+
+// export function createInstantionService() {
+// 	let result = create();
+// 	for (let service of _registry) {
+// 		result.addSingleton(service.id, service.descriptor);
+// 	}
+// 	return result;
+// }

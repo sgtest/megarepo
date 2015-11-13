@@ -2,186 +2,357 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+'use strict';
 
-import * as assert from 'assert';
-import { SyncDescriptor } from 'vs/platform/instantiation/common/descriptors';
-import { createDecorator, IInstantiationService, ServicesAccessor } from 'vs/platform/instantiation/common/instantiation';
-import { InstantiationService } from 'vs/platform/instantiation/common/instantiationService';
-import { ServiceCollection } from 'vs/platform/instantiation/common/serviceCollection';
 
-let IService1 = createDecorator<IService1>('service1');
+import assert = require('assert');
+import services = require('vs/platform/services');
+import instantiation = require('vs/platform/instantiation/common/instantiation');
+import instantiationService = require('vs/platform/instantiation/common/instantiationService');
+
+import {SyncDescriptor, createSyncDescriptor} from 'vs/platform/instantiation/common/descriptors'
+
+export class Target1 {
+
+	constructor(private platformServices:services.IPlatformServices) {
+		assert.ok(!!platformServices.editorService);
+	}
+
+	validate():boolean {
+		try {
+			this.platformServices.editorService;
+			return false;
+		} catch(e) {
+			return e instanceof Error;
+		}
+	}
+}
+
+export class Target2 {
+
+	constructor(private platformServices:services.IPlatformServices, private far:boolean) {
+		assert.ok(!!platformServices.editorService);
+	}
+
+	validate():boolean {
+		if(!this.far) {
+			return false;
+		}
+		try {
+			this.platformServices.editorService;
+			return false;
+		} catch(e) {
+			return e instanceof Error;
+		}
+	}
+}
+
+class Target3 {
+	constructor(private platformServices:services.IPlatformServices) {
+		assert.ok(!!platformServices.editorService);
+		assert.equal(platformServices['far'], 1234);
+	}
+}
+
+class Target4 {
+	constructor(private platformServices:services.IPlatformServices) {
+		assert.equal(platformServices.editorService, 1234);
+	}
+}
+
+export class EvilTarget1 {
+
+	constructor(private platformServices:services.IPlatformServices) {
+		platformServices.editorService = null;
+	}
+}
+
+var IService1 = instantiation.createDecorator<IService1>('service1')
 
 interface IService1 {
-	readonly _serviceBrand: undefined;
+	serviceId : instantiation.ServiceIdentifier<any>;
 	c: number;
 }
 
 class Service1 implements IService1 {
-	declare readonly _serviceBrand: undefined;
+	serviceId = IService1;
 	c = 1;
 }
 
-let IService2 = createDecorator<IService2>('service2');
+var IService2 = instantiation.createDecorator<IService2>('service2');
 
 interface IService2 {
-	readonly _serviceBrand: undefined;
+	serviceId : instantiation.ServiceIdentifier<any>;
 	d: boolean;
 }
 
 class Service2 implements IService2 {
-	declare readonly _serviceBrand: undefined;
+	serviceId = IService2;
 	d = true;
 }
 
-let IService3 = createDecorator<IService3>('service3');
+var IService3 = instantiation.createDecorator<IService3>('service3');
 
 interface IService3 {
-	readonly _serviceBrand: undefined;
+	serviceId : instantiation.ServiceIdentifier<any>;
 	s: string;
 }
 
 class Service3 implements IService3 {
-	declare readonly _serviceBrand: undefined;
+	serviceId = IService3;
 	s = 'farboo';
 }
 
-let IDependentService = createDecorator<IDependentService>('dependentService');
+var IDependentService = instantiation.createDecorator<IDependentService>('dependentService')
 
 interface IDependentService {
-	readonly _serviceBrand: undefined;
+	serviceId : instantiation.ServiceIdentifier<any>;
 	name: string;
 }
 
 class DependentService implements IDependentService {
-	declare readonly _serviceBrand: undefined;
-	constructor(@IService1 service: IService1) {
-		assert.strictEqual(service.c, 1);
+	serviceId = IDependentService;
+	constructor( @IService1 service: IService1) {
+		assert.equal(service.c, 1);
 	}
 
 	name = 'farboo';
 }
 
-class Service1Consumer {
+@instantiation.Uses(IService1)
+class UsesTarget {
 
-	constructor(@IService1 service1: IService1) {
+	constructor(ctx: instantiation.Context) {
+		var service = ctx.get(IService1);
+		assert.ok(service);
+		assert.equal(service.c, 1);
+	}
+}
+
+@instantiation.Uses(IService2)
+class UsesTarget2 extends UsesTarget {
+	constructor(ctx: instantiation.Context) {
+		super(ctx);
+
+		var service = ctx.get(IService2);
+		assert.ok(service);
+		assert.ok(service.d);
+	}
+}
+
+class UsesTarget3 extends UsesTarget2 {
+	constructor(ctx: instantiation.Context, @IService3 service:IService3) {
+		super(ctx);
+
+		assert.ok(service);
+		assert.equal(service.s, 'farboo');
+	}
+}
+
+class ParameterTarget {
+
+	constructor( @IService1 service1: IService1) {
 		assert.ok(service1);
-		assert.strictEqual(service1.c, 1);
+		assert.equal(service1.c, 1);
 	}
 }
 
-class Target2Dep {
-
-	constructor(@IService1 service1: IService1, @IService2 service2: Service2) {
-		assert.ok(service1 instanceof Service1);
-		assert.ok(service2 instanceof Service2);
-	}
-}
-
-class TargetWithStaticParam {
-	constructor(v: boolean, @IService1 service1: IService1) {
+class ParameterTarget2 {
+	constructor(v:boolean, @IService1 service1: IService1) {
 		assert.ok(v);
 		assert.ok(service1);
-		assert.strictEqual(service1.c, 1);
+		assert.equal(service1.c, 1);
 	}
 }
 
-
+class TargetOptional {
+	constructor( @IService1 service1: IService1, @IService2 service2?: IService2) {
+		assert.ok(service1);
+		assert.equal(service1.c, 1);
+		assert.ok(service2 === void 0)
+	}
+}
 
 class DependentServiceTarget {
-	constructor(@IDependentService d: IDependentService) {
+	constructor( @IDependentService d) {
 		assert.ok(d);
-		assert.strictEqual(d.name, 'farboo');
+		assert.equal(d.name, 'farboo');
 	}
 }
 
 class DependentServiceTarget2 {
-	constructor(@IDependentService d: IDependentService, @IService1 s: IService1) {
+	constructor( @IDependentService d:IDependentService, @IService1 s:IService1) {
 		assert.ok(d);
-		assert.strictEqual(d.name, 'farboo');
+		assert.equal(d.name, 'farboo');
 		assert.ok(s);
-		assert.strictEqual(s.c, 1);
+		assert.equal(s.c, 1);
 	}
 }
 
 
 class ServiceLoop1 implements IService1 {
-	declare readonly _serviceBrand: undefined;
+	serviceId = IService1;
 	c = 1;
 
-	constructor(@IService2 s: IService2) {
+	constructor( @IService2 s: IService2) {
 
 	}
 }
 
 class ServiceLoop2 implements IService2 {
-	declare readonly _serviceBrand: undefined;
+	serviceId = IService2;
 	d = true;
 
-	constructor(@IService1 s: IService1) {
+	constructor(@IService1 s:IService1) {
 
 	}
 }
 
 suite('Instantiation Service', () => {
+	var service:instantiation.IInstantiationService;
 
-	test('service collection, cannot overwrite', function () {
-		let collection = new ServiceCollection();
-		let result = collection.set(IService1, null!);
-		assert.strictEqual(result, undefined);
-		result = collection.set(IService1, new Service1());
-		assert.strictEqual(result, null);
+	setup(() => {
+		service = instantiationService.create({
+			editorService: 'boo',
+		});
 	});
 
-	test('service collection, add/has', function () {
-		let collection = new ServiceCollection();
-		collection.set(IService1, null!);
-		assert.ok(collection.has(IService1));
+	test('sync create, platformServices only', function(){
+		var instance = service.createInstance(Target1);
+		assert.ok(instance.validate());
+	});
 
-		collection.set(IService2, null!);
-		assert.ok(collection.has(IService1));
-		assert.ok(collection.has(IService2));
+	test('sync create, platformServices & argument', function(){
+		var instance = service.createInstance(Target2, true);
+		assert.ok(instance.validate());
+	});
+
+	test('sync create, access service defined by child instantiation service', function(){
+		var instance = service.createChild({ editorService: 'wee' } ).createInstance(Target2, true);
+		assert.ok(instance.validate());
+	});
+
+	test('sync create, access service defined in a child instantiation service', function(){
+		var instance = service.createChild({ someOtherService: 'hey' } ).createInstance(Target2, true);
+		assert.ok(instance.validate());
+	});
+
+	test('sync create, platformServices & static argument', function(){
+		var descriptor = createSyncDescriptor(Target2, true);
+		var instance = service.createInstance(descriptor);
+		assert.ok(instance.validate());
+	});
+
+	test('sync create, register NEW service', function(){
+		service.registerService('far', 1234);
+		service.createInstance(Target3);
+
+		var child = service.createChild({});
+		child.createInstance(Target3);
+	});
+
+	test('sync create, override service', () => {
+		assert.throws(() => service.registerService('editorService', 1234));
+	});
+
+	// test('async create, platformServices only', (done) => {
+	// 	var descriptor = new services.AsyncDescriptor<Target1>('vs/platform/instantiation/tests/instantiationService.test', 'Target1');
+	// 	service.createInstance(descriptor, true).then((instance) => {
+	// 		assert.ok(instance.validate());
+	// 		done();
+	// 	}, (e) => {
+	// 		assert.ok(false, e);
+	// 	});
+	// });
+
+	// test('async create, platformServices only & argument', (done) => {
+	// 	var descriptor = new services.AsyncDescriptor<Target2>('vs/platform/instantiation/tests/instantiationService.test', 'Target1');
+	// 	service.createInstance(descriptor, true).then((instance) => {
+	// 		assert.ok(instance.validate());
+	// 		done();
+	// 	}, (e) => {
+	// 		assert.ok(false, e);
+	// 	});
+	// });
+
+	// test('async create, platformServices only & static argument', (done) => {
+	// 	var descriptor = new services.AsyncDescriptor<Target2>('vs/platform/instantiation/tests/instantiationService.test', 'Target1', true);
+	// 	service.createInstance(descriptor).then((instance) => {
+	// 		assert.ok(instance.validate());
+	// 		done();
+	// 	}, (e) => {
+	// 		assert.ok(false, e);
+	// 	});
+	// });
+
+	// test('async create, illegal ctor name', (done) => {
+	// 	var descriptor = new services.AsyncDescriptor<Target2>('vs/platform/instantiation/tests/instantiationService.test', 'TaRget1', true);
+	// 	service.createInstance(descriptor).then((instance) => {
+	// 		assert.ok(false);
+	// 		done();
+	// 	}, (e) => {
+	// 		assert.ok(e instanceof Error);
+	// 	});
+	// });
+
+	test('safe on create - don\'t allow service change', function() {
+		assert.throws(() => service.createInstance(EvilTarget1));
+	});
+
+	test('@Uses - simple case', function () {
+
+		var service = instantiationService.create(Object.create(null));
+		service.addSingleton(IService1, new Service1());
+
+		var target = service.createInstance(UsesTarget);
+	});
+
+	test('@Uses - inheritance', function () {
+		var service = instantiationService.create(Object.create(null));
+		service.addSingleton(IService1, new Service1());
+		service.addSingleton(IService2, new Service2());
+
+		service.createInstance(UsesTarget2);
+	});
+
+	test('@Uses and @IServiceName', function() {
+		var service = instantiationService.create(Object.create(null));
+		service.addSingleton(IService1, new Service1());
+		service.addSingleton(IService2, new Service2());
+		service.addSingleton(IService3, new Service3());
+
+		service.createInstance(<instantiation.IConstructorSignature0<UsesTarget3>> UsesTarget3);
 	});
 
 	test('@Param - simple clase', function () {
-		let collection = new ServiceCollection();
-		let service = new InstantiationService(collection);
-		collection.set(IService1, new Service1());
-		collection.set(IService2, new Service2());
-		collection.set(IService3, new Service3());
+		var service = instantiationService.create(Object.create(null));
+		service.addSingleton(IService1, new Service1());
+		service.addSingleton(IService2, new Service2());
+		service.addSingleton(IService3, new Service3());
 
-		service.createInstance(Service1Consumer);
+		service.createInstance(ParameterTarget);
 	});
 
 	test('@Param - fixed args', function () {
-		let collection = new ServiceCollection();
-		let service = new InstantiationService(collection);
-		collection.set(IService1, new Service1());
-		collection.set(IService2, new Service2());
-		collection.set(IService3, new Service3());
+		var service = instantiationService.create(Object.create(null));
+		service.addSingleton(IService1, new Service1());
+		service.addSingleton(IService2, new Service2());
+		service.addSingleton(IService3, new Service3());
 
-		service.createInstance(TargetWithStaticParam, true);
+		service.createInstance(ParameterTarget2, true);
 	});
 
-	test('service collection is live', function () {
+	test('@Param - optional', function() {
+		var service = instantiationService.create(Object.create(null));
+		service.addSingleton(IService1, new Service1());
+		// service.addSingleton(IService2, new Service2());
 
-		let collection = new ServiceCollection();
-		collection.set(IService1, new Service1());
-
-		let service = new InstantiationService(collection);
-		service.createInstance(Service1Consumer);
-
-		collection.set(IService2, new Service2());
-
-		service.createInstance(Target2Dep);
-		service.invokeFunction(function (a) {
-			assert.ok(a.get(IService1));
-			assert.ok(a.get(IService2));
-		});
+		service.createInstance(TargetOptional);
 	});
 
 	// we made this a warning
 	// test('@Param - too many args', function () {
-	// 	let service = instantiationService.create(Object.create(null));
+	// 	var service = instantiationService.create(Object.create(null));
 	// 	service.addSingleton(IService1, new Service1());
 	// 	service.addSingleton(IService2, new Service2());
 	// 	service.addSingleton(IService3, new Service3());
@@ -190,7 +361,7 @@ suite('Instantiation Service', () => {
 	// });
 
 	// test('@Param - too few args', function () {
-	// 	let service = instantiationService.create(Object.create(null));
+	// 	var service = instantiationService.create(Object.create(null));
 	// 	service.addSingleton(IService1, new Service1());
 	// 	service.addSingleton(IService2, new Service2());
 	// 	service.addSingleton(IService3, new Service3());
@@ -199,198 +370,91 @@ suite('Instantiation Service', () => {
 	// });
 
 	test('SyncDesc - no dependencies', function () {
-		let collection = new ServiceCollection();
-		let service = new InstantiationService(collection);
-		collection.set(IService1, new SyncDescriptor<IService1>(Service1));
+		var service = instantiationService.create(Object.create(null));
+		service.addSingleton(IService1, new SyncDescriptor<IService1>(Service1));
 
-		service.invokeFunction(accessor => {
+		var service1 = service.getInstance(IService1);
+		assert.ok(service1);
+		assert.equal(service1.c, 1);
 
-			let service1 = accessor.get(IService1);
-			assert.ok(service1);
-			assert.strictEqual(service1.c, 1);
-
-			let service2 = accessor.get(IService1);
-			assert.ok(service1 === service2);
-		});
+		var service2 = service.getInstance(IService1);
+		assert.ok(service1 === service2);
 	});
 
 	test('SyncDesc - service with service dependency', function () {
-		let collection = new ServiceCollection();
-		let service = new InstantiationService(collection);
-		collection.set(IService1, new SyncDescriptor<IService1>(Service1));
-		collection.set(IDependentService, new SyncDescriptor<IDependentService>(DependentService));
+		var service = instantiationService.create(Object.create(null));
+		service.addSingleton(IService1, new SyncDescriptor<IService1>(Service1));
+		service.addSingleton(IDependentService, new SyncDescriptor<IDependentService>(DependentService));
 
-		service.invokeFunction(accessor => {
-			let d = accessor.get(IDependentService);
-			assert.ok(d);
-			assert.strictEqual(d.name, 'farboo');
-		});
+		var d = service.getInstance(IDependentService);
+		assert.ok(d);
+		assert.equal(d.name, 'farboo');
 	});
 
 	test('SyncDesc - target depends on service future', function () {
-		let collection = new ServiceCollection();
-		let service = new InstantiationService(collection);
-		collection.set(IService1, new SyncDescriptor<IService1>(Service1));
-		collection.set(IDependentService, new SyncDescriptor<IDependentService>(DependentService));
+		var service = instantiationService.create(Object.create(null));
+		service.addSingleton(IService1, new SyncDescriptor<IService1>(Service1));
+		service.addSingleton(IDependentService, new SyncDescriptor<IDependentService>(DependentService));
 
-		let d = service.createInstance(DependentServiceTarget);
+		var d = service.createInstance(DependentServiceTarget);
 		assert.ok(d instanceof DependentServiceTarget);
 
-		let d2 = service.createInstance(DependentServiceTarget2);
+		var d2 = service.createInstance(DependentServiceTarget2);
 		assert.ok(d2 instanceof DependentServiceTarget2);
 	});
 
 	test('SyncDesc - explode on loop', function () {
-		let collection = new ServiceCollection();
-		let service = new InstantiationService(collection);
-		collection.set(IService1, new SyncDescriptor<IService1>(ServiceLoop1));
-		collection.set(IService2, new SyncDescriptor<IService2>(ServiceLoop2));
+		var service = instantiationService.create(Object.create(null));
+		service.addSingleton(IService1, new SyncDescriptor<IService1>(ServiceLoop1));
+		service.addSingleton(IService2, new SyncDescriptor<IService2>(ServiceLoop2));
 
-		assert.throws(() => {
-			service.invokeFunction(accessor => {
-				accessor.get(IService1);
-			});
-		});
-		assert.throws(() => {
-			service.invokeFunction(accessor => {
-				accessor.get(IService2);
-			});
-		});
-
-		try {
-			service.invokeFunction(accessor => {
-				accessor.get(IService1);
-			});
-		} catch (err) {
-			assert.ok(err.name);
-			assert.ok(err.message);
-		}
+		assert.throws(() => service.getInstance(IService1));
+		assert.throws(() => service.getInstance(IService2));
 	});
 
-	test('Invoke - get services', function () {
-		let collection = new ServiceCollection();
-		let service = new InstantiationService(collection);
-		collection.set(IService1, new Service1());
-		collection.set(IService2, new Service2());
+	test('Invoke - get services', function() {
+		var service = instantiationService.create(Object.create(null));
+		service.addSingleton(IService1, new Service1());
+		service.addSingleton(IService2, new Service2());
 
-		function test(accessor: ServicesAccessor) {
+		function test(accessor: instantiation.ServicesAccessor) {
 			assert.ok(accessor.get(IService1) instanceof Service1);
-			assert.strictEqual(accessor.get(IService1).c, 1);
+			assert.equal(accessor.get(IService1).c, 1);
 
 			return true;
 		}
 
-		assert.strictEqual(service.invokeFunction(test), true);
+		assert.equal(service.invokeFunction(test), true);
 	});
 
-	test('Invoke - get service, optional', function () {
-		let collection = new ServiceCollection([IService1, new Service1()]);
-		let service = new InstantiationService(collection);
+	test('Invoke - keeping accessor NOT allowed', function() {
+		var service = instantiationService.create(Object.create(null));
+		service.addSingleton(IService1, new Service1());
+		service.addSingleton(IService2, new Service2());
 
-		function test(accessor: ServicesAccessor) {
+		let cached: instantiation.ServicesAccessor;
+
+		function test(accessor: instantiation.ServicesAccessor) {
 			assert.ok(accessor.get(IService1) instanceof Service1);
-			assert.throws(() => accessor.get(IService2));
-			return true;
-		}
-		assert.strictEqual(service.invokeFunction(test), true);
-	});
-
-	test('Invoke - keeping accessor NOT allowed', function () {
-		let collection = new ServiceCollection();
-		let service = new InstantiationService(collection);
-		collection.set(IService1, new Service1());
-		collection.set(IService2, new Service2());
-
-		let cached: ServicesAccessor;
-
-		function test(accessor: ServicesAccessor) {
-			assert.ok(accessor.get(IService1) instanceof Service1);
-			assert.strictEqual(accessor.get(IService1).c, 1);
+			assert.equal(accessor.get(IService1).c, 1);
 			cached = accessor;
 			return true;
 		}
 
-		assert.strictEqual(service.invokeFunction(test), true);
+		assert.equal(service.invokeFunction(test), true);
 
 		assert.throws(() => cached.get(IService2));
 	});
 
-	test('Invoke - throw error', function () {
-		let collection = new ServiceCollection();
-		let service = new InstantiationService(collection);
-		collection.set(IService1, new Service1());
-		collection.set(IService2, new Service2());
+	test('Invoke - throw error', function() {
+		var service = instantiationService.create(Object.create(null));
+		service.addSingleton(IService1, new Service1());
+		service.addSingleton(IService2, new Service2());
 
-		function test(accessor: ServicesAccessor) {
+		function test(accessor: instantiation.ServicesAccessor) {
 			throw new Error();
 		}
 
 		assert.throws(() => service.invokeFunction(test));
-	});
-
-	test('Create child', function () {
-
-		let serviceInstanceCount = 0;
-
-		const CtorCounter = class implements Service1 {
-			declare readonly _serviceBrand: undefined;
-			c = 1;
-			constructor() {
-				serviceInstanceCount += 1;
-			}
-		};
-
-		// creating the service instance BEFORE the child service
-		let service = new InstantiationService(new ServiceCollection([IService1, new SyncDescriptor(CtorCounter)]));
-		service.createInstance(Service1Consumer);
-
-		// second instance must be earlier ONE
-		let child = service.createChild(new ServiceCollection([IService2, new Service2()]));
-		child.createInstance(Service1Consumer);
-
-		assert.strictEqual(serviceInstanceCount, 1);
-
-		// creating the service instance AFTER the child service
-		serviceInstanceCount = 0;
-		service = new InstantiationService(new ServiceCollection([IService1, new SyncDescriptor(CtorCounter)]));
-		child = service.createChild(new ServiceCollection([IService2, new Service2()]));
-
-		// second instance must be earlier ONE
-		service.createInstance(Service1Consumer);
-		child.createInstance(Service1Consumer);
-
-		assert.strictEqual(serviceInstanceCount, 1);
-	});
-
-	test('Remote window / integration tests is broken #105562', function () {
-
-		const Service1 = createDecorator<any>('service1');
-		class Service1Impl {
-			constructor(@IInstantiationService insta: IInstantiationService) {
-				const c = insta.invokeFunction(accessor => accessor.get(Service2)); // THIS is the recursive call
-				assert.ok(c);
-			}
-		}
-		const Service2 = createDecorator<any>('service2');
-		class Service2Impl {
-			constructor() { }
-		}
-
-		// This service depends on Service1 and Service2 BUT creating Service1 creates Service2 (via recursive invocation)
-		// and then Servce2 should not be created a second time
-		const Service21 = createDecorator<any>('service21');
-		class Service21Impl {
-			constructor(@Service2 readonly service2: Service2Impl, @Service1 readonly service1: Service1Impl) { }
-		}
-
-		const insta = new InstantiationService(new ServiceCollection(
-			[Service1, new SyncDescriptor(Service1Impl)],
-			[Service2, new SyncDescriptor(Service2Impl)],
-			[Service21, new SyncDescriptor(Service21Impl)],
-		));
-
-		const obj = insta.invokeFunction(accessor => accessor.get(Service21));
-		assert.ok(obj);
-	});
-
+	})
 });

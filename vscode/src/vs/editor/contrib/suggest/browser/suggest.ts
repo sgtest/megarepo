@@ -2,445 +2,247 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+'use strict';
 
-import { CancellationToken } from 'vs/base/common/cancellation';
-import { CancellationError, isCancellationError, onUnexpectedExternalError } from 'vs/base/common/errors';
-import { FuzzyScore } from 'vs/base/common/filters';
-import { DisposableStore, IDisposable, isDisposable } from 'vs/base/common/lifecycle';
-import { StopWatch } from 'vs/base/common/stopwatch';
-import { assertType } from 'vs/base/common/types';
-import { URI } from 'vs/base/common/uri';
-import { ICodeEditor } from 'vs/editor/browser/editorBrowser';
-import { IPosition, Position } from 'vs/editor/common/core/position';
-import { Range } from 'vs/editor/common/core/range';
-import { IEditorContribution } from 'vs/editor/common/editorCommon';
-import { ITextModel } from 'vs/editor/common/model';
-import * as languages from 'vs/editor/common/languages';
-import { ITextModelService } from 'vs/editor/common/services/resolverService';
-import { SnippetParser } from 'vs/editor/contrib/snippet/browser/snippetParser';
-import { localize } from 'vs/nls';
-import { MenuId } from 'vs/platform/actions/common/actions';
-import { CommandsRegistry } from 'vs/platform/commands/common/commands';
-import { RawContextKey } from 'vs/platform/contextkey/common/contextkey';
-import { LanguageFeatureRegistry } from 'vs/editor/common/languageFeatureRegistry';
-import { ILanguageFeaturesService } from 'vs/editor/common/services/languageFeatures';
-import { historyNavigationVisible } from 'vs/platform/history/browser/contextScopedHistoryWidget';
-import { InternalQuickSuggestionsOptions, QuickSuggestionsValue } from 'vs/editor/common/config/editorOptions';
-import { ExtensionIdentifier } from 'vs/platform/extensions/common/extensions';
+import nls = require('vs/nls');
+import Lifecycle = require('vs/base/common/lifecycle');
+import Snippet = require('vs/editor/contrib/snippet/common/snippet');
+import SuggestWidget = require('./suggestWidget');
+import SuggestModel = require('./suggestModel');
+import Errors = require('vs/base/common/errors');
+import {TPromise} from 'vs/base/common/winjs.base';
+import {EditorBrowserRegistry} from 'vs/editor/browser/editorBrowserExtensions';
+import {CommonEditorRegistry, ContextKey, EditorActionDescriptor} from 'vs/editor/common/editorCommonExtensions';
+import {EditorAction, Behaviour} from 'vs/editor/common/editorAction';
+import EditorBrowser = require('vs/editor/browser/editorBrowser');
+import EditorCommon = require('vs/editor/common/editorCommon');
+import Modes = require('vs/editor/common/modes');
+import EventEmitter = require('vs/base/common/eventEmitter');
+import {IKeybindingService, IKeybindingContextKey} from 'vs/platform/keybinding/common/keybindingService';
+import {ITelemetryService} from 'vs/platform/telemetry/common/telemetry';
+import {SuggestRegistry, ACCEPT_SELECTED_SUGGESTION_CMD, CONTEXT_SUGGEST_WIDGET_VISIBLE} from 'vs/editor/contrib/suggest/common/suggest';
+import {INullService} from 'vs/platform/instantiation/common/instantiation';
+import {KeyMod, KeyCode} from 'vs/base/common/keyCodes';
 
-export const Context = {
-	Visible: historyNavigationVisible,
-	DetailsVisible: new RawContextKey<boolean>('suggestWidgetDetailsVisible', false, localize('suggestWidgetDetailsVisible', "Whether suggestion details are visible")),
-	MultipleSuggestions: new RawContextKey<boolean>('suggestWidgetMultipleSuggestions', false, localize('suggestWidgetMultipleSuggestions', "Whether there are multiple suggestions to pick from")),
-	MakesTextEdit: new RawContextKey('suggestionMakesTextEdit', true, localize('suggestionMakesTextEdit', "Whether inserting the current suggestion yields in a change or has everything already been typed")),
-	AcceptSuggestionsOnEnter: new RawContextKey<boolean>('acceptSuggestionOnEnter', true, localize('acceptSuggestionOnEnter', "Whether suggestions are inserted when pressing Enter")),
-	HasInsertAndReplaceRange: new RawContextKey('suggestionHasInsertAndReplaceRange', false, localize('suggestionHasInsertAndReplaceRange', "Whether the current suggestion has insert and replace behaviour")),
-	InsertMode: new RawContextKey<'insert' | 'replace'>('suggestionInsertMode', undefined, { type: 'string', description: localize('suggestionInsertMode', "Whether the default behaviour is to insert or replace") }),
-	CanResolve: new RawContextKey('suggestionCanResolve', false, localize('suggestionCanResolve', "Whether the current suggestion supports to resolve further details")),
-};
+export class SuggestController implements EditorCommon.IEditorContribution {
+	static ID = 'editor.contrib.suggestController';
 
-export const suggestWidgetStatusbarMenu = new MenuId('suggestWidgetStatusBar');
-
-export class CompletionItem {
-
-	_brand!: 'ISuggestionItem';
-
-	//
-	readonly editStart: IPosition;
-	readonly editInsertEnd: IPosition;
-	readonly editReplaceEnd: IPosition;
-
-	//
-	readonly textLabel: string;
-
-	// perf
-	readonly labelLow: string;
-	readonly sortTextLow?: string;
-	readonly filterTextLow?: string;
-
-	// validation
-	readonly isInvalid: boolean = false;
-
-	// sorting, filtering
-	score: FuzzyScore = FuzzyScore.Default;
-	distance: number = 0;
-	idx?: number;
-	word?: string;
-
-	// instrumentation
-	readonly extensionId?: ExtensionIdentifier;
-
-	// resolving
-	private _isResolved?: boolean;
-	private _resolveCache?: Promise<void>;
-
-	constructor(
-		readonly position: IPosition,
-		readonly completion: languages.CompletionItem,
-		readonly container: languages.CompletionList,
-		readonly provider: languages.CompletionItemProvider,
-	) {
-		this.textLabel = typeof completion.label === 'string'
-			? completion.label
-			: completion.label.label;
-
-		// ensure lower-variants (perf)
-		this.labelLow = this.textLabel.toLowerCase();
-
-		// validate label
-		this.isInvalid = !this.textLabel;
-
-		this.sortTextLow = completion.sortText && completion.sortText.toLowerCase();
-		this.filterTextLow = completion.filterText && completion.filterText.toLowerCase();
-
-		this.extensionId = completion.extensionId;
-
-		// normalize ranges
-		if (Range.isIRange(completion.range)) {
-			this.editStart = new Position(completion.range.startLineNumber, completion.range.startColumn);
-			this.editInsertEnd = new Position(completion.range.endLineNumber, completion.range.endColumn);
-			this.editReplaceEnd = new Position(completion.range.endLineNumber, completion.range.endColumn);
-
-			// validate range
-			this.isInvalid = this.isInvalid
-				|| Range.spansMultipleLines(completion.range) || completion.range.startLineNumber !== position.lineNumber;
-
-		} else {
-			this.editStart = new Position(completion.range.insert.startLineNumber, completion.range.insert.startColumn);
-			this.editInsertEnd = new Position(completion.range.insert.endLineNumber, completion.range.insert.endColumn);
-			this.editReplaceEnd = new Position(completion.range.replace.endLineNumber, completion.range.replace.endColumn);
-
-			// validate ranges
-			this.isInvalid = this.isInvalid
-				|| Range.spansMultipleLines(completion.range.insert) || Range.spansMultipleLines(completion.range.replace)
-				|| completion.range.insert.startLineNumber !== position.lineNumber || completion.range.replace.startLineNumber !== position.lineNumber
-				|| completion.range.insert.startColumn !== completion.range.replace.startColumn;
-		}
-
-		// create the suggestion resolver
-		if (typeof provider.resolveCompletionItem !== 'function') {
-			this._resolveCache = Promise.resolve();
-			this._isResolved = true;
-		}
+	static getSuggestController(editor:EditorCommon.ICommonCodeEditor): SuggestController {
+		return <SuggestController>editor.getContribution(SuggestController.ID);
 	}
 
-	// ---- resolving
+	private editor:EditorBrowser.ICodeEditor;
+	private model:SuggestModel.SuggestModel;
+	private suggestWidget: SuggestWidget.SuggestWidget;
+	private toDispose: Lifecycle.IDisposable[];
 
-	get isResolved(): boolean {
-		return !!this._isResolved;
-	}
+	private triggerCharacterListeners: Function[];
+	private suggestWidgetVisible: IKeybindingContextKey<boolean>;
 
-	async resolve(token: CancellationToken) {
-		if (!this._resolveCache) {
-			const sub = token.onCancellationRequested(() => {
-				this._resolveCache = undefined;
-				this._isResolved = false;
-			});
-			this._resolveCache = Promise.resolve(this.provider.resolveCompletionItem!(this.completion, token)).then(value => {
-				Object.assign(this.completion, value);
-				this._isResolved = true;
-				sub.dispose();
-			}, err => {
-				if (isCancellationError(err)) {
-					// the IPC queue will reject the request with the
-					// cancellation error -> reset cached
-					this._resolveCache = undefined;
-					this._isResolved = false;
-				}
-			});
-		}
-		return this._resolveCache;
-	}
-}
+	constructor(editor:EditorBrowser.ICodeEditor, @IKeybindingService keybindingService: IKeybindingService, @ITelemetryService telemetryService: ITelemetryService) {
+		this.editor = editor;
+		this.suggestWidgetVisible = keybindingService.createKey(CONTEXT_SUGGEST_WIDGET_VISIBLE, false);
 
-export const enum SnippetSortOrder {
-	Top, Inline, Bottom
-}
-
-export class CompletionOptions {
-
-	static readonly default = new CompletionOptions();
-
-	constructor(
-		readonly snippetSortOrder = SnippetSortOrder.Bottom,
-		readonly kindFilter = new Set<languages.CompletionItemKind>(),
-		readonly providerFilter = new Set<languages.CompletionItemProvider>(),
-		readonly showDeprecated = true
-	) { }
-}
-
-let _snippetSuggestSupport: languages.CompletionItemProvider;
-
-export function getSnippetSuggestSupport(): languages.CompletionItemProvider {
-	return _snippetSuggestSupport;
-}
-
-export function setSnippetSuggestSupport(support: languages.CompletionItemProvider): languages.CompletionItemProvider {
-	const old = _snippetSuggestSupport;
-	_snippetSuggestSupport = support;
-	return old;
-}
-
-export interface CompletionDurationEntry {
-	readonly providerName: string;
-	readonly elapsedProvider: number;
-	readonly elapsedOverall: number;
-}
-
-export interface CompletionDurations {
-	readonly entries: readonly CompletionDurationEntry[];
-	readonly elapsed: number;
-}
-
-export class CompletionItemModel {
-	constructor(
-		readonly items: CompletionItem[],
-		readonly needsClipboard: boolean,
-		readonly durations: CompletionDurations,
-		readonly disposable: IDisposable,
-	) { }
-}
-
-export async function provideSuggestionItems(
-	registry: LanguageFeatureRegistry<languages.CompletionItemProvider>,
-	model: ITextModel,
-	position: Position,
-	options: CompletionOptions = CompletionOptions.default,
-	context: languages.CompletionContext = { triggerKind: languages.CompletionTriggerKind.Invoke },
-	token: CancellationToken = CancellationToken.None
-): Promise<CompletionItemModel> {
-
-	const sw = new StopWatch(true);
-	position = position.clone();
-
-	const word = model.getWordAtPosition(position);
-	const defaultReplaceRange = word ? new Range(position.lineNumber, word.startColumn, position.lineNumber, word.endColumn) : Range.fromPositions(position);
-	const defaultRange = { replace: defaultReplaceRange, insert: defaultReplaceRange.setEndPosition(position.lineNumber, position.column) };
-
-	const result: CompletionItem[] = [];
-	const disposables = new DisposableStore();
-	const durations: CompletionDurationEntry[] = [];
-	let needsClipboard = false;
-
-	const onCompletionList = (provider: languages.CompletionItemProvider, container: languages.CompletionList | null | undefined, sw: StopWatch): boolean => {
-		let didAddResult = false;
-		if (!container) {
-			return didAddResult;
-		}
-		for (let suggestion of container.suggestions) {
-			if (!options.kindFilter.has(suggestion.kind)) {
-				// skip if not showing deprecated suggestions
-				if (!options.showDeprecated && suggestion?.tags?.includes(languages.CompletionItemTag.Deprecated)) {
-					continue;
-				}
-				// fill in default range when missing
-				if (!suggestion.range) {
-					suggestion.range = defaultRange;
-				}
-				// fill in default sortText when missing
-				if (!suggestion.sortText) {
-					suggestion.sortText = typeof suggestion.label === 'string' ? suggestion.label : suggestion.label.label;
-				}
-				if (!needsClipboard && suggestion.insertTextRules && suggestion.insertTextRules & languages.CompletionItemInsertTextRule.InsertAsSnippet) {
-					needsClipboard = SnippetParser.guessNeedsClipboard(suggestion.insertText);
-				}
-				result.push(new CompletionItem(position, suggestion, container, provider));
-				didAddResult = true;
-			}
-		}
-		if (isDisposable(container)) {
-			disposables.add(container);
-		}
-		durations.push({
-			providerName: provider._debugDisplayName ?? 'unknown_provider', elapsedProvider: container.duration ?? -1, elapsedOverall: sw.elapsed()
+		this.model = new SuggestModel.SuggestModel(this.editor, (snippet:Snippet.CodeSnippet, overwriteBefore:number, overwriteAfter:number) => {
+			Snippet.get(this.editor).run(snippet, overwriteBefore, overwriteAfter);
 		});
-		return didAddResult;
-	};
 
-	// ask for snippets in parallel to asking "real" providers. Only do something if configured to
-	// do so - no snippet filter, no special-providers-only request
-	const snippetCompletions = (async () => {
-		if (!_snippetSuggestSupport || options.kindFilter.has(languages.CompletionItemKind.Snippet)) {
-			return;
-		}
-		if (options.providerFilter.size > 0 && !options.providerFilter.has(_snippetSuggestSupport)) {
-			return;
-		}
-		const sw = new StopWatch(true);
-		const list = await _snippetSuggestSupport.provideCompletionItems(model, position, context, token);
-		onCompletionList(_snippetSuggestSupport, list, sw);
-	})();
+		this.suggestWidget = new SuggestWidget.SuggestWidget(this.editor, telemetryService, keybindingService, () => {
+			this.suggestWidgetVisible.set(true);
+		}, () => {
+			this.suggestWidgetVisible.reset();
+		});
+		this.suggestWidget.setModel(this.model);
 
-	// add suggestions from contributed providers - providers are ordered in groups of
-	// equal score and once a group produces a result the process stops
-	// get provider groups, always add snippet suggestion provider
-	for (let providerGroup of registry.orderedGroups(model)) {
+		this.triggerCharacterListeners = [];
 
-		// for each support in the group ask for suggestions
-		let didAddResult = false;
-		await Promise.all(providerGroup.map(async provider => {
-			if (options.providerFilter.size > 0 && !options.providerFilter.has(provider)) {
-				return;
-			}
-			try {
-				const sw = new StopWatch(true);
-				const list = await provider.provideCompletionItems(model, position, context, token);
-				didAddResult = onCompletionList(provider, list, sw) || didAddResult;
-			} catch (err) {
-				onUnexpectedExternalError(err);
+		this.toDispose = [];
+		this.toDispose.push(editor.addListener2(EditorCommon.EventType.ConfigurationChanged, () => this.update()));
+		this.toDispose.push(editor.addListener2(EditorCommon.EventType.ModelChanged, () => this.update()));
+		this.toDispose.push(editor.addListener2(EditorCommon.EventType.ModelModeChanged, () => this.update()));
+		this.toDispose.push(editor.addListener2(EditorCommon.EventType.ModelModeSupportChanged, (e: EditorCommon.IModeSupportChangedEvent) => {
+			if (e.suggestSupport) {
+				this.update();
 			}
 		}));
+		this.toDispose.push(SuggestRegistry.onDidChange(this.update, this));
 
-		if (didAddResult || token.isCancellationRequested) {
-			break;
+		this.update();
+	}
+
+	public getId(): string {
+		return SuggestController.ID;
+	}
+
+	public dispose(): void {
+		this.toDispose = Lifecycle.disposeAll(this.toDispose);
+		this.triggerCharacterListeners = Lifecycle.cAll(this.triggerCharacterListeners);
+
+		if (this.suggestWidget) {
+			this.suggestWidget.destroy();
+			this.suggestWidget = null;
+		}
+		if (this.model) {
+			this.model.destroy();
+			this.model = null;
 		}
 	}
 
-	await snippetCompletions;
+	private update(): void {
 
-	if (token.isCancellationRequested) {
-		disposables.dispose();
-		return Promise.reject<any>(new CancellationError());
+		this.triggerCharacterListeners = Lifecycle.cAll(this.triggerCharacterListeners);
+
+		if (this.editor.getConfiguration().readOnly
+			|| !this.editor.getModel()
+			|| !this.editor.getConfiguration().suggestOnTriggerCharacters) {
+
+			return;
+		}
+
+		let groups = SuggestRegistry.orderedGroups(this.editor.getModel());
+		if (groups.length === 0) {
+			return;
+		}
+
+		let triggerCharacters: { [ch: string]: Modes.ISuggestSupport[][] } = Object.create(null);
+
+		groups.forEach(group => {
+
+			let groupTriggerCharacters: { [ch: string]: Modes.ISuggestSupport[] } = Object.create(null);
+
+			group.forEach(support => {
+				let localTriggerCharacters = support.getTriggerCharacters();
+				if (localTriggerCharacters) {
+					for (let ch of localTriggerCharacters) {
+						let array = groupTriggerCharacters[ch];
+						if (array) {
+							array.push(support);
+						} else {
+							array = [support];
+							groupTriggerCharacters[ch] = array;
+							if (triggerCharacters[ch]) {
+								triggerCharacters[ch].push(array);
+							} else {
+								triggerCharacters[ch] = [array];
+							}
+						}
+					}
+				}
+			});
+		});
+
+		Object.keys(triggerCharacters).forEach(ch => {
+			this.triggerCharacterListeners.push(this.editor.addTypingListener(ch, () => {
+				this.triggerCharacterHandler(ch, triggerCharacters[ch]);
+			}));
+		});
 	}
 
-	return new CompletionItemModel(
-		result.sort(getSuggestionComparator(options.snippetSortOrder)),
-		needsClipboard,
-		{ entries: durations, elapsed: sw.elapsed() },
-		disposables,
-	);
+	private triggerCharacterHandler(character: string, groups: Modes.ISuggestSupport[][]): void {
+		var position = this.editor.getPosition();
+		var lineContext = this.editor.getModel().getLineContext(position.lineNumber);
+		var mode: Modes.IMode = this.editor.getModel().getMode();
+
+		groups = groups.map(supports => {
+			return supports.filter(support => support.shouldAutotriggerSuggest(lineContext, position.column - 1, character));
+		});
+
+		if (groups.length > 0) {
+			this.triggerSuggest(character, groups).done(null, Errors.onUnexpectedError);
+		}
+	}
+
+	public triggerSuggest(triggerCharacter?: string, groups?: Modes.ISuggestSupport[][]): TPromise<boolean> {
+		this.model.trigger(false, triggerCharacter, false, groups);
+		this.editor.focus();
+
+		return TPromise.as(false);
+	}
+
+	public acceptSelectedSuggestion(): void {
+		if (this.suggestWidget) {
+			this.suggestWidget.acceptSelectedSuggestion();
+		}
+	}
+
+	public hideSuggestWidget(): void {
+		if (this.suggestWidget) {
+			this.suggestWidget.cancel();
+		}
+	}
+
+	public selectNextSuggestion(): void {
+		if (this.suggestWidget) {
+			this.suggestWidget.selectNext();
+		}
+	}
+
+	public selectNextPageSuggestion(): void {
+		if (this.suggestWidget) {
+			this.suggestWidget.selectNextPage();
+		}
+	}
+
+	public selectPrevSuggestion(): void {
+		if (this.suggestWidget) {
+			this.suggestWidget.selectPrevious();
+		}
+	}
+
+	public selectPrevPageSuggestion(): void {
+		if (this.suggestWidget) {
+			this.suggestWidget.selectPreviousPage();
+		}
+	}
 }
 
+export class TriggerSuggestAction extends EditorAction {
 
-function defaultComparator(a: CompletionItem, b: CompletionItem): number {
-	// check with 'sortText'
-	if (a.sortTextLow && b.sortTextLow) {
-		if (a.sortTextLow < b.sortTextLow) {
-			return -1;
-		} else if (a.sortTextLow > b.sortTextLow) {
-			return 1;
-		}
+	static ID = 'editor.action.triggerSuggest';
+
+	constructor(descriptor:EditorCommon.IEditorActionDescriptorData, editor:EditorCommon.ICommonCodeEditor, @INullService ns) {
+		super(descriptor, editor);
 	}
-	// check with 'label'
-	if (a.completion.label < b.completion.label) {
-		return -1;
-	} else if (a.completion.label > b.completion.label) {
-		return 1;
+
+	public isSupported(): boolean {
+		return SuggestRegistry.has(this.editor.getModel()) && !this.editor.getConfiguration().readOnly;
 	}
-	// check with 'type'
-	return a.completion.kind - b.completion.kind;
+
+	public run():TPromise<boolean> {
+		return SuggestController.getSuggestController(this.editor).triggerSuggest();
+	}
 }
 
-function snippetUpComparator(a: CompletionItem, b: CompletionItem): number {
-	if (a.completion.kind !== b.completion.kind) {
-		if (a.completion.kind === languages.CompletionItemKind.Snippet) {
-			return -1;
-		} else if (b.completion.kind === languages.CompletionItemKind.Snippet) {
-			return 1;
-		}
-	}
-	return defaultComparator(a, b);
-}
+var weight = CommonEditorRegistry.commandWeight(90);
 
-function snippetDownComparator(a: CompletionItem, b: CompletionItem): number {
-	if (a.completion.kind !== b.completion.kind) {
-		if (a.completion.kind === languages.CompletionItemKind.Snippet) {
-			return 1;
-		} else if (b.completion.kind === languages.CompletionItemKind.Snippet) {
-			return -1;
-		}
-	}
-	return defaultComparator(a, b);
-}
-
-interface Comparator<T> { (a: T, b: T): number }
-const _snippetComparators = new Map<SnippetSortOrder, Comparator<CompletionItem>>();
-_snippetComparators.set(SnippetSortOrder.Top, snippetUpComparator);
-_snippetComparators.set(SnippetSortOrder.Bottom, snippetDownComparator);
-_snippetComparators.set(SnippetSortOrder.Inline, defaultComparator);
-
-export function getSuggestionComparator(snippetConfig: SnippetSortOrder): (a: CompletionItem, b: CompletionItem) => number {
-	return _snippetComparators.get(snippetConfig)!;
-}
-
-CommandsRegistry.registerCommand('_executeCompletionItemProvider', async (accessor, ...args: [URI, IPosition, string?, number?]) => {
-	const [uri, position, triggerCharacter, maxItemsToResolve] = args;
-	assertType(URI.isUri(uri));
-	assertType(Position.isIPosition(position));
-	assertType(typeof triggerCharacter === 'string' || !triggerCharacter);
-	assertType(typeof maxItemsToResolve === 'number' || !maxItemsToResolve);
-
-	const { completionProvider } = accessor.get(ILanguageFeaturesService);
-	const ref = await accessor.get(ITextModelService).createModelReference(uri);
-	try {
-
-		const result: languages.CompletionList = {
-			incomplete: false,
-			suggestions: []
-		};
-
-		const resolving: Promise<any>[] = [];
-		const completions = await provideSuggestionItems(completionProvider, ref.object.textEditorModel, Position.lift(position), undefined, { triggerCharacter, triggerKind: triggerCharacter ? languages.CompletionTriggerKind.TriggerCharacter : languages.CompletionTriggerKind.Invoke });
-		for (const item of completions.items) {
-			if (resolving.length < (maxItemsToResolve ?? 0)) {
-				resolving.push(item.resolve(CancellationToken.None));
-			}
-			result.incomplete = result.incomplete || item.container.incomplete;
-			result.suggestions.push(item.completion);
-		}
-
-		try {
-			await Promise.all(resolving);
-			return result;
-		} finally {
-			setTimeout(() => completions.disposable.dispose(), 100);
-		}
-
-	} finally {
-		ref.dispose();
-	}
-
+// register action
+CommonEditorRegistry.registerEditorAction(new EditorActionDescriptor(TriggerSuggestAction, TriggerSuggestAction.ID, nls.localize('suggest.trigger.label', "Trigger Suggest"), {
+	context: ContextKey.EditorTextFocus,
+	primary: KeyMod.CtrlCmd | KeyCode.Space,
+	mac: { primary: KeyMod.WinCtrl | KeyCode.Space }
+}));
+CommonEditorRegistry.registerEditorCommand(ACCEPT_SELECTED_SUGGESTION_CMD, weight, { primary: KeyCode.Enter, secondary:[KeyCode.Tab] }, true, CONTEXT_SUGGEST_WIDGET_VISIBLE, (ctx, editor, args) => {
+	var controller = SuggestController.getSuggestController(editor);
+	controller.acceptSelectedSuggestion();
 });
-
-interface SuggestController extends IEditorContribution {
-	triggerSuggest(onlyFrom?: Set<languages.CompletionItemProvider>, auto?: boolean, noFilter?: boolean): void;
-}
-
-export function showSimpleSuggestions(editor: ICodeEditor, provider: languages.CompletionItemProvider) {
-	editor.getContribution<SuggestController>('editor.contrib.suggestController')?.triggerSuggest(
-		new Set<languages.CompletionItemProvider>().add(provider), undefined, true
-	);
-}
-
-export interface ISuggestItemPreselector {
-	/**
-	 * The preselector with highest priority is asked first.
-	*/
-	readonly priority: number;
-
-	/**
-	 * Is called to preselect a suggest item.
-	 * When -1 is returned, item preselectors with lower priority are asked.
-	*/
-	select(model: ITextModel, pos: IPosition, items: CompletionItem[]): number | -1;
-}
-
-
-export abstract class QuickSuggestionsOptions {
-
-	static isAllOff(config: InternalQuickSuggestionsOptions): boolean {
-		return config.other === 'off' && config.comments === 'off' && config.strings === 'off';
-	}
-
-	static isAllOn(config: InternalQuickSuggestionsOptions): boolean {
-		return config.other === 'on' && config.comments === 'on' && config.strings === 'on';
-	}
-
-	static valueFor(config: InternalQuickSuggestionsOptions, tokenType: languages.StandardTokenType): QuickSuggestionsValue {
-		switch (tokenType) {
-			case languages.StandardTokenType.Comment: return config.comments;
-			case languages.StandardTokenType.String: return config.strings;
-			default: return config.other;
-		}
-	}
-}
+CommonEditorRegistry.registerEditorCommand('hideSuggestWidget', weight, { primary: KeyCode.Escape }, true, CONTEXT_SUGGEST_WIDGET_VISIBLE, (ctx, editor, args) => {
+	var controller = SuggestController.getSuggestController(editor);
+	controller.hideSuggestWidget();
+});
+CommonEditorRegistry.registerEditorCommand('selectNextSuggestion', weight, { primary: KeyCode.DownArrow }, true, CONTEXT_SUGGEST_WIDGET_VISIBLE, (ctx, editor, args) => {
+	var controller = SuggestController.getSuggestController(editor);
+	controller.selectNextSuggestion();
+});
+CommonEditorRegistry.registerEditorCommand('selectNextPageSuggestion', weight, { primary: KeyCode.PageDown }, true, CONTEXT_SUGGEST_WIDGET_VISIBLE, (ctx, editor, args) => {
+	var controller = SuggestController.getSuggestController(editor);
+	controller.selectNextPageSuggestion();
+});
+CommonEditorRegistry.registerEditorCommand('selectPrevSuggestion', weight, { primary: KeyCode.UpArrow }, true, CONTEXT_SUGGEST_WIDGET_VISIBLE, (ctx, editor, args) => {
+	var controller = SuggestController.getSuggestController(editor);
+	controller.selectPrevSuggestion();
+});
+CommonEditorRegistry.registerEditorCommand('selectPrevPageSuggestion', weight, { primary: KeyCode.PageUp }, true, CONTEXT_SUGGEST_WIDGET_VISIBLE, (ctx, editor, args) => {
+	var controller = SuggestController.getSuggestController(editor);
+	controller.selectPrevPageSuggestion();
+});
+EditorBrowserRegistry.registerEditorContribution(SuggestController);

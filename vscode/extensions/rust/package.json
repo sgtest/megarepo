@@ -1,40 +1,23 @@
 {
-  "name": "rust",
-  "displayName": "%displayName%",
-  "description": "%description%",
-  "version": "1.0.0",
-  "publisher": "vscode",
-  "license": "MIT",
-  "engines": {
-    "vscode": "*"
-  },
-  "scripts": {
-    "update-grammar": "node ../node_modules/vscode-grammar-updater/bin dustypomerleau/rust-syntax syntaxes/rust.tmLanguage.json ./syntaxes/rust.tmLanguage.json"
-  },
-  "contributes": {
-    "languages": [
-      {
-        "id": "rust",
-        "extensions": [
-          ".rs"
-        ],
-        "aliases": [
-          "Rust",
-          "rust"
-        ],
-        "configuration": "./language-configuration.json"
-      }
-    ],
-    "grammars": [
-      {
-        "language": "rust",
-        "path": "./syntaxes/rust.tmLanguage.json",
-        "scopeName": "source.rust"
-      }
-    ]
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/microsoft/vscode.git"
-  }
+	"name": "rust",
+	"version": "0.1.0",
+	"publisher": "vscode",
+	"engines": { "vscode": "*" },
+	"contributes": {
+		"languages": [{
+			"id": "rust",
+			"extensions": [".rs"],
+			"aliases": ["Rust", "rust"],
+			"configuration": "./rust.configuration.json"
+		}],
+		"grammars": [{
+			"language": "rust",
+			"path": "./syntaxes/rust.json",
+			"scopeName":"source.rust"
+		}],
+		"snippets": [{
+			"language": "rust",
+			"path": "./snippets/rust.json"
+		}]
+	}
 }

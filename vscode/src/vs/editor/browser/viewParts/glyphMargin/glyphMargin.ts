@@ -3,199 +3,165 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+'use strict';
+
 import 'vs/css!./glyphMargin';
-import { DynamicViewOverlay } from 'vs/editor/browser/view/dynamicViewOverlay';
-import { RenderingContext } from 'vs/editor/browser/view/renderingContext';
-import { ViewContext } from 'vs/editor/common/viewModel/viewContext';
-import * as viewEvents from 'vs/editor/common/viewEvents';
-import { EditorOption } from 'vs/editor/common/config/editorOptions';
+import DomUtils = require('vs/base/browser/dom');
 
+import {ViewEventHandler} from 'vs/editor/common/viewModel/viewEventHandler';
+import EditorBrowser = require('vs/editor/browser/editorBrowser');
+import EditorCommon = require('vs/editor/common/editorCommon');
 
-export class DecorationToRender {
-	_decorationToRenderBrand: void = undefined;
-
-	public startLineNumber: number;
-	public endLineNumber: number;
-	public className: string;
-
-	constructor(startLineNumber: number, endLineNumber: number, className: string) {
-		this.startLineNumber = +startLineNumber;
-		this.endLineNumber = +endLineNumber;
-		this.className = String(className);
-	}
+interface IRenderResult {
+	[lineNumber:string]:string[];
 }
 
-export abstract class DedupOverlay extends DynamicViewOverlay {
+export class GlyphMarginOverlay extends ViewEventHandler implements EditorBrowser.IDynamicViewOverlay {
 
-	protected _render(visibleStartLineNumber: number, visibleEndLineNumber: number, decorations: DecorationToRender[]): string[][] {
+	private _context:EditorBrowser.IViewContext;
+	private _glyphMarginLeft:number;
+	private _glyphMarginWidth:number;
+	private _renderResult:IRenderResult;
 
-		const output: string[][] = [];
-		for (let lineNumber = visibleStartLineNumber; lineNumber <= visibleEndLineNumber; lineNumber++) {
-			const lineIndex = lineNumber - visibleStartLineNumber;
-			output[lineIndex] = [];
-		}
-
-		if (decorations.length === 0) {
-			return output;
-		}
-
-		decorations.sort((a, b) => {
-			if (a.className === b.className) {
-				if (a.startLineNumber === b.startLineNumber) {
-					return a.endLineNumber - b.endLineNumber;
-				}
-				return a.startLineNumber - b.startLineNumber;
-			}
-			return (a.className < b.className ? -1 : 1);
-		});
-
-		let prevClassName: string | null = null;
-		let prevEndLineIndex = 0;
-		for (let i = 0, len = decorations.length; i < len; i++) {
-			const d = decorations[i];
-			const className = d.className;
-			let startLineIndex = Math.max(d.startLineNumber, visibleStartLineNumber) - visibleStartLineNumber;
-			const endLineIndex = Math.min(d.endLineNumber, visibleEndLineNumber) - visibleStartLineNumber;
-
-			if (prevClassName === className) {
-				startLineIndex = Math.max(prevEndLineIndex + 1, startLineIndex);
-				prevEndLineIndex = Math.max(prevEndLineIndex, endLineIndex);
-			} else {
-				prevClassName = className;
-				prevEndLineIndex = endLineIndex;
-			}
-
-			for (let i = startLineIndex; i <= prevEndLineIndex; i++) {
-				output[i].push(prevClassName);
-			}
-		}
-
-		return output;
-	}
-}
-
-export class GlyphMarginOverlay extends DedupOverlay {
-
-	private readonly _context: ViewContext;
-	private _lineHeight: number;
-	private _glyphMargin: boolean;
-	private _glyphMarginLeft: number;
-	private _glyphMarginWidth: number;
-	private _renderResult: string[] | null;
-
-	constructor(context: ViewContext) {
+	constructor(context:EditorBrowser.IViewContext) {
 		super();
 		this._context = context;
-
-		const options = this._context.configuration.options;
-		const layoutInfo = options.get(EditorOption.layoutInfo);
-
-		this._lineHeight = options.get(EditorOption.lineHeight);
-		this._glyphMargin = options.get(EditorOption.glyphMargin);
-		this._glyphMarginLeft = layoutInfo.glyphMarginLeft;
-		this._glyphMarginWidth = layoutInfo.glyphMarginWidth;
+		this._glyphMarginLeft = 0;
+		this._glyphMarginWidth = 0;
 		this._renderResult = null;
 		this._context.addEventHandler(this);
 	}
 
-	public override dispose(): void {
+	public dispose(): void {
 		this._context.removeEventHandler(this);
+		this._context = null;
 		this._renderResult = null;
-		super.dispose();
 	}
 
 	// --- begin event handlers
 
-	public override onConfigurationChanged(e: viewEvents.ViewConfigurationChangedEvent): boolean {
-		const options = this._context.configuration.options;
-		const layoutInfo = options.get(EditorOption.layoutInfo);
-
-		this._lineHeight = options.get(EditorOption.lineHeight);
-		this._glyphMargin = options.get(EditorOption.glyphMargin);
+	public onModelFlushed(): boolean {
+		return true;
+	}
+	public onModelDecorationsChanged(e:EditorCommon.IViewDecorationsChangedEvent): boolean {
+		return true;
+	}
+	public onModelLinesDeleted(e:EditorCommon.IViewLinesDeletedEvent): boolean {
+		return true;
+	}
+	public onModelLineChanged(e:EditorCommon.IViewLineChangedEvent): boolean {
+		return true;
+	}
+	public onModelLinesInserted(e:EditorCommon.IViewLinesInsertedEvent): boolean {
+		return true;
+	}
+	public onCursorPositionChanged(e:EditorCommon.IViewCursorPositionChangedEvent): boolean {
+		return false;
+	}
+	public onCursorSelectionChanged(e:EditorCommon.IViewCursorSelectionChangedEvent): boolean {
+		return false;
+	}
+	public onCursorRevealRange(e:EditorCommon.IViewRevealRangeEvent): boolean {
+		return false;
+	}
+	public onConfigurationChanged(e:EditorCommon.IConfigurationChangedEvent): boolean {
+		return true;
+	}
+	public onLayoutChanged(layoutInfo:EditorCommon.IEditorLayoutInfo): boolean {
 		this._glyphMarginLeft = layoutInfo.glyphMarginLeft;
 		this._glyphMarginWidth = layoutInfo.glyphMarginWidth;
 		return true;
 	}
-	public override onDecorationsChanged(e: viewEvents.ViewDecorationsChangedEvent): boolean {
+	public onScrollChanged(e:EditorCommon.IScrollEvent): boolean {
+		return e.vertical;
+	}
+	public onZonesChanged(): boolean {
 		return true;
 	}
-	public override onFlushed(e: viewEvents.ViewFlushedEvent): boolean {
-		return true;
+	public onScrollWidthChanged(scrollWidth:number): boolean {
+		return false;
 	}
-	public override onLinesChanged(e: viewEvents.ViewLinesChangedEvent): boolean {
-		return true;
-	}
-	public override onLinesDeleted(e: viewEvents.ViewLinesDeletedEvent): boolean {
-		return true;
-	}
-	public override onLinesInserted(e: viewEvents.ViewLinesInsertedEvent): boolean {
-		return true;
-	}
-	public override onScrollChanged(e: viewEvents.ViewScrollChangedEvent): boolean {
-		return e.scrollTopChanged;
-	}
-	public override onZonesChanged(e: viewEvents.ViewZonesChangedEvent): boolean {
-		return true;
+	public onScrollHeightChanged(scrollHeight:number): boolean {
+		return false;
 	}
 
 	// --- end event handlers
 
-	protected _getDecorations(ctx: RenderingContext): DecorationToRender[] {
-		const decorations = ctx.getDecorationsInViewport();
-		const r: DecorationToRender[] = [];
-		let rLen = 0;
-		for (let i = 0, len = decorations.length; i < len; i++) {
-			const d = decorations[i];
-			const glyphMarginClassName = d.options.glyphMarginClassName;
-			if (glyphMarginClassName) {
-				r[rLen++] = new DecorationToRender(d.range.startLineNumber, d.range.endLineNumber, glyphMarginClassName);
-			}
+	public shouldCallRender2(ctx:EditorBrowser.IRenderingContext): boolean {
+		if (!this.shouldRender) {
+			return false;
 		}
-		return r;
-	}
+		this.shouldRender = false;
 
-	public prepareRender(ctx: RenderingContext): void {
-		if (!this._glyphMargin) {
+		if (!this._context.configuration.editor.glyphMargin) {
 			this._renderResult = null;
-			return;
+			return false;
 		}
 
-		const visibleStartLineNumber = ctx.visibleRange.startLineNumber;
-		const visibleEndLineNumber = ctx.visibleRange.endLineNumber;
-		const toRender = this._render(visibleStartLineNumber, visibleEndLineNumber, this._getDecorations(ctx));
+		var output: IRenderResult = {};
+		var count = 0;
 
-		const lineHeight = this._lineHeight.toString();
-		const left = this._glyphMarginLeft.toString();
-		const width = this._glyphMarginWidth.toString();
-		const common = '" style="left:' + left + 'px;width:' + width + 'px' + ';height:' + lineHeight + 'px;"></div>';
+		var decorations = ctx.getDecorationsInViewport(),
+			lineHeight = this._context.configuration.editor.lineHeight.toString(),
+			d:EditorCommon.IModelDecoration,
+			rng:EditorCommon.IRange,
+			i:number, lenI:number,
+			classNames:{[lineNumber:string]:{[className:string]:boolean;};} = {},
+			lineClassNames:{[className:string]:boolean;},
+			className:string,
+			lineOutput:string[],
+			lineNumber: number,
+			lineNumberStr: string;
 
-		const output: string[] = [];
-		for (let lineNumber = visibleStartLineNumber; lineNumber <= visibleEndLineNumber; lineNumber++) {
-			const lineIndex = lineNumber - visibleStartLineNumber;
-			const classNames = toRender[lineIndex];
-
-			if (classNames.length === 0) {
-				output[lineIndex] = '';
-			} else {
-				output[lineIndex] = (
-					'<div class="cgmr codicon '
-					+ classNames.join(' ')
-					+ common
-				);
+		for (i = 0, lenI = decorations.length; i < lenI; i++) {
+			d = decorations[i];
+			if (!d.options.glyphMarginClassName) {
+				continue;
 			}
+
+			rng = d.range;
+			for (lineNumber = rng.startLineNumber; lineNumber <= rng.endLineNumber; lineNumber++) {
+				if (!ctx.lineIsVisible(lineNumber)) {
+					continue;
+				}
+
+				lineNumberStr = lineNumber.toString();
+
+				if (!classNames.hasOwnProperty(lineNumberStr)) {
+					classNames[lineNumberStr] = {};
+				}
+				classNames[lineNumberStr][d.options.glyphMarginClassName] = true;
+			}
+		}
+
+		var left = this._glyphMarginLeft.toString(),
+			width = this._glyphMarginWidth.toString();
+
+		var common = '" style="left:' + left + 'px;width:' + width + 'px' + ';height:' + lineHeight + 'px;"></div>';
+
+		for (lineNumberStr in classNames) {
+			lineClassNames = classNames[lineNumberStr];
+			lineOutput = [];
+			lineOutput.push('<div class="cgmr');
+			for (className in lineClassNames) {
+				// Count one more glyph
+				count++;
+				lineOutput.push(' ');
+				lineOutput.push(className);
+			}
+			lineOutput.push(common);
+			output[lineNumberStr] = lineOutput;
 		}
 
 		this._renderResult = output;
+
+		return true;
 	}
 
-	public render(startLineNumber: number, lineNumber: number): string {
-		if (!this._renderResult) {
-			return '';
+	public render2(lineNumber:number): string[] {
+		if (this._renderResult && this._renderResult.hasOwnProperty(lineNumber.toString())) {
+			return this._renderResult[lineNumber.toString()];
 		}
-		const lineIndex = lineNumber - startLineNumber;
-		if (lineIndex < 0 || lineIndex >= this._renderResult.length) {
-			return '';
-		}
-		return this._renderResult[lineIndex];
+		return null;
 	}
 }

@@ -2,623 +2,212 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+'use strict';
 
-import 'vs/css!./media/progressService';
+import {Promise} from 'vs/base/common/winjs.base';
+import types = require('vs/base/common/types');
+import {ProgressBar} from 'vs/base/browser/ui/progressbar/progressbar';
+import {ScopedService} from 'vs/workbench/browser/services';
+import {IEventService} from 'vs/platform/event/common/event';
+import {IProgressService, IProgressRunner} from 'vs/platform/progress/common/progress';
 
-import { localize } from 'vs/nls';
-import { IDisposable, dispose, DisposableStore, Disposable, toDisposable } from 'vs/base/common/lifecycle';
-import { IProgressService, IProgressOptions, IProgressStep, ProgressLocation, IProgress, Progress, IProgressCompositeOptions, IProgressNotificationOptions, IProgressRunner, IProgressIndicator, IProgressWindowOptions, IProgressDialogOptions } from 'vs/platform/progress/common/progress';
-import { StatusbarAlignment, IStatusbarService, IStatusbarEntryAccessor, IStatusbarEntry } from 'vs/workbench/services/statusbar/browser/statusbar';
-import { DeferredPromise, RunOnceScheduler, timeout } from 'vs/base/common/async';
-import { ProgressBadge, IActivityService } from 'vs/workbench/services/activity/common/activity';
-import { INotificationService, Severity, INotificationHandle } from 'vs/platform/notification/common/notification';
-import { Action } from 'vs/base/common/actions';
-import { Event, Emitter } from 'vs/base/common/event';
-import { registerSingleton } from 'vs/platform/instantiation/common/extensions';
-import { ILayoutService } from 'vs/platform/layout/browser/layoutService';
-import { Dialog } from 'vs/base/browser/ui/dialog/dialog';
-import { attachDialogStyler } from 'vs/platform/theme/common/styler';
-import { IThemeService } from 'vs/platform/theme/common/themeService';
-import { IKeybindingService } from 'vs/platform/keybinding/common/keybinding';
-import { StandardKeyboardEvent } from 'vs/base/browser/keyboardEvent';
-import { EventHelper } from 'vs/base/browser/dom';
-import { parseLinkedText } from 'vs/base/common/linkedText';
-import { IViewsService, IViewDescriptorService, ViewContainerLocation } from 'vs/workbench/common/views';
-import { IPaneCompositePartService } from 'vs/workbench/services/panecomposite/browser/panecomposite';
-import { stripIcons } from 'vs/base/common/iconLabels';
+interface ProgressState {
+	infinite?: boolean;
+	total?: number;
+	worked?: number;
+	done?: boolean;
+	whilePromise?: Promise;
+}
 
-export class ProgressService extends Disposable implements IProgressService {
+export class WorkbenchProgressService extends ScopedService implements IProgressService {
+	public serviceId = IProgressService;
+	private isActive: boolean;
+	private progressbar: ProgressBar;
+	private progressState: ProgressState;
 
-	declare readonly _serviceBrand: undefined;
+	constructor(eventService: IEventService, progressbar: ProgressBar, scopeId?: string, isActive?: boolean) {
+		super(eventService, scopeId);
 
-	constructor(
-		@IActivityService private readonly activityService: IActivityService,
-		@IPaneCompositePartService private readonly paneCompositeService: IPaneCompositePartService,
-		@IViewDescriptorService private readonly viewDescriptorService: IViewDescriptorService,
-		@IViewsService private readonly viewsService: IViewsService,
-		@INotificationService private readonly notificationService: INotificationService,
-		@IStatusbarService private readonly statusbarService: IStatusbarService,
-		@ILayoutService private readonly layoutService: ILayoutService,
-		@IThemeService private readonly themeService: IThemeService,
-		@IKeybindingService private readonly keybindingService: IKeybindingService
-	) {
-		super();
+		this.progressbar = progressbar;
+		this.isActive = isActive || types.isUndefinedOrNull(scopeId); // If service is unscoped, enable by default
+		this.progressState = {};
 	}
 
-	async withProgress<R = unknown>(options: IProgressOptions, task: (progress: IProgress<IProgressStep>) => Promise<R>, onDidCancel?: (choice?: number) => void): Promise<R> {
-		const { location } = options;
+	public onScopeDeactivated(): void {
+		this.isActive = false;
+	}
 
-		const handleStringLocation = (location: string) => {
-			const viewContainer = this.viewDescriptorService.getViewContainerById(location);
-			if (viewContainer) {
-				const viewContainerLocation = this.viewDescriptorService.getViewContainerLocation(viewContainer);
-				if (viewContainerLocation !== null) {
-					return this.withPaneCompositeProgress(location, viewContainerLocation, task, { ...options, location });
+	public onScopeActivated(): void {
+		this.isActive = true;
+
+		// Return early if progress state indicates that progress is done
+		if (this.progressState.done) {
+			return;
+		}
+
+		// Replay Infinite Progress from Promise
+		if (this.progressState.whilePromise) {
+			this.doShowWhile();
+		}
+
+		// Replay Infinite Progress
+		else if (this.progressState.infinite) {
+			this.progressbar.infinite().getContainer().show();
+		}
+
+		// Replay Finite Progress (Total & Worked)
+		else {
+			if (this.progressState.total) {
+				this.progressbar.total(this.progressState.total).getContainer().show();
+			}
+
+			if (this.progressState.worked) {
+				this.progressbar.worked(this.progressState.worked).getContainer().show();
+			}
+		}
+	}
+
+	private clearProgressState(): void {
+		delete this.progressState.infinite;
+		delete this.progressState.done;
+		delete this.progressState.worked;
+		delete this.progressState.total;
+		delete this.progressState.whilePromise;
+	}
+
+	public show(infinite: boolean, delay?: number): IProgressRunner;
+	public show(total: number, delay?: number): IProgressRunner;
+	public show(infiniteOrTotal: any, delay?: number): IProgressRunner {
+		let infinite: boolean;
+		let total: number;
+
+		// Sort out Arguments
+		if (infiniteOrTotal === false || infiniteOrTotal === true) {
+			infinite = infiniteOrTotal;
+		} else {
+			total = infiniteOrTotal;
+		}
+
+		// Reset State
+		this.clearProgressState();
+
+		// Keep in State
+		this.progressState.infinite = infinite;
+		this.progressState.total = total;
+
+		// Active: Show Progress
+		if (this.isActive) {
+
+			// Infinite: Start Progressbar and Show after Delay
+			if (!types.isUndefinedOrNull(infinite)) {
+				if (types.isUndefinedOrNull(delay)) {
+					this.progressbar.infinite().getContainer().show();
+				} else {
+					this.progressbar.infinite().getContainer().showDelayed(delay);
 				}
 			}
 
-			if (this.viewDescriptorService.getViewDescriptorById(location) !== null) {
-				return this.withViewProgress(location, task, { ...options, location });
+			// Finite: Start Progressbar and Show after Delay
+			else if (!types.isUndefinedOrNull(total)) {
+				if (types.isUndefinedOrNull(delay)) {
+					this.progressbar.total(total).getContainer().show();
+				} else {
+					this.progressbar.total(total).getContainer().showDelayed(delay);
+				}
 			}
+		}
 
-			throw new Error(`Bad progress location: ${location}`);
+		return {
+			total: (total: number) => {
+				this.progressState.infinite = false;
+				this.progressState.total = total;
+
+				if (this.isActive) {
+					this.progressbar.total(total);
+				}
+			},
+
+			worked: (worked: number) => {
+
+				// Verify first that we are either not active or the progressbar has a total set
+				if (!this.isActive || this.progressbar.hasTotal()) {
+					this.progressState.infinite = false;
+					if (this.progressState.worked) {
+						this.progressState.worked += worked;
+					} else {
+						this.progressState.worked = worked;
+					}
+
+					if (this.isActive) {
+						this.progressbar.worked(worked);
+					}
+				}
+
+				// Otherwise the progress bar does not support worked(), we fallback to infinite() progress
+				else {
+					this.progressState.infinite = true;
+					delete this.progressState.worked;
+					delete this.progressState.total;
+					this.progressbar.infinite().getContainer().show();
+				}
+			},
+
+			done: () => {
+				this.progressState.infinite = false;
+				this.progressState.done = true;
+
+				if (this.isActive) {
+					this.progressbar.stop().getContainer().hide();
+				}
+			}
 		};
-
-		if (typeof location === 'string') {
-			return handleStringLocation(location);
-		}
-
-		switch (location) {
-			case ProgressLocation.Notification:
-				return this.withNotificationProgress({ ...options, location }, task, onDidCancel);
-			case ProgressLocation.Window:
-				if ((options as IProgressWindowOptions).command) {
-					// Window progress with command get's shown in the status bar
-					return this.withWindowProgress({ ...options, location }, task);
-				}
-				// Window progress without command can be shown as silent notification
-				// which will first appear in the status bar and can then be brought to
-				// the front when clicking.
-				return this.withNotificationProgress({ delay: 150 /* default for ProgressLocation.Window */, ...options, silent: true, location: ProgressLocation.Notification }, task, onDidCancel);
-			case ProgressLocation.Explorer:
-				return this.withPaneCompositeProgress('workbench.view.explorer', ViewContainerLocation.Sidebar, task, { ...options, location });
-			case ProgressLocation.Scm:
-				return handleStringLocation('workbench.scm');
-			case ProgressLocation.Extensions:
-				return this.withPaneCompositeProgress('workbench.view.extensions', ViewContainerLocation.Sidebar, task, { ...options, location });
-			case ProgressLocation.Dialog:
-				return this.withDialogProgress(options, task, onDidCancel);
-			default:
-				throw new Error(`Bad progress location: ${location}`);
-		}
 	}
 
-	private readonly windowProgressStack: [IProgressOptions, Progress<IProgressStep>][] = [];
-	private windowProgressStatusEntry: IStatusbarEntryAccessor | undefined = undefined;
+	public showWhile(promise: Promise, delay?: number): Promise {
+		let stack: boolean = !!this.progressState.whilePromise;
 
-	private withWindowProgress<R = unknown>(options: IProgressWindowOptions, callback: (progress: IProgress<{ message?: string }>) => Promise<R>): Promise<R> {
-		const task: [IProgressWindowOptions, Progress<IProgressStep>] = [options, new Progress<IProgressStep>(() => this.updateWindowProgress())];
+		// Reset State
+		if (!stack) {
+			this.clearProgressState();
+		}
 
-		const promise = callback(task[1]);
+		// Otherwise join with existing running promise to ensure progress is accurate
+		else {
+			promise = Promise.join([promise, this.progressState.whilePromise]);
+		}
 
-		let delayHandle: any = setTimeout(() => {
-			delayHandle = undefined;
-			this.windowProgressStack.unshift(task);
-			this.updateWindowProgress();
+		// Keep Promise in State
+		this.progressState.whilePromise = promise;
 
-			// show progress for at least 150ms
-			Promise.all([
-				timeout(150),
-				promise
-			]).finally(() => {
-				const idx = this.windowProgressStack.indexOf(task);
-				this.windowProgressStack.splice(idx, 1);
-				this.updateWindowProgress();
-			});
-		}, 150);
+		let stop = () => {
 
-		// cancel delay if promise finishes below 150ms
-		return promise.finally(() => clearTimeout(delayHandle));
-	}
-
-	private updateWindowProgress(idx: number = 0) {
-
-		// We still have progress to show
-		if (idx < this.windowProgressStack.length) {
-			const [options, progress] = this.windowProgressStack[idx];
-
-			let progressTitle = options.title;
-			let progressMessage = progress.value && progress.value.message;
-			let progressCommand = (<IProgressWindowOptions>options).command;
-			let text: string;
-			let title: string;
-			const source = options.source && typeof options.source !== 'string' ? options.source.label : options.source;
-
-			if (progressTitle && progressMessage) {
-				// <title>: <message>
-				text = localize('progress.text2', "{0}: {1}", progressTitle, progressMessage);
-				title = source ? localize('progress.title3', "[{0}] {1}: {2}", source, progressTitle, progressMessage) : text;
-
-			} else if (progressTitle) {
-				// <title>
-				text = progressTitle;
-				title = source ? localize('progress.title2', "[{0}]: {1}", source, progressTitle) : text;
-
-			} else if (progressMessage) {
-				// <message>
-				text = progressMessage;
-				title = source ? localize('progress.title2', "[{0}]: {1}", source, progressMessage) : text;
-
-			} else {
-				// no title, no message -> no progress. try with next on stack
-				this.updateWindowProgress(idx + 1);
+			// If this is not the last promise in the list of joined promises, return early
+			if (!!this.progressState.whilePromise && this.progressState.whilePromise !== promise) {
 				return;
 			}
 
-			const statusEntryProperties: IStatusbarEntry = {
-				name: localize('status.progress', "Progress Message"),
-				text,
-				showProgress: true,
-				ariaLabel: text,
-				tooltip: title,
-				command: progressCommand
-			};
+			// The while promise is either null or equal the promise we last hooked on
+			this.clearProgressState();
 
-			if (this.windowProgressStatusEntry) {
-				this.windowProgressStatusEntry.update(statusEntryProperties);
+			if (this.isActive) {
+				this.progressbar.stop().getContainer().hide();
+			}
+		};
+
+		this.doShowWhile(delay);
+
+		return promise.then(stop, stop);
+	}
+
+	private doShowWhile(delay?: number): void {
+
+		// Show Progress when active
+		if (this.isActive) {
+			if (types.isUndefinedOrNull(delay)) {
+				this.progressbar.infinite().getContainer().show();
 			} else {
-				this.windowProgressStatusEntry = this.statusbarService.addEntry(statusEntryProperties, 'status.progress', StatusbarAlignment.LEFT);
+				this.progressbar.infinite().getContainer().showDelayed(delay);
 			}
 		}
-
-		// Progress is done so we remove the status entry
-		else {
-			this.windowProgressStatusEntry?.dispose();
-			this.windowProgressStatusEntry = undefined;
-		}
-	}
-
-	private withNotificationProgress<P extends Promise<R>, R = unknown>(options: IProgressNotificationOptions, callback: (progress: IProgress<IProgressStep>) => P, onDidCancel?: (choice?: number) => void): P {
-
-		const progressStateModel = new class extends Disposable {
-
-			private readonly _onDidReport = this._register(new Emitter<IProgressStep>());
-			readonly onDidReport = this._onDidReport.event;
-
-			private readonly _onWillDispose = this._register(new Emitter<void>());
-			readonly onWillDispose = this._onWillDispose.event;
-
-			private _step: IProgressStep | undefined = undefined;
-			get step() { return this._step; }
-
-			private _done = false;
-			get done() { return this._done; }
-
-			readonly promise: P;
-
-			constructor() {
-				super();
-
-				this.promise = callback(this);
-
-				this.promise.finally(() => {
-					this.dispose();
-				});
-			}
-
-			report(step: IProgressStep): void {
-				this._step = step;
-
-				this._onDidReport.fire(step);
-			}
-
-			cancel(choice?: number): void {
-				onDidCancel?.(choice);
-
-				this.dispose();
-			}
-
-			override dispose(): void {
-				this._done = true;
-				this._onWillDispose.fire();
-
-				super.dispose();
-			}
-		};
-
-		const createWindowProgress = () => {
-
-			// Create a promise that we can resolve as needed
-			// when the outside calls dispose on us
-			const promise = new DeferredPromise<void>();
-
-			this.withWindowProgress({
-				location: ProgressLocation.Window,
-				title: options.title ? parseLinkedText(options.title).toString() : undefined, // convert markdown links => string
-				command: 'notifications.showList'
-			}, progress => {
-
-				function reportProgress(step: IProgressStep) {
-					if (step.message) {
-						progress.report({
-							message: parseLinkedText(step.message).toString()  // convert markdown links => string
-						});
-					}
-				}
-
-				// Apply any progress that was made already
-				if (progressStateModel.step) {
-					reportProgress(progressStateModel.step);
-				}
-
-				// Continue to report progress as it happens
-				const onDidReportListener = progressStateModel.onDidReport(step => reportProgress(step));
-				promise.p.finally(() => onDidReportListener.dispose());
-
-				// When the progress model gets disposed, we are done as well
-				Event.once(progressStateModel.onWillDispose)(() => promise.complete());
-
-				return promise.p;
-			});
-
-			// Dispose means completing our promise
-			return toDisposable(() => promise.complete());
-		};
-
-		const createNotification = (message: string, silent: boolean, increment?: number): INotificationHandle => {
-			const notificationDisposables = new DisposableStore();
-
-			const primaryActions = options.primaryActions ? Array.from(options.primaryActions) : [];
-			const secondaryActions = options.secondaryActions ? Array.from(options.secondaryActions) : [];
-
-			if (options.buttons) {
-				options.buttons.forEach((button, index) => {
-					const buttonAction = new class extends Action {
-						constructor() {
-							super(`progress.button.${button}`, button, undefined, true);
-						}
-
-						override async run(): Promise<void> {
-							progressStateModel.cancel(index);
-						}
-					};
-					notificationDisposables.add(buttonAction);
-
-					primaryActions.push(buttonAction);
-				});
-			}
-
-			if (options.cancellable) {
-				const cancelAction = new class extends Action {
-					constructor() {
-						super('progress.cancel', localize('cancel', "Cancel"), undefined, true);
-					}
-
-					override async run(): Promise<void> {
-						progressStateModel.cancel();
-					}
-				};
-				notificationDisposables.add(cancelAction);
-
-				primaryActions.push(cancelAction);
-			}
-
-			const notification = this.notificationService.notify({
-				severity: Severity.Info,
-				message: stripIcons(message), // status entries support codicons, but notifications do not (https://github.com/microsoft/vscode/issues/145722)
-				source: options.source,
-				actions: { primary: primaryActions, secondary: secondaryActions },
-				progress: typeof increment === 'number' && increment >= 0 ? { total: 100, worked: increment } : { infinite: true },
-				silent
-			});
-
-			// Switch to window based progress once the notification
-			// changes visibility to hidden and is still ongoing.
-			// Remove that window based progress once the notification
-			// shows again.
-			let windowProgressDisposable: IDisposable | undefined = undefined;
-			const onVisibilityChange = (visible: boolean) => {
-				// Clear any previous running window progress
-				dispose(windowProgressDisposable);
-
-				// Create new window progress if notification got hidden
-				if (!visible && !progressStateModel.done) {
-					windowProgressDisposable = createWindowProgress();
-				}
-			};
-			notificationDisposables.add(notification.onDidChangeVisibility(onVisibilityChange));
-			if (silent) {
-				onVisibilityChange(false);
-			}
-
-			// Clear upon dispose
-			Event.once(notification.onDidClose)(() => notificationDisposables.dispose());
-
-			return notification;
-		};
-
-		const updateProgress = (notification: INotificationHandle, increment?: number): void => {
-			if (typeof increment === 'number' && increment >= 0) {
-				notification.progress.total(100); // always percentage based
-				notification.progress.worked(increment);
-			} else {
-				notification.progress.infinite();
-			}
-		};
-
-		let notificationHandle: INotificationHandle | undefined;
-		let notificationTimeout: any | undefined;
-		let titleAndMessage: string | undefined; // hoisted to make sure a delayed notification shows the most recent message
-
-		const updateNotification = (step?: IProgressStep): void => {
-
-			// full message (inital or update)
-			if (step?.message && options.title) {
-				titleAndMessage = `${options.title}: ${step.message}`; // always prefix with overall title if we have it (https://github.com/microsoft/vscode/issues/50932)
-			} else {
-				titleAndMessage = options.title || step?.message;
-			}
-
-			if (!notificationHandle && titleAndMessage) {
-
-				// create notification now or after a delay
-				if (typeof options.delay === 'number' && options.delay > 0) {
-					if (typeof notificationTimeout !== 'number') {
-						notificationTimeout = setTimeout(() => notificationHandle = createNotification(titleAndMessage!, !!options.silent, step?.increment), options.delay);
-					}
-				} else {
-					notificationHandle = createNotification(titleAndMessage, !!options.silent, step?.increment);
-				}
-			}
-
-			if (notificationHandle) {
-				if (titleAndMessage) {
-					notificationHandle.updateMessage(titleAndMessage);
-				}
-
-				if (typeof step?.increment === 'number') {
-					updateProgress(notificationHandle, step.increment);
-				}
-			}
-		};
-
-		// Show initially
-		updateNotification(progressStateModel.step);
-		const listener = progressStateModel.onDidReport(step => updateNotification(step));
-		Event.once(progressStateModel.onWillDispose)(() => listener.dispose());
-
-		// Clean up eventually
-		(async () => {
-			try {
-
-				// with a delay we only wait for the finish of the promise
-				if (typeof options.delay === 'number' && options.delay > 0) {
-					await progressStateModel.promise;
-				}
-
-				// without a delay we show the notification for at least 800ms
-				// to reduce the chance of the notification flashing up and hiding
-				else {
-					await Promise.all([timeout(800), progressStateModel.promise]);
-				}
-			} finally {
-				clearTimeout(notificationTimeout);
-				notificationHandle?.close();
-			}
-		})();
-
-		return progressStateModel.promise;
-	}
-
-	private withPaneCompositeProgress<P extends Promise<R>, R = unknown>(paneCompositeId: string, viewContainerLocation: ViewContainerLocation, task: (progress: IProgress<IProgressStep>) => P, options: IProgressCompositeOptions): P {
-
-		// show in viewlet
-		const progressIndicator = this.paneCompositeService.getProgressIndicator(paneCompositeId, viewContainerLocation);
-		const promise = progressIndicator ? this.withCompositeProgress(progressIndicator, task, options) : task({ report: () => { } });
-
-		// show on activity bar
-		if (viewContainerLocation === ViewContainerLocation.Sidebar) {
-			this.showOnActivityBar<P, R>(paneCompositeId, options, promise);
-		}
-
-		return promise;
-	}
-
-	private withViewProgress<P extends Promise<R>, R = unknown>(viewId: string, task: (progress: IProgress<IProgressStep>) => P, options: IProgressCompositeOptions): P {
-
-		// show in viewlet
-		const progressIndicator = this.viewsService.getViewProgressIndicator(viewId);
-		const promise = progressIndicator ? this.withCompositeProgress(progressIndicator, task, options) : task({ report: () => { } });
-
-		const location = this.viewDescriptorService.getViewLocationById(viewId);
-		if (location !== ViewContainerLocation.Sidebar) {
-			return promise;
-		}
-
-		const viewletId = this.viewDescriptorService.getViewContainerByViewId(viewId)?.id;
-		if (viewletId === undefined) {
-			return promise;
-		}
-
-		// show on activity bar
-		this.showOnActivityBar(viewletId, options, promise);
-
-		return promise;
-	}
-
-	private showOnActivityBar<P extends Promise<R>, R = unknown>(viewletId: string, options: IProgressCompositeOptions, promise: P): void {
-		let activityProgress: IDisposable;
-		let delayHandle: any = setTimeout(() => {
-			delayHandle = undefined;
-			const handle = this.activityService.showViewContainerActivity(viewletId, { badge: new ProgressBadge(() => ''), clazz: 'progress-badge', priority: 100 });
-			const startTimeVisible = Date.now();
-			const minTimeVisible = 300;
-			activityProgress = {
-				dispose() {
-					const d = Date.now() - startTimeVisible;
-					if (d < minTimeVisible) {
-						// should at least show for Nms
-						setTimeout(() => handle.dispose(), minTimeVisible - d);
-					} else {
-						// shown long enough
-						handle.dispose();
-					}
-				}
-			};
-		}, options.delay || 300);
-		promise.finally(() => {
-			clearTimeout(delayHandle);
-			dispose(activityProgress);
-		});
-	}
-
-	private withCompositeProgress<P extends Promise<R>, R = unknown>(progressIndicator: IProgressIndicator, task: (progress: IProgress<IProgressStep>) => P, options: IProgressCompositeOptions): P {
-		let discreteProgressRunner: IProgressRunner | undefined = undefined;
-
-		function updateProgress(stepOrTotal: IProgressStep | number | undefined): IProgressRunner | undefined {
-
-			// Figure out whether discrete progress applies
-			// by figuring out the "total" progress to show
-			// and the increment if any.
-			let total: number | undefined = undefined;
-			let increment: number | undefined = undefined;
-			if (typeof stepOrTotal !== 'undefined') {
-				if (typeof stepOrTotal === 'number') {
-					total = stepOrTotal;
-				} else if (typeof stepOrTotal.increment === 'number') {
-					total = stepOrTotal.total ?? 100; // always percentage based
-					increment = stepOrTotal.increment;
-				}
-			}
-
-			// Discrete
-			if (typeof total === 'number') {
-				if (!discreteProgressRunner) {
-					discreteProgressRunner = progressIndicator.show(total, options.delay);
-					promise.catch(() => undefined /* ignore */).finally(() => discreteProgressRunner?.done());
-				}
-
-				if (typeof increment === 'number') {
-					discreteProgressRunner.worked(increment);
-				}
-			}
-
-			// Infinite
-			else {
-				if (discreteProgressRunner) {
-					discreteProgressRunner.done();
-				}
-				progressIndicator.showWhile(promise, options.delay);
-			}
-
-			return discreteProgressRunner;
-		}
-
-		const promise = task({
-			report: progress => {
-				updateProgress(progress);
-			}
-		});
-
-		updateProgress(options.total);
-
-		return promise;
-	}
-
-	private withDialogProgress<P extends Promise<R>, R = unknown>(options: IProgressDialogOptions, task: (progress: IProgress<IProgressStep>) => P, onDidCancel?: (choice?: number) => void): P {
-		const disposables = new DisposableStore();
-
-		const allowableCommands = [
-			'workbench.action.quit',
-			'workbench.action.reloadWindow',
-			'copy',
-			'cut',
-			'editor.action.clipboardCopyAction',
-			'editor.action.clipboardCutAction'
-		];
-
-		let dialog: Dialog;
-
-		const createDialog = (message: string) => {
-			const buttons = options.buttons || [];
-			if (!options.sticky) {
-				buttons.push(options.cancellable ? localize('cancel', "Cancel") : localize('dismiss', "Dismiss"));
-			}
-
-			dialog = new Dialog(
-				this.layoutService.container,
-				message,
-				buttons,
-				{
-					type: 'pending',
-					detail: options.detail,
-					cancelId: buttons.length - 1,
-					disableCloseAction: options.sticky,
-					disableDefaultAction: options.sticky,
-					keyEventProcessor: (event: StandardKeyboardEvent) => {
-						const resolved = this.keybindingService.softDispatch(event, this.layoutService.container);
-						if (resolved?.commandId) {
-							if (!allowableCommands.includes(resolved.commandId)) {
-								EventHelper.stop(event, true);
-							}
-						}
-					}
-				}
-			);
-
-			disposables.add(dialog);
-			disposables.add(attachDialogStyler(dialog, this.themeService));
-
-			dialog.show().then(dialogResult => {
-				onDidCancel?.(dialogResult.button);
-
-				dispose(dialog);
-			});
-
-			return dialog;
-		};
-
-		// In order to support the `delay` option, we use a scheduler
-		// that will guard each access to the dialog behind a delay
-		// that is either the original delay for one invocation and
-		// otherwise runs without delay.
-		let delay = options.delay ?? 0;
-		let latestMessage: string | undefined = undefined;
-		const scheduler = disposables.add(new RunOnceScheduler(() => {
-			delay = 0; // since we have run once, we reset the delay
-
-			if (latestMessage && !dialog) {
-				dialog = createDialog(latestMessage);
-			} else if (latestMessage) {
-				dialog.updateMessage(latestMessage);
-			}
-		}, 0));
-
-		const updateDialog = function (message?: string): void {
-			latestMessage = message;
-
-			// Make sure to only run one dialog update and not multiple
-			if (!scheduler.isScheduled()) {
-				scheduler.schedule(delay);
-			}
-		};
-
-		const promise = task({
-			report: progress => {
-				updateDialog(progress.message);
-			}
-		});
-
-		promise.finally(() => {
-			dispose(disposables);
-		});
-
-		if (options.title) {
-			updateDialog(options.title);
-		}
-
-		return promise;
 	}
 }
-
-registerSingleton(IProgressService, ProgressService, true);

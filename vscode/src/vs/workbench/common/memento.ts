@@ -2,112 +2,124 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+'use strict';
 
-import { IStorageService, StorageScope, StorageTarget } from 'vs/platform/storage/common/storage';
-import { isEmptyObject } from 'vs/base/common/types';
-import { onUnexpectedError } from 'vs/base/common/errors';
+import {TPromise} from 'vs/base/common/winjs.base';
+import types = require('vs/base/common/types');
+import {IStorageService, StorageScope} from 'vs/platform/storage/common/storage';
 
-export type MementoObject = { [key: string]: any };
+/**
+ * Supported memento scopes.
+ */
+export enum Scope {
 
+	/**
+	 * The memento will be scoped to all workspaces of this domain.
+	 */
+	GLOBAL,
+
+	/**
+	 * The memento will be scoped to the current workspace.
+	 */
+	WORKSPACE
+}
+
+/**
+ * A memento provides access to a datastructure that is persisted and restored as part of the workbench lifecycle.
+ */
 export class Memento {
 
-	private static readonly globalMementos = new Map<string, ScopedMemento>();
-	private static readonly workspaceMementos = new Map<string, ScopedMemento>();
+	// Mementos are static to ensure that for a given component with an id only ever one memento gets loaded
+	private static globalMementos: { [id: string]: ScopedMemento } = {};
+	private static workspaceMementos: { [id: string]: ScopedMemento } = {};
 
-	private static readonly COMMON_PREFIX = 'memento/';
+	private static COMMON_PREFIX = 'memento/';
 
-	private readonly id: string;
+	private id: string;
 
-	constructor(id: string, private storageService: IStorageService) {
-		this.id = Memento.COMMON_PREFIX + id;
+	constructor(id: string) {
+		this.id = Memento.COMMON_PREFIX + id.toLowerCase();
 	}
 
-	getMemento(scope: StorageScope, target: StorageTarget): MementoObject {
+	/**
+	 * Returns a JSON Object that represents the data of this memento. The optional
+	 * parameter scope allows to specify the scope of the memento to load. If not
+	 * provided, the scope will be global, Memento.Scope.WORKSPACE can be used to
+	 * scope the memento to the workspace.
+	 */
+	public getMemento(storageService: IStorageService, scope: Scope = Scope.GLOBAL): any {
 
 		// Scope by Workspace
-		if (scope === StorageScope.WORKSPACE) {
-			let workspaceMemento = Memento.workspaceMementos.get(this.id);
+		if (scope === Scope.WORKSPACE) {
+			let workspaceMemento = Memento.workspaceMementos[this.id];
 			if (!workspaceMemento) {
-				workspaceMemento = new ScopedMemento(this.id, scope, target, this.storageService);
-				Memento.workspaceMementos.set(this.id, workspaceMemento);
+				workspaceMemento = new ScopedMemento(this.id, scope, storageService);
+				Memento.workspaceMementos[this.id] = workspaceMemento;
 			}
 
 			return workspaceMemento.getMemento();
 		}
 
-		// Scope Global
-		let globalMemento = Memento.globalMementos.get(this.id);
+		// Use global scope
+		let globalMemento = Memento.globalMementos[this.id];
 		if (!globalMemento) {
-			globalMemento = new ScopedMemento(this.id, scope, target, this.storageService);
-			Memento.globalMementos.set(this.id, globalMemento);
+			globalMemento = new ScopedMemento(this.id, scope, storageService);
+			Memento.globalMementos[this.id] = globalMemento;
 		}
 
 		return globalMemento.getMemento();
 	}
 
-	saveMemento(): void {
-
-		// Workspace
-		const workspaceMemento = Memento.workspaceMementos.get(this.id);
-		if (workspaceMemento) {
-			workspaceMemento.save();
-		}
+	/**
+	 * Saves all data of the mementos that have been loaded to the local storage. This includes
+	 * global and workspace scope.
+	 */
+	public saveMemento(): void {
 
 		// Global
-		const globalMemento = Memento.globalMementos.get(this.id);
-		if (globalMemento) {
-			globalMemento.save();
+		if (Memento.globalMementos[this.id]) {
+			Memento.globalMementos[this.id].save();
 		}
-	}
-
-	static clear(scope: StorageScope): void {
 
 		// Workspace
-		if (scope === StorageScope.WORKSPACE) {
-			Memento.workspaceMementos.clear();
-		}
-
-		// Global
-		if (scope === StorageScope.GLOBAL) {
-			Memento.globalMementos.clear();
+		if (Memento.workspaceMementos[this.id]) {
+			Memento.workspaceMementos[this.id].save();
 		}
 	}
 }
 
 class ScopedMemento {
+	private id: string;
+	private mementoObj: any;
+	private scope: Scope;
 
-	private readonly mementoObj: MementoObject;
-
-	constructor(private id: string, private scope: StorageScope, private target: StorageTarget, private storageService: IStorageService) {
-		this.mementoObj = this.load();
+	constructor(id: string, scope: Scope, private storageService: IStorageService) {
+		this.id = id;
+		this.scope = scope;
+		this.mementoObj = this.loadMemento();
 	}
 
-	getMemento(): MementoObject {
+	public getMemento(): any {
 		return this.mementoObj;
 	}
 
-	private load(): MementoObject {
-		const memento = this.storageService.get(this.id, this.scope);
+	private loadMemento(): any {
+		let storageScope = this.scope === Scope.GLOBAL ? StorageScope.GLOBAL : StorageScope.WORKSPACE;
+		let memento = this.storageService.get(this.id, storageScope);
 		if (memento) {
-			try {
-				return JSON.parse(memento);
-			} catch (error) {
-				// Seeing reports from users unable to open editors
-				// from memento parsing exceptions. Log the contents
-				// to diagnose further
-				// https://github.com/microsoft/vscode/issues/102251
-				onUnexpectedError(`[memento]: failed to parse contents: ${error} (id: ${this.id}, scope: ${this.scope}, contents: ${memento})`);
-			}
+			return JSON.parse(memento);
 		}
 
 		return {};
 	}
 
-	save(): void {
-		if (!isEmptyObject(this.mementoObj)) {
-			this.storageService.store(this.id, JSON.stringify(this.mementoObj), this.scope, this.target);
+	public save(): void {
+		let storageScope = this.scope === Scope.GLOBAL ? StorageScope.GLOBAL : StorageScope.WORKSPACE;
+
+		if (!types.isEmptyObject(this.mementoObj)) {
+			this.storageService.store(this.id, JSON.stringify(this.mementoObj), storageScope);
 		} else {
-			this.storageService.remove(this.id, this.scope);
+			this.storageService.remove(this.id, storageScope);
 		}
 	}
 }
