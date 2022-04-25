@@ -1,12 +1,10 @@
 {
-  "name": "watch",
-  "version": "1.0.0",
-  "description": "",
-  "author": "Microsoft ",
-  "private": true,
-  "license": "MIT",
-  "devDependencies": {},
-  "dependencies": {
-    "vscode-gulp-watch": "^5.0.3"
-  }
+	"name": "watch",
+	"version": "1.0.0",
+	"description": "",
+	"author": "Microsoft ",
+	"private": true,
+	"devDependencies": {
+		"gulp-watch": "^4.3.5"
+	}
 }

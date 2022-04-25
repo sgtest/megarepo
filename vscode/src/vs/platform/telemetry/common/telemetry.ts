@@ -2,90 +2,88 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+'use strict';
 
-import { createDecorator } from 'vs/platform/instantiation/common/instantiation';
-import { ClassifiedEvent, GDPRClassification, StrictPropertyCheck } from 'vs/platform/telemetry/common/gdprTypings';
-import { IObservableValue } from 'vs/base/common/observableValue';
+import Lifecycle = require('vs/base/common/lifecycle');
+import Timer = require('vs/base/common/timer');
+import {createDecorator, ServiceIdentifier, IInstantiationService} from 'vs/platform/instantiation/common/instantiation';
 
-export const ITelemetryService = createDecorator<ITelemetryService>('telemetryService');
+export var ID = 'telemetryService';
+
+export var ITelemetryService = createDecorator<ITelemetryService>(ID);
 
 export interface ITelemetryInfo {
-	sessionId: string;
-	machineId: string;
-	firstSessionDate: string;
-	msftInternal?: boolean;
+		sessionId: string;
+		machineId: string;
+		instanceId: string;
 }
 
-export interface ITelemetryData {
-	from?: string;
-	target?: string;
-	[key: string]: any;
-}
-
-export interface ITelemetryService {
-
-	/**
-	 * Whether error telemetry will get sent. If false, `publicLogError` will no-op.
-	 */
-	readonly sendErrorTelemetry: boolean;
-
-	readonly _serviceBrand: undefined;
+export interface ITelemetryService extends Lifecycle.IDisposable {
+	serviceId : ServiceIdentifier<any>;
 
 	/**
 	 * Sends a telemetry event that has been privacy approved.
 	 * Do not call this unless you have been given approval.
 	 */
-	publicLog(eventName: string, data?: ITelemetryData, anonymizeFilePaths?: boolean): Promise<void>;
+	publicLog(eventName: string, data?: any):void;
 
-	publicLog2<E extends ClassifiedEvent<T> = never, T extends GDPRClassification<T> = never>(eventName: string, data?: StrictPropertyCheck<T, E>, anonymizeFilePaths?: boolean): Promise<void>;
+	/**
+	 * Starts a telemetry timer. Call stop() to send the event.
+	 */
+	start(name:string, data?:any):Timer.ITimerEvent;
 
-	publicLogError(errorEventName: string, data?: ITelemetryData): Promise<void>;
+	/**
+	 * Session Id
+	 */
+	getSessionId(): string;
 
-	publicLogError2<E extends ClassifiedEvent<T> = never, T extends GDPRClassification<T> = never>(eventName: string, data?: StrictPropertyCheck<T, E>): Promise<void>;
+	/**
+	 * a unique Id that is not hardware specific
+	 */
+	getInstanceId(): string;
 
-	getTelemetryInfo(): Promise<ITelemetryInfo>;
+	/**
+	 * a hardware specific machine Id
+	 */
+	getMachineId(): string;
 
-	setExperimentProperty(name: string, value: string): void;
+	getTelemetryInfo(): Thenable<ITelemetryInfo>;
 
-	readonly telemetryLevel: IObservableValue<TelemetryLevel>;
+	/**
+	 * Appender operations
+	 */
+	getAppendersCount(): number;
+	getAppenders(): ITelemetryAppender[];
+	addTelemetryAppender(appender: ITelemetryAppender): void;
+	removeTelemetryAppender(appender: ITelemetryAppender): void;
+	setInstantiationService(instantiationService: IInstantiationService): void;
 }
 
-export interface ITelemetryEndpoint {
-	id: string;
-	aiKey: string;
-	sendErrorTelemetry: boolean;
+export interface ITelemetryAppender extends Lifecycle.IDisposable {
+	log(eventName: string, data?: any): void;
 }
 
-export const ICustomEndpointTelemetryService = createDecorator<ICustomEndpointTelemetryService>('customEndpointTelemetryService');
+export function anonymize(input: string): string {
+	if (!input) {
+		return input;
+	}
 
-export interface ICustomEndpointTelemetryService {
-	readonly _serviceBrand: undefined;
-
-	publicLog(endpoint: ITelemetryEndpoint, eventName: string, data?: ITelemetryData): Promise<void>;
-	publicLogError(endpoint: ITelemetryEndpoint, errorEventName: string, data?: ITelemetryData): Promise<void>;
-}
-
-// Keys
-export const currentSessionDateStorageKey = 'telemetry.currentSessionDate';
-export const firstSessionDateStorageKey = 'telemetry.firstSessionDate';
-export const lastSessionDateStorageKey = 'telemetry.lastSessionDate';
-export const machineIdKey = 'telemetry.machineId';
-
-// Configuration Keys
-export const TELEMETRY_SECTION_ID = 'telemetry';
-export const TELEMETRY_SETTING_ID = 'telemetry.telemetryLevel';
-export const TELEMETRY_OLD_SETTING_ID = 'telemetry.enableTelemetry';
-
-export const enum TelemetryLevel {
-	NONE = 0,
-	CRASH = 1,
-	ERROR = 2,
-	USAGE = 3
-}
-
-export const enum TelemetryConfiguration {
-	OFF = 'off',
-	CRASH = 'crash',
-	ERROR = 'error',
-	ON = 'all'
+	var r = '';
+	for (var i = 0; i < input.length; i++) {
+		var ch = input[i];
+		if (ch >= '0' && ch <= '9') {
+			r += '0';
+			continue;
+		}
+		if (ch >= 'a' && ch <= 'z') {
+			r += 'a';
+			continue;
+		}
+		if (ch >= 'A' && ch <= 'Z') {
+			r += 'A';
+			continue;
+		}
+		r += ch;
+	}
+	return r;
 }

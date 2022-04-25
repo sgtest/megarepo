@@ -3,973 +3,701 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import * as dom from 'vs/base/browser/dom';
-import { IKeyboardEvent } from 'vs/base/browser/keyboardEvent';
-import 'vs/base/browser/ui/codicons/codiconStyles'; // The codicon symbol styles are defined here and must be loaded
-import { IListEvent, IListGestureEvent, IListMouseEvent } from 'vs/base/browser/ui/list/list';
-import { List } from 'vs/base/browser/ui/list/listWidget';
-import { CancelablePromise, createCancelablePromise, disposableTimeout, TimeoutTimer } from 'vs/base/common/async';
-import { onUnexpectedError } from 'vs/base/common/errors';
-import { Emitter, Event } from 'vs/base/common/event';
-import { DisposableStore, IDisposable } from 'vs/base/common/lifecycle';
-import { clamp } from 'vs/base/common/numbers';
-import * as strings from 'vs/base/common/strings';
-import 'vs/css!./media/suggest';
-import { ContentWidgetPositionPreference, ICodeEditor, IContentWidget, IContentWidgetPosition, IEditorMouseEvent } from 'vs/editor/browser/editorBrowser';
-import { EmbeddedCodeEditorWidget } from 'vs/editor/browser/widget/embeddedCodeEditorWidget';
-import { EditorOption } from 'vs/editor/common/config/editorOptions';
-import { IPosition } from 'vs/editor/common/core/position';
-import { SuggestWidgetStatus } from 'vs/editor/contrib/suggest/browser/suggestWidgetStatus';
-import 'vs/editor/contrib/symbolIcons/browser/symbolIcons'; // The codicon symbol colors are defined here and must be loaded to get colors
-import * as nls from 'vs/nls';
-import { IContextKey, IContextKeyService } from 'vs/platform/contextkey/common/contextkey';
-import { IInstantiationService } from 'vs/platform/instantiation/common/instantiation';
-import { IStorageService, StorageScope, StorageTarget } from 'vs/platform/storage/common/storage';
-import { activeContrastBorder, editorForeground, editorWidgetBackground, editorWidgetBorder, listFocusHighlightForeground, listHighlightForeground, quickInputListFocusBackground, quickInputListFocusForeground, quickInputListFocusIconForeground, registerColor, transparent } from 'vs/platform/theme/common/colorRegistry';
-import { attachListStyler } from 'vs/platform/theme/common/styler';
-import { isHighContrast } from 'vs/platform/theme/common/theme';
-import { IColorTheme, IThemeService } from 'vs/platform/theme/common/themeService';
-import { CompletionModel } from './completionModel';
-import { ResizableHTMLElement } from './resizable';
-import { CompletionItem, Context as SuggestContext } from './suggest';
-import { canExpandCompletionItem, SuggestDetailsOverlay, SuggestDetailsWidget } from './suggestWidgetDetails';
-import { getAriaId, ItemRenderer } from './suggestWidgetRenderer';
+'use strict';
 
-/**
- * Suggest widget colors
- */
-export const editorSuggestWidgetBackground = registerColor('editorSuggestWidget.background', { dark: editorWidgetBackground, light: editorWidgetBackground, hcDark: editorWidgetBackground, hcLight: editorWidgetBackground }, nls.localize('editorSuggestWidgetBackground', 'Background color of the suggest widget.'));
-export const editorSuggestWidgetBorder = registerColor('editorSuggestWidget.border', { dark: editorWidgetBorder, light: editorWidgetBorder, hcDark: editorWidgetBorder, hcLight: editorWidgetBorder }, nls.localize('editorSuggestWidgetBorder', 'Border color of the suggest widget.'));
-export const editorSuggestWidgetForeground = registerColor('editorSuggestWidget.foreground', { dark: editorForeground, light: editorForeground, hcDark: editorForeground, hcLight: editorForeground }, nls.localize('editorSuggestWidgetForeground', 'Foreground color of the suggest widget.'));
-export const editorSuggestWidgetSelectedForeground = registerColor('editorSuggestWidget.selectedForeground', { dark: quickInputListFocusForeground, light: quickInputListFocusForeground, hcDark: quickInputListFocusForeground, hcLight: quickInputListFocusForeground }, nls.localize('editorSuggestWidgetSelectedForeground', 'Foreground color of the selected entry in the suggest widget.'));
-export const editorSuggestWidgetSelectedIconForeground = registerColor('editorSuggestWidget.selectedIconForeground', { dark: quickInputListFocusIconForeground, light: quickInputListFocusIconForeground, hcDark: quickInputListFocusIconForeground, hcLight: quickInputListFocusIconForeground }, nls.localize('editorSuggestWidgetSelectedIconForeground', 'Icon foreground color of the selected entry in the suggest widget.'));
-export const editorSuggestWidgetSelectedBackground = registerColor('editorSuggestWidget.selectedBackground', { dark: quickInputListFocusBackground, light: quickInputListFocusBackground, hcDark: quickInputListFocusBackground, hcLight: quickInputListFocusBackground }, nls.localize('editorSuggestWidgetSelectedBackground', 'Background color of the selected entry in the suggest widget.'));
-export const editorSuggestWidgetHighlightForeground = registerColor('editorSuggestWidget.highlightForeground', { dark: listHighlightForeground, light: listHighlightForeground, hcDark: listHighlightForeground, hcLight: listHighlightForeground }, nls.localize('editorSuggestWidgetHighlightForeground', 'Color of the match highlights in the suggest widget.'));
-export const editorSuggestWidgetHighlightFocusForeground = registerColor('editorSuggestWidget.focusHighlightForeground', { dark: listFocusHighlightForeground, light: listFocusHighlightForeground, hcDark: listFocusHighlightForeground, hcLight: listFocusHighlightForeground }, nls.localize('editorSuggestWidgetFocusHighlightForeground', 'Color of the match highlights in the suggest widget when an item is focused.'));
-export const editorSuggestWidgetStatusForeground = registerColor('editorSuggestWidgetStatus.foreground', { dark: transparent(editorSuggestWidgetForeground, .5), light: transparent(editorSuggestWidgetForeground, .5), hcDark: transparent(editorSuggestWidgetForeground, .5), hcLight: transparent(editorSuggestWidgetForeground, .5) }, nls.localize('editorSuggestWidgetStatusForeground', 'Foreground color of the suggest widget status.'));
+import 'vs/css!./suggest';
+import nls = require('vs/nls');
+import {TPromise} from 'vs/base/common/winjs.base';
+import Errors = require('vs/base/common/errors');
+import dom = require('vs/base/browser/dom');
+import Tree = require('vs/base/parts/tree/common/tree');
+import TreeImpl = require('vs/base/parts/tree/browser/treeImpl');
+import TreeDefaults = require('vs/base/parts/tree/browser/treeDefaults');
+import HighlightedLabel = require('vs/base/browser/ui/highlightedlabel/highlightedLabel');
+import {SuggestModel, SuggestDataEvent, CompletionItem} from './suggestModel';
+import Mouse = require('vs/base/browser/mouseEvent');
+import EditorBrowser = require('vs/editor/browser/editorBrowser');
+import EditorCommon = require('vs/editor/common/editorCommon');
+import EventEmitter = require('vs/base/common/eventEmitter');
+import Timer = require('vs/base/common/timer');
+import {ITelemetryService} from 'vs/platform/telemetry/common/telemetry';
+import {SuggestRegistry, CONTEXT_SUGGESTION_SUPPORTS_ACCEPT_ON_KEY} from '../common/suggest';
+import {IKeybindingService, IKeybindingContextKey} from 'vs/platform/keybinding/common/keybindingService';
 
-const enum State {
-	Hidden,
-	Loading,
-	Empty,
-	Open,
-	Frozen,
-	Details
+var $ = dom.emmet;
+
+
+// To be used as a tree element when we want to show a message
+export class Message {
+	constructor(public parent: MessageRoot, public message: string) {
+		// nothing to do
+	}
 }
 
-export interface ISelectedSuggestion {
-	item: CompletionItem;
-	index: number;
-	model: CompletionModel;
+export class MessageRoot {
+	public child: Message;
+
+	constructor(message: string) {
+		this.child = new Message(this, message);
+	}
 }
 
-class PersistedWidgetSize {
+class DataSource implements Tree.IDataSource {
 
-	private readonly _key: string;
+	private static _IdPool:number = 0;
+	private root: SuggestDataEvent;
 
-	constructor(
-		private readonly _service: IStorageService,
-		editor: ICodeEditor
-	) {
-		this._key = `suggestWidget.size/${editor.getEditorType()}/${editor instanceof EmbeddedCodeEditorWidget}`;
+	constructor() {
+		this.root = null;
 	}
 
-	restore(): dom.Dimension | undefined {
-		const raw = this._service.get(this._key, StorageScope.GLOBAL) ?? '';
-		try {
-			const obj = JSON.parse(raw);
-			if (dom.Dimension.is(obj)) {
-				return dom.Dimension.lift(obj);
+	private isRoot(element: any) : boolean {
+		if (element instanceof MessageRoot) {
+			return true;
+		} else if (element instanceof Message) {
+			return false;
+		} else if (element instanceof CompletionItem) {
+			return false;
+		} else if (Array.isArray((<SuggestDataEvent>element).suggestions.completionItems)) {
+			this.root = element;
+			return true;
+		} else {
+			return false;
+		}
+	}
+
+	public getId(tree: Tree.ITree, element: any): string {
+		if (element instanceof MessageRoot) {
+			return 'messageroot';
+		} else if (element instanceof Message) {
+			return 'message' + element.message;
+		} else if (!!element.suggestions) {
+			return 'root';
+		} else if (element instanceof CompletionItem) {
+			return (<CompletionItem>element).id;
+		} else {
+			throw Errors.illegalArgument('element');
+		}
+	}
+
+	public getParent(tree: Tree.ITree, element: any): TPromise<any> {
+		if (element instanceof MessageRoot) {
+			return TPromise.as(null);
+		} else if (element instanceof Message) {
+			return TPromise.as(element.parent);
+		}
+		return TPromise.as(this.isRoot(element)
+			? null
+			: this.root);
+	}
+
+	public getChildren(tree: Tree.ITree, element: any): TPromise<any[]> {
+		if (element instanceof MessageRoot) {
+			return TPromise.as([element.child]);
+		} else if (element instanceof Message) {
+			return TPromise.as([]);
+		}
+
+		return TPromise.as(this.isRoot(element)
+			? this.root.suggestions.completionItems
+			: []);
+	}
+
+	public hasChildren(tree: Tree.ITree, element: any): boolean {
+		return this.isRoot(element);
+	}
+}
+
+class Controller extends TreeDefaults.DefaultController {
+
+	/* protected */ public onLeftClick(tree:Tree.ITree, element:any, event:Mouse.StandardMouseEvent):boolean {
+		event.preventDefault();
+		event.stopPropagation();
+
+		if (!(element instanceof Message)) {
+			tree.setSelection([element], { origin: 'mouse' });
+		}
+
+		return true;
+	}
+}
+
+interface IMessageTemplateData {
+	element: HTMLElement;
+}
+
+interface ISuggestionTemplateData {
+	root: HTMLElement;
+	icon: HTMLElement;
+	colorspan: HTMLElement;
+	highlightedLabel: HighlightedLabel.HighlightedLabel;
+	typeLabel: HTMLElement;
+	documentationLabel: HTMLElement;
+}
+
+class Renderer implements Tree.IRenderer {
+
+	private editor: EditorBrowser.ICodeEditor;
+
+	constructor(editor: EditorBrowser.ICodeEditor) {
+		this.editor = editor;
+	}
+
+	public getHeight(tree:Tree.ITree, element:any):number {
+		// var suggestion = <Modes.ISuggestion>element;
+
+		if (element instanceof CompletionItem) {
+			if ((<CompletionItem>element).suggestion.documentationLabel && tree.isFocused(element)) {
+				return 35;
 			}
-		} catch {
-			// ignore
 		}
-		return undefined;
+
+		return 19;
 	}
 
-	store(size: dom.Dimension) {
-		this._service.store(this._key, JSON.stringify(size), StorageScope.GLOBAL, StorageTarget.MACHINE);
+	public getTemplateId(tree: Tree.ITree, element: any): string {
+		return (element instanceof Message) ? 'message' : 'suggestion';
 	}
 
-	reset(): void {
-		this._service.remove(this._key, StorageScope.GLOBAL);
+	public renderTemplate(tree: Tree.ITree, templateId: string, container: HTMLElement): any {
+		if (templateId === 'message') {
+			var span = $('span');
+			span.style.opacity = '0.7';
+			span.style.paddingLeft = '12px';
+			container.appendChild(span);
+			return <IMessageTemplateData> { element: span };
+		}
+
+		var data = <ISuggestionTemplateData> Object.create(null);
+		data.root = container;
+
+		data.icon = dom.append(container, $('.icon'));
+		data.colorspan = dom.append(data.icon, $('span.colorspan'));
+
+		var text = dom.append(container, $('.text'));
+		var main = dom.append(text, $('.main'));
+		data.highlightedLabel = new HighlightedLabel.HighlightedLabel(main);
+		data.typeLabel = dom.append(main, $('span.type-label'));
+		var documentation = dom.append(text, $('.docs'));
+		data.documentationLabel = dom.append(documentation, $('.docs-label'));
+
+		return data;
+	}
+
+	public renderElement(tree: Tree.ITree, element: any, templateId: string, templateData: any): void {
+		if (templateId === 'message') {
+			(<IMessageTemplateData> templateData).element.textContent = element.message;
+			return;
+		}
+
+		var data = <ISuggestionTemplateData> templateData;
+		var suggestion = (<CompletionItem> element).suggestion;
+
+		if (suggestion.type && suggestion.type.charAt(0) === '#') {
+			data.root.setAttribute('aria-label', 'color');
+			data.icon.className = 'icon customcolor';
+			data.colorspan.style.backgroundColor = suggestion.type.substring(1);
+		} else {
+			data.root.setAttribute('aria-label', suggestion.type);
+			data.icon.className = 'icon ' + suggestion.type;
+			data.colorspan.style.backgroundColor = '';
+		}
+
+		data.highlightedLabel.set(suggestion.label, suggestion.highlights);
+		data.typeLabel.textContent = suggestion.typeLabel || '';
+		data.documentationLabel.textContent = suggestion.documentationLabel || '';
+	}
+
+	public disposeTemplate(tree: Tree.ITree, templateId: string, templateData: any): void {
+		if (templateId === 'message') {
+			return;
+		}
+
+		var data = <ISuggestionTemplateData> templateData;
+		data.highlightedLabel.dispose();
 	}
 }
 
-export class SuggestWidget implements IDisposable {
+function computeScore(suggestion:string, currentWord:string, currentWordLowerCase:string) : number {
+	var suggestionLowerCase = suggestion.toLowerCase();
+	var score = 0;
 
-	private static LOADING_MESSAGE: string = nls.localize('suggestWidget.loading', "Loading...");
-	private static NO_SUGGESTIONS_MESSAGE: string = nls.localize('suggestWidget.noSuggestions', "No suggestions.");
-
-	private _state: State = State.Hidden;
-	private _isAuto: boolean = false;
-	private _loadingTimeout?: IDisposable;
-	private _currentSuggestionDetails?: CancelablePromise<void>;
-	private _focusedItem?: CompletionItem;
-	private _ignoreFocusEvents: boolean = false;
-	private _completionModel?: CompletionModel;
-	private _cappedHeight?: { wanted: number; capped: number };
-	private _forceRenderingAbove: boolean = false;
-	private _explainMode: boolean = false;
-
-	readonly element: ResizableHTMLElement;
-	private readonly _messageElement: HTMLElement;
-	private readonly _listElement: HTMLElement;
-	private readonly _list: List<CompletionItem>;
-	private readonly _status: SuggestWidgetStatus;
-	private readonly _details: SuggestDetailsOverlay;
-	private readonly _contentWidget: SuggestContentWidget;
-	private readonly _persistedSize: PersistedWidgetSize;
-
-	private readonly _ctxSuggestWidgetVisible: IContextKey<boolean>;
-	private readonly _ctxSuggestWidgetDetailsVisible: IContextKey<boolean>;
-	private readonly _ctxSuggestWidgetMultipleSuggestions: IContextKey<boolean>;
-
-	private readonly _showTimeout = new TimeoutTimer();
-	private readonly _disposables = new DisposableStore();
-
-
-	private readonly _onDidSelect = new Emitter<ISelectedSuggestion>();
-	private readonly _onDidFocus = new Emitter<ISelectedSuggestion>();
-	private readonly _onDidHide = new Emitter<this>();
-	private readonly _onDidShow = new Emitter<this>();
-
-	readonly onDidSelect: Event<ISelectedSuggestion> = this._onDidSelect.event;
-	readonly onDidFocus: Event<ISelectedSuggestion> = this._onDidFocus.event;
-	readonly onDidHide: Event<this> = this._onDidHide.event;
-	readonly onDidShow: Event<this> = this._onDidShow.event;
-
-	private readonly _onDetailsKeydown = new Emitter<IKeyboardEvent>();
-	readonly onDetailsKeyDown: Event<IKeyboardEvent> = this._onDetailsKeydown.event;
-
-	constructor(
-		private readonly editor: ICodeEditor,
-		@IStorageService private readonly _storageService: IStorageService,
-		@IContextKeyService _contextKeyService: IContextKeyService,
-		@IThemeService _themeService: IThemeService,
-		@IInstantiationService instantiationService: IInstantiationService,
-	) {
-		this.element = new ResizableHTMLElement();
-		this.element.domNode.classList.add('editor-widget', 'suggest-widget');
-
-		this._contentWidget = new SuggestContentWidget(this, editor);
-		this._persistedSize = new PersistedWidgetSize(_storageService, editor);
-
-		class ResizeState {
-			constructor(
-				readonly persistedSize: dom.Dimension | undefined,
-				readonly currentSize: dom.Dimension,
-				public persistHeight = false,
-				public persistWidth = false,
-			) { }
+	for (var i = 0; i < currentWord.length && i < suggestion.length; i++) {
+		if (currentWord[i] === suggestion[i]) {
+			score += 2;
+		} else if (currentWordLowerCase[i] === suggestionLowerCase[i]) {
+			score += 1;
+		} else {
+			break;
 		}
+	}
 
-		let state: ResizeState | undefined;
-		this._disposables.add(this.element.onDidWillResize(() => {
-			this._contentWidget.lockPreference();
-			state = new ResizeState(this._persistedSize.restore(), this.element.size);
+	return score;
+}
+
+interface ITelemetryData {
+	suggestionCount?: number;
+	suggestedIndex?: number;
+	selectedIndex?: number;
+	hintLength?: number;
+	wasCancelled?: boolean;
+	wasAutomaticallyTriggered?: boolean;
+}
+
+export class SuggestWidget implements EditorBrowser.IContentWidget {
+	static ID = 'editor.widget.suggestWidget';
+	static WIDTH = 438;
+
+	static LOADING_MESSAGE = new MessageRoot(nls.localize('suggestWidget.loading', "Loading..."));
+	static NO_SUGGESTIONS_MESSAGE = new MessageRoot(nls.localize('suggestWidget.noSuggestions', "No suggestions."));
+
+	private editor: EditorBrowser.ICodeEditor;
+	private shouldShowEmptySuggestionList: boolean;
+	private isActive: boolean;
+	private isLoading: boolean;
+	private isAuto: boolean;
+	private listenersToRemove: EventEmitter.ListenerUnbind[];
+	private modelListenersToRemove: EventEmitter.ListenerUnbind[];
+	private model: SuggestModel;
+	private suggestionSupportsAutoAccept: IKeybindingContextKey<boolean>;
+
+	private telemetryData: ITelemetryData;
+	private telemetryService: ITelemetryService;
+
+	private element: HTMLElement;
+	private tree: Tree.ITree;
+	private renderer: Renderer;
+
+	// Editor.IContentWidget.allowEditorOverflow
+	public allowEditorOverflow = true;
+
+	private _onShown: () => void;
+	private _onHidden: () => void;
+
+	constructor(editor: EditorBrowser.ICodeEditor, telemetryService:ITelemetryService, keybindingService:IKeybindingService, onShown: () => void, onHidden: () => void) {
+		this.editor = editor;
+		this._onShown = onShown;
+		this._onHidden = onHidden;
+
+		this.isActive = false;
+		this.isLoading = false;
+		this.isAuto = false;
+		this.modelListenersToRemove = [];
+		this.model = null;
+		this.suggestionSupportsAutoAccept = keybindingService.createKey<boolean>(CONTEXT_SUGGESTION_SUPPORTS_ACCEPT_ON_KEY, true);
+
+		this.telemetryData = null;
+		this.telemetryService = telemetryService;
+
+		var onModelModeChanged = () => {
+			var model = this.editor.getModel();
+			this.shouldShowEmptySuggestionList = SuggestRegistry.all(model)
+				.some(support => support.shouldShowEmptySuggestionList());
+		};
+
+		onModelModeChanged();
+		this.listenersToRemove = [];
+		this.listenersToRemove.push(editor.addListener(EditorCommon.EventType.ModelChanged, onModelModeChanged));
+		this.listenersToRemove.push(editor.addListener(EditorCommon.EventType.ModelModeChanged, onModelModeChanged));
+		this.listenersToRemove.push(editor.addListener(EditorCommon.EventType.ModelModeSupportChanged, (e: EditorCommon.IModeSupportChangedEvent) => {
+			if (e.suggestSupport) {
+				onModelModeChanged();
+			}
 		}));
-		this._disposables.add(this.element.onDidResize(e => {
+		let subscription = SuggestRegistry.onDidChange(onModelModeChanged);
+		this.listenersToRemove.push(() => subscription.dispose());
 
-			this._resize(e.dimension.width, e.dimension.height);
+		this.element = $('.editor-widget.suggest-widget.monaco-editor-background');
+		this.element.style.width = SuggestWidget.WIDTH + 'px';
+		this.element.style.top = '0';
+		this.element.style.left = '0';
 
-			if (state) {
-				state.persistHeight = state.persistHeight || !!e.north || !!e.south;
-				state.persistWidth = state.persistWidth || !!e.east || !!e.west;
+		if (!this.editor.getConfiguration().iconsInSuggestions) {
+			dom.addClass(this.element, 'no-icons');
+		}
+
+		var dataSource = new DataSource();
+		this.renderer = new Renderer(this.editor);
+
+		this.tree = new TreeImpl.Tree(this.element, {
+			dataSource: dataSource,
+			renderer: this.renderer,
+			controller: new Controller()
+		}, {
+			twistiePixels: 0,
+			alwaysFocused: true,
+			verticalScrollMode: 'visible',
+			useShadows: false
+		});
+
+		this.listenersToRemove.push(editor.addListener(EditorCommon.EventType.EditorTextBlur, () => {
+			TPromise.timeout(150).done(() => {
+				if (this.tree && !this.tree.isDOMFocused()) {
+					this.hide();
+				}
+			});
+		}));
+
+		this.listenersToRemove.push(this.tree.addListener('selection', (e:Tree.ISelectionEvent) => {
+			if (e.selection && e.selection.length > 0) {
+				var element = e.selection[0];
+				if (!element.hasOwnProperty('suggestions') && !(element instanceof MessageRoot) && !(element instanceof Message)) {
+
+					this.telemetryData.selectedIndex = (<SuggestDataEvent> this.tree.getInput()).suggestions.completionItems.indexOf(element);
+					this.telemetryData.wasCancelled = false;
+					this.submitTelemetryData();
+
+					this.model.accept(element);
+					this.editor.focus();
+				}
+			}
+		}));
+
+		var oldFocus: any = null;
+
+		this.listenersToRemove.push(this.tree.addListener('focus', (e:Tree.IFocusEvent) => {
+			var focus = e.focus;
+			var payload = e.payload;
+
+			if(focus instanceof CompletionItem) {
+				this.resolveDetails(<CompletionItem>focus);
+				this.suggestionSupportsAutoAccept.set(!(<CompletionItem>focus).suggestion.noAutoAccept);
 			}
 
-			if (!e.done) {
+			if (focus === oldFocus) {
 				return;
 			}
 
-			if (state) {
-				// only store width or height value that have changed and also
-				// only store changes that are above a certain threshold
-				const { itemHeight, defaultSize } = this.getLayoutInfo();
-				const threshold = Math.round(itemHeight / 2);
-				let { width, height } = this.element.size;
-				if (!state.persistHeight || Math.abs(state.currentSize.height - height) <= threshold) {
-					height = state.persistedSize?.height ?? defaultSize.height;
+			var elementsToRefresh: any[] = [];
+
+			if (oldFocus) {
+				elementsToRefresh.push(oldFocus);
+			}
+
+			if (focus) {
+				elementsToRefresh.push(focus);
+			}
+
+			oldFocus = focus;
+
+			this.tree.refreshAll(elementsToRefresh).done(() => {
+				this.updateWidgetHeight();
+
+				if (focus) {
+					this.tree.reveal(focus, (payload && payload.firstSuggestion) ? 0 : null);
 				}
-				if (!state.persistWidth || Math.abs(state.currentSize.width - width) <= threshold) {
-					width = state.persistedSize?.width ?? defaultSize.width;
-				}
-				this._persistedSize.store(new dom.Dimension(width, height));
-			}
-
-			// reset working state
-			this._contentWidget.unlockPreference();
-			state = undefined;
+			}, Errors.onUnexpectedError);
 		}));
 
-		this._messageElement = dom.append(this.element.domNode, dom.$('.message'));
-		this._listElement = dom.append(this.element.domNode, dom.$('.tree'));
+		this.editor.addContentWidget(this);
 
-		const details = instantiationService.createInstance(SuggestDetailsWidget, this.editor);
-		details.onDidClose(this.toggleDetails, this, this._disposables);
-		this._details = new SuggestDetailsOverlay(details, this.editor);
-
-		const applyIconStyle = () => this.element.domNode.classList.toggle('no-icons', !this.editor.getOption(EditorOption.suggest).showIcons);
-		applyIconStyle();
-
-		const renderer = instantiationService.createInstance(ItemRenderer, this.editor);
-		this._disposables.add(renderer);
-		this._disposables.add(renderer.onDidToggleDetails(() => this.toggleDetails()));
-
-		this._list = new List('SuggestWidget', this._listElement, {
-			getHeight: (_element: CompletionItem): number => this.getLayoutInfo().itemHeight,
-			getTemplateId: (_element: CompletionItem): string => 'suggestion'
-		}, [renderer], {
-			alwaysConsumeMouseWheel: true,
-			useShadows: false,
-			mouseSupport: false,
-			multipleSelectionSupport: false,
-			accessibilityProvider: {
-				getRole: () => 'option',
-				getWidgetAriaLabel: () => nls.localize('suggest', "Suggest"),
-				getWidgetRole: () => 'listbox',
-				getAriaLabel: (item: CompletionItem) => {
-
-					let label = item.textLabel;
-					if (typeof item.completion.label !== 'string') {
-						const { detail, description } = item.completion.label;
-						if (detail && description) {
-							label = nls.localize('label.full', '{0}{1}, {2}', label, detail, description);
-						} else if (detail) {
-							label = nls.localize('label.detail', '{0}{1}', label, detail);
-						} else if (description) {
-							label = nls.localize('label.desc', '{0}, {1}', label, description);
-						}
-					}
-
-					if (!item.isResolved || !this._isDetailsVisible()) {
-						return label;
-					}
-
-					const { documentation, detail } = item.completion;
-					const docs = strings.format(
-						'{0}{1}',
-						detail || '',
-						documentation ? (typeof documentation === 'string' ? documentation : documentation.value) : '');
-
-					return nls.localize('ariaCurrenttSuggestionReadDetails', "{0}, docs: {1}", label, docs);
-				},
-			}
-		});
-
-		this._status = instantiationService.createInstance(SuggestWidgetStatus, this.element.domNode);
-		const applyStatusBarStyle = () => this.element.domNode.classList.toggle('with-status-bar', this.editor.getOption(EditorOption.suggest).showStatusBar);
-		applyStatusBarStyle();
-
-		this._disposables.add(attachListStyler(this._list, _themeService, {
-			listInactiveFocusBackground: editorSuggestWidgetSelectedBackground,
-			listInactiveFocusOutline: activeContrastBorder
-		}));
-		this._disposables.add(_themeService.onDidColorThemeChange(t => this._onThemeChange(t)));
-		this._onThemeChange(_themeService.getColorTheme());
-
-		this._disposables.add(this._list.onMouseDown(e => this._onListMouseDownOrTap(e)));
-		this._disposables.add(this._list.onTap(e => this._onListMouseDownOrTap(e)));
-		this._disposables.add(this._list.onDidChangeSelection(e => this._onListSelection(e)));
-		this._disposables.add(this._list.onDidChangeFocus(e => this._onListFocus(e)));
-		this._disposables.add(this.editor.onDidChangeCursorSelection(() => this._onCursorSelectionChanged()));
-		this._disposables.add(this.editor.onDidChangeConfiguration(e => {
-			if (e.hasChanged(EditorOption.suggest)) {
-				applyStatusBarStyle();
-				applyIconStyle();
+		this.listenersToRemove.push(this.editor.addListener(EditorCommon.EventType.CursorSelectionChanged, (e: EditorCommon.ICursorSelectionChangedEvent) => {
+			if (this.isActive) {
+				this.editor.layoutContentWidget(this);
 			}
 		}));
 
-		this._ctxSuggestWidgetVisible = SuggestContext.Visible.bindTo(_contextKeyService);
-		this._ctxSuggestWidgetDetailsVisible = SuggestContext.DetailsVisible.bindTo(_contextKeyService);
-		this._ctxSuggestWidgetMultipleSuggestions = SuggestContext.MultipleSuggestions.bindTo(_contextKeyService);
-
-
-		this._disposables.add(dom.addStandardDisposableListener(this._details.widget.domNode, 'keydown', e => {
-			this._onDetailsKeydown.fire(e);
-		}));
-
-		this._disposables.add(this.editor.onMouseDown((e: IEditorMouseEvent) => this._onEditorMouseDown(e)));
+		this.hide();
 	}
 
-	dispose(): void {
-		this._details.widget.dispose();
-		this._details.dispose();
-		this._list.dispose();
-		this._status.dispose();
-		this._disposables.dispose();
-		this._loadingTimeout?.dispose();
-		this._showTimeout.dispose();
-		this._contentWidget.dispose();
-		this.element.dispose();
-	}
+	public setModel(newModel: SuggestModel) : void {
+		this.releaseModel();
+		this.model = newModel;
 
-	private _onEditorMouseDown(mouseEvent: IEditorMouseEvent): void {
-		if (this._details.widget.domNode.contains(mouseEvent.target.element)) {
-			// Clicking inside details
-			this._details.widget.domNode.focus();
-		} else {
-			// Clicking outside details and inside suggest
-			if (this.element.domNode.contains(mouseEvent.target.element)) {
-				this.editor.focus();
-			}
-		}
-	}
+		var timer : Timer.ITimerEvent = null,
+			loadingHandle:number;
 
-	private _onCursorSelectionChanged(): void {
-		if (this._state !== State.Hidden) {
-			this._contentWidget.layout();
-		}
-	}
+		this.modelListenersToRemove.push(this.model.addListener('loading', (e: any) => {
+			if (!this.isActive) {
+				timer = this.telemetryService.start('suggestWidgetLoadingTime');
+				this.isLoading = true;
+				this.isAuto = !!e.auto;
 
-	private _onListMouseDownOrTap(e: IListMouseEvent<CompletionItem> | IListGestureEvent<CompletionItem>): void {
-		if (typeof e.element === 'undefined' || typeof e.index === 'undefined') {
-			return;
-		}
-
-		// prevent stealing browser focus from the editor
-		e.browserEvent.preventDefault();
-		e.browserEvent.stopPropagation();
-
-		this._select(e.element, e.index);
-	}
-
-	private _onListSelection(e: IListEvent<CompletionItem>): void {
-		if (e.elements.length) {
-			this._select(e.elements[0], e.indexes[0]);
-		}
-	}
-
-	private _select(item: CompletionItem, index: number): void {
-		const completionModel = this._completionModel;
-		if (completionModel) {
-			this._onDidSelect.fire({ item, index, model: completionModel });
-			this.editor.focus();
-		}
-	}
-
-	private _onThemeChange(theme: IColorTheme) {
-		this._details.widget.borderWidth = isHighContrast(theme.type) ? 2 : 1;
-	}
-
-	private _onListFocus(e: IListEvent<CompletionItem>): void {
-		if (this._ignoreFocusEvents) {
-			return;
-		}
-
-		if (!e.elements.length) {
-			if (this._currentSuggestionDetails) {
-				this._currentSuggestionDetails.cancel();
-				this._currentSuggestionDetails = undefined;
-				this._focusedItem = undefined;
-			}
-
-			this.editor.setAriaOptions({ activeDescendant: undefined });
-			return;
-		}
-
-		if (!this._completionModel) {
-			return;
-		}
-
-		const item = e.elements[0];
-		const index = e.indexes[0];
-
-		if (item !== this._focusedItem) {
-
-			this._currentSuggestionDetails?.cancel();
-			this._currentSuggestionDetails = undefined;
-
-			this._focusedItem = item;
-
-			this._list.reveal(index);
-
-			this._currentSuggestionDetails = createCancelablePromise(async token => {
-				const loading = disposableTimeout(() => {
-					if (this._isDetailsVisible()) {
-						this.showDetails(true);
-					}
-				}, 250);
-				const sub = token.onCancellationRequested(() => loading.dispose());
-				const result = await item.resolve(token);
-				loading.dispose();
-				sub.dispose();
-				return result;
-			});
-
-			this._currentSuggestionDetails.then(() => {
-				if (index >= this._list.length || item !== this._list.element(index)) {
-					return;
+				if (!this.isAuto) {
+					loadingHandle = setTimeout(() => {
+						dom.removeClass(this.element, 'empty');
+						this.tree.setInput(SuggestWidget.LOADING_MESSAGE).done(null, Errors.onUnexpectedError);
+						this.updateWidgetHeight();
+						this.show();
+					}, 50);
 				}
 
-				// item can have extra information, so re-render
-				this._ignoreFocusEvents = true;
-				this._list.splice(index, 1, [item]);
-				this._list.setFocus([index]);
-				this._ignoreFocusEvents = false;
+				if (!e.retrigger) {
+					this.telemetryData = {
+						wasAutomaticallyTriggered: e.characterTriggered
+					};
+				}
+			}
+		}));
 
-				if (this._isDetailsVisible()) {
-					this.showDetails(false);
+		this.modelListenersToRemove.push(this.model.addListener('suggest', (e: SuggestDataEvent) => {
+			this.isLoading = false;
+
+			if(typeof loadingHandle !== 'undefined') {
+				clearTimeout(loadingHandle);
+			}
+
+			var currentWord = e.suggestions.currentWord;
+			var currentWordLowerCase = currentWord.toLowerCase();
+			var suggestions = e.suggestions.completionItems;
+
+			var bestSuggestionIndex = -1;
+			var bestSuggestion = e.suggestions.completionItems[0];
+			var bestScore = -1;
+
+			for (var i = 0, len = suggestions.length; i < len; i++) {
+				var score = computeScore(suggestions[i].suggestion.label, currentWord, currentWordLowerCase);
+				if (score > bestScore) {
+					bestScore = score;
+					bestSuggestion = suggestions[i];
+					bestSuggestionIndex = i;
+				}
+			}
+
+			dom.removeClass(this.element, 'empty');
+			this.tree.setInput(e).done(null, Errors.onUnexpectedError);
+			this.tree.setFocus(bestSuggestion, { firstSuggestion: true });
+			this.updateWidgetHeight();
+			this.show();
+
+			this.resolveDetails(bestSuggestion);
+
+			this.telemetryData = this.telemetryData || {};
+			this.telemetryData.suggestionCount = suggestions.length;
+			this.telemetryData.suggestedIndex = bestSuggestionIndex;
+			this.telemetryData.hintLength = currentWord.length;
+
+			if(timer) {
+				timer.data = { reason: 'results'};
+				timer.stop();
+				timer = null;
+			}
+		}));
+
+		this.modelListenersToRemove.push(this.model.addListener('empty', (e: { auto:boolean; }) => {
+			var wasLoading = this.isLoading;
+			this.isLoading = false;
+
+			if(typeof loadingHandle !== 'undefined') {
+				clearTimeout(loadingHandle);
+			}
+
+			if (e.auto) {
+				this.hide();
+			} else if (wasLoading) {
+				if (this.shouldShowEmptySuggestionList) {
+					dom.removeClass(this.element, 'empty');
+					this.tree.setInput(SuggestWidget.NO_SUGGESTIONS_MESSAGE).done(null, Errors.onUnexpectedError);
+					this.updateWidgetHeight();
+					this.show();
 				} else {
-					this.element.domNode.classList.remove('docs-side');
+					this.hide();
 				}
+			} else {
+				dom.addClass(this.element, 'empty');
+			}
 
-				this.editor.setAriaOptions({ activeDescendant: getAriaId(index) });
-			}).catch(onUnexpectedError);
-		}
+			if(timer) {
+				timer.data = { reason: 'empty'};
+				timer.stop();
+				timer = null;
+			}
+		}));
 
-		// emit an event
-		this._onDidFocus.fire({ item, index, model: this._completionModel });
+		this.modelListenersToRemove.push(this.model.addListener('cancel', (e:any) => {
+			this.isLoading = false;
+
+			if (!e.retrigger) {
+				this.hide();
+
+				if (this.telemetryData) {
+					this.telemetryData.selectedIndex = -1;
+					this.telemetryData.wasCancelled = true;
+					this.submitTelemetryData();
+				}
+			}
+
+			if (timer) {
+				timer.data = { reason: 'cancel' };
+				timer.stop();
+				timer = null;
+			}
+		}));
 	}
 
-	private _setState(state: State): void {
+	private currentSuggestionDetails:TPromise<CompletionItem>;
 
-		if (this._state === state) {
-			return;
-		}
-		this._state = state;
+	private resolveDetails(item: CompletionItem): void {
+		if (item) {
+			if(this.currentSuggestionDetails) {
+				this.currentSuggestionDetails.cancel();
+			}
 
-		this.element.domNode.classList.toggle('frozen', state === State.Frozen);
-		this.element.domNode.classList.remove('message');
+			this.currentSuggestionDetails = item.resolveDetails(this.editor.getModel().getAssociatedResource(),
+				this.model.getRequestPosition() || this.editor.getPosition());
 
-		switch (state) {
-			case State.Hidden:
-				dom.hide(this._messageElement, this._listElement, this._status.element);
-				this._details.hide(true);
-				this._status.hide();
-				this._contentWidget.hide();
-				this._ctxSuggestWidgetVisible.reset();
-				this._ctxSuggestWidgetMultipleSuggestions.reset();
-				this._showTimeout.cancel();
-				this.element.domNode.classList.remove('visible');
-				this._list.splice(0, this._list.length);
-				this._focusedItem = undefined;
-				this._cappedHeight = undefined;
-				this._explainMode = false;
-				break;
-			case State.Loading:
-				this.element.domNode.classList.add('message');
-				this._messageElement.textContent = SuggestWidget.LOADING_MESSAGE;
-				dom.hide(this._listElement, this._status.element);
-				dom.show(this._messageElement);
-				this._details.hide();
-				this._show();
-				this._focusedItem = undefined;
-				break;
-			case State.Empty:
-				this.element.domNode.classList.add('message');
-				this._messageElement.textContent = SuggestWidget.NO_SUGGESTIONS_MESSAGE;
-				dom.hide(this._listElement, this._status.element);
-				dom.show(this._messageElement);
-				this._details.hide();
-				this._show();
-				this._focusedItem = undefined;
-				break;
-			case State.Open:
-				dom.hide(this._messageElement);
-				dom.show(this._listElement, this._status.element);
-				this._show();
-				break;
-			case State.Frozen:
-				dom.hide(this._messageElement);
-				dom.show(this._listElement, this._status.element);
-				this._show();
-				break;
-			case State.Details:
-				dom.hide(this._messageElement);
-				dom.show(this._listElement, this._status.element);
-				this._details.show();
-				this._show();
-				break;
+			this.currentSuggestionDetails.then(() => {
+				this.currentSuggestionDetails = undefined;
+				return this.tree.refresh(item).then(() => this.updateWidgetHeight());
+			}, (err) => {
+				return Errors.isPromiseCanceledError(err) ? null : err;
+			}).done(undefined, Errors.onUnexpectedError);
 		}
 	}
 
-	private _show(): void {
-		this._status.show();
-		this._contentWidget.show();
-		this._layout(this._persistedSize.restore());
-		this._ctxSuggestWidgetVisible.set(true);
-
-		this._showTimeout.cancelAndSet(() => {
-			this.element.domNode.classList.add('visible');
-			this._onDidShow.fire(this);
-		}, 100);
+	public selectNextPage(): boolean {
+		if (this.isLoading) {
+			return !this.isAuto;
+		}
+		if (this.isActive) {
+			this.tree.focusNextPage();
+			return true;
+		}
+		return false;
 	}
 
-	showTriggered(auto: boolean, delay: number) {
-		if (this._state !== State.Hidden) {
-			return;
+	public selectNext(): boolean {
+		if (this.isLoading) {
+			return !this.isAuto;
 		}
-		this._contentWidget.setPosition(this.editor.getPosition());
-		this._isAuto = !!auto;
-
-		if (!this._isAuto) {
-			this._loadingTimeout = disposableTimeout(() => this._setState(State.Loading), delay);
+		if (this.isActive) {
+			var focus = this.tree.getFocus();
+			this.tree.focusNext(1);
+			if (focus === this.tree.getFocus()) {
+				this.tree.focusFirst();
+			}
+			return true;
 		}
+		return false;
 	}
 
-	showSuggestions(completionModel: CompletionModel, selectionIndex: number, isFrozen: boolean, isAuto: boolean): void {
-
-		this._contentWidget.setPosition(this.editor.getPosition());
-		this._loadingTimeout?.dispose();
-
-		this._currentSuggestionDetails?.cancel();
-		this._currentSuggestionDetails = undefined;
-
-		if (this._completionModel !== completionModel) {
-			this._completionModel = completionModel;
+	public selectPreviousPage(): boolean {
+		if (this.isLoading) {
+			return !this.isAuto;
 		}
-
-		if (isFrozen && this._state !== State.Empty && this._state !== State.Hidden) {
-			this._setState(State.Frozen);
-			return;
+		if (this.isActive) {
+			this.tree.focusPreviousPage();
+			return true;
 		}
-
-		const visibleCount = this._completionModel.items.length;
-		const isEmpty = visibleCount === 0;
-		this._ctxSuggestWidgetMultipleSuggestions.set(visibleCount > 1);
-
-		if (isEmpty) {
-			this._setState(isAuto ? State.Hidden : State.Empty);
-			this._completionModel = undefined;
-			return;
-		}
-
-		this._focusedItem = undefined;
-		this._list.splice(0, this._list.length, this._completionModel.items);
-		this._setState(isFrozen ? State.Frozen : State.Open);
-		this._list.reveal(selectionIndex, 0);
-		this._list.setFocus([selectionIndex]);
-
-		this._layout(this.element.size);
-		// Reset focus border
-		this._details.widget.domNode.classList.remove('focused');
+		return false;
 	}
 
-	selectNextPage(): boolean {
-		switch (this._state) {
-			case State.Hidden:
-				return false;
-			case State.Details:
-				this._details.widget.pageDown();
-				return true;
-			case State.Loading:
-				return !this._isAuto;
-			default:
-				this._list.focusNextPage();
-				return true;
+	public selectPrevious(): boolean {
+		if (this.isLoading) {
+			return !this.isAuto;
 		}
+		if (this.isActive) {
+			var focus = this.tree.getFocus();
+			this.tree.focusPrevious(1);
+			if (focus === this.tree.getFocus()) {
+				this.tree.focusLast();
+			}
+			return true;
+		}
+		return false;
 	}
 
-	selectNext(): boolean {
-		switch (this._state) {
-			case State.Hidden:
-				return false;
-			case State.Loading:
-				return !this._isAuto;
-			default:
-				this._list.focusNext(1, true);
-				return true;
+	public acceptSelectedSuggestion() : boolean {
+		if (this.isLoading) {
+			return !this.isAuto;
 		}
+		if (this.isActive) {
+			var focus = this.tree.getFocus();
+			if (focus) {
+				this.tree.setSelection([focus]);
+			} else {
+				this.model.cancel();
+			}
+			return true;
+		}
+		return false;
 	}
 
-	selectLast(): boolean {
-		switch (this._state) {
-			case State.Hidden:
-				return false;
-			case State.Details:
-				this._details.widget.scrollBottom();
-				return true;
-			case State.Loading:
-				return !this._isAuto;
-			default:
-				this._list.focusLast();
-				return true;
+	private releaseModel() : void {
+		var listener:()=>void;
+		while (listener = this.modelListenersToRemove.pop()) {
+			listener();
 		}
+		this.model = null;
 	}
 
-	selectPreviousPage(): boolean {
-		switch (this._state) {
-			case State.Hidden:
-				return false;
-			case State.Details:
-				this._details.widget.pageUp();
-				return true;
-			case State.Loading:
-				return !this._isAuto;
-			default:
-				this._list.focusPreviousPage();
-				return true;
-		}
+	public show(): void {
+		this._onShown();
+		this.isActive = true;
+		this.tree.layout();
+		this.editor.layoutContentWidget(this);
+		TPromise.timeout(100).done(() => {
+			dom.addClass(this.element, 'visible');
+		});
 	}
 
-	selectPrevious(): boolean {
-		switch (this._state) {
-			case State.Hidden:
-				return false;
-			case State.Loading:
-				return !this._isAuto;
-			default:
-				this._list.focusPrevious(1, true);
-				return false;
-		}
+	public cancel(): void {
+		this.model.cancel();
 	}
 
-	selectFirst(): boolean {
-		switch (this._state) {
-			case State.Hidden:
-				return false;
-			case State.Details:
-				this._details.widget.scrollTop();
-				return true;
-			case State.Loading:
-				return !this._isAuto;
-			default:
-				this._list.focusFirst();
-				return true;
-		}
+	public hide(): void {
+		this._onHidden();
+
+		this.isActive = false;
+		dom.removeClass(this.element, 'visible');
+		this.editor.layoutContentWidget(this);
 	}
 
-	getFocusedItem(): ISelectedSuggestion | undefined {
-		if (this._state !== State.Hidden
-			&& this._state !== State.Empty
-			&& this._state !== State.Loading
-			&& this._completionModel
-		) {
-
+	public getPosition():EditorBrowser.IContentWidgetPosition {
+		if (this.isActive) {
 			return {
-				item: this._list.getFocusedElements()[0],
-				index: this._list.getFocus()[0],
-				model: this._completionModel
+				position: this.editor.getPosition(),
+				preference: [EditorBrowser.ContentWidgetPositionPreference.BELOW, EditorBrowser.ContentWidgetPositionPreference.ABOVE]
 			};
 		}
-		return undefined;
+		return null;
 	}
 
-	toggleDetailsFocus(): void {
-		if (this._state === State.Details) {
-			this._setState(State.Open);
-			this._details.widget.domNode.classList.remove('focused');
-
-		} else if (this._state === State.Open && this._isDetailsVisible()) {
-			this._setState(State.Details);
-			this._details.widget.domNode.classList.add('focused');
-		}
+	public getDomNode() : HTMLElement {
+		return this.element;
 	}
 
-	toggleDetails(): void {
-		if (this._isDetailsVisible()) {
-			// hide details widget
-			this._ctxSuggestWidgetDetailsVisible.set(false);
-			this._setDetailsVisible(false);
-			this._details.hide();
-			this.element.domNode.classList.remove('shows-details');
-
-		} else if ((canExpandCompletionItem(this._list.getFocusedElements()[0]) || this._explainMode) && (this._state === State.Open || this._state === State.Details || this._state === State.Frozen)) {
-			// show details widget (iff possible)
-			this._ctxSuggestWidgetDetailsVisible.set(true);
-			this._setDetailsVisible(true);
-			this.showDetails(false);
-		}
+	public getId() : string {
+		return SuggestWidget.ID;
 	}
 
-	showDetails(loading: boolean): void {
-		this._details.show();
-		if (loading) {
-			this._details.widget.renderLoading();
+	private submitTelemetryData() : void {
+		this.telemetryService.publicLog('suggestWidget', this.telemetryData);
+		this.telemetryData = null;
+	}
+
+	private updateWidgetHeight(): void {
+		var input = this.tree.getInput();
+		var maxHeight = 1000;
+		var height = 0;
+
+		if (input === SuggestWidget.LOADING_MESSAGE || input === SuggestWidget.NO_SUGGESTIONS_MESSAGE) {
+			height = 19;
 		} else {
-			this._details.widget.renderItem(this._list.getFocusedElements()[0], this._explainMode);
-		}
-		this._positionDetails();
-		this.editor.focus();
-		this.element.domNode.classList.add('shows-details');
-	}
+			var focus = this.tree.getFocus();
+			var focusHeight = focus ? this.renderer.getHeight(this.tree, focus) : 19;
+			height += focusHeight;
 
-	toggleExplainMode(): void {
-		if (this._list.getFocusedElements()[0]) {
-			this._explainMode = !this._explainMode;
-			if (!this._isDetailsVisible()) {
-				this.toggleDetails();
-			} else {
-				this.showDetails(false);
-			}
-		}
-	}
-
-	resetPersistedSize(): void {
-		this._persistedSize.reset();
-	}
-
-	hideWidget(): void {
-		this._loadingTimeout?.dispose();
-		this._setState(State.Hidden);
-		this._onDidHide.fire(this);
-		this.element.clearSashHoverState();
-
-		// ensure that a reasonable widget height is persisted so that
-		// accidential "resize-to-single-items" cases aren't happening
-		const dim = this._persistedSize.restore();
-		const minPersistedHeight = Math.ceil(this.getLayoutInfo().itemHeight * 4.3);
-		if (dim && dim.height < minPersistedHeight) {
-			this._persistedSize.store(dim.with(undefined, minPersistedHeight));
-		}
-	}
-
-	isFrozen(): boolean {
-		return this._state === State.Frozen;
-	}
-
-	_afterRender(position: ContentWidgetPositionPreference | null) {
-		if (position === null) {
-			if (this._isDetailsVisible()) {
-				this._details.hide(); //todo@jrieken soft-hide
-			}
-			return;
-		}
-		if (this._state === State.Empty || this._state === State.Loading) {
-			// no special positioning when widget isn't showing list
-			return;
-		}
-		if (this._isDetailsVisible()) {
-			this._details.show();
-		}
-		this._positionDetails();
-	}
-
-	private _layout(size: dom.Dimension | undefined): void {
-		if (!this.editor.hasModel()) {
-			return;
-		}
-		if (!this.editor.getDomNode()) {
-			// happens when running tests
-			return;
+			var maxSuggestions = Math.floor((maxHeight - focusHeight) / 19);
+			var data = <SuggestDataEvent>input;
+			height += Math.min(data.suggestions.completionItems.length - 1, 11, maxSuggestions) * 19;
 		}
 
-		const bodyBox = dom.getClientArea(document.body);
-		const info = this.getLayoutInfo();
+		this.element.style.height = height + 'px';
 
-		if (!size) {
-			size = info.defaultSize;
-		}
-
-		let height = size.height;
-		let width = size.width;
-
-		// status bar
-		this._status.element.style.lineHeight = `${info.itemHeight}px`;
-
-		if (this._state === State.Empty || this._state === State.Loading) {
-			// showing a message only
-			height = info.itemHeight + info.borderHeight;
-			width = info.defaultSize.width / 2;
-			this.element.enableSashes(false, false, false, false);
-			this.element.minSize = this.element.maxSize = new dom.Dimension(width, height);
-			this._contentWidget.setPreference(ContentWidgetPositionPreference.BELOW);
-
-		} else {
-			// showing items
-
-			// width math
-			const maxWidth = bodyBox.width - info.borderHeight - 2 * info.horizontalPadding;
-			if (width > maxWidth) {
-				width = maxWidth;
-			}
-			const preferredWidth = this._completionModel ? this._completionModel.stats.pLabelLen * info.typicalHalfwidthCharacterWidth : width;
-
-			// height math
-			const fullHeight = info.statusBarHeight + this._list.contentHeight + info.borderHeight;
-			const minHeight = info.itemHeight + info.statusBarHeight;
-			const editorBox = dom.getDomNodePagePosition(this.editor.getDomNode());
-			const cursorBox = this.editor.getScrolledVisiblePosition(this.editor.getPosition());
-			const cursorBottom = editorBox.top + cursorBox.top + cursorBox.height;
-			const maxHeightBelow = Math.min(bodyBox.height - cursorBottom - info.verticalPadding, fullHeight);
-			const availableSpaceAbove = editorBox.top + cursorBox.top - info.verticalPadding;
-			const maxHeightAbove = Math.min(availableSpaceAbove, fullHeight);
-			let maxHeight = Math.min(Math.max(maxHeightAbove, maxHeightBelow) + info.borderHeight, fullHeight);
-
-			if (height === this._cappedHeight?.capped) {
-				// Restore the old (wanted) height when the current
-				// height is capped to fit
-				height = this._cappedHeight.wanted;
-			}
-
-			if (height < minHeight) {
-				height = minHeight;
-			}
-			if (height > maxHeight) {
-				height = maxHeight;
-			}
-
-			const forceRenderingAboveRequiredSpace = 150;
-			if (height > maxHeightBelow || (this._forceRenderingAbove && availableSpaceAbove > forceRenderingAboveRequiredSpace)) {
-				this._contentWidget.setPreference(ContentWidgetPositionPreference.ABOVE);
-				this.element.enableSashes(true, true, false, false);
-				maxHeight = maxHeightAbove;
-			} else {
-				this._contentWidget.setPreference(ContentWidgetPositionPreference.BELOW);
-				this.element.enableSashes(false, true, true, false);
-				maxHeight = maxHeightBelow;
-			}
-			this.element.preferredSize = new dom.Dimension(preferredWidth, info.defaultSize.height);
-			this.element.maxSize = new dom.Dimension(maxWidth, maxHeight);
-			this.element.minSize = new dom.Dimension(220, minHeight);
-
-			// Know when the height was capped to fit and remember
-			// the wanted height for later. This is required when going
-			// left to widen suggestions.
-			this._cappedHeight = height === fullHeight
-				? { wanted: this._cappedHeight?.wanted ?? size.height, capped: height }
-				: undefined;
-		}
-		this._resize(width, height);
+		this.tree.layout(height);
+		this.editor.layoutContentWidget(this);
 	}
 
-	private _resize(width: number, height: number): void {
+	public destroy() : void {
+		this.releaseModel();
+		this.tree.dispose();
+		this.tree = null;
+		this.element = null;
 
-		const { width: maxWidth, height: maxHeight } = this.element.maxSize;
-		width = Math.min(maxWidth, width);
-		height = Math.min(maxHeight, height);
-
-		const { statusBarHeight } = this.getLayoutInfo();
-		this._list.layout(height - statusBarHeight, width);
-		this._listElement.style.height = `${height - statusBarHeight}px`;
-		this.element.layout(height, width);
-		this._contentWidget.layout();
-
-		this._positionDetails();
-	}
-
-	private _positionDetails(): void {
-		if (this._isDetailsVisible()) {
-			this._details.placeAtAnchor(this.element.domNode, this._contentWidget.getPosition()?.preference[0] === ContentWidgetPositionPreference.BELOW);
-		}
-	}
-
-	getLayoutInfo() {
-		const fontInfo = this.editor.getOption(EditorOption.fontInfo);
-		const itemHeight = clamp(this.editor.getOption(EditorOption.suggestLineHeight) || fontInfo.lineHeight, 8, 1000);
-		const statusBarHeight = !this.editor.getOption(EditorOption.suggest).showStatusBar || this._state === State.Empty || this._state === State.Loading ? 0 : itemHeight;
-		const borderWidth = this._details.widget.borderWidth;
-		const borderHeight = 2 * borderWidth;
-
-		return {
-			itemHeight,
-			statusBarHeight,
-			borderWidth,
-			borderHeight,
-			typicalHalfwidthCharacterWidth: fontInfo.typicalHalfwidthCharacterWidth,
-			verticalPadding: 22,
-			horizontalPadding: 14,
-			defaultSize: new dom.Dimension(430, statusBarHeight + 12 * itemHeight + borderHeight)
-		};
-	}
-
-	private _isDetailsVisible(): boolean {
-		return this._storageService.getBoolean('expandSuggestionDocs', StorageScope.GLOBAL, false);
-	}
-
-	private _setDetailsVisible(value: boolean) {
-		this._storageService.store('expandSuggestionDocs', value, StorageScope.GLOBAL, StorageTarget.USER);
-	}
-
-	forceRenderingAbove() {
-		if (!this._forceRenderingAbove) {
-			this._forceRenderingAbove = true;
-			this._layout(this._persistedSize.restore());
-		}
-	}
-
-	stopForceRenderingAbove() {
-		this._forceRenderingAbove = false;
-	}
-}
-
-export class SuggestContentWidget implements IContentWidget {
-
-	readonly allowEditorOverflow = true;
-	readonly suppressMouseDown = false;
-
-	private _position?: IPosition | null;
-	private _preference?: ContentWidgetPositionPreference;
-	private _preferenceLocked = false;
-
-	private _added: boolean = false;
-	private _hidden: boolean = false;
-
-	constructor(
-		private readonly _widget: SuggestWidget,
-		private readonly _editor: ICodeEditor
-	) { }
-
-	dispose(): void {
-		if (this._added) {
-			this._added = false;
-			this._editor.removeContentWidget(this);
-		}
-	}
-
-	getId(): string {
-		return 'editor.widget.suggestWidget';
-	}
-
-	getDomNode(): HTMLElement {
-		return this._widget.element.domNode;
-	}
-
-	show(): void {
-		this._hidden = false;
-		if (!this._added) {
-			this._added = true;
-			this._editor.addContentWidget(this);
-		}
-	}
-
-	hide(): void {
-		if (!this._hidden) {
-			this._hidden = true;
-			this.layout();
-		}
-	}
-
-	layout(): void {
-		this._editor.layoutContentWidget(this);
-	}
-
-	getPosition(): IContentWidgetPosition | null {
-		if (this._hidden || !this._position || !this._preference) {
-			return null;
-		}
-		return {
-			position: this._position,
-			preference: [this._preference]
-		};
-	}
-
-	beforeRender() {
-		const { height, width } = this._widget.element.size;
-		const { borderWidth, horizontalPadding } = this._widget.getLayoutInfo();
-		return new dom.Dimension(width + 2 * borderWidth + horizontalPadding, height + 2 * borderWidth);
-	}
-
-	afterRender(position: ContentWidgetPositionPreference | null) {
-		this._widget._afterRender(position);
-	}
-
-	setPreference(preference: ContentWidgetPositionPreference) {
-		if (!this._preferenceLocked) {
-			this._preference = preference;
-		}
-	}
-
-	lockPreference() {
-		this._preferenceLocked = true;
-	}
-
-	unlockPreference() {
-		this._preferenceLocked = false;
-	}
-
-	setPosition(position: IPosition | null): void {
-		this._position = position;
+		this.listenersToRemove.forEach((element) => {
+			element();
+		});
+		this.listenersToRemove = null;
 	}
 }

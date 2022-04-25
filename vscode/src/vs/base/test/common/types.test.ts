@@ -2,12 +2,12 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+'use strict';
 
 import * as assert from 'assert';
-import * as types from 'vs/base/common/types';
+import types = require('vs/base/common/types');
 
 suite('Types', () => {
-
 	test('isFunction', () => {
 		assert(!types.isFunction(undefined));
 		assert(!types.isFunction(null));
@@ -57,7 +57,7 @@ suite('Types', () => {
 		assert(!types.isObject(/test/));
 		assert(!types.isObject(new RegExp('')));
 		assert(!types.isFunction(new Date()));
-		assert.strictEqual(types.isObject(assert), false);
+		assert(!types.isObject(assert));
 		assert(!types.isObject(function foo() { }));
 
 		assert(types.isObject({}));
@@ -75,7 +75,7 @@ suite('Types', () => {
 		assert(!types.isEmptyObject(/test/));
 		assert(!types.isEmptyObject(new RegExp('')));
 		assert(!types.isEmptyObject(new Date()));
-		assert.strictEqual(types.isEmptyObject(assert), false);
+		assert(!types.isEmptyObject(assert));
 		assert(!types.isEmptyObject(function foo() { /**/ }));
 		assert(!types.isEmptyObject({ foo: 'bar' }));
 
@@ -171,42 +171,28 @@ suite('Types', () => {
 		assert(types.isUndefinedOrNull(null));
 	});
 
-	test('assertIsDefined / assertAreDefined', () => {
-		assert.throws(() => types.assertIsDefined(undefined));
-		assert.throws(() => types.assertIsDefined(null));
-		assert.throws(() => types.assertAllDefined(null, undefined));
-		assert.throws(() => types.assertAllDefined(true, undefined));
-		assert.throws(() => types.assertAllDefined(undefined, false));
+	test('create', () => {
+		var zeroConstructor = function() { /**/ };
 
-		assert.strictEqual(types.assertIsDefined(true), true);
-		assert.strictEqual(types.assertIsDefined(false), false);
-		assert.strictEqual(types.assertIsDefined('Hello'), 'Hello');
-		assert.strictEqual(types.assertIsDefined(''), '');
+		assert(types.create(zeroConstructor) instanceof zeroConstructor);
+		assert(types.isObject(types.create(zeroConstructor)));
 
-		const res = types.assertAllDefined(1, true, 'Hello');
-		assert.strictEqual(res[0], 1);
-		assert.strictEqual(res[1], true);
-		assert.strictEqual(res[2], 'Hello');
-	});
+		var manyArgConstructor = function(foo, bar) {
+			this.foo = foo;
+			this.bar = bar;
+		};
 
-	test('validateConstraints', () => {
-		types.validateConstraints([1, 'test', true], [Number, String, Boolean]);
-		types.validateConstraints([1, 'test', true], ['number', 'string', 'boolean']);
-		types.validateConstraints([console.log], [Function]);
-		types.validateConstraints([undefined], [types.isUndefined]);
-		types.validateConstraints([1], [types.isNumber]);
+		var foo = {};
+		var bar = 'foo';
 
-		class Foo { }
-		types.validateConstraints([new Foo()], [Foo]);
+		assert(types.create(manyArgConstructor) instanceof manyArgConstructor);
+		assert(types.isObject(types.create(manyArgConstructor)));
 
-		function isFoo(f: any) { }
-		assert.throws(() => types.validateConstraints([new Foo()], [isFoo]));
+		assert(types.create(manyArgConstructor, foo, bar) instanceof manyArgConstructor);
+		assert(types.isObject(types.create(manyArgConstructor, foo, bar)));
 
-		function isFoo2(f: any) { return true; }
-		types.validateConstraints([new Foo()], [isFoo2]);
-
-		assert.throws(() => types.validateConstraints([1, true], [types.isNumber, types.isString]));
-		assert.throws(() => types.validateConstraints(['2'], [types.isNumber]));
-		assert.throws(() => types.validateConstraints([1, 'test', true], [Number, String, Number]));
+		var obj = types.create(manyArgConstructor, foo, bar);
+		assert.strictEqual(obj.foo, foo);
+		assert.strictEqual(obj.bar, bar);
 	});
 });

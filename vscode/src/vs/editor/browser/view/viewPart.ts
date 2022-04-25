@@ -2,75 +2,85 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+'use strict';
 
-import { FastDomNode } from 'vs/base/browser/fastDomNode';
-import { RenderingContext, RestrictedRenderingContext } from 'vs/editor/browser/view/renderingContext';
-import { ViewContext } from 'vs/editor/common/viewModel/viewContext';
-import { ViewEventHandler } from 'vs/editor/common/viewEventHandler';
+import {ViewEventHandler} from 'vs/editor/common/viewModel/viewEventHandler';
+import EditorBrowser = require('vs/editor/browser/editorBrowser');
 
-export abstract class ViewPart extends ViewEventHandler {
+export interface IRunner {
+	(): void;
+}
 
-	_context: ViewContext;
+export class ViewPart extends ViewEventHandler implements EditorBrowser.IViewPart {
 
-	constructor(context: ViewContext) {
+	_context:EditorBrowser.IViewContext;
+	private _modificationBeforeRenderingRunners:IRunner[];
+	private _modificationRunners:IRunner[];
+
+	constructor(context:EditorBrowser.IViewContext) {
 		super();
 		this._context = context;
 		this._context.addEventHandler(this);
+		this._modificationBeforeRenderingRunners = [];
+		this._modificationRunners = [];
 	}
 
-	public override dispose(): void {
+	public dispose(): void {
 		this._context.removeEventHandler(this);
-		super.dispose();
+		this._context = null;
+		this._modificationBeforeRenderingRunners = [];
+		this._modificationRunners = [];
 	}
 
-	public abstract prepareRender(ctx: RenderingContext): void;
-	public abstract render(ctx: RestrictedRenderingContext): void;
-}
-
-export const enum PartFingerprint {
-	None,
-	ContentWidgets,
-	OverflowingContentWidgets,
-	OverflowGuard,
-	OverlayWidgets,
-	ScrollableElement,
-	TextArea,
-	ViewLines,
-	Minimap
-}
-
-export class PartFingerprints {
-
-	public static write(target: Element | FastDomNode<HTMLElement>, partId: PartFingerprint) {
-		target.setAttribute('data-mprt', String(partId));
+	/**
+	 * Modify the DOM right before when the orchestrated rendering occurs.
+	 */
+	_requestModificationFrameBeforeRendering(runner:IRunner): void {
+		this._modificationBeforeRenderingRunners.push(runner);
 	}
 
-	public static read(target: Element): PartFingerprint {
-		const r = target.getAttribute('data-mprt');
-		if (r === null) {
-			return PartFingerprint.None;
-		}
-		return parseInt(r, 10);
+	/**
+	 * Modify the DOM when the orchestrated rendering occurs.
+	 */
+	_requestModificationFrame(runner:IRunner): void {
+		this._modificationRunners.push(runner);
 	}
 
-	public static collect(child: Element | null, stopAt: Element): Uint8Array {
-		const result: PartFingerprint[] = [];
-		let resultLen = 0;
-
-		while (child && child !== document.body) {
-			if (child === stopAt) {
-				break;
+	public onBeforeForcedLayout(): void {
+		if (this._modificationBeforeRenderingRunners.length > 0) {
+			for (var i = 0; i < this._modificationBeforeRenderingRunners.length; i++) {
+				this._modificationBeforeRenderingRunners[i]();
 			}
-			if (child.nodeType === child.ELEMENT_NODE) {
-				result[resultLen++] = this.read(child);
-			}
-			child = child.parentElement;
+			this._modificationBeforeRenderingRunners = [];
 		}
+	}
 
-		const r = new Uint8Array(resultLen);
-		for (let i = 0; i < resultLen; i++) {
-			r[i] = result[resultLen - i - 1];
+	public onReadAfterForcedLayout(ctx:EditorBrowser.IRenderingContext): void {
+		if (!this.shouldRender) {
+			return;
 		}
-		return r;
+		this._render(ctx);
+	}
+
+	public onWriteAfterForcedLayout(): void {
+		if (!this.shouldRender) {
+			return;
+		}
+		this.shouldRender = false;
+
+		this._executeModificationRunners();
+	}
+
+	_executeModificationRunners(): void {
+		if (this._modificationRunners.length > 0) {
+			for (var i = 0; i < this._modificationRunners.length; i++) {
+				this._modificationRunners[i]();
+			}
+			this._modificationRunners = [];
+		}
+	}
+
+	_render(ctx:EditorBrowser.IRenderingContext): void {
+		throw new Error('Implement me!');
 	}
 }

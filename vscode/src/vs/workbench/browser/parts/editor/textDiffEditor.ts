@@ -3,339 +3,281 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { localize } from 'vs/nls';
-import { deepClone } from 'vs/base/common/objects';
-import { isObject, isArray, assertIsDefined, withUndefinedAsNull, withNullAsUndefined } from 'vs/base/common/types';
-import { IDiffEditor, isDiffEditor } from 'vs/editor/browser/editorBrowser';
-import { IDiffEditorOptions, IEditorOptions as ICodeEditorOptions } from 'vs/editor/common/config/editorOptions';
-import { BaseTextEditor, IEditorConfiguration } from 'vs/workbench/browser/parts/editor/textEditor';
-import { TEXT_DIFF_EDITOR_ID, IEditorFactoryRegistry, EditorExtensions, ITextDiffEditorPane, IEditorOpenContext, EditorInputCapabilities, isEditorInput, isTextEditorViewState } from 'vs/workbench/common/editor';
-import { EditorInput } from 'vs/workbench/common/editor/editorInput';
-import { applyTextEditorOptions } from 'vs/workbench/common/editor/editorOptions';
-import { DiffEditorInput } from 'vs/workbench/common/editor/diffEditorInput';
-import { DiffNavigator } from 'vs/editor/browser/widget/diffNavigator';
-import { DiffEditorWidget } from 'vs/editor/browser/widget/diffEditorWidget';
-import { TextDiffEditorModel } from 'vs/workbench/common/editor/textDiffEditorModel';
-import { ITelemetryService } from 'vs/platform/telemetry/common/telemetry';
-import { IStorageService } from 'vs/platform/storage/common/storage';
-import { ITextResourceConfigurationService } from 'vs/editor/common/services/textResourceConfiguration';
-import { IInstantiationService } from 'vs/platform/instantiation/common/instantiation';
-import { IThemeService } from 'vs/platform/theme/common/themeService';
-import { TextFileOperationError, TextFileOperationResult } from 'vs/workbench/services/textfile/common/textfiles';
-import { ScrollType, IDiffEditorViewState, IDiffEditorModel } from 'vs/editor/common/editorCommon';
-import { DisposableStore, MutableDisposable } from 'vs/base/common/lifecycle';
-import { Registry } from 'vs/platform/registry/common/platform';
-import { URI } from 'vs/base/common/uri';
-import { IEditorGroupsService } from 'vs/workbench/services/editor/common/editorGroupsService';
-import { IEditorService } from 'vs/workbench/services/editor/common/editorService';
-import { CancellationToken } from 'vs/base/common/cancellation';
-import { EditorActivation, ITextEditorOptions } from 'vs/platform/editor/common/editor';
-import { IContextKeyService } from 'vs/platform/contextkey/common/contextkey';
-import { isEqual } from 'vs/base/common/resources';
-import { multibyteAwareBtoa } from 'vs/base/browser/dom';
-import { IFileService } from 'vs/platform/files/common/files';
+'use strict';
+
+import 'vs/css!./media/textdiffeditor';
+import {Promise, TPromise} from 'vs/base/common/winjs.base';
+import nls = require('vs/nls');
+import {Builder} from 'vs/base/browser/builder';
+import {Action, IAction} from 'vs/base/common/actions';
+import types = require('vs/base/common/types');
+import {IDiffEditor} from 'vs/editor/browser/editorBrowser';
+import {IDiffEditorOptions, IEditorOptions} from 'vs/editor/common/editorCommon';
+import {BaseEditor} from 'vs/workbench/browser/parts/editor/baseEditor';
+import {BaseTextEditor} from 'vs/workbench/browser/parts/editor/textEditor';
+import {TextEditorOptions, TextDiffEditorOptions, EditorModel, EditorInput, EditorOptions} from 'vs/workbench/common/editor';
+import {StringEditorInput} from 'vs/workbench/browser/parts/editor/stringEditorInput';
+import {ResourceEditorInput} from 'vs/workbench/browser/parts/editor/resourceEditorInput';
+import {DiffEditorInput} from 'vs/workbench/browser/parts/editor/diffEditorInput';
+import {DiffNavigator} from 'vs/editor/contrib/diffNavigator/common/diffNavigator';
+import {DiffEditorWidget} from 'vs/editor/browser/widget/diffEditorWidget';
+import {TextDiffEditorModel} from 'vs/workbench/browser/parts/editor/textDiffEditorModel';
+import {DelegatingWorkbenchEditorService} from 'vs/workbench/services/editor/browser/editorService';
+import {IFileOperationResult, FileOperationResult} from 'vs/platform/files/common/files';
+import {ITelemetryService} from 'vs/platform/telemetry/common/telemetry';
+import {IWorkspaceContextService} from 'vs/workbench/services/workspace/common/contextService';
+import {IStorageService} from 'vs/platform/storage/common/storage';
+import {IConfigurationService, IConfigurationServiceEvent, ConfigurationServiceEventTypes} from 'vs/platform/configuration/common/configuration';
+import {IEventService} from 'vs/platform/event/common/event';
+import {IInstantiationService} from 'vs/platform/instantiation/common/instantiation';
+import {IMessageService} from 'vs/platform/message/common/message';
+import {IWorkbenchEditorService} from 'vs/workbench/services/editor/common/editorService';
+import {IModeService} from 'vs/editor/common/services/modeService';
 
 /**
- * The text editor that leverages the diff text editor for the editing experience.
+ * The text editor that leverages the monaco diff text editor for the editing experience.
  */
-export class TextDiffEditor extends BaseTextEditor<IDiffEditorViewState> implements ITextDiffEditorPane {
+export class TextDiffEditor extends BaseTextEditor {
 
-	static readonly ID = TEXT_DIFF_EDITOR_ID;
+	public static ID = 'workbench.editors.textDiffEditor';
 
-	private diffNavigator: DiffNavigator | undefined;
-	private readonly diffNavigatorDisposables = this._register(new DisposableStore());
-
-	private readonly inputListener = this._register(new MutableDisposable());
-
-	override get scopedContextKeyService(): IContextKeyService | undefined {
-		const control = this.getControl();
-		if (!control) {
-			return undefined;
-		}
-
-		const originalEditor = control.getOriginalEditor();
-		const modifiedEditor = control.getModifiedEditor();
-
-		return (originalEditor.hasTextFocus() ? originalEditor : modifiedEditor).invokeWithinContext(accessor => accessor.get(IContextKeyService));
-	}
+	private diffNavigator: DiffNavigator;
+	private nextDiffAction: NavigateAction;
+	private previousDiffAction: NavigateAction;
 
 	constructor(
 		@ITelemetryService telemetryService: ITelemetryService,
 		@IInstantiationService instantiationService: IInstantiationService,
+		@IWorkspaceContextService contextService: IWorkspaceContextService,
 		@IStorageService storageService: IStorageService,
-		@ITextResourceConfigurationService configurationService: ITextResourceConfigurationService,
-		@IEditorService editorService: IEditorService,
-		@IThemeService themeService: IThemeService,
-		@IEditorGroupsService editorGroupService: IEditorGroupsService,
-		@IFileService private readonly fileService: IFileService
+		@IMessageService messageService: IMessageService,
+		@IConfigurationService configurationService: IConfigurationService,
+		@IEventService eventService: IEventService,
+		@IWorkbenchEditorService editorService: IWorkbenchEditorService,
+		@IModeService modeService: IModeService
 	) {
-		super(TextDiffEditor.ID, telemetryService, instantiationService, storageService, configurationService, themeService, editorService, editorGroupService);
+		super(TextDiffEditor.ID, telemetryService, instantiationService, contextService, storageService, messageService, configurationService, eventService, editorService, modeService);
+}
 
-		// Listen to file system provider changes
-		this._register(this.fileService.onDidChangeFileSystemProviderCapabilities(e => this.onDidChangeFileSystemProvider(e.scheme)));
-		this._register(this.fileService.onDidChangeFileSystemProviderRegistrations(e => this.onDidChangeFileSystemProvider(e.scheme)));
-	}
-
-	private onDidChangeFileSystemProvider(scheme: string): void {
-		if (this.input instanceof DiffEditorInput && (this.input.original.resource?.scheme === scheme || this.input.modified.resource?.scheme === scheme)) {
-			this.updateReadonly(this.input);
-		}
-	}
-
-	private onDidChangeInputCapabilities(input: DiffEditorInput): void {
-		if (this.input === input) {
-			this.updateReadonly(input);
-		}
-	}
-
-	private updateReadonly(input: DiffEditorInput): void {
-		const control = this.getControl();
-		if (control) {
-			control.updateOptions({
-				readOnly: input.modified.hasCapability(EditorInputCapabilities.Readonly),
-				originalEditable: !input.original.hasCapability(EditorInputCapabilities.Readonly)
-			});
-		}
-	}
-
-	override getTitle(): string {
+	public getTitle(): string {
 		if (this.input) {
 			return this.input.getName();
 		}
 
-		return localize('textDiffEditor', "Text Diff Editor");
+		return nls.localize('textDiffEditor', "Text Diff Editor");
 	}
 
-	override createEditorControl(parent: HTMLElement, configuration: ICodeEditorOptions): IDiffEditor {
-		return this.instantiationService.createInstance(DiffEditorWidget, parent, configuration, {});
+	public createEditorControl(parent: Builder): IDiffEditor {
+		this.nextDiffAction = new NavigateAction(this, true);
+		this.previousDiffAction = new NavigateAction(this, false);
+
+		let delegatingService = this.instantiationService.createInstance(DelegatingWorkbenchEditorService, this, (editor: BaseEditor, input: EditorInput, options?: EditorOptions, arg4?: any) => {
+
+			// Check if arg4 is a position argument that differs from this editors position
+			if (types.isUndefinedOrNull(arg4) || arg4 === false || arg4 === this.position) {
+				let activeDiffInput = <DiffEditorInput>this.getInput();
+				if (input && options && activeDiffInput) {
+
+					// Input matches modified side of the diff editor: perform the action on modified side
+					if (input.matches(activeDiffInput.getModifiedInput())) {
+						return this.setInput(this.getInput(), options).then(() => {
+							return true;
+						});
+					}
+
+					// Input matches original side of the diff editor: perform the action on original side
+					else if (input.matches(activeDiffInput.getOriginalInput())) {
+						let originalEditor = this.getControl().getOriginalEditor();
+						if (options instanceof TextEditorOptions) {
+							(<TextEditorOptions>options).apply(originalEditor);
+
+							return TPromise.as<boolean>(true);
+						}
+					}
+				}
+			}
+
+			return TPromise.as<boolean>(false);
+		});
+
+		// Create a special child of instantiator that will delegate all calls to openEditor() to the same diff editor if the input matches with the modified one
+		let sideEditorInstantiator = this.instantiationService.createChild({
+			editorService: delegatingService
+		});
+
+		return sideEditorInstantiator.createInstance(DiffEditorWidget, parent.getHTMLElement(), this.getCodeEditorOptions());
 	}
 
-	override async setInput(input: DiffEditorInput, options: ITextEditorOptions | undefined, context: IEditorOpenContext, token: CancellationToken): Promise<void> {
+	public setInput(input: EditorInput, options: EditorOptions): TPromise<void> {
+		let oldInput = this.getInput();
+		super.setInput(input, options);
 
-		// Update our listener for input capabilities
-		this.inputListener.value = input.onDidChangeCapabilities(() => this.onDidChangeInputCapabilities(input));
+		// Detect options
+		let forceOpen = options && options.forceOpen;
+
+		// Same Input
+		if (!forceOpen && input.matches(oldInput)) {
+
+			// TextOptions (avoiding instanceof here for a reason, do not change!)
+			let textOptions = <TextEditorOptions>options;
+			if (textOptions && types.isFunction(textOptions.apply)) {
+				textOptions.apply(<IDiffEditor>this.getControl());
+			}
+
+			return TPromise.as<void>(null);
+		}
 
 		// Dispose previous diff navigator
-		this.diffNavigatorDisposables.clear();
+		if (this.diffNavigator) {
+			this.diffNavigator.dispose();
+		}
 
-		// Set input and resolve
-		await super.setInput(input, options, context, token);
+		// Different Input (Reload)
+		return this.editorService.resolveEditorModel(input, true /* Reload */).then((resolvedModel: EditorModel) => {
 
-		try {
-			const resolvedModel = await input.resolve();
-
-			// Check for cancellation
-			if (token.isCancellationRequested) {
-				return undefined;
-			}
-
-			// Fallback to open as binary if not text
+			// Assert Model Instance
 			if (!(resolvedModel instanceof TextDiffEditorModel)) {
-				this.openAsBinary(input, options);
-				return undefined;
+				return TPromise.wrapError<void>(nls.localize('cannotDiffBinary', "At least one of the resources to compare seems to be binary and this is currently not supported"));
 			}
 
-			// Set Editor Model
-			const diffEditor = assertIsDefined(this.getControl());
-			const resolvedDiffEditorModel = resolvedModel as TextDiffEditorModel;
-			diffEditor.setModel(withUndefinedAsNull(resolvedDiffEditorModel.textDiffEditorModel));
-
-			// Restore view state (unless provided by options)
-			let hasPreviousViewState = false;
-			if (!isTextEditorViewState(options?.viewState)) {
-				hasPreviousViewState = this.restoreTextDiffEditorViewState(input, options, context, diffEditor);
+			// Assert that the current input is still the one we expect. This prevents a race condition when loading a diff takes long and another input was set meanwhile
+			if (!this.getInput() || this.getInput() !== input) {
+				return null;
 			}
 
-			// Apply options to editor if any
-			let optionsGotApplied = false;
-			if (options) {
-				optionsGotApplied = applyTextEditorOptions(options, diffEditor, ScrollType.Immediate);
+			// Editor
+			let diffEditor = <IDiffEditor>this.getControl();
+			diffEditor.setModel((<TextDiffEditorModel>resolvedModel).textDiffEditorModel);
+
+			// Respect text diff editor options
+			let autoRevealFirstChange = true;
+			if (options instanceof TextDiffEditorOptions) {
+				let textDiffOptions = (<TextDiffEditorOptions>options);
+				autoRevealFirstChange = !types.isUndefinedOrNull(textDiffOptions.autoRevealFirstChange) ? textDiffOptions.autoRevealFirstChange : autoRevealFirstChange;
 			}
 
-			// Diff navigator
+			// listen on diff updated changes to reveal the first change
 			this.diffNavigator = new DiffNavigator(diffEditor, {
-				alwaysRevealFirst: !optionsGotApplied && !hasPreviousViewState // only reveal first change if we had no options or viewstate
+				alwaysRevealFirst: autoRevealFirstChange
 			});
-			this.diffNavigatorDisposables.add(this.diffNavigator);
-
-			// Since the resolved model provides information about being readonly
-			// or not, we apply it here to the editor even though the editor input
-			// was already asked for being readonly or not. The rationale is that
-			// a resolved model might have more specific information about being
-			// readonly or not that the input did not have.
-			diffEditor.updateOptions({
-				readOnly: resolvedDiffEditorModel.modifiedModel?.isReadonly(),
-				originalEditable: !resolvedDiffEditorModel.originalModel?.isReadonly()
+			this.diffNavigator.addListener(DiffNavigator.Events.UPDATED, () => {
+				this.nextDiffAction.updateEnablement();
+				this.previousDiffAction.updateEnablement();
 			});
-		} catch (error) {
 
-			// In case we tried to open a file and the response indicates that this is not a text file, fallback to binary diff.
+			// Handle TextOptions
+			if (options && types.isFunction((<TextEditorOptions>options).apply)) {
+				(<TextEditorOptions>options).apply(<IDiffEditor>diffEditor);
+			}
+
+			// Apply options again because input has changed
+			diffEditor.updateOptions(this.getCodeEditorOptions());
+		}, (error) => {
+
+			// In case we tried to open a file and the response indicates that this is not a text file, bail out to the user.
 			if (this.isFileBinaryError(error)) {
-				this.openAsBinary(input, options);
-				return;
+				return Promise.wrapError(nls.localize('cannotDiffBinary', "At least one of the resources to compare seems to be binary and this is currently not supported"));
 			}
 
-			throw error;
-		}
+			// Otherwise make sure the error bubbles up
+			return Promise.wrapError(error);
+		});
 	}
 
-	private restoreTextDiffEditorViewState(editor: DiffEditorInput, options: ITextEditorOptions | undefined, context: IEditorOpenContext, control: IDiffEditor): boolean {
-		const editorViewState = this.loadEditorViewState(editor, context);
-		if (editorViewState) {
-			if (options?.selection && editorViewState.modified) {
-				editorViewState.modified.cursorState = []; // prevent duplicate selections via options
-			}
+	protected getCodeEditorOptions(): IEditorOptions {
+		let options:IDiffEditorOptions = super.getCodeEditorOptions();
 
-			control.restoreViewState(editorViewState);
+		let input = this.input;
+		if (input && types.isFunction((<DiffEditorInput>input).getModifiedInput)) {
+			let modifiedInput = (<DiffEditorInput>input).getModifiedInput();
+			let readOnly = modifiedInput instanceof StringEditorInput || modifiedInput instanceof ResourceEditorInput;
 
-			return true;
+			options.readOnly = readOnly;
 		}
-
-		return false;
-	}
-
-	private openAsBinary(input: DiffEditorInput, options: ITextEditorOptions | undefined): void {
-		const original = input.original;
-		const modified = input.modified;
-
-		const binaryDiffInput = this.instantiationService.createInstance(DiffEditorInput, input.getName(), input.getDescription(), original, modified, true);
-
-		// Forward binary flag to input if supported
-		const fileEditorFactory = Registry.as<IEditorFactoryRegistry>(EditorExtensions.EditorFactory).getFileEditorFactory();
-		if (fileEditorFactory.isFileEditor(original)) {
-			original.setForceOpenAsBinary();
-		}
-
-		if (fileEditorFactory.isFileEditor(modified)) {
-			modified.setForceOpenAsBinary();
-		}
-
-		// Replace this editor with the binary one
-		(this.group ?? this.editorGroupService.activeGroup).replaceEditors([{
-			editor: input,
-			replacement: binaryDiffInput,
-			options: {
-				...options,
-				// Make sure to not steal away the currently active group
-				// because we are triggering another openEditor() call
-				// and do not control the initial intent that resulted
-				// in us now opening as binary.
-				activation: EditorActivation.PRESERVE,
-				pinned: this.group?.isPinned(input),
-				sticky: this.group?.isSticky(input)
-			}
-		}]);
-	}
-
-	protected override computeConfiguration(configuration: IEditorConfiguration): ICodeEditorOptions {
-		const editorConfiguration = super.computeConfiguration(configuration);
-
-		// Handle diff editor specially by merging in diffEditor configuration
-		if (isObject(configuration.diffEditor)) {
-			const diffEditorConfiguration: IDiffEditorOptions = deepClone(configuration.diffEditor);
-
-			// User settings defines `diffEditor.codeLens`, but here we rename that to `diffEditor.diffCodeLens` to avoid collisions with `editor.codeLens`.
-			diffEditorConfiguration.diffCodeLens = diffEditorConfiguration.codeLens;
-			delete diffEditorConfiguration.codeLens;
-
-			// User settings defines `diffEditor.wordWrap`, but here we rename that to `diffEditor.diffWordWrap` to avoid collisions with `editor.wordWrap`.
-			diffEditorConfiguration.diffWordWrap = <'off' | 'on' | 'inherit' | undefined>diffEditorConfiguration.wordWrap;
-			delete diffEditorConfiguration.wordWrap;
-
-			Object.assign(editorConfiguration, diffEditorConfiguration);
-		}
-
-		return editorConfiguration;
-	}
-
-	protected override getConfigurationOverrides(): ICodeEditorOptions {
-		const options: IDiffEditorOptions = super.getConfigurationOverrides();
-
-		options.readOnly = this.input instanceof DiffEditorInput && this.input.modified.hasCapability(EditorInputCapabilities.Readonly);
-		options.originalEditable = this.input instanceof DiffEditorInput && !this.input.original.hasCapability(EditorInputCapabilities.Readonly);
-		options.lineDecorationsWidth = '2ch';
 
 		return options;
 	}
 
 	private isFileBinaryError(error: Error[]): boolean;
 	private isFileBinaryError(error: Error): boolean;
-	private isFileBinaryError(error: Error | Error[]): boolean {
-		if (isArray(error)) {
-			const errors = <Error[]>error;
-
-			return errors.some(error => this.isFileBinaryError(error));
+	private isFileBinaryError(error: any): boolean {
+		if (types.isArray(error)) {
+			let errors = <Error[]>error;
+			return errors.some((e) => this.isFileBinaryError(e));
 		}
 
-		return (<TextFileOperationError>error).textFileOperationResult === TextFileOperationResult.FILE_IS_BINARY;
+		return (<IFileOperationResult>error).fileOperationResult === FileOperationResult.FILE_IS_BINARY;
 	}
 
-	override clearInput(): void {
-		super.clearInput();
-
-		// Clear input listener
-		this.inputListener.clear();
+	public clearInput(): void {
 
 		// Dispose previous diff navigator
-		this.diffNavigatorDisposables.clear();
+		if (this.diffNavigator) {
+			this.diffNavigator.dispose();
+		}
 
 		// Clear Model
-		const diffEditor = this.getControl();
-		diffEditor?.setModel(null);
+		this.getControl().setModel(null);
+
+		// Pass to super
+		super.clearInput();
 	}
 
-	getDiffNavigator(): DiffNavigator | undefined {
+	public getDiffNavigator(): DiffNavigator {
 		return this.diffNavigator;
 	}
 
-	override getControl(): IDiffEditor | undefined {
-		return super.getControl() as IDiffEditor | undefined;
+	public getActions(): IAction[] {
+		return [
+			this.previousDiffAction,
+			this.nextDiffAction
+		];
 	}
 
-	protected override tracksEditorViewState(input: EditorInput): boolean {
-		return input instanceof DiffEditorInput;
+	public getControl(): IDiffEditor {
+		return <any>super.getControl();
 	}
 
-	protected override computeEditorViewState(resource: URI): IDiffEditorViewState | undefined {
-		const control = this.getControl();
-		if (!isDiffEditor(control)) {
-			return undefined;
+	public dispose(): void {
+
+		// Dispose previous diff navigator
+		if (this.diffNavigator) {
+			this.diffNavigator.dispose();
 		}
 
-		const model = control.getModel();
-		if (!model || !model.modified || !model.original) {
-			return undefined; // view state always needs a model
-		}
+		super.dispose();
+	}
+}
 
-		const modelUri = this.toEditorViewStateResource(model);
-		if (!modelUri) {
-			return undefined; // model URI is needed to make sure we save the view state correctly
-		}
+class NavigateAction extends Action {
+	static ID_NEXT = 'workbench.action.nextDiff';
+	static ID_PREV = 'workbench.action.previousDiff';
 
-		if (!isEqual(modelUri, resource)) {
-			return undefined; // prevent saving view state for a model that is not the expected one
-		}
+	private editor: TextDiffEditor;
+	private next: boolean;
 
-		return withNullAsUndefined(control.saveViewState());
+	constructor(editor: TextDiffEditor, next: boolean) {
+		super(next ? NavigateAction.ID_NEXT : NavigateAction.ID_PREV);
+
+		this.editor = editor;
+		this.next = next;
+
+		this.label = this.next ? nls.localize('navigate.next.label', "Next Change") : nls.localize('navigate.prev.label', "Previous Change");
+		this.class = this.next ? 'textdiff-editor-action next' : 'textdiff-editor-action previous';
+		this.enabled = false;
 	}
 
-	protected override toEditorViewStateResource(modelOrInput: IDiffEditorModel | EditorInput): URI | undefined {
-		let original: URI | undefined;
-		let modified: URI | undefined;
-
-		if (modelOrInput instanceof DiffEditorInput) {
-			original = modelOrInput.original.resource;
-			modified = modelOrInput.modified.resource;
-		} else if (!isEditorInput(modelOrInput)) {
-			original = modelOrInput.original.uri;
-			modified = modelOrInput.modified.uri;
+	public run(): Promise {
+		if (this.next) {
+			this.editor.getDiffNavigator().next();
+		} else {
+			this.editor.getDiffNavigator().previous();
 		}
 
-		if (!original || !modified) {
-			return undefined;
-		}
+		return null;
+	}
 
-		// create a URI that is the Base64 concatenation of original + modified resource
-		return URI.from({ scheme: 'diff', path: `${multibyteAwareBtoa(original.toString())}${multibyteAwareBtoa(modified.toString())}` });
+	public updateEnablement(): void {
+		this.enabled = this.editor.getDiffNavigator().canNavigate();
 	}
 }

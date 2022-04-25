@@ -3,427 +3,312 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import * as dom from 'vs/base/browser/dom';
-import * as aria from 'vs/base/browser/ui/aria/aria';
-import { DomScrollableElement } from 'vs/base/browser/ui/scrollbar/scrollableElement';
-import { Codicon } from 'vs/base/common/codicons';
-import { Event } from 'vs/base/common/event';
-import { IMarkdownString } from 'vs/base/common/htmlContent';
-import { Disposable, DisposableStore } from 'vs/base/common/lifecycle';
-import { escapeRegExpCharacters } from 'vs/base/common/strings';
-import { assertIsDefined } from 'vs/base/common/types';
+'use strict';
+
 import 'vs/css!./parameterHints';
-import { IMarkdownRenderResult, MarkdownRenderer } from 'vs/editor/contrib/markdownRenderer/browser/markdownRenderer';
-import { ContentWidgetPositionPreference, ICodeEditor, IContentWidget, IContentWidgetPosition } from 'vs/editor/browser/editorBrowser';
-import { ConfigurationChangedEvent, EditorOption } from 'vs/editor/common/config/editorOptions';
-import * as languages from 'vs/editor/common/languages';
-import { ILanguageService } from 'vs/editor/common/languages/language';
-import { ParameterHintsModel, TriggerContext } from 'vs/editor/contrib/parameterHints/browser/parameterHintsModel';
-import { Context } from 'vs/editor/contrib/parameterHints/browser/provideSignatureHelp';
-import * as nls from 'vs/nls';
-import { IContextKey, IContextKeyService } from 'vs/platform/contextkey/common/contextkey';
-import { IOpenerService } from 'vs/platform/opener/common/opener';
-import { editorHoverBackground, editorHoverBorder, editorHoverForeground, registerColor, textCodeBlockBackground, textLinkActiveForeground, textLinkForeground, listHighlightForeground } from 'vs/platform/theme/common/colorRegistry';
-import { registerIcon } from 'vs/platform/theme/common/iconRegistry';
-import { isHighContrast } from 'vs/platform/theme/common/theme';
-import { registerThemingParticipant, ThemeIcon } from 'vs/platform/theme/common/themeService';
-import { ILanguageFeaturesService } from 'vs/editor/common/services/languageFeatures';
+import {TPromise} from 'vs/base/common/winjs.base';
+import lifecycle = require('vs/base/common/lifecycle');
+import Builder = require('vs/base/browser/builder');
+import Model = require('./parameterHintsModel');
+import EditorBrowser = require('vs/editor/browser/editorBrowser');
+import EditorCommon = require('vs/editor/common/editorCommon');
+import Modes = require('vs/editor/common/modes');
+import EventEmitter = require('vs/base/common/eventEmitter');
 
-const $ = dom.$;
+var $ = Builder.$;
 
-const parameterHintsNextIcon = registerIcon('parameter-hints-next', Codicon.chevronDown, nls.localize('parameterHintsNextIcon', 'Icon for show next parameter hint.'));
-const parameterHintsPreviousIcon = registerIcon('parameter-hints-previous', Codicon.chevronUp, nls.localize('parameterHintsPreviousIcon', 'Icon for show previous parameter hint.'));
+interface ISignatureView {
+	top: number;
+	height: number;
+}
 
-export class ParameterHintsWidget extends Disposable implements IContentWidget {
+export class ParameterHintsWidget implements EditorBrowser.IContentWidget {
 
-	private static readonly ID = 'editor.widget.parameterHintsWidget';
+	static ID = 'editor.widget.parameterHintsWidget';
 
-	private readonly markdownRenderer: MarkdownRenderer;
-	private readonly renderDisposeables = this._register(new DisposableStore());
-	private readonly model: ParameterHintsModel;
-	private readonly keyVisible: IContextKey<boolean>;
-	private readonly keyMultipleSignatures: IContextKey<boolean>;
+	private editor: EditorBrowser.ICodeEditor;
+	private modelListenersToRemove: EventEmitter.ListenerUnbind[];
+	private model: Model.ParameterHintsModel;
+	private $el: Builder.Builder;
+	private $wrapper: Builder.Builder;
+	private $signatures: Builder.Builder;
+	private $overloads: Builder.Builder;
+	private signatureViews: ISignatureView[];
+	private currentSignature: number;
+	private isDisposed: boolean;
+	private isVisible: boolean;
+	private toDispose: lifecycle.IDisposable[];
 
-	private domNodes?: {
-		readonly element: HTMLElement;
-		readonly signature: HTMLElement;
-		readonly docs: HTMLElement;
-		readonly overloads: HTMLElement;
-		readonly scrollbar: DomScrollableElement;
-	};
-
-	private visible: boolean = false;
-	private announcedLabel: string | null = null;
+	private _onShown: () => void;
+	private _onHidden: () => void;
 
 	// Editor.IContentWidget.allowEditorOverflow
-	allowEditorOverflow = true;
+	public allowEditorOverflow = true;
 
-	constructor(
-		private readonly editor: ICodeEditor,
-		@IContextKeyService contextKeyService: IContextKeyService,
-		@IOpenerService openerService: IOpenerService,
-		@ILanguageService languageService: ILanguageService,
-		@ILanguageFeaturesService languageFeaturesService: ILanguageFeaturesService
-	) {
-		super();
-		this.markdownRenderer = this._register(new MarkdownRenderer({ editor }, languageService, openerService));
-		this.model = this._register(new ParameterHintsModel(editor, languageFeaturesService.signatureHelpProvider));
-		this.keyVisible = Context.Visible.bindTo(contextKeyService);
-		this.keyMultipleSignatures = Context.MultipleSignatures.bindTo(contextKeyService);
+	constructor(model: Model.ParameterHintsModel, editor: EditorBrowser.ICodeEditor, onShown: () => void, onHidden: () => void) {
+		this._onShown = onShown;
+		this._onHidden = onHidden;
+		this.editor = editor;
+		this.modelListenersToRemove = [];
+		this.model = null;
+		this.isVisible = false;
+		this.isDisposed = false;
 
-		this._register(this.model.onChangedHints(newParameterHints => {
-			if (newParameterHints) {
-				this.show();
-				this.render(newParameterHints);
-			} else {
-				this.hide();
-			}
-		}));
-	}
+		this.setModel(model);
 
-	private createParameterHintDOMNodes() {
-		const element = $('.editor-widget.parameter-hints-widget');
-		const wrapper = dom.append(element, $('.phwrapper'));
-		wrapper.tabIndex = -1;
+		this.$el = $('.editor-widget.parameter-hints-widget').on('click', () => {
+			this.selectNext();
+			this.editor.focus();
+		});
 
-		const controls = dom.append(wrapper, $('.controls'));
-		const previous = dom.append(controls, $('.button' + ThemeIcon.asCSSSelector(parameterHintsPreviousIcon)));
-		const overloads = dom.append(controls, $('.overloads'));
-		const next = dom.append(controls, $('.button' + ThemeIcon.asCSSSelector(parameterHintsNextIcon)));
+		this.$wrapper = $('.wrapper.monaco-editor-background').appendTo(this.$el);
 
-		this._register(dom.addDisposableListener(previous, 'click', e => {
-			dom.EventHelper.stop(e);
-			this.previous();
-		}));
+		var $buttons = $('.buttons').appendTo(this.$wrapper);
 
-		this._register(dom.addDisposableListener(next, 'click', e => {
-			dom.EventHelper.stop(e);
-			this.next();
-		}));
+		$('.button.previous').on('click', (e) => {
+			e.preventDefault();
+			e.stopPropagation();
+			this.selectPrevious();
+		}).appendTo($buttons);
 
-		const body = $('.body');
-		const scrollbar = new DomScrollableElement(body, {});
-		this._register(scrollbar);
-		wrapper.appendChild(scrollbar.getDomNode());
+		$('.button.next').on('click', (e) => {
+			e.preventDefault();
+			e.stopPropagation();
+			this.selectNext();
+		}).appendTo($buttons);
 
-		const signature = dom.append(body, $('.signature'));
-		const docs = dom.append(body, $('.docs'));
+		this.$overloads = $('.overloads').appendTo(this.$wrapper);
 
-		element.style.userSelect = 'text';
+		this.$signatures = $('.signatures').appendTo(this.$wrapper);
 
-		this.domNodes = {
-			element,
-			signature,
-			overloads,
-			docs,
-			scrollbar,
-		};
+		this.signatureViews = [];
+		this.currentSignature = 0;
 
 		this.editor.addContentWidget(this);
 		this.hide();
 
-		this._register(this.editor.onDidChangeCursorSelection(e => {
-			if (this.visible) {
-				this.editor.layoutContentWidget(this);
-			}
+		this.toDispose = [];
+
+		this.toDispose.push(this.editor.addListener2(EditorCommon.EventType.CursorSelectionChanged,(e: EditorCommon.ICursorSelectionChangedEvent) => {
+			this.editor.layoutContentWidget(this);
+		}));
+	}
+
+	private setModel(newModel: Model.ParameterHintsModel): void {
+		this.releaseModel();
+		this.model = newModel;
+
+		this.modelListenersToRemove.push(this.model.addListener('hint', (e:Model.IHintEvent) => {
+			this.show();
+			this.render(e.hints);
+			this.currentSignature = e.hints.currentSignature;
+			this.select(this.currentSignature);
 		}));
 
-		const updateFont = () => {
-			if (!this.domNodes) {
-				return;
-			}
-			const fontInfo = this.editor.getOption(EditorOption.fontInfo);
-			this.domNodes.element.style.fontSize = `${fontInfo.fontSize}px`;
-			this.domNodes.element.style.lineHeight = `${fontInfo.lineHeight / fontInfo.fontSize}`;
-		};
-
-		updateFont();
-
-		this._register(Event.chain<ConfigurationChangedEvent>(this.editor.onDidChangeConfiguration.bind(this.editor))
-			.filter(e => e.hasChanged(EditorOption.fontInfo))
-			.on(updateFont, null));
-
-		this._register(this.editor.onDidLayoutChange(e => this.updateMaxHeight()));
-		this.updateMaxHeight();
+		this.modelListenersToRemove.push(this.model.addListener('cancel', (e) => {
+			this.hide();
+		}));
 	}
 
 	private show(): void {
-		if (this.visible) {
+		if (this.isDisposed) {
 			return;
 		}
+		this._onShown();
 
-		if (!this.domNodes) {
-			this.createParameterHintDOMNodes();
-		}
-
-		this.keyVisible.set(true);
-		this.visible = true;
-		setTimeout(() => {
-			if (this.domNodes) {
-				this.domNodes.element.classList.add('visible');
-			}
-		}, 100);
+		this.isVisible = true;
+		TPromise.timeout(100).done(() => {
+			this.$el.addClass('visible');
+		});
 		this.editor.layoutContentWidget(this);
 	}
 
 	private hide(): void {
-		this.renderDisposeables.clear();
-
-		if (!this.visible) {
+		if (this.isDisposed) {
 			return;
 		}
+		this._onHidden();
 
-		this.keyVisible.reset();
-		this.visible = false;
-		this.announcedLabel = null;
-		if (this.domNodes) {
-			this.domNodes.element.classList.remove('visible');
-		}
+		this.isVisible = false;
+		this.$el.removeClass('visible');
 		this.editor.layoutContentWidget(this);
 	}
 
-	getPosition(): IContentWidgetPosition | null {
-		if (this.visible) {
+	public getPosition():EditorBrowser.IContentWidgetPosition {
+		if (this.isVisible) {
 			return {
 				position: this.editor.getPosition(),
-				preference: [ContentWidgetPositionPreference.ABOVE, ContentWidgetPositionPreference.BELOW]
+				preference: [EditorBrowser.ContentWidgetPositionPreference.ABOVE, EditorBrowser.ContentWidgetPositionPreference.BELOW]
 			};
 		}
 		return null;
 	}
 
-	private render(hints: languages.SignatureHelp): void {
-		this.renderDisposeables.clear();
-
-		if (!this.domNodes) {
-			return;
+	private render(hints:Modes.IParameterHints): void {
+		if (hints.signatures.length > 1) {
+			this.$el.addClass('multiple');
+		} else {
+			this.$el.removeClass('multiple');
 		}
 
-		const multiple = hints.signatures.length > 1;
-		this.domNodes.element.classList.toggle('multiple', multiple);
-		this.keyMultipleSignatures.set(multiple);
+		this.$signatures.empty();
+		this.signatureViews = [];
+		var height = 0;
 
-		this.domNodes.signature.innerText = '';
-		this.domNodes.docs.innerText = '';
+		for (var i = 0, len = hints.signatures.length; i < len; i++) {
+			var signature = hints.signatures[i];
+			var $signature = this.renderSignature(this.$signatures, signature, hints.currentParameter);
 
-		const signature = hints.signatures[hints.activeSignature];
+			this.renderDocumentation($signature, signature, hints.currentParameter);
+
+			var signatureHeight = $signature.getClientArea().height;
+
+			this.signatureViews.push({
+				top: height,
+				height: signatureHeight
+			});
+
+			height += signatureHeight;
+		}
+	}
+
+	private renderSignature($el:Builder.Builder, signature:Modes.ISignature, currentParameter:number):Builder.Builder {
+
+		var $signature = $('.signature').appendTo($el),
+			hasParameters = signature.parameters.length > 0;
+
+		if(!hasParameters) {
+			$signature.append($('span').text(signature.label));
+
+		} else {
+
+			var $parameters = $('span.parameters'),
+				offset = 0;
+
+			for (var i = 0, len = signature.parameters.length; i < len; i++) {
+				var parameter = signature.parameters[i];
+				(i === 0 ? $signature : $parameters).append($('span').text(signature.label.substring(offset, parameter.signatureLabelOffset)));
+				$parameters.append($('span.parameter').addClass(i === currentParameter ? 'active' : '').text(signature.label.substring(parameter.signatureLabelOffset, parameter.signatureLabelEnd)));
+				offset = parameter.signatureLabelEnd;
+			}
+
+			$signature.append($parameters);
+			$signature.append($('span').text(signature.label.substring(offset)));
+		}
+
+		return $signature;
+	}
+
+	private renderDocumentation($el:Builder.Builder, signature:Modes.ISignature, activeParameterIdx:number): void {
+
+		if(signature.documentation) {
+			$el.append($('.documentation').text(signature.documentation));
+		}
+
+		var activeParameter = signature.parameters[activeParameterIdx];
+		if(activeParameter && activeParameter.documentation) {
+			var $parameter = $('.documentation');
+			$parameter.append($('span.parameter').text(activeParameter.label));
+			$parameter.append($('span').text(activeParameter.documentation));
+			$el.append($parameter);
+		}
+	}
+
+	private select(position: number): void {
+		var signature = this.signatureViews[position];
+
 		if (!signature) {
 			return;
 		}
 
-		const code = dom.append(this.domNodes.signature, $('.code'));
-		const fontInfo = this.editor.getOption(EditorOption.fontInfo);
-		code.style.fontSize = `${fontInfo.fontSize}px`;
-		code.style.fontFamily = fontInfo.fontFamily;
+		this.$signatures.style({ height: signature.height + 'px' });
+		this.$signatures.getHTMLElement().scrollTop = signature.top;
 
-		const hasParameters = signature.parameters.length > 0;
-		const activeParameterIndex = signature.activeParameter ?? hints.activeParameter;
+		var overloads = '' + (position + 1);
 
-		if (!hasParameters) {
-			const label = dom.append(code, $('span'));
-			label.textContent = signature.label;
-		} else {
-			this.renderParameters(code, signature, activeParameterIndex);
+		if (this.signatureViews.length < 10) {
+			overloads += '/' + this.signatureViews.length;
 		}
 
-		const activeParameter: languages.ParameterInformation | undefined = signature.parameters[activeParameterIndex];
-		if (activeParameter?.documentation) {
-			const documentation = $('span.documentation');
-			if (typeof activeParameter.documentation === 'string') {
-				documentation.textContent = activeParameter.documentation;
-			} else {
-				const renderedContents = this.renderMarkdownDocs(activeParameter.documentation);
-				documentation.appendChild(renderedContents.element);
-			}
-			dom.append(this.domNodes.docs, $('p', {}, documentation));
-		}
-
-		if (signature.documentation === undefined) {
-			/** no op */
-		} else if (typeof signature.documentation === 'string') {
-			dom.append(this.domNodes.docs, $('p', {}, signature.documentation));
-		} else {
-			const renderedContents = this.renderMarkdownDocs(signature.documentation);
-			dom.append(this.domNodes.docs, renderedContents.element);
-		}
-
-		const hasDocs = this.hasDocs(signature, activeParameter);
-
-		this.domNodes.signature.classList.toggle('has-docs', hasDocs);
-		this.domNodes.docs.classList.toggle('empty', !hasDocs);
-
-		this.domNodes.overloads.textContent =
-			String(hints.activeSignature + 1).padStart(hints.signatures.length.toString().length, '0') + '/' + hints.signatures.length;
-
-		if (activeParameter) {
-			let labelToAnnounce = '';
-			const param = signature.parameters[activeParameterIndex];
-			if (Array.isArray(param.label)) {
-				labelToAnnounce = signature.label.substring(param.label[0], param.label[1]);
-			} else {
-				labelToAnnounce = param.label;
-			}
-			if (param.documentation) {
-				labelToAnnounce += typeof param.documentation === 'string' ? `, ${param.documentation}` : `, ${param.documentation.value}`;
-			}
-			if (signature.documentation) {
-				labelToAnnounce += typeof signature.documentation === 'string' ? `, ${signature.documentation}` : `, ${signature.documentation.value}`;
-			}
-
-			// Select method gets called on every user type while parameter hints are visible.
-			// We do not want to spam the user with same announcements, so we only announce if the current parameter changed.
-
-			if (this.announcedLabel !== labelToAnnounce) {
-				aria.alert(nls.localize('hint', "{0}, hint", labelToAnnounce));
-				this.announcedLabel = labelToAnnounce;
-			}
-		}
-
+		this.$overloads.text(overloads);
 		this.editor.layoutContentWidget(this);
-		this.domNodes.scrollbar.scanDomNode();
 	}
 
-	private renderMarkdownDocs(markdown: IMarkdownString | undefined): IMarkdownRenderResult {
-		const renderedContents = this.renderDisposeables.add(this.markdownRenderer.render(markdown, {
-			asyncRenderCallback: () => {
-				this.domNodes?.scrollbar.scanDomNode();
-			}
-		}));
-		renderedContents.element.classList.add('markdown-docs');
-		return renderedContents;
-	}
-
-	private hasDocs(signature: languages.SignatureInformation, activeParameter: languages.ParameterInformation | undefined): boolean {
-		if (activeParameter && typeof activeParameter.documentation === 'string' && assertIsDefined(activeParameter.documentation).length > 0) {
-			return true;
+	public selectNext(): boolean {
+		if (this.signatureViews.length < 2) {
+			this.cancel();
+			return false;
 		}
-		if (activeParameter && typeof activeParameter.documentation === 'object' && assertIsDefined(activeParameter.documentation).value.length > 0) {
-			return true;
+
+		this.currentSignature = (this.currentSignature + 1) % this.signatureViews.length;
+		this.select(this.currentSignature);
+		return true;
+	}
+
+	public selectPrevious(): boolean {
+		if (this.signatureViews.length < 2) {
+			this.cancel();
+			return false;
 		}
-		if (signature.documentation && typeof signature.documentation === 'string' && assertIsDefined(signature.documentation).length > 0) {
-			return true;
+
+		this.currentSignature--;
+
+		if (this.currentSignature < 0) {
+			this.currentSignature = this.signatureViews.length - 1;
 		}
-		if (signature.documentation && typeof signature.documentation === 'object' && assertIsDefined(signature.documentation.value).length > 0) {
-			return true;
-		}
-		return false;
+
+		this.select(this.currentSignature);
+		return true;
 	}
 
-	private renderParameters(parent: HTMLElement, signature: languages.SignatureInformation, activeParameterIndex: number): void {
-		const [start, end] = this.getParameterLabelOffsets(signature, activeParameterIndex);
-
-		const beforeSpan = document.createElement('span');
-		beforeSpan.textContent = signature.label.substring(0, start);
-
-		const paramSpan = document.createElement('span');
-		paramSpan.textContent = signature.label.substring(start, end);
-		paramSpan.className = 'parameter active';
-
-		const afterSpan = document.createElement('span');
-		afterSpan.textContent = signature.label.substring(end);
-
-		dom.append(parent, beforeSpan, paramSpan, afterSpan);
-	}
-
-	private getParameterLabelOffsets(signature: languages.SignatureInformation, paramIdx: number): [number, number] {
-		const param = signature.parameters[paramIdx];
-		if (!param) {
-			return [0, 0];
-		} else if (Array.isArray(param.label)) {
-			return param.label;
-		} else if (!param.label.length) {
-			return [0, 0];
-		} else {
-			const regex = new RegExp(`(\\W|^)${escapeRegExpCharacters(param.label)}(?=\\W|$)`, 'g');
-			regex.test(signature.label);
-			const idx = regex.lastIndex - param.label.length;
-			return idx >= 0
-				? [idx, regex.lastIndex]
-				: [0, 0];
-		}
-	}
-
-	next(): void {
-		this.editor.focus();
-		this.model.next();
-	}
-
-	previous(): void {
-		this.editor.focus();
-		this.model.previous();
-	}
-
-	cancel(): void {
+	public cancel(): void {
 		this.model.cancel();
 	}
 
-	getDomNode(): HTMLElement {
-		if (!this.domNodes) {
-			this.createParameterHintDOMNodes();
-		}
-		return this.domNodes!.element;
+	public getDomNode(): HTMLElement {
+		return this.$el.getHTMLElement();
 	}
 
-	getId(): string {
+	public getId(): string {
 		return ParameterHintsWidget.ID;
 	}
 
-	trigger(context: TriggerContext): void {
-		this.model.trigger(context, 0);
+	private releaseModel(): void {
+		var listener:()=>void;
+		while (listener = this.modelListenersToRemove.pop()) {
+			listener();
+		}
+		if (this.model) {
+			this.model.dispose();
+			this.model = null;
+		}
 	}
 
-	private updateMaxHeight(): void {
-		if (!this.domNodes) {
-			return;
+	public destroy(): void {
+		this.toDispose = lifecycle.disposeAll(this.toDispose);
+		this.releaseModel();
+
+		if (this.$overloads) {
+			this.$overloads.destroy();
+			delete this.$overloads;
 		}
-		const height = Math.max(this.editor.getLayoutInfo().height / 4, 250);
-		const maxHeight = `${height}px`;
-		this.domNodes.element.style.maxHeight = maxHeight;
-		const wrapper = this.domNodes.element.getElementsByClassName('phwrapper') as HTMLCollectionOf<HTMLElement>;
-		if (wrapper.length) {
-			wrapper[0].style.maxHeight = maxHeight;
+
+		if (this.$signatures) {
+			this.$signatures.destroy();
+			delete this.$signatures;
 		}
+
+		if (this.$wrapper) {
+			this.$wrapper.destroy();
+			delete this.$wrapper;
+		}
+
+		if (this.$el) {
+			this.$el.destroy();
+			delete this.$el;
+		}
+
+		this.isDisposed = true;
 	}
 }
 
-export const editorHoverWidgetHighlightForeground = registerColor('editorHoverWidget.highlightForeground', { dark: listHighlightForeground, light: listHighlightForeground, hcDark: listHighlightForeground, hcLight: listHighlightForeground }, nls.localize('editorHoverWidgetHighlightForeground', 'Foreground color of the active item in the parameter hint.'));
-
-registerThemingParticipant((theme, collector) => {
-	const border = theme.getColor(editorHoverBorder);
-	if (border) {
-		const borderWidth = isHighContrast(theme.type) ? 2 : 1;
-		collector.addRule(`.monaco-editor .parameter-hints-widget { border: ${borderWidth}px solid ${border}; }`);
-		collector.addRule(`.monaco-editor .parameter-hints-widget.multiple .body { border-left: 1px solid ${border.transparent(0.5)}; }`);
-		collector.addRule(`.monaco-editor .parameter-hints-widget .signature.has-docs { border-bottom: 1px solid ${border.transparent(0.5)}; }`);
-	}
-	const background = theme.getColor(editorHoverBackground);
-	if (background) {
-		collector.addRule(`.monaco-editor .parameter-hints-widget { background-color: ${background}; }`);
-	}
-
-	const link = theme.getColor(textLinkForeground);
-	if (link) {
-		collector.addRule(`.monaco-editor .parameter-hints-widget a { color: ${link}; }`);
-	}
-
-	const linkHover = theme.getColor(textLinkActiveForeground);
-	if (linkHover) {
-		collector.addRule(`.monaco-editor .parameter-hints-widget a:hover { color: ${linkHover}; }`);
-	}
-
-	const foreground = theme.getColor(editorHoverForeground);
-	if (foreground) {
-		collector.addRule(`.monaco-editor .parameter-hints-widget { color: ${foreground}; }`);
-	}
-
-	const codeBackground = theme.getColor(textCodeBlockBackground);
-	if (codeBackground) {
-		collector.addRule(`.monaco-editor .parameter-hints-widget code { background-color: ${codeBackground}; }`);
-	}
-
-	const parameterHighlightColor = theme.getColor(editorHoverWidgetHighlightForeground);
-	if (parameterHighlightColor) {
-		collector.addRule(`.monaco-editor .parameter-hints-widget .parameter.active { color: ${parameterHighlightColor}}`);
-	}
-
-});

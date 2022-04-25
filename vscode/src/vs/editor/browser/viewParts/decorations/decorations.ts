@@ -3,241 +3,174 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+'use strict';
+
 import 'vs/css!./decorations';
-import { DynamicViewOverlay } from 'vs/editor/browser/view/dynamicViewOverlay';
-import { Range } from 'vs/editor/common/core/range';
-import { HorizontalRange, RenderingContext } from 'vs/editor/browser/view/renderingContext';
-import { ViewContext } from 'vs/editor/common/viewModel/viewContext';
-import * as viewEvents from 'vs/editor/common/viewEvents';
-import { ViewModelDecoration } from 'vs/editor/common/viewModel';
-import { EditorOption } from 'vs/editor/common/config/editorOptions';
+import {ViewEventHandler} from 'vs/editor/common/viewModel/viewEventHandler';
+import EditorBrowser = require('vs/editor/browser/editorBrowser');
+import EditorCommon = require('vs/editor/common/editorCommon');
 
-export class DecorationsOverlay extends DynamicViewOverlay {
+interface IRenderResult {
+	[lineNumber:string]:string[];
+}
 
-	private readonly _context: ViewContext;
-	private _lineHeight: number;
-	private _typicalHalfwidthCharacterWidth: number;
-	private _renderResult: string[] | null;
+export class DecorationsOverlay extends ViewEventHandler implements EditorBrowser.IDynamicViewOverlay {
 
-	constructor(context: ViewContext) {
+	private _context:EditorBrowser.IViewContext;
+	private _renderResult:IRenderResult;
+
+	constructor(context:EditorBrowser.IViewContext) {
 		super();
 		this._context = context;
-		const options = this._context.configuration.options;
-		this._lineHeight = options.get(EditorOption.lineHeight);
-		this._typicalHalfwidthCharacterWidth = options.get(EditorOption.fontInfo).typicalHalfwidthCharacterWidth;
 		this._renderResult = null;
 
 		this._context.addEventHandler(this);
 	}
 
-	public override dispose(): void {
+	public dispose(): void {
 		this._context.removeEventHandler(this);
+		this._context = null;
 		this._renderResult = null;
-		super.dispose();
 	}
 
 	// --- begin event handlers
 
-	public override onConfigurationChanged(e: viewEvents.ViewConfigurationChangedEvent): boolean {
-		const options = this._context.configuration.options;
-		this._lineHeight = options.get(EditorOption.lineHeight);
-		this._typicalHalfwidthCharacterWidth = options.get(EditorOption.fontInfo).typicalHalfwidthCharacterWidth;
+	public onModelFlushed(): boolean {
 		return true;
 	}
-	public override onDecorationsChanged(e: viewEvents.ViewDecorationsChangedEvent): boolean {
+	public onModelDecorationsChanged(e:EditorCommon.IViewDecorationsChangedEvent): boolean {
 		return true;
 	}
-	public override onFlushed(e: viewEvents.ViewFlushedEvent): boolean {
+	public onModelLinesDeleted(e:EditorCommon.IViewLinesDeletedEvent): boolean {
 		return true;
 	}
-	public override onLinesChanged(e: viewEvents.ViewLinesChangedEvent): boolean {
+	public onModelLineChanged(e:EditorCommon.IViewLineChangedEvent): boolean {
 		return true;
 	}
-	public override onLinesDeleted(e: viewEvents.ViewLinesDeletedEvent): boolean {
+	public onModelLinesInserted(e:EditorCommon.IViewLinesInsertedEvent): boolean {
 		return true;
 	}
-	public override onLinesInserted(e: viewEvents.ViewLinesInsertedEvent): boolean {
+	public onCursorPositionChanged(e:EditorCommon.IViewCursorPositionChangedEvent): boolean {
+		return false;
+	}
+	public onCursorSelectionChanged(e:EditorCommon.IViewCursorSelectionChangedEvent): boolean {
+		return false;
+	}
+	public onCursorRevealRange(e:EditorCommon.IViewRevealRangeEvent): boolean {
+		return false;
+	}
+	public onConfigurationChanged(e:EditorCommon.IConfigurationChangedEvent): boolean {
 		return true;
 	}
-	public override onScrollChanged(e: viewEvents.ViewScrollChangedEvent): boolean {
-		return e.scrollTopChanged || e.scrollWidthChanged;
-	}
-	public override onZonesChanged(e: viewEvents.ViewZonesChangedEvent): boolean {
+	public onLayoutChanged(layoutInfo:EditorCommon.IEditorLayoutInfo): boolean {
 		return true;
 	}
+	public onScrollChanged(e:EditorCommon.IScrollEvent): boolean {
+		return e.vertical;
+	}
+	public onZonesChanged(): boolean {
+		return true;
+	}
+	public onScrollWidthChanged(scrollWidth:number): boolean {
+		return true;
+	}
+	public onScrollHeightChanged(scrollHeight:number): boolean {
+		return false;
+	}
+
 	// --- end event handlers
 
-	public prepareRender(ctx: RenderingContext): void {
-		const _decorations = ctx.getDecorationsInViewport();
-
-		// Keep only decorations with `className`
-		let decorations: ViewModelDecoration[] = [];
-		let decorationsLen = 0;
-		for (let i = 0, len = _decorations.length; i < len; i++) {
-			const d = _decorations[i];
-			if (d.options.className) {
-				decorations[decorationsLen++] = d;
-			}
+	public shouldCallRender2(ctx:EditorBrowser.IRenderingContext): boolean {
+		if (!this.shouldRender) {
+			return false;
 		}
+		this.shouldRender = false;
 
-		// Sort decorations for consistent render output
-		decorations = decorations.sort((a, b) => {
-			if (a.options.zIndex! < b.options.zIndex!) {
-				return -1;
-			}
-			if (a.options.zIndex! > b.options.zIndex!) {
-				return 1;
-			}
-			const aClassName = a.options.className!;
-			const bClassName = b.options.className!;
+		var output: IRenderResult = {},
+			lineOutput: string[],
+			decorations = ctx.getDecorationsInViewport(),
+			d:EditorCommon.IModelDecoration,
+			rng:EditorCommon.IRange,
+			linesVisibleRanges:EditorBrowser.ILineVisibleRanges[],
+			lineVisibleRanges:EditorBrowser.ILineVisibleRanges,
+			visibleRange:EditorBrowser.IHorizontalRange,
+			lineHeight = this._context.configuration.editor.lineHeight.toString(),
+			i:number, lenI:number,
+			j:number, lenJ:number,
+			k:number, lenK:number,
+			piecesCount = 0;
 
-			if (aClassName < bClassName) {
-				return -1;
-			}
-			if (aClassName > bClassName) {
-				return 1;
-			}
+		for (i = 0, lenI = decorations.length; i < lenI; i++) {
+			d = decorations[i];
+			rng = d.range;
 
-			return Range.compareRangesUsingStarts(a.range, b.range);
-		});
-
-		const visibleStartLineNumber = ctx.visibleRange.startLineNumber;
-		const visibleEndLineNumber = ctx.visibleRange.endLineNumber;
-		const output: string[] = [];
-		for (let lineNumber = visibleStartLineNumber; lineNumber <= visibleEndLineNumber; lineNumber++) {
-			const lineIndex = lineNumber - visibleStartLineNumber;
-			output[lineIndex] = '';
-		}
-
-		// Render first whole line decorations and then regular decorations
-		this._renderWholeLineDecorations(ctx, decorations, output);
-		this._renderNormalDecorations(ctx, decorations, output);
-		this._renderResult = output;
-	}
-
-	private _renderWholeLineDecorations(ctx: RenderingContext, decorations: ViewModelDecoration[], output: string[]): void {
-		const lineHeight = String(this._lineHeight);
-		const visibleStartLineNumber = ctx.visibleRange.startLineNumber;
-		const visibleEndLineNumber = ctx.visibleRange.endLineNumber;
-
-		for (let i = 0, lenI = decorations.length; i < lenI; i++) {
-			const d = decorations[i];
-
-			if (!d.options.isWholeLine) {
+			if (!d.options.className) {
 				continue;
 			}
-
-			const decorationOutput = (
-				'<div class="cdr '
-				+ d.options.className
-				+ '" style="left:0;width:100%;height:'
-				+ lineHeight
-				+ 'px;"></div>'
-			);
-
-			const startLineNumber = Math.max(d.range.startLineNumber, visibleStartLineNumber);
-			const endLineNumber = Math.min(d.range.endLineNumber, visibleEndLineNumber);
-			for (let j = startLineNumber; j <= endLineNumber; j++) {
-				const lineIndex = j - visibleStartLineNumber;
-				output[lineIndex] += decorationOutput;
-			}
-		}
-	}
-
-	private _renderNormalDecorations(ctx: RenderingContext, decorations: ViewModelDecoration[], output: string[]): void {
-		const lineHeight = String(this._lineHeight);
-		const visibleStartLineNumber = ctx.visibleRange.startLineNumber;
-
-		let prevClassName: string | null = null;
-		let prevShowIfCollapsed: boolean = false;
-		let prevRange: Range | null = null;
-
-		for (let i = 0, lenI = decorations.length; i < lenI; i++) {
-			const d = decorations[i];
 
 			if (d.options.isWholeLine) {
-				continue;
-			}
 
-			const className = d.options.className!;
-			const showIfCollapsed = Boolean(d.options.showIfCollapsed);
+				for (j = rng.startLineNumber; j <= rng.endLineNumber; j++) {
+					if (!ctx.lineIsVisible(j)) {
+						continue;
+					}
+					if (output.hasOwnProperty(j.toString())) {
+						lineOutput = output[j.toString()];
+					} else {
+						lineOutput = [];
+						output[j.toString()] = lineOutput;
+					}
 
-			let range = d.range;
-			if (showIfCollapsed && range.endColumn === 1 && range.endLineNumber !== range.startLineNumber) {
-				range = new Range(range.startLineNumber, range.startColumn, range.endLineNumber - 1, this._context.viewModel.getLineMaxColumn(range.endLineNumber - 1));
-			}
+					piecesCount++;
+					lineOutput.push('<div class="cdr ');
+					lineOutput.push(d.options.className);
+					lineOutput.push('" style="left:0;width:100%;height:');
+					lineOutput.push(lineHeight.toString());
+					lineOutput.push('px;"></div>');
+				}
 
-			if (prevClassName === className && prevShowIfCollapsed === showIfCollapsed && Range.areIntersectingOrTouching(prevRange!, range)) {
-				// merge into previous decoration
-				prevRange = Range.plusRange(prevRange!, range);
-				continue;
-			}
 
-			// flush previous decoration
-			if (prevClassName !== null) {
-				this._renderNormalDecoration(ctx, prevRange!, prevClassName, prevShowIfCollapsed, lineHeight, visibleStartLineNumber, output);
-			}
+			} else {
+				linesVisibleRanges = ctx.linesVisibleRangesForRange(rng, false);
+				if (linesVisibleRanges) {
+					for (j = 0, lenJ = linesVisibleRanges.length; j < lenJ; j++) {
+						lineVisibleRanges = linesVisibleRanges[j];
 
-			prevClassName = className;
-			prevShowIfCollapsed = showIfCollapsed;
-			prevRange = range;
-		}
+						if (output.hasOwnProperty(lineVisibleRanges.lineNumber.toString())) {
+							lineOutput = output[lineVisibleRanges.lineNumber.toString()];
+						} else {
+							lineOutput = [];
+							output[lineVisibleRanges.lineNumber.toString()] = lineOutput;
+						}
 
-		if (prevClassName !== null) {
-			this._renderNormalDecoration(ctx, prevRange!, prevClassName, prevShowIfCollapsed, lineHeight, visibleStartLineNumber, output);
-		}
-	}
+						for (k = 0, lenK = lineVisibleRanges.ranges.length; k < lenK; k++) {
+							visibleRange = lineVisibleRanges.ranges[k];
 
-	private _renderNormalDecoration(ctx: RenderingContext, range: Range, className: string, showIfCollapsed: boolean, lineHeight: string, visibleStartLineNumber: number, output: string[]): void {
-		const linesVisibleRanges = ctx.linesVisibleRangesForRange(range, /*TODO@Alex*/className === 'findMatch');
-		if (!linesVisibleRanges) {
-			return;
-		}
-
-		for (let j = 0, lenJ = linesVisibleRanges.length; j < lenJ; j++) {
-			const lineVisibleRanges = linesVisibleRanges[j];
-			if (lineVisibleRanges.outsideRenderedLine) {
-				continue;
-			}
-			const lineIndex = lineVisibleRanges.lineNumber - visibleStartLineNumber;
-
-			if (showIfCollapsed && lineVisibleRanges.ranges.length === 1) {
-				const singleVisibleRange = lineVisibleRanges.ranges[0];
-				if (singleVisibleRange.width < this._typicalHalfwidthCharacterWidth) {
-					// collapsed/very small range case => make the decoration visible by expanding its width
-					// expand its size on both sides (both to the left and to the right, keeping it centered)
-					const center = Math.round(singleVisibleRange.left + singleVisibleRange.width / 2);
-					const left = Math.max(0, Math.round(center - this._typicalHalfwidthCharacterWidth / 2));
-					lineVisibleRanges.ranges[0] = new HorizontalRange(left, this._typicalHalfwidthCharacterWidth);
+							piecesCount++;
+							lineOutput.push('<div class="cdr ');
+							lineOutput.push(d.options.className);
+							lineOutput.push('" style="left:');
+							lineOutput.push(visibleRange.left.toString());
+							lineOutput.push('px;width:');
+							lineOutput.push(visibleRange.width.toString());
+							lineOutput.push('px;height:');
+							lineOutput.push(lineHeight.toString());
+							lineOutput.push('px;"></div>');
+						}
+					}
 				}
 			}
-
-			for (let k = 0, lenK = lineVisibleRanges.ranges.length; k < lenK; k++) {
-				const visibleRange = lineVisibleRanges.ranges[k];
-				const decorationOutput = (
-					'<div class="cdr '
-					+ className
-					+ '" style="left:'
-					+ String(visibleRange.left)
-					+ 'px;width:'
-					+ String(visibleRange.width)
-					+ 'px;height:'
-					+ lineHeight
-					+ 'px;"></div>'
-				);
-				output[lineIndex] += decorationOutput;
-			}
 		}
+
+		this._renderResult = output;
+
+		return true;
 	}
 
-	public render(startLineNumber: number, lineNumber: number): string {
-		if (!this._renderResult) {
-			return '';
+	public render2(lineNumber:number): string[] {
+		if (this._renderResult && this._renderResult.hasOwnProperty(lineNumber.toString())) {
+			return this._renderResult[lineNumber.toString()];
 		}
-		const lineIndex = lineNumber - startLineNumber;
-		if (lineIndex < 0 || lineIndex >= this._renderResult.length) {
-			return '';
-		}
-		return this._renderResult[lineIndex];
+		return null;
 	}
 }

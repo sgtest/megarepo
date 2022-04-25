@@ -3,88 +3,119 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { localize } from 'vs/nls';
-import { Emitter } from 'vs/base/common/event';
-import { EditorInput } from 'vs/workbench/common/editor/editorInput';
-import { BinaryEditorModel } from 'vs/workbench/common/editor/binaryEditorModel';
-import { ITelemetryService } from 'vs/platform/telemetry/common/telemetry';
-import { IThemeService } from 'vs/platform/theme/common/themeService';
-import { IStorageService } from 'vs/platform/storage/common/storage';
-import { ByteSize } from 'vs/platform/files/common/files';
-import { IEditorOptions } from 'vs/platform/editor/common/editor';
-import { IInstantiationService } from 'vs/platform/instantiation/common/instantiation';
-import { EditorPlaceholder, IEditorPlaceholderContents } from 'vs/workbench/browser/parts/editor/editorPlaceholder';
+'use strict';
 
-export interface IOpenCallbacks {
-	openInternal: (input: EditorInput, options: IEditorOptions | undefined) => Promise<void>;
-}
+import 'vs/css!./media/binaryeditor';
+import nls = require('vs/nls');
+import DOM = require('vs/base/browser/dom');
+import {TPromise} from 'vs/base/common/winjs.base';
+import {Dimension, Builder, $} from 'vs/base/browser/builder';
+import {ResourceViewer} from 'vs/base/browser/ui/resourceviewer/resourceViewer';
+import {EditorModel, EditorInput, EditorOptions} from 'vs/workbench/common/editor';
+import {BaseEditor} from 'vs/workbench/browser/parts/editor/baseEditor';
+import {BinaryResourceEditorModel} from 'vs/workbench/browser/parts/editor/resourceEditorModel';
+import {IWorkbenchEditorService} from 'vs/workbench/services/editor/common/editorService';
+import {ITelemetryService} from 'vs/platform/telemetry/common/telemetry';
 
 /*
  * This class is only intended to be subclassed and not instantiated.
  */
-export abstract class BaseBinaryResourceEditor extends EditorPlaceholder {
+export abstract class BaseBinaryResourceEditor extends BaseEditor {
+	private binaryContainer: Builder;
 
-	private readonly _onDidChangeMetadata = this._register(new Emitter<void>());
-	readonly onDidChangeMetadata = this._onDidChangeMetadata.event;
-
-	private readonly _onDidOpenInPlace = this._register(new Emitter<void>());
-	readonly onDidOpenInPlace = this._onDidOpenInPlace.event;
-
-	private metadata: string | undefined;
-
-	constructor(
-		id: string,
-		private readonly callbacks: IOpenCallbacks,
-		telemetryService: ITelemetryService,
-		themeService: IThemeService,
-		@IStorageService storageService: IStorageService,
-		@IInstantiationService instantiationService: IInstantiationService
-	) {
-		super(id, telemetryService, themeService, storageService, instantiationService);
+	constructor(id: string, telemetryService: ITelemetryService, private _editorService: IWorkbenchEditorService) {
+		super(id, telemetryService);
 	}
 
-	override getTitle(): string {
-		return this.input ? this.input.getName() : localize('binaryEditor', "Binary Viewer");
+	public getTitle(): string {
+		return this.getInput() ? this.getInput().getName() : nls.localize('binaryEditor', "Binary Viewer");
 	}
 
-	protected async getContents(input: EditorInput, options: IEditorOptions): Promise<IEditorPlaceholderContents> {
-		const model = await input.resolve();
+	public get editorService() {
+		return this._editorService;
+	}
 
-		// Assert Model instance
-		if (!(model instanceof BinaryEditorModel)) {
-			throw new Error('Unable to open file as binary');
+	public createEditor(parent: Builder): void {
+
+		// Container for Binary
+		let binaryContainerElement = document.createElement('div');
+		binaryContainerElement.className = 'binary-container monaco-editor-background'; // Inherit the background color from selected theme'
+		this.binaryContainer = $(binaryContainerElement);
+		this.binaryContainer.tabindex(0); // enable focus support
+		parent.getHTMLElement().appendChild(this.binaryContainer.getHTMLElement());
+	}
+
+	public setInput(input: EditorInput, options: EditorOptions): TPromise<void> {
+		let oldInput = this.getInput();
+		super.setInput(input, options);
+
+		// Detect options
+		let forceOpen = options && options.forceOpen;
+
+		// Same Input
+		if (!forceOpen && input.matches(oldInput)) {
+			return TPromise.as<void>(null);
 		}
 
-		// Update metadata
-		const size = model.getSize();
-		this.handleMetadataChanged(typeof size === 'number' ? ByteSize.formatSize(size) : '');
+		// Different Input (Reload)
+		return this._editorService.resolveEditorModel(input, true /* Reload */).then((resolvedModel: EditorModel) => {
 
-		return {
-			icon: '$(warning)',
-			label: localize('binaryError', "The file is not displayed in the editor because it is either binary or uses an unsupported text encoding."),
-			actions: [
-				{
-					label: localize('openAnyway', "Open Anyway"),
-					run: async () => {
+			// Assert Model instance
+			if (!(resolvedModel instanceof BinaryResourceEditorModel)) {
+				return TPromise.wrapError<void>('Invalid editor input. Binary resource editor requires a model instance of BinaryResourceEditorModel.');
+			}
 
-						// Open in place
-						await this.callbacks.openInternal(input, options);
+			// Assert that the current input is still the one we expect. This prevents a race condition when loading takes long and another input was set meanwhile
+			if (!this.getInput() || this.getInput() !== input) {
+				return null;
+			}
 
-						// Signal to listeners that the binary editor has been opened in-place
-						this._onDidOpenInPlace.fire();
-					}
-				}
-			]
-		};
+			// Render Input
+			let binaryResourceModel = <BinaryResourceEditorModel>resolvedModel;
+			ResourceViewer.show(binaryResourceModel.getName(), binaryResourceModel.getUrl(), this.binaryContainer);
+
+			return TPromise.as<void>(null);
+		});
 	}
 
-	private handleMetadataChanged(meta: string | undefined): void {
-		this.metadata = meta;
+	public clearInput(): void {
 
-		this._onDidChangeMetadata.fire();
+		// Empty HTML Container
+		$(this.binaryContainer).empty();
+
+		super.clearInput();
 	}
 
-	getMetadata(): string | undefined {
-		return this.metadata;
+	public layout(dimension: Dimension): void {
+
+		// Pass on to Binary Container
+		this.binaryContainer.size(dimension.width, dimension.height);
+	}
+
+	public focus(): void {
+		this.binaryContainer.domFocus();
+	}
+
+	public dispose(): void {
+
+		// Destroy Container
+		this.binaryContainer.destroy();
+
+		super.dispose();
+	}
+}
+
+/**
+ * An implementation of editor for binary files like images or videos leveraging the ResourceEditorInput.
+ */
+export class BinaryResourceEditor extends BaseBinaryResourceEditor {
+
+	public static ID = 'workbench.editors.binaryResourceEditor';
+
+	constructor(
+		@ITelemetryService telemetryService: ITelemetryService,
+		@IWorkbenchEditorService editorService: IWorkbenchEditorService
+	) {
+		super(BinaryResourceEditor.ID, telemetryService, editorService);
 	}
 }

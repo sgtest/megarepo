@@ -2,46 +2,32 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+'use strict';
 
-import * as objects from 'vs/base/common/objects';
-import { ICodeEditor, IDiffEditorConstructionOptions } from 'vs/editor/browser/editorBrowser';
-import { ICodeEditorService } from 'vs/editor/browser/services/codeEditorService';
-import { CodeEditorWidget } from 'vs/editor/browser/widget/codeEditorWidget';
-import { DiffEditorWidget } from 'vs/editor/browser/widget/diffEditorWidget';
-import { ConfigurationChangedEvent, IDiffEditorOptions, IEditorOptions } from 'vs/editor/common/config/editorOptions';
-import { IEditorWorkerService } from 'vs/editor/common/services/editorWorker';
-import { ICommandService } from 'vs/platform/commands/common/commands';
-import { IContextKeyService } from 'vs/platform/contextkey/common/contextkey';
-import { IInstantiationService } from 'vs/platform/instantiation/common/instantiation';
-import { INotificationService } from 'vs/platform/notification/common/notification';
-import { IThemeService } from 'vs/platform/theme/common/themeService';
-import { IAccessibilityService } from 'vs/platform/accessibility/common/accessibility';
-import { IContextMenuService } from 'vs/platform/contextview/browser/contextView';
-import { IClipboardService } from 'vs/platform/clipboard/common/clipboardService';
-import { IEditorProgressService } from 'vs/platform/progress/common/progress';
-import { ILanguageConfigurationService } from 'vs/editor/common/languages/languageConfigurationRegistry';
-import { ILanguageFeaturesService } from 'vs/editor/common/services/languageFeatures';
+import CodeEditorWidget = require('vs/editor/browser/widget/codeEditorWidget');
+import EditorBrowser = require('vs/editor/browser/editorBrowser');
+import EditorCommon = require('vs/editor/common/editorCommon');
+import Objects = require('vs/base/common/objects');
+import {IInstantiationService} from 'vs/platform/instantiation/common/instantiation';
+import {ITelemetryService} from 'vs/platform/telemetry/common/telemetry';
+import {IKeybindingService} from 'vs/platform/keybinding/common/keybindingService';
+import {ICodeEditorService} from 'vs/editor/common/services/codeEditorService';
 
-export class EmbeddedCodeEditorWidget extends CodeEditorWidget {
+export class EmbeddedCodeEditorWidget extends CodeEditorWidget.CodeEditorWidget {
 
-	private readonly _parentEditor: ICodeEditor;
-	private readonly _overwriteOptions: IEditorOptions;
+	private _parentEditor: EditorBrowser.ICodeEditor;
+	private _overwriteOptions: EditorCommon.ICodeEditorWidgetCreationOptions;
 
 	constructor(
-		domElement: HTMLElement,
-		options: IEditorOptions,
-		parentEditor: ICodeEditor,
+		domElement:HTMLElement,
+		options:EditorCommon.ICodeEditorWidgetCreationOptions,
+		parentEditor:EditorBrowser.ICodeEditor,
 		@IInstantiationService instantiationService: IInstantiationService,
 		@ICodeEditorService codeEditorService: ICodeEditorService,
-		@ICommandService commandService: ICommandService,
-		@IContextKeyService contextKeyService: IContextKeyService,
-		@IThemeService themeService: IThemeService,
-		@INotificationService notificationService: INotificationService,
-		@IAccessibilityService accessibilityService: IAccessibilityService,
-		@ILanguageConfigurationService languageConfigurationService: ILanguageConfigurationService,
-		@ILanguageFeaturesService languageFeaturesService: ILanguageFeaturesService,
+		@IKeybindingService keybindingService: IKeybindingService,
+		@ITelemetryService telemetryService: ITelemetryService
 	) {
-		super(domElement, { ...parentEditor.getRawOptions(), overflowWidgetsDomNode: parentEditor.getOverflowWidgetsDomNode() }, {}, instantiationService, codeEditorService, commandService, contextKeyService, themeService, notificationService, accessibilityService, languageConfigurationService, languageFeaturesService);
+		super(domElement, parentEditor.getRawConfiguration(), instantiationService, codeEditorService, keybindingService, telemetryService);
 
 		this._parentEditor = parentEditor;
 		this._overwriteOptions = options;
@@ -49,65 +35,16 @@ export class EmbeddedCodeEditorWidget extends CodeEditorWidget {
 		// Overwrite parent's options
 		super.updateOptions(this._overwriteOptions);
 
-		this._register(parentEditor.onDidChangeConfiguration((e: ConfigurationChangedEvent) => this._onParentConfigurationChanged(e)));
+		this._lifetimeListeners.push(parentEditor.addListener(EditorCommon.EventType.ConfigurationChanged, (e:EditorCommon.IConfigurationChangedEvent) => this._onParentConfigurationChanged(e)));
 	}
 
-	getParentEditor(): ICodeEditor {
-		return this._parentEditor;
-	}
-
-	private _onParentConfigurationChanged(e: ConfigurationChangedEvent): void {
-		super.updateOptions(this._parentEditor.getRawOptions());
+	private _onParentConfigurationChanged(e:EditorCommon.IConfigurationChangedEvent): void {
+		super.updateOptions(this._parentEditor.getRawConfiguration());
 		super.updateOptions(this._overwriteOptions);
 	}
 
-	override updateOptions(newOptions: IEditorOptions): void {
-		objects.mixin(this._overwriteOptions, newOptions, true);
-		super.updateOptions(this._overwriteOptions);
-	}
-}
-
-export class EmbeddedDiffEditorWidget extends DiffEditorWidget {
-
-	private readonly _parentEditor: ICodeEditor;
-	private readonly _overwriteOptions: IDiffEditorOptions;
-
-	constructor(
-		domElement: HTMLElement,
-		options: Readonly<IDiffEditorConstructionOptions>,
-		parentEditor: ICodeEditor,
-		@IEditorWorkerService editorWorkerService: IEditorWorkerService,
-		@IContextKeyService contextKeyService: IContextKeyService,
-		@IInstantiationService instantiationService: IInstantiationService,
-		@ICodeEditorService codeEditorService: ICodeEditorService,
-		@IThemeService themeService: IThemeService,
-		@INotificationService notificationService: INotificationService,
-		@IContextMenuService contextMenuService: IContextMenuService,
-		@IClipboardService clipboardService: IClipboardService,
-		@IEditorProgressService editorProgressService: IEditorProgressService,
-	) {
-		super(domElement, parentEditor.getRawOptions(), {}, clipboardService, editorWorkerService, contextKeyService, instantiationService, codeEditorService, themeService, notificationService, contextMenuService, editorProgressService);
-
-		this._parentEditor = parentEditor;
-		this._overwriteOptions = options;
-
-		// Overwrite parent's options
-		super.updateOptions(this._overwriteOptions);
-
-		this._register(parentEditor.onDidChangeConfiguration(e => this._onParentConfigurationChanged(e)));
-	}
-
-	getParentEditor(): ICodeEditor {
-		return this._parentEditor;
-	}
-
-	private _onParentConfigurationChanged(e: ConfigurationChangedEvent): void {
-		super.updateOptions(this._parentEditor.getRawOptions());
-		super.updateOptions(this._overwriteOptions);
-	}
-
-	override updateOptions(newOptions: IEditorOptions): void {
-		objects.mixin(this._overwriteOptions, newOptions, true);
+	public updateOptions(newOptions:EditorCommon.IEditorOptions): void {
+		Objects.mixin(this._overwriteOptions, newOptions, true);
 		super.updateOptions(this._overwriteOptions);
 	}
 }

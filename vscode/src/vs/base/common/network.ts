@@ -2,242 +2,466 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+'use strict';
 
-import * as platform from 'vs/base/common/platform';
-import { URI } from 'vs/base/common/uri';
+import assert = require('vs/base/common/assert');
+import objects = require('vs/base/common/objects');
+import strings = require('vs/base/common/strings');
+import hash = require('vs/base/common/hash');
+import marshalling = require('vs/base/common/marshalling');
+import paths = require('vs/base/common/paths');
+import URI from 'vs/base/common/uri';
 
-export namespace Schemas {
+interface ISerializedURL {
+	$isURL: boolean;
+	$value: string;
+}
+
+marshalling.registerMarshallingContribution({
+
+	canSerialize: (obj:any): boolean => {
+		return obj instanceof URL;
+	},
+
+	serialize: (url:URL, serialize:(obj:any)=>any): ISerializedURL => {
+		return url._toSerialized();
+	},
+
+	canDeserialize: (obj:ISerializedURL): boolean => {
+		return obj.$isURL;
+	},
+
+	deserialize: (obj:ISerializedURL, deserialize:(obj:any)=>any): any => {
+		return new URL(obj.$value);
+	}
+});
+
+
+var _colon = ':'.charCodeAt(0),
+	_slash = '/'.charCodeAt(0),
+	_questionMark = '?'.charCodeAt(0),
+	_hash = '#'.charCodeAt(0);
+
+export class ParsedUrl {
+
+	private spec:string;
+	private specLength:number;
+	private schemeStart:number;
+	private domainStart:number;
+	private portStart:number;
+	private pathStart:number;
+	private queryStringStart:number;
+	private fragmentIdStart:number;
+
+	constructor(spec:string) {
+		this.spec = spec || strings.empty;
+		this.specLength = this.spec.length;
+
+
+
+		this.parse();
+	}
+
+	private forwardSubstring(startIndex:number, endIndex:number): string {
+		if (startIndex < endIndex) {
+			return this.spec.substring(startIndex, endIndex);
+		}
+		return strings.empty;
+	}
+
+	/**
+	 * http for http://www.test.com:8000/this/that/theother.html?query=foo#hash
+	 */
+	public getScheme(): string {
+		return this.forwardSubstring(this.schemeStart, this.domainStart - 1);
+	}
+
+	/**
+	 * http: for http://www.test.com:8000/this/that/theother.html?query=foo#hash
+	 */
+	public getProtocol(): string {
+		return this.forwardSubstring(this.schemeStart, this.domainStart);
+	}
+
+	/**
+	 * www.test.com for http://www.test.com:8000/this/that/theother.html?query=foo#hash
+	 */
+	public getDomain(): string {
+		return this.forwardSubstring(this.domainStart + 2, this.portStart);
+	}
+
+	/**
+	 * 8000 for http://www.test.com:8000/this/that/theother.html?query=foo#hash
+	 */
+	public getPort(): string {
+		return this.forwardSubstring(this.portStart + 1, this.pathStart);
+	}
+
+	/**
+	 * www.test.com:8000 for http://www.test.com:8000/this/that/theother.html?query=foo#hash
+	 */
+	public getHost(): string {
+		return this.forwardSubstring(this.domainStart + 2, this.pathStart);
+	}
+
+	/**
+	 * /this/that/theother.html for http://www.test.com:8000/this/that/theother.html?query=foo#hash
+	 */
+	public getPath(): string {
+		return this.forwardSubstring(this.pathStart, this.queryStringStart);
+	}
+
+	/**
+	 * query=foo for http://www.test.com:8000/this/that/theother.html?query=foo#hash
+	 */
+	public getQueryString(): string {
+		return this.forwardSubstring(this.queryStringStart + 1, this.fragmentIdStart);
+	}
+
+	/**
+	 * hash for http://www.test.com:8000/this/that/theother.html?query=foo#hash
+	 */
+	public getFragmentId(): string {
+		return this.forwardSubstring(this.fragmentIdStart + 1, this.specLength);
+	}
+
+	/**
+	 * http://www.test.com:8000 for http://www.test.com:8000/this/that/theother.html?query=foo#hash
+	 */
+	public getAllBeforePath(): string {
+		return this.forwardSubstring(0, this.pathStart);
+	}
+	/**
+	 * http://www.test.com:8000/this/that/theother.html?query=foo for http://www.test.com:8000/this/that/theother.html?query=foo#hash
+	 */
+	public getAllBeforeFragmentId(): string {
+		return this.forwardSubstring(0, this.fragmentIdStart);
+	}
+
+
+	/**
+	 * Combine with a relative url, returns absolute url
+	 * e.g.
+	 * http://www.test.com/this/that/theother.html?query=foo#hash=hash
+	 * combined with ../test.js?query=foo#hash
+	 * results in http://www.test.com/this/test.js?query=foo#hash
+	 */
+	public combine(relativeUrl:string):string {
+		var questionMarkIndex = relativeUrl.indexOf('?');
+		var hashIndex = relativeUrl.indexOf('#');
+		var suffixIndex = relativeUrl.length;
+		if (questionMarkIndex !== -1 && questionMarkIndex < suffixIndex) {
+			suffixIndex = questionMarkIndex;
+		}
+		if (hashIndex !== -1 && hashIndex < suffixIndex) {
+			suffixIndex = hashIndex;
+		}
+
+		var relativeUrlPath = relativeUrl.substring(0, suffixIndex);
+		var relativeUrlSuffix = relativeUrl.substring(suffixIndex);
+
+
+		relativeUrlPath = relativeUrlPath.replace('\\', '/');
+
+		var resultPath: string;
+		if (strings.startsWith(relativeUrlPath, '/')) {
+			// Looks like an absolute URL
+			resultPath = paths.join(relativeUrlPath);
+		} else {
+			resultPath = paths.join(paths.dirname(this.getPath()), relativeUrlPath);
+		}
+
+		while (resultPath.charAt(0) === '/') {
+			resultPath = resultPath.substr(1);
+		}
+
+		while (resultPath.indexOf('../') === 0) {
+			resultPath = resultPath.substr(3);
+		}
+
+		return this.getAllBeforePath() + '/' + resultPath + relativeUrlSuffix;
+	}
+
+	// scheme://domain:port/path?query_string#fragment_id
+	private parse(): void {
+		var IN_SCHEME = 0,
+			IN_DOMAIN = 1,
+			IN_PORT = 2,
+			IN_PATH = 3,
+			IN_QUERY_STRING = 4,
+			state = IN_SCHEME,
+			spec = this.spec,
+			length = this.specLength,
+			i:number,
+			prevChCode:number = -1,
+			prevPrevChCode:number = -1,
+			chCode:number;
+
+		this.schemeStart = 0;
+		this.domainStart = this.specLength;
+		this.portStart = this.specLength;
+		this.pathStart = this.specLength;
+		this.queryStringStart = this.specLength;
+		this.fragmentIdStart = this.specLength;
+
+		for (i = 0; i < length; i++) {
+			chCode = spec.charCodeAt(i);
+
+			switch (state) {
+				case IN_SCHEME:
+					if (prevChCode === _slash && chCode === _slash) {
+						// going into the domain
+						state = IN_DOMAIN;
+						this.domainStart = i - 1;
+					}
+					break;
+
+				case IN_DOMAIN:
+					if (chCode === _colon) {
+						// going into the port
+						state = IN_PORT;
+						this.portStart = i;
+					} else if (chCode === _slash) {
+						// skipping the port, going straight to the path
+						state = IN_PATH;
+						this.portStart = i;
+						this.pathStart = i;
+					} else if (chCode === _hash) {
+						// skipping the port, path & query string, going straight to the fragment, we can halt now
+						this.portStart = i;
+						this.pathStart = i;
+						this.queryStringStart = i;
+						this.fragmentIdStart = i;
+						i = length;
+					}
+					break;
+
+				case IN_PORT:
+					if (chCode === _slash) {
+						// going into the path
+						state = IN_PATH;
+						this.pathStart = i;
+					} else if (chCode === _hash) {
+						// skipping the path & query string, going straight to the fragment, we can halt now
+						this.pathStart = i;
+						this.queryStringStart = i;
+						this.fragmentIdStart = i;
+						i = length;
+					}
+					break;
+
+				case IN_PATH:
+					if (chCode === _questionMark) {
+						// going in to the query string
+						state = IN_QUERY_STRING;
+						this.queryStringStart = i;
+					} else if (chCode === _hash) {
+						// skipping the query string, going straight to the fragment, we can halt now
+						this.queryStringStart = i;
+						this.fragmentIdStart = i;
+						i = length;
+					}
+					break;
+
+				case IN_QUERY_STRING:
+					if (chCode === _hash) {
+						// going into the hash, we can halt now
+						this.fragmentIdStart = i;
+						i = length;
+					}
+					break;
+			}
+
+			prevPrevChCode = prevChCode;
+			prevChCode = chCode;
+		}
+
+		if (state === IN_SCHEME) {
+			// Looks like we had a very bad url
+			this.schemeStart = this.specLength;
+		}
+	}
+}
+
+
+export class URL extends URI implements objects.IEqualable {
+
+	/**
+	 * Creates a new URL from the provided value
+	 * by decoding it first.
+	 * @param value A encoded url value.
+	 */
+	public static fromEncoded(value:string):URL {
+		return new URL(decodeURIComponent(value));
+	}
+
+	public static fromValue(value:string):URL {
+		return new URL(value);
+	}
+
+	public static fromUri(value: URI): URL {
+		return new URL(value);
+	}
+
+	private _spec:string;
+	private _uri: URI;
+	private _parsed:ParsedUrl;
+
+	constructor(spec: string);
+	constructor(spec: URI);
+	constructor(stringOrURI: any) {
+		super();
+		assert.ok(!!stringOrURI, 'spec must not be null');
+		if(typeof stringOrURI === 'string') {
+			this._uri = URI.parse(stringOrURI);
+		} else {
+			this._uri = stringOrURI;
+		}
+		this._spec = this._uri.toString(); // make sure spec is normalized
+		this._parsed = null;
+	}
+
+	public equals(other:any):boolean {
+		if (this.toString() !== String(other)) {
+			return false;
+		}
+
+		return ((other instanceof URL) || URI.isURI(other));
+	}
+
+	public hashCode():number {
+		return hash.computeMurmur2StringHashCode(this._spec);
+	}
+
+	public isInMemory(): boolean {
+		return this.scheme === schemas.inMemory;
+	}
+
+	/**
+	 * http for http://www.test.com:8000/this/that/theother.html?query=foo#hash
+	 */
+	public getScheme():string {
+		this._ensureParsedUrl();
+		return this._parsed.getScheme();
+	}
+
+	/**
+	 * /this/that/theother.html for http://www.test.com:8000/this/that/theother.html?query=foo#hash
+	 */
+	public getPath():string {
+		this._ensureParsedUrl();
+		return this._parsed.getPath();
+	}
+
+	/**
+	 * Strip out the hash part of the URL
+	 * http://www.test.com:8000/this/that/theother.html?query=foo for http://www.test.com:8000/this/that/theother.html?query=foo#hash
+	 */
+	public toUnique():string {
+		this._ensureParsedUrl();
+		return this._parsed.getAllBeforeFragmentId();
+	}
+
+	public startsWith(other:URL):boolean {
+		return strings.startsWith(this._spec, other._spec);
+	}
+
+	/**
+	 * Combine with a relative url, returns absolute url
+	 * e.g.
+	 * http://www.test.com/this/that/theother.html?query=foo#hash=hash
+	 * combined with ../test.js?query=foo#hash
+	 * results in http://www.test.com/this/test.js?query=foo#hash
+	 */
+	public combine(relativeUrl:string):URL {
+		this._ensureParsedUrl();
+		return new URL(this._parsed.combine(relativeUrl));
+	}
+
+	private _ensureParsedUrl(): void {
+		if(this._parsed === null) {
+			this._parsed = new ParsedUrl(this._spec);
+		}
+	}
+
+	// ----- URI implementation -------------------------
+
+	public get scheme(): string {
+		return this._uri.scheme;
+	}
+
+	public get authority(): string {
+		return this._uri.authority;
+	}
+
+	public get path(): string {
+		return this._uri.path;
+	}
+
+	public get fsPath(): string {
+		return this._uri.fsPath;
+	}
+
+	public get query(): string {
+		return this._uri.query;
+	}
+
+	public get fragment(): string {
+		return this._uri.fragment;
+	}
+
+	public withScheme(value: string): URI {
+		return URI.create(value, this.authority, this.fsPath, this.query, this.fragment);
+	}
+
+	public withAuthority(value: string): URI {
+		return URI.create(this.scheme, value, this.fsPath, this.query, this.fragment);
+	}
+
+	public withPath(value: string): URI {
+		return URI.create(this.scheme, this.authority, value, this.query, this.fragment);
+	}
+
+	public withQuery(value: string): URI {
+		return URI.create(this.scheme, this.authority, this.fsPath, value, this.fragment);
+	}
+
+	public withFragment(value: string): URI {
+		return URI.create(this.scheme, this.authority, this.fsPath, this.query, value);
+	}
+
+	public with(scheme: string, authority: string, path: string, query: string, fragment: string): URI {
+		return URI.create(scheme, authority, path, query, fragment);
+	}
+
+	public toString():string {
+		return this._spec;
+	}
+
+	public toJSON(): any {
+		return this.toString();
+	}
+
+	public _toSerialized(): any {
+		return {
+			$isURL: true,
+			// TODO@Alex: implement derived resources (embedded mirror models) better
+			$value: this.toString().replace(/URL_MARSHAL_REMOVE.*$/, '')
+		};
+	}
+}
+
+export namespace schemas {
 
 	/**
 	 * A schema that is used for models that exist in memory
-	 * only and that have no correspondence on a server or such.
+	 * only and that have no correspondance on a server or such.
 	 */
-	export const inMemory = 'inmemory';
+	export var inMemory:string = 'inmemory';
 
-	/**
-	 * A schema that is used for setting files
-	 */
-	export const vscode = 'vscode';
+	export var http:string = 'http';
 
-	/**
-	 * A schema that is used for internal private files
-	 */
-	export const internal = 'private';
+	export var https:string = 'https';
 
-	/**
-	 * A walk-through document.
-	 */
-	export const walkThrough = 'walkThrough';
-
-	/**
-	 * An embedded code snippet.
-	 */
-	export const walkThroughSnippet = 'walkThroughSnippet';
-
-	export const http = 'http';
-
-	export const https = 'https';
-
-	export const file = 'file';
-
-	export const mailto = 'mailto';
-
-	export const untitled = 'untitled';
-
-	export const data = 'data';
-
-	export const command = 'command';
-
-	export const vscodeRemote = 'vscode-remote';
-
-	export const vscodeRemoteResource = 'vscode-remote-resource';
-
-	export const vscodeUserData = 'vscode-userdata';
-
-	export const vscodeCustomEditor = 'vscode-custom-editor';
-
-	export const vscodeNotebook = 'vscode-notebook';
-
-	export const vscodeNotebookCell = 'vscode-notebook-cell';
-
-	export const vscodeNotebookCellMetadata = 'vscode-notebook-cell-metadata';
-	export const vscodeNotebookCellOutput = 'vscode-notebook-cell-output';
-	export const vscodeInteractive = 'vscode-interactive';
-	export const vscodeInteractiveInput = 'vscode-interactive-input';
-
-	export const vscodeSettings = 'vscode-settings';
-
-	export const vscodeWorkspaceTrust = 'vscode-workspace-trust';
-
-	export const vscodeTerminal = 'vscode-terminal';
-
-	/**
-	 * Scheme used internally for webviews that aren't linked to a resource (i.e. not custom editors)
-	 */
-	export const webviewPanel = 'webview-panel';
-
-	/**
-	 * Scheme used for loading the wrapper html and script in webviews.
-	 */
-	export const vscodeWebview = 'vscode-webview';
-
-	/**
-	 * Scheme used for extension pages
-	 */
-	export const extension = 'extension';
-
-	/**
-	 * Scheme used as a replacement of `file` scheme to load
-	 * files with our custom protocol handler (desktop only).
-	 */
-	export const vscodeFileResource = 'vscode-file';
-
-	/**
-	 * Scheme used for temporary resources
-	 */
-	export const tmp = 'tmp';
-
-	/**
-	 * Scheme used vs live share
-	 */
-	export const vsls = 'vsls';
+	export var file:string = 'file';
 }
-
-export const connectionTokenCookieName = 'vscode-tkn';
-export const connectionTokenQueryName = 'tkn';
-
-class RemoteAuthoritiesImpl {
-	private readonly _hosts: { [authority: string]: string | undefined } = Object.create(null);
-	private readonly _ports: { [authority: string]: number | undefined } = Object.create(null);
-	private readonly _connectionTokens: { [authority: string]: string | undefined } = Object.create(null);
-	private _preferredWebSchema: 'http' | 'https' = 'http';
-	private _delegate: ((uri: URI) => URI) | null = null;
-
-	setPreferredWebSchema(schema: 'http' | 'https') {
-		this._preferredWebSchema = schema;
-	}
-
-	setDelegate(delegate: (uri: URI) => URI): void {
-		this._delegate = delegate;
-	}
-
-	set(authority: string, host: string, port: number): void {
-		this._hosts[authority] = host;
-		this._ports[authority] = port;
-	}
-
-	setConnectionToken(authority: string, connectionToken: string): void {
-		this._connectionTokens[authority] = connectionToken;
-	}
-
-	getPreferredWebSchema(): 'http' | 'https' {
-		return this._preferredWebSchema;
-	}
-
-	rewrite(uri: URI): URI {
-		if (this._delegate) {
-			return this._delegate(uri);
-		}
-		const authority = uri.authority;
-		let host = this._hosts[authority];
-		if (host && host.indexOf(':') !== -1) {
-			host = `[${host}]`;
-		}
-		const port = this._ports[authority];
-		const connectionToken = this._connectionTokens[authority];
-		let query = `path=${encodeURIComponent(uri.path)}`;
-		if (typeof connectionToken === 'string') {
-			query += `&${connectionTokenQueryName}=${encodeURIComponent(connectionToken)}`;
-		}
-		return URI.from({
-			scheme: platform.isWeb ? this._preferredWebSchema : Schemas.vscodeRemoteResource,
-			authority: `${host}:${port}`,
-			path: `/vscode-remote-resource`,
-			query
-		});
-	}
-}
-
-export const RemoteAuthorities = new RemoteAuthoritiesImpl();
-
-class FileAccessImpl {
-
-	private static readonly FALLBACK_AUTHORITY = 'vscode-app';
-
-	/**
-	 * Returns a URI to use in contexts where the browser is responsible
-	 * for loading (e.g. fetch()) or when used within the DOM.
-	 *
-	 * **Note:** use `dom.ts#asCSSUrl` whenever the URL is to be used in CSS context.
-	 */
-	asBrowserUri(uri: URI): URI;
-	asBrowserUri(moduleId: string, moduleIdToUrl: { toUrl(moduleId: string): string }): URI;
-	asBrowserUri(uriOrModule: URI | string, moduleIdToUrl?: { toUrl(moduleId: string): string }): URI {
-		const uri = this.toUri(uriOrModule, moduleIdToUrl);
-
-		// Handle remote URIs via `RemoteAuthorities`
-		if (uri.scheme === Schemas.vscodeRemote) {
-			return RemoteAuthorities.rewrite(uri);
-		}
-
-		// Convert to `vscode-file` resource..
-		if (
-			// ...only ever for `file` resources
-			uri.scheme === Schemas.file &&
-			(
-				// ...and we run in native environments
-				platform.isNative ||
-				// ...or web worker extensions on desktop
-				(platform.isWebWorker && platform.globals.origin === `${Schemas.vscodeFileResource}://${FileAccessImpl.FALLBACK_AUTHORITY}`)
-			)
-		) {
-			return uri.with({
-				scheme: Schemas.vscodeFileResource,
-				// We need to provide an authority here so that it can serve
-				// as origin for network and loading matters in chromium.
-				// If the URI is not coming with an authority already, we
-				// add our own
-				authority: uri.authority || FileAccessImpl.FALLBACK_AUTHORITY,
-				query: null,
-				fragment: null
-			});
-		}
-
-		return uri;
-	}
-
-	/**
-	 * Returns the `file` URI to use in contexts where node.js
-	 * is responsible for loading.
-	 */
-	asFileUri(uri: URI): URI;
-	asFileUri(moduleId: string, moduleIdToUrl: { toUrl(moduleId: string): string }): URI;
-	asFileUri(uriOrModule: URI | string, moduleIdToUrl?: { toUrl(moduleId: string): string }): URI {
-		const uri = this.toUri(uriOrModule, moduleIdToUrl);
-
-		// Only convert the URI if it is `vscode-file:` scheme
-		if (uri.scheme === Schemas.vscodeFileResource) {
-			return uri.with({
-				scheme: Schemas.file,
-				// Only preserve the `authority` if it is different from
-				// our fallback authority. This ensures we properly preserve
-				// Windows UNC paths that come with their own authority.
-				authority: uri.authority !== FileAccessImpl.FALLBACK_AUTHORITY ? uri.authority : null,
-				query: null,
-				fragment: null
-			});
-		}
-
-		return uri;
-	}
-
-	private toUri(uriOrModule: URI | string, moduleIdToUrl?: { toUrl(moduleId: string): string }): URI {
-		if (URI.isUri(uriOrModule)) {
-			return uriOrModule;
-		}
-
-		return URI.parse(moduleIdToUrl!.toUrl(uriOrModule));
-	}
-}
-
-export const FileAccess = new FileAccessImpl();

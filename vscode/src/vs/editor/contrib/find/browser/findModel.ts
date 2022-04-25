@@ -2,596 +2,475 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+'use strict';
+import EditorCommon = require('vs/editor/common/editorCommon');
+import Strings = require('vs/base/common/strings');
+import Events = require('vs/base/common/eventEmitter');
+import ReplaceAllCommand = require('./replaceAllCommand');
+import Lifecycle = require('vs/base/common/lifecycle');
+import Schedulers = require('vs/base/common/async');
+import {Range} from 'vs/editor/common/core/range';
+import {Position} from 'vs/editor/common/core/position';
+import {ReplaceCommand} from 'vs/editor/common/commands/replaceCommand';
 
-import { findFirstInSorted } from 'vs/base/common/arrays';
-import { RunOnceScheduler, TimeoutTimer } from 'vs/base/common/async';
-import { KeyCode, KeyMod } from 'vs/base/common/keyCodes';
-import { DisposableStore, dispose } from 'vs/base/common/lifecycle';
-import { Constants } from 'vs/base/common/uint';
-import { IActiveCodeEditor } from 'vs/editor/browser/editorBrowser';
-import { ReplaceCommand, ReplaceCommandThatPreservesSelection } from 'vs/editor/common/commands/replaceCommand';
-import { EditorOption } from 'vs/editor/common/config/editorOptions';
-import { CursorChangeReason, ICursorPositionChangedEvent } from 'vs/editor/common/cursorEvents';
-import { Position } from 'vs/editor/common/core/position';
-import { Range } from 'vs/editor/common/core/range';
-import { Selection } from 'vs/editor/common/core/selection';
-import { ICommand, ScrollType } from 'vs/editor/common/editorCommon';
-import { EndOfLinePreference, FindMatch, ITextModel } from 'vs/editor/common/model';
-import { SearchParams } from 'vs/editor/common/model/textModelSearch';
-import { FindDecorations } from 'vs/editor/contrib/find/browser/findDecorations';
-import { FindReplaceState, FindReplaceStateChangedEvent } from 'vs/editor/contrib/find/browser/findState';
-import { ReplaceAllCommand } from 'vs/editor/contrib/find/browser/replaceAllCommand';
-import { parseReplaceString, ReplacePattern } from 'vs/editor/contrib/find/browser/replacePattern';
-import { RawContextKey } from 'vs/platform/contextkey/common/contextkey';
-import { IKeybindings } from 'vs/platform/keybinding/common/keybindingsRegistry';
+export var START_FIND_ID = 'actions.find';
+export var NEXT_MATCH_FIND_ID = 'editor.action.nextMatchFindAction';
+export var PREVIOUS_MATCH_FIND_ID = 'editor.action.previousMatchFindAction';
 
-export const CONTEXT_FIND_WIDGET_VISIBLE = new RawContextKey<boolean>('findWidgetVisible', false);
-export const CONTEXT_FIND_WIDGET_NOT_VISIBLE = CONTEXT_FIND_WIDGET_VISIBLE.toNegated();
-// Keep ContextKey use of 'Focussed' to not break when clauses
-export const CONTEXT_FIND_INPUT_FOCUSED = new RawContextKey<boolean>('findInputFocussed', false);
-export const CONTEXT_REPLACE_INPUT_FOCUSED = new RawContextKey<boolean>('replaceInputFocussed', false);
+export var START_FIND_REPLACE_ID = 'editor.action.startFindReplaceAction';
 
-export const ToggleCaseSensitiveKeybinding: IKeybindings = {
-	primary: KeyMod.Alt | KeyCode.KeyC,
-	mac: { primary: KeyMod.CtrlCmd | KeyMod.Alt | KeyCode.KeyC }
-};
-export const ToggleWholeWordKeybinding: IKeybindings = {
-	primary: KeyMod.Alt | KeyCode.KeyW,
-	mac: { primary: KeyMod.CtrlCmd | KeyMod.Alt | KeyCode.KeyW }
-};
-export const ToggleRegexKeybinding: IKeybindings = {
-	primary: KeyMod.Alt | KeyCode.KeyR,
-	mac: { primary: KeyMod.CtrlCmd | KeyMod.Alt | KeyCode.KeyR }
-};
-export const ToggleSearchScopeKeybinding: IKeybindings = {
-	primary: KeyMod.Alt | KeyCode.KeyL,
-	mac: { primary: KeyMod.CtrlCmd | KeyMod.Alt | KeyCode.KeyL }
-};
-export const TogglePreserveCaseKeybinding: IKeybindings = {
-	primary: KeyMod.Alt | KeyCode.KeyP,
-	mac: { primary: KeyMod.CtrlCmd | KeyMod.Alt | KeyCode.KeyP }
-};
+export interface IFindMatchesEvent {
+	position: number;
+	count: number;
+}
 
-export const FIND_IDS = {
-	StartFindAction: 'actions.find',
-	StartFindWithSelection: 'actions.findWithSelection',
-	StartFindWithArgs: 'editor.actions.findWithArgs',
-	NextMatchFindAction: 'editor.action.nextMatchFindAction',
-	PreviousMatchFindAction: 'editor.action.previousMatchFindAction',
-	NextSelectionMatchFindAction: 'editor.action.nextSelectionMatchFindAction',
-	PreviousSelectionMatchFindAction: 'editor.action.previousSelectionMatchFindAction',
-	StartFindReplaceAction: 'editor.action.startFindReplaceAction',
-	CloseFindWidgetCommand: 'closeFindWidget',
-	ToggleCaseSensitiveCommand: 'toggleFindCaseSensitive',
-	ToggleWholeWordCommand: 'toggleFindWholeWord',
-	ToggleRegexCommand: 'toggleFindRegex',
-	ToggleSearchScopeCommand: 'toggleFindInSelection',
-	TogglePreserveCaseCommand: 'togglePreserveCase',
-	ReplaceOneAction: 'editor.action.replaceOne',
-	ReplaceAllAction: 'editor.action.replaceAll',
-	SelectAllMatchesAction: 'editor.action.selectAllMatches'
-};
+export interface IFindProperties {
+	isRegex: boolean;
+	wholeWord: boolean;
+	matchCase: boolean;
+}
 
-export const MATCHES_LIMIT = 19999;
-const RESEARCH_DELAY = 240;
+export interface IFindState {
+	searchString: string;
+	replaceString: string;
+	properties: IFindProperties;
+	isReplaceRevealed: boolean;
+}
 
-export class FindModelBoundToEditorModel {
+export interface IFindStartEvent {
+	state: IFindState;
+	selectionFindEnabled: boolean;
+	shouldFocus: boolean;
+}
 
-	private readonly _editor: IActiveCodeEditor;
-	private readonly _state: FindReplaceState;
-	private readonly _toDispose = new DisposableStore();
-	private readonly _decorations: FindDecorations;
-	private _ignoreModelContentChanged: boolean;
-	private readonly _startSearchingTimer: TimeoutTimer;
+export interface IFindModel {
+	dispose(): void;
 
-	private readonly _updateDecorationsScheduler: RunOnceScheduler;
-	private _isDisposed: boolean;
+	start(newFindData:IFindState, findScope:EditorCommon.IEditorRange, shouldFocus:boolean): void;
+	recomputeMatches(newFindData:IFindState, jumpToNextMatch:boolean): void;
+	setFindScope(findScope:EditorCommon.IEditorRange): void;
 
-	constructor(editor: IActiveCodeEditor, state: FindReplaceState) {
-		this._editor = editor;
-		this._state = state;
-		this._isDisposed = false;
-		this._startSearchingTimer = new TimeoutTimer();
+	next(): void;
+	prev(): void;
+	replace(): void;
+	replaceAll(): void;
 
-		this._decorations = new FindDecorations(editor);
-		this._toDispose.add(this._decorations);
+	addStartEventListener(callback:(e:IFindStartEvent)=>void): Lifecycle.IDisposable;
+	addMatchesUpdatedEventListener(callback:(e:IFindMatchesEvent)=>void): Lifecycle.IDisposable;
+}
 
-		this._updateDecorationsScheduler = new RunOnceScheduler(() => this.research(false), 100);
-		this._toDispose.add(this._updateDecorationsScheduler);
+export class FindModelBoundToEditorModel extends Events.EventEmitter implements IFindModel {
 
-		this._toDispose.add(this._editor.onDidChangeCursorPosition((e: ICursorPositionChangedEvent) => {
-			if (
-				e.reason === CursorChangeReason.Explicit
-				|| e.reason === CursorChangeReason.Undo
-				|| e.reason === CursorChangeReason.Redo
-			) {
-				this._decorations.setStartPosition(this._editor.getPosition());
+	private static _START_EVENT = 'start';
+	private static _MATCHES_UPDATED_EVENT = 'matches';
+
+	private editor:EditorCommon.ICommonCodeEditor;
+	private startPosition:EditorCommon.IEditorPosition;
+	private searchString:string;
+	private replaceString:string;
+	private searchOnlyEditableRange:boolean;
+	private decorations:string[];
+	private decorationIndex:number;
+	private findScopeDecorationId:string;
+	private highlightedDecorationId:string;
+	private listenersToRemove:Events.ListenerUnbind[];
+	private updateDecorationsScheduler:Schedulers.RunOnceScheduler;
+	private didReplace:boolean;
+
+	private isRegex:boolean;
+	private matchCase:boolean;
+	private wholeWord:boolean;
+
+	constructor(editor:EditorCommon.ICommonCodeEditor) {
+		super([
+			FindModelBoundToEditorModel._MATCHES_UPDATED_EVENT,
+			FindModelBoundToEditorModel._START_EVENT
+		]);
+		this.editor = editor;
+		this.startPosition = null;
+		this.searchString = '';
+		this.replaceString = '';
+		this.searchOnlyEditableRange = false;
+		this.decorations = [];
+		this.decorationIndex = 0;
+		this.findScopeDecorationId = null;
+		this.highlightedDecorationId = null;
+		this.listenersToRemove = [];
+		this.didReplace = false;
+
+		this.isRegex = false;
+		this.matchCase = false;
+		this.wholeWord = false;
+
+		this.updateDecorationsScheduler = new Schedulers.RunOnceScheduler(() => {
+			this.updateDecorations(false, false, null);
+		}, 100);
+
+		this.listenersToRemove.push(this.editor.addListener(EditorCommon.EventType.CursorPositionChanged, (e:EditorCommon.ICursorPositionChangedEvent) => {
+			if (e.reason === 'explicit' || e.reason === 'undo' || e.reason === 'redo') {
+				if (this.highlightedDecorationId !== null) {
+					this.editor.changeDecorations((changeAccessor: EditorCommon.IModelDecorationsChangeAccessor) => {
+						changeAccessor.changeDecorationOptions(this.highlightedDecorationId, this.createFindMatchDecorationOptions(false));
+						this.highlightedDecorationId = null;
+					});
+				}
+				this.startPosition = this.editor.getPosition();
+				this.decorationIndex = -1;
 			}
 		}));
 
-		this._ignoreModelContentChanged = false;
-		this._toDispose.add(this._editor.onDidChangeModelContent((e) => {
-			if (this._ignoreModelContentChanged) {
-				return;
-			}
-			if (e.isFlush) {
+		this.listenersToRemove.push(this.editor.addListener(EditorCommon.EventType.ModelContentChanged, (e:EditorCommon.IModelContentChangedEvent) => {
+			if (e.changeType === EditorCommon.EventType.ModelContentChangedFlush) {
 				// a model.setValue() was called
-				this._decorations.reset();
+				this.decorations = [];
+				this.decorationIndex = -1;
+				this.findScopeDecorationId = null;
+				this.highlightedDecorationId = null;
 			}
-			this._decorations.setStartPosition(this._editor.getPosition());
-			this._updateDecorationsScheduler.schedule();
+			this.startPosition = this.editor.getPosition();
+			this.updateDecorationsScheduler.schedule();
 		}));
-
-		this._toDispose.add(this._state.onFindReplaceStateChange((e) => this._onStateChanged(e)));
-
-		this.research(false, this._state.searchScope);
 	}
 
-	public dispose(): void {
-		this._isDisposed = true;
-		dispose(this._startSearchingTimer);
-		this._toDispose.dispose();
+	private removeOldDecorations(changeAccessor:EditorCommon.IModelDecorationsChangeAccessor, removeFindScopeDecoration:boolean): void {
+		let toRemove: string[] = [];
+		var i:number, len:number;
+		for (i = 0, len = this.decorations.length; i < len; i++) {
+			toRemove.push(this.decorations[i]);
+		}
+		this.decorations = [];
+
+		if (removeFindScopeDecoration && this.hasFindScope()) {
+			toRemove.push(this.findScopeDecorationId);
+			this.findScopeDecorationId = null;
+		}
+
+		changeAccessor.deltaDecorations(toRemove, []);
 	}
 
-	private _onStateChanged(e: FindReplaceStateChangedEvent): void {
-		if (this._isDisposed) {
-			// The find model is disposed during a find state changed event
-			return;
-		}
-		if (!this._editor.hasModel()) {
-			// The find model will be disposed momentarily
-			return;
-		}
-		if (e.searchString || e.isReplaceRevealed || e.isRegex || e.wholeWord || e.matchCase || e.searchScope) {
-			let model = this._editor.getModel();
-
-			if (model.isTooLargeForSyncing()) {
-				this._startSearchingTimer.cancel();
-
-				this._startSearchingTimer.setIfNotSet(() => {
-					if (e.searchScope) {
-						this.research(e.moveCursor, this._state.searchScope);
-					} else {
-						this.research(e.moveCursor);
-					}
-				}, RESEARCH_DELAY);
-			} else {
-				if (e.searchScope) {
-					this.research(e.moveCursor, this._state.searchScope);
-				} else {
-					this.research(e.moveCursor);
-				}
+	private createFindMatchDecorationOptions(isCurrent:boolean): EditorCommon.IModelDecorationOptions {
+		return {
+			stickiness: EditorCommon.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+			className: isCurrent ? 'currentFindMatch' : 'findMatch',
+			overviewRuler: {
+				color: 'rgba(246, 185, 77, 0.7)',
+				darkColor: 'rgba(246, 185, 77, 0.7)',
+				position: EditorCommon.OverviewRulerLane.Center
 			}
-		}
+		};
 	}
 
-	private static _getSearchRange(model: ITextModel, findScope: Range | null): Range {
-		// If we have set now or before a find scope, use it for computing the search range
-		if (findScope) {
-			return findScope;
-		}
-
-		return model.getFullModelRange();
+	private createFindScopeDecorationOptions(): EditorCommon.IModelDecorationOptions {
+		return {
+			className: 'findScope',
+			isWholeLine: true
+		};
 	}
 
-	private research(moveCursor: boolean, newFindScope?: Range | Range[] | null): void {
-		let findScopes: Range[] | null = null;
-		if (typeof newFindScope !== 'undefined') {
-			if (newFindScope !== null) {
-				if (!Array.isArray(newFindScope)) {
-					findScopes = [newFindScope as Range];
-				} else {
-					findScopes = newFindScope;
-				}
-			}
+	private addMatchesDecorations(changeAccessor:EditorCommon.IModelDecorationsChangeAccessor, matches:EditorCommon.IEditorRange[]): void {
+		var newDecorations: EditorCommon.IModelDeltaDecoration[] = [];
+
+		var i:number, len:number;
+		for (i = 0, len = matches.length; i < len; i++) {
+			newDecorations[i] = {
+				range: matches[i],
+				options: this.createFindMatchDecorationOptions(false)
+			};
+		}
+
+		this.decorations = changeAccessor.deltaDecorations([], newDecorations);
+	}
+
+	private _getSearchRange(): EditorCommon.IEditorRange {
+		var searchRange:EditorCommon.IEditorRange;
+
+		if (this.searchOnlyEditableRange) {
+			searchRange = this.editor.getModel().getEditableRange();
 		} else {
-			findScopes = this._decorations.getFindScopes();
-		}
-		if (findScopes !== null) {
-			findScopes = findScopes.map(findScope => {
-				if (findScope.startLineNumber !== findScope.endLineNumber) {
-					let endLineNumber = findScope.endLineNumber;
-
-					if (findScope.endColumn === 1) {
-						endLineNumber = endLineNumber - 1;
-					}
-
-					return new Range(findScope.startLineNumber, 1, endLineNumber, this._editor.getModel().getLineMaxColumn(endLineNumber));
-				}
-				return findScope;
-			});
+			searchRange = this.editor.getModel().getFullModelRange();
 		}
 
-		let findMatches = this._findMatches(findScopes, false, MATCHES_LIMIT);
-		this._decorations.set(findMatches, findScopes);
-
-		const editorSelection = this._editor.getSelection();
-		let currentMatchesPosition = this._decorations.getCurrentMatchesPosition(editorSelection);
-		if (currentMatchesPosition === 0 && findMatches.length > 0) {
-			// current selection is not on top of a match
-			// try to find its nearest result from the top of the document
-			const matchAfterSelection = findFirstInSorted(findMatches.map(match => match.range), range => Range.compareRangesUsingStarts(range, editorSelection) >= 0);
-			currentMatchesPosition = matchAfterSelection > 0 ? matchAfterSelection - 1 + 1 /** match position is one based */ : currentMatchesPosition;
+		if (this.hasFindScope()) {
+			// If we have set now or before a find scope, use it for computing the search range
+			searchRange = searchRange.intersectRanges(this.editor.getModel().getDecorationRange(this.findScopeDecorationId));
 		}
-
-		this._state.changeMatchInfo(
-			currentMatchesPosition,
-			this._decorations.getCount(),
-			undefined
-		);
-
-		if (moveCursor && this._editor.getOption(EditorOption.find).cursorMoveOnType) {
-			this._moveToNextMatch(this._decorations.getStartPosition());
-		}
+		return searchRange;
 	}
 
-	private _hasMatches(): boolean {
-		return (this._state.matchesCount > 0);
-	}
+	private updateDecorations(jumpToNextMatch:boolean, resetFindScopeDecoration:boolean, newFindScope:EditorCommon.IEditorRange): void {
+		if (this.didReplace) {
+			this.next();
+		}
 
-	private _cannotFind(): boolean {
-		if (!this._hasMatches()) {
-			let findScope = this._decorations.getFindScope();
-			if (findScope) {
-				// Reveal the selection so user is reminded that 'selection find' is on.
-				this._editor.revealRangeInCenterIfOutsideViewport(findScope, ScrollType.Smooth);
+		this.editor.changeDecorations((changeAccessor:EditorCommon.IModelDecorationsChangeAccessor) => {
+			this.removeOldDecorations(changeAccessor, resetFindScopeDecoration);
+
+			if (resetFindScopeDecoration && newFindScope) {
+				// Add a decoration to track the find scope
+				let decorations = changeAccessor.deltaDecorations([], [{
+					range: newFindScope,
+					options: this.createFindScopeDecorationOptions()
+				}]);
+				this.findScopeDecorationId = decorations[0];
 			}
-			return true;
+
+			this.addMatchesDecorations(changeAccessor, this.editor.getModel().findMatches(this.searchString, this._getSearchRange(), this.isRegex, this.matchCase, this.wholeWord));
+		});
+		this.highlightedDecorationId = null;
+
+		this.decorationIndex = this.indexAfterPosition(this.startPosition);
+
+		if (!this.didReplace && !jumpToNextMatch) {
+			this.decorationIndex = this.previousIndex(this.decorationIndex);
+		} else if (this.decorations.length > 0) {
+			this.setSelectionToDecoration(this.decorations[this.decorationIndex]);
 		}
-		return false;
+
+		var e:IFindMatchesEvent = {
+			position: this.decorations.length > 0 ? (this.decorationIndex+1) : 0,
+			count: this.decorations.length
+		};
+
+		this._emitMatchesUpdatedEvent(e);
+
+		this.didReplace = false;
 	}
 
-	private _setCurrentFindMatch(match: Range): void {
-		let matchesPosition = this._decorations.setCurrentFindMatch(match);
-		this._state.changeMatchInfo(
-			matchesPosition,
-			this._decorations.getCount(),
-			match
-		);
 
-		this._editor.setSelection(match);
-		this._editor.revealRangeInCenterIfOutsideViewport(match, ScrollType.Smooth);
-	}
-
-	private _prevSearchPosition(before: Position) {
-		let isUsingLineStops = this._state.isRegex && (
-			this._state.searchString.indexOf('^') >= 0
-			|| this._state.searchString.indexOf('$') >= 0
-		);
-		let { lineNumber, column } = before;
-		let model = this._editor.getModel();
-
-		if (isUsingLineStops || column === 1) {
-			if (lineNumber === 1) {
-				lineNumber = model.getLineCount();
-			} else {
-				lineNumber--;
-			}
-			column = model.getLineMaxColumn(lineNumber);
+	/**
+	 * Updates selection find scope.
+	 * Selection find scope just gets removed if passed findScope is null.
+	 * Selection find scope does not take columns into account.
+	 */
+	public setFindScope(findScope:EditorCommon.IEditorRange): void {
+		if (findScope === null) {
+			this.updateDecorations(false, true, findScope);
 		} else {
-			column--;
+			this.updateDecorations(false, true, new Range(findScope.startLineNumber, 1, findScope.endLineNumber, this.editor.getModel().getLineMaxColumn(findScope.endLineNumber)));
 		}
-
-		return new Position(lineNumber, column);
 	}
 
-	private _moveToPrevMatch(before: Position, isRecursed: boolean = false): void {
-		if (!this._state.canNavigateBack()) {
-			// we are beyond the first matched find result
-			// instead of doing nothing, we should refocus the first item
-			const nextMatchRange = this._decorations.matchAfterPosition(before);
-
-			if (nextMatchRange) {
-				this._setCurrentFindMatch(nextMatchRange);
-			}
-			return;
+	public recomputeMatches(newFindData:IFindState, jumpToNextMatch:boolean): void {
+		var somethingChanged = false;
+		if (this.isRegex !== newFindData.properties.isRegex) {
+			this.isRegex = newFindData.properties.isRegex;
+			somethingChanged = true;
 		}
-		if (this._decorations.getCount() < MATCHES_LIMIT) {
-			let prevMatchRange = this._decorations.matchBeforePosition(before);
-
-			if (prevMatchRange && prevMatchRange.isEmpty() && prevMatchRange.getStartPosition().equals(before)) {
-				before = this._prevSearchPosition(before);
-				prevMatchRange = this._decorations.matchBeforePosition(before);
-			}
-
-			if (prevMatchRange) {
-				this._setCurrentFindMatch(prevMatchRange);
-			}
-
-			return;
+		if (this.matchCase !== newFindData.properties.matchCase) {
+			this.matchCase = newFindData.properties.matchCase;
+			somethingChanged = true;
+		}
+		if (this.wholeWord !== newFindData.properties.wholeWord) {
+			this.wholeWord = newFindData.properties.wholeWord;
+			somethingChanged = true;
+		}
+		if (newFindData.searchString !== this.searchString) {
+			this.searchString = newFindData.searchString;
+			somethingChanged = true;
+		}
+		this.replaceString = newFindData.replaceString;
+		if (newFindData.isReplaceRevealed !== this.searchOnlyEditableRange) {
+			this.searchOnlyEditableRange = newFindData.isReplaceRevealed;
+			somethingChanged = true;
 		}
 
-		if (this._cannotFind()) {
-			return;
+		if (somethingChanged) {
+			this.updateDecorations(jumpToNextMatch, false, null);
 		}
-
-		let findScope = this._decorations.getFindScope();
-		let searchRange = FindModelBoundToEditorModel._getSearchRange(this._editor.getModel(), findScope);
-
-		// ...(----)...|...
-		if (searchRange.getEndPosition().isBefore(before)) {
-			before = searchRange.getEndPosition();
-		}
-
-		// ...|...(----)...
-		if (before.isBefore(searchRange.getStartPosition())) {
-			before = searchRange.getEndPosition();
-		}
-
-		let { lineNumber, column } = before;
-		let model = this._editor.getModel();
-
-		let position = new Position(lineNumber, column);
-
-		let prevMatch = model.findPreviousMatch(this._state.searchString, position, this._state.isRegex, this._state.matchCase, this._state.wholeWord ? this._editor.getOption(EditorOption.wordSeparators) : null, false);
-
-		if (prevMatch && prevMatch.range.isEmpty() && prevMatch.range.getStartPosition().equals(position)) {
-			// Looks like we're stuck at this position, unacceptable!
-			position = this._prevSearchPosition(position);
-			prevMatch = model.findPreviousMatch(this._state.searchString, position, this._state.isRegex, this._state.matchCase, this._state.wholeWord ? this._editor.getOption(EditorOption.wordSeparators) : null, false);
-		}
-
-		if (!prevMatch) {
-			// there is precisely one match and selection is on top of it
-			return;
-		}
-
-		if (!isRecursed && !searchRange.containsRange(prevMatch.range)) {
-			return this._moveToPrevMatch(prevMatch.range.getStartPosition(), true);
-		}
-
-		this._setCurrentFindMatch(prevMatch.range);
 	}
 
-	public moveToPrevMatch(): void {
-		this._moveToPrevMatch(this._editor.getSelection().getStartPosition());
+	public start(newFindData:IFindState, findScope:EditorCommon.IEditorRange, shouldFocus:boolean): void {
+		this.startPosition = this.editor.getPosition();
+
+		this.isRegex = newFindData.properties.isRegex;
+		this.matchCase = newFindData.properties.matchCase;
+		this.wholeWord = newFindData.properties.wholeWord;
+		this.searchString = newFindData.searchString;
+		this.replaceString = newFindData.replaceString;
+		this.searchOnlyEditableRange = newFindData.isReplaceRevealed;
+
+		this.setFindScope(findScope);
+		this.decorationIndex = this.previousIndex(this.indexAfterPosition(this.startPosition));
+		var e:IFindStartEvent = {
+			state: newFindData,
+			selectionFindEnabled: this.hasFindScope(),
+			shouldFocus: shouldFocus
+		};
+		this._emitStartEvent(e);
 	}
 
-	private _nextSearchPosition(after: Position) {
-		let isUsingLineStops = this._state.isRegex && (
-			this._state.searchString.indexOf('^') >= 0
-			|| this._state.searchString.indexOf('$') >= 0
-		);
+	public prev(): void {
+		if (this.decorations.length > 0) {
+			if (this.decorationIndex === -1) {
+				this.decorationIndex = this.indexAfterPosition(this.startPosition);
+			}
+			this.decorationIndex = this.previousIndex(this.decorationIndex);
+			this.setSelectionToDecoration(this.decorations[this.decorationIndex]);
+		} else if (this.hasFindScope()) {
+			// Reveal the selection so user is reminded that 'selection find' is on.
+			this.editor.revealRangeInCenterIfOutsideViewport(this.editor.getModel().getDecorationRange(this.findScopeDecorationId));
+		}
+	}
 
-		let { lineNumber, column } = after;
-		let model = this._editor.getModel();
-
-		if (isUsingLineStops || column === model.getLineMaxColumn(lineNumber)) {
-			if (lineNumber === model.getLineCount()) {
-				lineNumber = 1;
+	public next(): void {
+		if (this.decorations.length > 0) {
+			if (this.decorationIndex === -1) {
+				this.decorationIndex = this.indexAfterPosition(this.startPosition);
 			} else {
-				lineNumber++;
+				this.decorationIndex = this.nextIndex(this.decorationIndex);
 			}
-			column = 1;
-		} else {
-			column++;
-		}
-
-		return new Position(lineNumber, column);
-	}
-
-	private _moveToNextMatch(after: Position): void {
-		if (!this._state.canNavigateForward()) {
-			// we are beyond the last matched find result
-			// instead of doing nothing, we should refocus the last item
-			const prevMatchRange = this._decorations.matchBeforePosition(after);
-
-			if (prevMatchRange) {
-				this._setCurrentFindMatch(prevMatchRange);
-			}
-			return;
-		}
-		if (this._decorations.getCount() < MATCHES_LIMIT) {
-			let nextMatchRange = this._decorations.matchAfterPosition(after);
-
-			if (nextMatchRange && nextMatchRange.isEmpty() && nextMatchRange.getStartPosition().equals(after)) {
-				// Looks like we're stuck at this position, unacceptable!
-				after = this._nextSearchPosition(after);
-				nextMatchRange = this._decorations.matchAfterPosition(after);
-			}
-			if (nextMatchRange) {
-				this._setCurrentFindMatch(nextMatchRange);
-			}
-
-			return;
-		}
-
-		let nextMatch = this._getNextMatch(after, false, true);
-		if (nextMatch) {
-			this._setCurrentFindMatch(nextMatch.range);
+			this.setSelectionToDecoration(this.decorations[this.decorationIndex]);
+		} else if (this.hasFindScope()) {
+			// Reveal the selection so user is reminded that 'selection find' is on.
+			this.editor.revealRangeInCenterIfOutsideViewport(this.editor.getModel().getDecorationRange(this.findScopeDecorationId));
 		}
 	}
 
-	private _getNextMatch(after: Position, captureMatches: boolean, forceMove: boolean, isRecursed: boolean = false): FindMatch | null {
-		if (this._cannotFind()) {
-			return null;
+
+	private setSelectionToDecoration(decorationId:string): void {
+		this.editor.changeDecorations((changeAccessor: EditorCommon.IModelDecorationsChangeAccessor) => {
+			if (this.highlightedDecorationId !== null) {
+				changeAccessor.changeDecorationOptions(this.highlightedDecorationId, this.createFindMatchDecorationOptions(false));
+			}
+			changeAccessor.changeDecorationOptions(decorationId, this.createFindMatchDecorationOptions(true));
+			this.highlightedDecorationId = decorationId;
+		});
+		var decorationRange = this.editor.getModel().getDecorationRange(decorationId);
+		if (Range.isIRange(decorationRange)) {
+			this.editor.setSelection(decorationRange);
+			this.editor.revealRangeInCenterIfOutsideViewport(decorationRange);
 		}
-
-		let findScope = this._decorations.getFindScope();
-		let searchRange = FindModelBoundToEditorModel._getSearchRange(this._editor.getModel(), findScope);
-
-		// ...(----)...|...
-		if (searchRange.getEndPosition().isBefore(after)) {
-			after = searchRange.getStartPosition();
-		}
-
-		// ...|...(----)...
-		if (after.isBefore(searchRange.getStartPosition())) {
-			after = searchRange.getStartPosition();
-		}
-
-		let { lineNumber, column } = after;
-		let model = this._editor.getModel();
-
-		let position = new Position(lineNumber, column);
-
-		let nextMatch = model.findNextMatch(this._state.searchString, position, this._state.isRegex, this._state.matchCase, this._state.wholeWord ? this._editor.getOption(EditorOption.wordSeparators) : null, captureMatches);
-
-		if (forceMove && nextMatch && nextMatch.range.isEmpty() && nextMatch.range.getStartPosition().equals(position)) {
-			// Looks like we're stuck at this position, unacceptable!
-			position = this._nextSearchPosition(position);
-			nextMatch = model.findNextMatch(this._state.searchString, position, this._state.isRegex, this._state.matchCase, this._state.wholeWord ? this._editor.getOption(EditorOption.wordSeparators) : null, captureMatches);
-		}
-
-		if (!nextMatch) {
-			// there is precisely one match and selection is on top of it
-			return null;
-		}
-
-		if (!isRecursed && !searchRange.containsRange(nextMatch.range)) {
-			return this._getNextMatch(nextMatch.range.getEndPosition(), captureMatches, forceMove, true);
-		}
-
-		return nextMatch;
 	}
 
-	public moveToNextMatch(): void {
-		this._moveToNextMatch(this._editor.getSelection().getEndPosition());
-	}
-
-	private _getReplacePattern(): ReplacePattern {
-		if (this._state.isRegex) {
-			return parseReplaceString(this._state.replaceString);
+	private getReplaceString(matchedString:string): string {
+		if (!this.isRegex) {
+			return this.replaceString;
 		}
-		return ReplacePattern.fromStaticValue(this._state.replaceString);
+		var regexp = Strings.createRegExp(this.searchString, this.isRegex, this.matchCase, this.wholeWord);
+		return matchedString.replace(regexp, this.replaceString);
 	}
 
 	public replace(): void {
-		if (!this._hasMatches()) {
+		if (this.decorations.length === 0) {
 			return;
 		}
 
-		let replacePattern = this._getReplacePattern();
-		let selection = this._editor.getSelection();
-		let nextMatch = this._getNextMatch(selection.getStartPosition(), true, false);
-		if (nextMatch) {
-			if (selection.equalsRange(nextMatch.range)) {
-				// selection sits on a find match => replace it!
-				let replaceString = replacePattern.buildReplaceString(nextMatch.matches, this._state.preserveCase);
+		var model = this.editor.getModel();
+		var currentDecorationRange = model.getDecorationRange(this.decorations[this.decorationIndex]);
+		var selection = this.editor.getSelection();
 
-				let command = new ReplaceCommand(selection, replaceString);
+		if (currentDecorationRange !== null &&
+			selection.startColumn === currentDecorationRange.startColumn &&
+			selection.endColumn === currentDecorationRange.endColumn &&
+			selection.startLineNumber === currentDecorationRange.startLineNumber &&
+			selection.endLineNumber === currentDecorationRange.endLineNumber) {
 
-				this._executeEditorCommand('replace', command);
+			var matchedString = model.getValueInRange(selection);
+			var replaceString = this.getReplaceString(matchedString);
 
-				this._decorations.setStartPosition(new Position(selection.startLineNumber, selection.startColumn + replaceString.length));
-				this.research(true);
-			} else {
-				this._decorations.setStartPosition(this._editor.getPosition());
-				this._setCurrentFindMatch(nextMatch.range);
-			}
+			var command = new ReplaceCommand(selection, replaceString);
+			this.editor.executeCommand('replace', command);
+
+			this.startPosition = new Position(selection.startLineNumber, selection.startColumn + replaceString.length);
+			this.decorationIndex = -1;
+			this.didReplace = true;
+		} else {
+			this.next();
 		}
-	}
-
-	private _findMatches(findScopes: Range[] | null, captureMatches: boolean, limitResultCount: number): FindMatch[] {
-		const searchRanges = (findScopes as [] || [null]).map((scope: Range | null) =>
-			FindModelBoundToEditorModel._getSearchRange(this._editor.getModel(), scope)
-		);
-
-		return this._editor.getModel().findMatches(this._state.searchString, searchRanges, this._state.isRegex, this._state.matchCase, this._state.wholeWord ? this._editor.getOption(EditorOption.wordSeparators) : null, captureMatches, limitResultCount);
 	}
 
 	public replaceAll(): void {
-		if (!this._hasMatches()) {
+		if (this.decorations.length === 0) {
 			return;
 		}
 
-		const findScopes = this._decorations.getFindScopes();
+		let model = this.editor.getModel();
 
-		if (findScopes === null && this._state.matchesCount >= MATCHES_LIMIT) {
-			// Doing a replace on the entire file that is over ${MATCHES_LIMIT} matches
-			this._largeReplaceAll();
-		} else {
-			this._regularReplaceAll(findScopes);
+		// Get all the ranges (even more than the highlighted ones)
+		let ranges = this.editor.getModel().findMatches(this.searchString, this._getSearchRange(), this.isRegex, this.matchCase, this.wholeWord, Number.MAX_VALUE);
+
+		// Remove all decorations
+		this.editor.changeDecorations((changeAccessor:EditorCommon.IModelDecorationsChangeAccessor) => {
+			this.removeOldDecorations(changeAccessor, false);
+		});
+
+		var replaceStrings:string[] = [];
+		for (var i = 0, len = ranges.length; i < len; i++) {
+			replaceStrings.push(this.getReplaceString(model.getValueInRange(ranges[i])));
 		}
 
-		this.research(false);
+		var command = new ReplaceAllCommand.ReplaceAllCommand(ranges, replaceStrings);
+		this.editor.executeCommand('replaceAll', command);
 	}
 
-	private _largeReplaceAll(): void {
-		const searchParams = new SearchParams(this._state.searchString, this._state.isRegex, this._state.matchCase, this._state.wholeWord ? this._editor.getOption(EditorOption.wordSeparators) : null);
-		const searchData = searchParams.parseSearchRequest();
-		if (!searchData) {
-			return;
-		}
-
-		let searchRegex = searchData.regex;
-		if (!searchRegex.multiline) {
-			let mod = 'mu';
-			if (searchRegex.ignoreCase) {
-				mod += 'i';
-			}
-			if (searchRegex.global) {
-				mod += 'g';
-			}
-			searchRegex = new RegExp(searchRegex.source, mod);
-		}
-
-		const model = this._editor.getModel();
-		const modelText = model.getValue(EndOfLinePreference.LF);
-		const fullModelRange = model.getFullModelRange();
-
-		const replacePattern = this._getReplacePattern();
-		let resultText: string;
-		const preserveCase = this._state.preserveCase;
-
-		if (replacePattern.hasReplacementPatterns || preserveCase) {
-			resultText = modelText.replace(searchRegex, function () {
-				return replacePattern.buildReplaceString(<string[]><any>arguments, preserveCase);
+	public dispose(): void {
+		super.dispose();
+		this.updateDecorationsScheduler.dispose();
+		this.listenersToRemove.forEach((element) => {
+			element();
+		});
+		this.listenersToRemove = [];
+		if (this.editor.getModel()) {
+			this.editor.changeDecorations((changeAccessor:EditorCommon.IModelDecorationsChangeAccessor) => {
+				this.removeOldDecorations(changeAccessor, true);
 			});
-		} else {
-			resultText = modelText.replace(searchRegex, replacePattern.buildReplaceString(null, preserveCase));
 		}
-
-		let command = new ReplaceCommandThatPreservesSelection(fullModelRange, resultText, this._editor.getSelection());
-		this._executeEditorCommand('replaceAll', command);
 	}
 
-	private _regularReplaceAll(findScopes: Range[] | null): void {
-		const replacePattern = this._getReplacePattern();
-		// Get all the ranges (even more than the highlighted ones)
-		let matches = this._findMatches(findScopes, replacePattern.hasReplacementPatterns || this._state.preserveCase, Constants.MAX_SAFE_SMALL_INTEGER);
-
-		let replaceStrings: string[] = [];
-		for (let i = 0, len = matches.length; i < len; i++) {
-			replaceStrings[i] = replacePattern.buildReplaceString(matches[i].matches, this._state.preserveCase);
-		}
-
-		let command = new ReplaceAllCommand(this._editor.getSelection(), matches.map(m => m.range), replaceStrings);
-		this._executeEditorCommand('replaceAll', command);
+	public hasFindScope(): boolean {
+		return !!this.findScopeDecorationId;
 	}
 
-	public selectAllMatches(): void {
-		if (!this._hasMatches()) {
-			return;
+	private previousIndex(index:number): number {
+		if (this.decorations.length > 0) {
+			return (index - 1 + this.decorations.length) % this.decorations.length;
 		}
+		return 0;
+	}
 
-		let findScopes = this._decorations.getFindScopes();
+	private nextIndex(index:number): number {
+		if (this.decorations.length > 0) {
+			return (index + 1) % this.decorations.length;
+		}
+		return 0;
+	}
 
-		// Get all the ranges (even more than the highlighted ones)
-		let matches = this._findMatches(findScopes, false, Constants.MAX_SAFE_SMALL_INTEGER);
-		let selections = matches.map(m => new Selection(m.range.startLineNumber, m.range.startColumn, m.range.endLineNumber, m.range.endColumn));
-
-		// If one of the ranges is the editor selection, then maintain it as primary
-		let editorSelection = this._editor.getSelection();
-		for (let i = 0, len = selections.length; i < len; i++) {
-			let sel = selections[i];
-			if (sel.equalsRange(editorSelection)) {
-				selections = [editorSelection].concat(selections.slice(0, i)).concat(selections.slice(i + 1));
-				break;
+	private indexAfterPosition(position:EditorCommon.IEditorPosition): number {
+		if (this.decorations.length === 0) {
+			return 0;
+		}
+		for (var i = 0, len = this.decorations.length; i < len; i++) {
+			var decorationId = this.decorations[i];
+			var r = this.editor.getModel().getDecorationRange(decorationId);
+			if (!r || r.startLineNumber < position.lineNumber) {
+				continue;
 			}
+			if (r.startLineNumber > position.lineNumber) {
+				return i;
+			}
+			if (r.startColumn < position.column) {
+				continue;
+			}
+			return i;
 		}
-
-		this._editor.setSelections(selections);
+		return 0;
 	}
 
-	private _executeEditorCommand(source: string, command: ICommand): void {
-		try {
-			this._ignoreModelContentChanged = true;
-			this._editor.pushUndoStop();
-			this._editor.executeCommand(source, command);
-			this._editor.pushUndoStop();
-		} finally {
-			this._ignoreModelContentChanged = false;
-		}
+	public addStartEventListener(callback:(e:IFindStartEvent)=>void): Lifecycle.IDisposable {
+		return this.addListener2(FindModelBoundToEditorModel._START_EVENT, callback);
 	}
+
+	private _emitStartEvent(e:IFindStartEvent): void {
+		this.emit(FindModelBoundToEditorModel._START_EVENT, e);
+	}
+
+	public addMatchesUpdatedEventListener(callback:(e:IFindMatchesEvent)=>void): Lifecycle.IDisposable {
+		return this.addListener2(FindModelBoundToEditorModel._MATCHES_UPDATED_EVENT, callback);
+	}
+
+	private _emitMatchesUpdatedEvent(e:IFindMatchesEvent): void {
+		this.emit(FindModelBoundToEditorModel._MATCHES_UPDATED_EVENT, e);
+	}
+
 }
+

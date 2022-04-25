@@ -2,47 +2,45 @@
  *  Copyright (c) Microsoft Corporation. All rights reserved.
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
+'use strict';
 
-import { IContextMenuDelegate } from 'vs/base/browser/contextmenu';
-import { AnchorAlignment, AnchorAxisAlignment, IContextViewProvider } from 'vs/base/browser/ui/contextview/contextview';
-import { Event } from 'vs/base/common/event';
-import { IDisposable } from 'vs/base/common/lifecycle';
-import { createDecorator } from 'vs/platform/instantiation/common/instantiation';
+import Lifecycle = require('vs/base/common/lifecycle');
+import Actions = require('vs/base/common/actions');
+import ActionBar = require('vs/base/browser/ui/actionbar/actionbar');
+import winjs = require('vs/base/common/winjs.base');
+import {Keybinding} from 'vs/base/common/keyCodes';
+import {createDecorator, ServiceIdentifier} from 'vs/platform/instantiation/common/instantiation';
 
-export const IContextViewService = createDecorator<IContextViewService>('contextViewService');
+export var IContextViewService = createDecorator<IContextViewService>('contextViewService');
 
-export interface IContextViewService extends IContextViewProvider {
-
-	readonly _serviceBrand: undefined;
-
-	showContextView(delegate: IContextViewDelegate, container?: HTMLElement, shadowRoot?: boolean): IDisposable;
-	hideContextView(data?: any): void;
-	getContextViewElement(): HTMLElement;
-	layout(): void;
-	anchorAlignment?: AnchorAlignment;
+export interface IContextViewService {
+	serviceId : ServiceIdentifier<any>;
+	showContextView(delegate: IContextViewDelegate):void;
+	hideContextView(data?: any):void;
+	layout():void;
 }
 
 export interface IContextViewDelegate {
-
-	canRelayout?: boolean; // Default: true
-
-	getAnchor(): HTMLElement | { x: number; y: number; width?: number; height?: number };
-	render(container: HTMLElement): IDisposable;
-	onDOMEvent?(e: any, activeElement: HTMLElement): void;
-	onHide?(data?: any): void;
-	focus?(): void;
-	anchorAlignment?: AnchorAlignment;
-	anchorAxisAlignment?: AnchorAxisAlignment;
+	getAnchor():HTMLElement|{x: number; y: number; }
+	render(container: HTMLElement): Lifecycle.IDisposable;
+	canRelayout?:boolean; // Default: true
+	onDOMEvent?(e:Event, activeElement: HTMLElement):void;
+	onHide?(data?: any):void;
 }
 
-export const IContextMenuService = createDecorator<IContextMenuService>('contextMenuService');
+export var IContextMenuService = createDecorator<IContextMenuService>('contextMenuService');
 
 export interface IContextMenuService {
+	serviceId : ServiceIdentifier<any>;
+	showContextMenu(delegate: IContextMenuDelegate):void;
+}
 
-	readonly _serviceBrand: undefined;
-
-	readonly onDidShowContextMenu: Event<void>;
-	readonly onDidHideContextMenu: Event<void>;
-
-	showContextMenu(delegate: IContextMenuDelegate): void;
+export interface IContextMenuDelegate {
+	getAnchor():HTMLElement|{x: number; y: number; }
+	getActions(): winjs.Promise;
+	getActionItem?(action: Actions.IAction): ActionBar.IActionItem;
+	getActionsContext?():any;
+	getKeyBinding?(action: Actions.IAction): Keybinding;
+	getMenuClassName?():string;
+	onHide?(didCancel: boolean): void;
 }
