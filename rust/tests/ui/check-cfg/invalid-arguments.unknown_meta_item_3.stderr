@@ -1,2 +1,0 @@
-error: invalid `--check-cfg` argument: `cfg(foo,values(test()))` (`values()` arguments must be string literals, `none()` or `any()`)
-

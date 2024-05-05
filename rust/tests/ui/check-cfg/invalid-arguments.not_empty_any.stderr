@@ -1,2 +1,0 @@
-error: invalid `--check-cfg` argument: `cfg(any(foo))` (`any()` must be empty)
-

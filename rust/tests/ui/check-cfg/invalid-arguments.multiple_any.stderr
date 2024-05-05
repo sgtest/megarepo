@@ -1,2 +1,0 @@
-error: invalid `--check-cfg` argument: `cfg(any(),any())` (`any()` cannot be specified multiple times)
-

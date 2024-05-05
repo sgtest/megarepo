@@ -1,2 +1,0 @@
-error: invalid `--check-cfg` argument: `cfg(foo,any())` (`cfg(any())` can only be provided in isolation)
-

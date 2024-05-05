@@ -1,2 +1,0 @@
-error: invalid `--check-cfg` argument: `cfg(values(any()),foo)` (`values()` cannot be specified before the names)
-
