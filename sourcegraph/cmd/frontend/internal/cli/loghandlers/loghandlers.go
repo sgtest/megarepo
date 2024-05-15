@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/inconshreveable/log15" //nolint:logging // Legacy loghandlers for log15
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 // Trace returns a filter for the given traces that run longer than threshold

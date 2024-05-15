@@ -1,17 +1,13 @@
-// The testproxy command runs a simple HTTP proxy that wraps a Sourcegraph server running with the
-// http-header auth provider to test the authentication HTTP proxy support.
-//
-// Also see dev/internal/cmd/auth-proxy-http-header for conveniently starting
-// up a proxy for multiple users.
+// The testproxy command runs a simple HTTP proxy that wraps a Sourcegraph server running with site
+// config auth.provider=="http-header" to test the authentication HTTP proxy support.
 
-//go:build ignore
 // +build ignore
 
 package main
 
 import (
 	"flag"
-	"log" //nolint:logging // TODO move all logging to sourcegraph/log
+	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -19,11 +15,10 @@ import (
 )
 
 var (
-	addr           = flag.String("addr", ":4080", "HTTP listen address")
-	urlStr         = flag.String("url", "http://localhost:3080", "proxy origin URL (Sourcegraph HTTP/HTTPS URL)") // CI:LOCALHOST_OK
-	username       = flag.String("username", os.Getenv("USER"), "username to report to Sourcegraph")
-	usernamePrefix = flag.String("usernamePrefix", "", "prefix to place in front of username in the auth header value")
-	httpHeader     = flag.String("header", "X-Forwarded-User", "name of HTTP header to add to request")
+	addr       = flag.String("addr", ":4080", "HTTP listen address")
+	urlStr     = flag.String("url", "http://localhost:3080", "proxy origin URL (Sourcegraph HTTP/HTTPS URL)") // CI:LOCALHOST_OK
+	username   = flag.String("username", os.Getenv("USER"), "username to report to Sourcegraph")
+	httpHeader = flag.String("header", "X-Forwarded-User", "name of HTTP header to add to request")
 )
 
 func main() {
@@ -40,12 +35,11 @@ func main() {
 	if *httpHeader == "" {
 		log.Fatal("Error: No -header specified.")
 	}
-	headerVal := *usernamePrefix + *username
-	log.Printf(`Listening on %s, forwarding requests to %s with added header "%s: %s"`, *addr, url, *httpHeader, headerVal)
+	log.Printf(`Listening on %s, forwarding requests to %s with added header "%s: %s"`, *addr, url, *httpHeader, *username)
 	p := httputil.NewSingleHostReverseProxy(url)
 	log.Fatalf("Server error: %s.", http.ListenAndServe(*addr, &httputil.ReverseProxy{
 		Director: func(r *http.Request) {
-			r.Header.Set(*httpHeader, headerVal)
+			r.Header.Set(*httpHeader, *username)
 			r.Host = url.Host
 			p.Director(r)
 		},

@@ -1,28 +1,32 @@
 // Command goremancmd exists for testing the internally vendored goreman that
-// ./cmd/server uses.
+// Sourcegraph Server uses.
 package main
 
 import (
-	"log" //nolint:logging // TODO move all logging to sourcegraph/log
+	"fmt"
+	"io/ioutil"
+	"log"
 	"os"
 
 	"github.com/sourcegraph/sourcegraph/cmd/server/internal/goreman"
-	"github.com/sourcegraph/sourcegraph/lib/errors"
 )
 
 func do() error {
 	if len(os.Args) != 2 {
-		return errors.Errorf("USAGE: %s Procfile", os.Args[0])
+		return fmt.Errorf("USAGE: %s Procfile", os.Args[0])
 	}
 
-	procfile, err := os.ReadFile(os.Args[1])
+	procfile, err := ioutil.ReadFile(os.Args[1])
 	if err != nil {
 		return err
 	}
 
-	return goreman.Start(procfile, goreman.Options{
-		RPCAddr: "127.0.0.1:5005",
-	})
+	const goremanAddr = "127.0.0.1:5005"
+	if err := os.Setenv("GOREMAN_RPC_ADDR", goremanAddr); err != nil {
+		return err
+	}
+
+	return goreman.Start(goremanAddr, procfile)
 }
 
 func main() {

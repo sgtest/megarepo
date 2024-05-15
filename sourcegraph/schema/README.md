@@ -5,15 +5,16 @@
 Sourcegraph uses the following JSON Schemas:
 
 - [`settings.schema.json`](./settings.schema.json)
-- [`critical.schema.json`](./critical.schema.json)
 - [`site.schema.json`](./site.schema.json)
+- [`datacenter.schema.json`](./datacenter.schema.json)
+- [`extension.schema.json`](https://github.com/sourcegraph/extensions-client-common/blob/master/src/schema/extension.schema.json) is manually copied to this directory as needed. Only the subset of properties and definitions used by our Go code is needed. The web app uses the `extension.schema.json` file from the `@sourcegraph/extensions-client-common` npm package (the Go code currently doesn't use the file from this npm package because that would require running `yarn` in all Go tests in CI, which would be slow).
 
 # Modifying a schema
 
 1.  Edit the `*.schema.json` file in this directory.
-1.  Run `bazel run //schema:write_generated_schema`.
+1.  Run `go generate` to update the `*_stringdata.json` file.
 1.  Commit the changes to both files.
-1.  Run `sg start` to automatically update TypeScript schema files.
+1.  When the change is ready for release, [update the documentation](https://github.com/sourcegraph/website/blob/master/README.md#documentation-pages).
 
 ## Known issues
 

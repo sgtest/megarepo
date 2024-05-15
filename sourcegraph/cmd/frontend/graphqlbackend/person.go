@@ -5,18 +5,14 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/sourcegraph/sourcegraph/internal/database"
-	"github.com/sourcegraph/sourcegraph/internal/errcode"
-	"github.com/sourcegraph/sourcegraph/internal/types"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/db"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
+	"github.com/sourcegraph/sourcegraph/pkg/errcode"
 )
 
-type PersonResolver struct {
-	db    database.DB
+type personResolver struct {
 	name  string
 	email string
-
-	// fetch + serve sourcegraph stored user information
-	includeUserInfo bool
 
 	// cache result because it is used by multiple fields
 	once sync.Once
@@ -24,31 +20,12 @@ type PersonResolver struct {
 	err  error
 }
 
-func NewPersonResolver(db database.DB, name, email string, includeUserInfo bool) *PersonResolver {
-	return &PersonResolver{
-		db:              db,
-		name:            name,
-		email:           email,
-		includeUserInfo: includeUserInfo,
-	}
-}
-
-func NewPersonResolverFromUser(db database.DB, email string, user *types.User) *PersonResolver {
-	return &PersonResolver{
-		db:    db,
-		user:  user,
-		email: email,
-		// We don't need to query for user.
-		includeUserInfo: false,
-	}
-}
-
 // resolveUser resolves the person to a user (using the email address). Not all persons can be
 // resolved to a user.
-func (r *PersonResolver) resolveUser(ctx context.Context) (*types.User, error) {
+func (r *personResolver) resolveUser(ctx context.Context) (*types.User, error) {
 	r.once.Do(func() {
-		if r.includeUserInfo && r.email != "" {
-			r.user, r.err = r.db.Users().GetByVerifiedEmail(ctx, r.email)
+		if r.email != "" {
+			r.user, r.err = db.Users.GetByVerifiedEmail(ctx, r.email)
 			if errcode.IsNotFound(r.err) {
 				r.err = nil
 			}
@@ -57,26 +34,25 @@ func (r *PersonResolver) resolveUser(ctx context.Context) (*types.User, error) {
 	return r.user, r.err
 }
 
-func (r *PersonResolver) Name(ctx context.Context) (string, error) {
+func (r *personResolver) Name(ctx context.Context) (string, error) {
 	user, err := r.resolveUser(ctx)
-	if err != nil {
+	if err != nil && !errcode.IsNotFound(err) {
 		return "", err
 	}
 	if user != nil && user.Username != "" {
-		return user.Username, nil
+		return user.DisplayName, nil
 	}
 
-	// Fall back to provided username.
 	return r.name, nil
 }
 
-func (r *PersonResolver) Email() string {
+func (r *personResolver) Email() string {
 	return r.email
 }
 
-func (r *PersonResolver) DisplayName(ctx context.Context) (string, error) {
+func (r *personResolver) DisplayName(ctx context.Context) (string, error) {
 	user, err := r.resolveUser(ctx)
-	if err != nil {
+	if err != nil && !errcode.IsNotFound(err) {
 		return "", err
 	}
 	if user != nil && user.DisplayName != "" {
@@ -92,25 +68,21 @@ func (r *PersonResolver) DisplayName(ctx context.Context) (string, error) {
 	return "unknown", nil
 }
 
-func (r *PersonResolver) AvatarURL(ctx context.Context) (*string, error) {
+func (r *personResolver) AvatarURL(ctx context.Context) (string, error) {
 	user, err := r.resolveUser(ctx)
-	if err != nil {
-		return nil, err
+	if err != nil && !errcode.IsNotFound(err) {
+		return "", err
 	}
 	if user != nil && user.AvatarURL != "" {
-		return &user.AvatarURL, nil
+		return user.AvatarURL, nil
 	}
-	return nil, nil
+	return "", nil
 }
 
-func (r *PersonResolver) User(ctx context.Context) (*UserResolver, error) {
+func (r *personResolver) User(ctx context.Context) (*UserResolver, error) {
 	user, err := r.resolveUser(ctx)
 	if user == nil || err != nil {
 		return nil, err
 	}
-	return NewUserResolver(ctx, r.db, user), nil
-}
-
-func (r *PersonResolver) OwnerField() string {
-	return EnterpriseResolvers.ownResolver.PersonOwnerField(r)
+	return &UserResolver{user: user}, nil
 }

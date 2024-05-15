@@ -1,16 +1,11 @@
-// Package app exports symbols from frontend/internal/app. See the parent
-// package godoc for more information.
 package app
 
-import (
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/app"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/app/jscontext"
+import "github.com/sourcegraph/sourcegraph/cmd/frontend/internal/app"
+
+type (
+	SignOutURL = app.SignOutURL
 )
 
-type SignOutURL = app.SignOutURL
-
-var RegisterSSOSignOutHandler = app.RegisterSSOSignOutHandler
-
-func SetBillingPublishableKey(value string) {
-	jscontext.BillingPublishableKey = value
-}
+var (
+	RegisterSSOSignOutHandler = app.RegisterSSOSignOutHandler
+)

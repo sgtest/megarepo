@@ -1,68 +1,49 @@
-<p align="center">
-<a href="https://sourcegraph.com/" target="_blank">
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://p21.p4.n0.cdn.getcloudapp.com/items/6qub2y6g/8c25cf68-2715-4f0e-9de6-26292fad604f.svg" width="50%">
-  <img src="https://p21.p4.n0.cdn.getcloudapp.com/items/12u7NWXL/5e21725d-6e84-4ccd-8300-27bf9a050416.svg" width="50%">
-</picture></a>
-</p>
+# Sourcegraph
 
-<p align="center">
-    <a href="https://sourcegraph.com/docs">Docs</a> •
-    <a href="https://sourcegraph.com/github.com/sourcegraph/sourcegraph/-/blob/CONTRIBUTING.md">Contributing</a> •
-    <a href="https://twitter.com/sourcegraph">Twitter</a> •
-    <a href="https://discord.gg/s2qDtYGnAE">Discord</a>
-    <br /><br />
-    <a href="https://buildkite.com/sourcegraph/sourcegraph">
-        <img src="https://badge.buildkite.com/00bbe6fa9986c78b8e8591cffeb0b0f2e8c4bb610d7e339ff6.svg?branch=main" alt="Build status" />
-    </a>
-    <a href="https://api.securityscorecards.dev/projects/github.com/sourcegraph/sourcegraph">
-        <img src="https://img.shields.io/ossf-scorecard/github.com/sourcegraph/sourcegraph?label=openssf%20scorecard" alt="Scorecard" />
-    </a>
-    <a href="https://github.com/sourcegraph/sourcegraph/releases/">
-        <img src="https://img.shields.io/github/release/sourcegraph/Sourcegraph.svg" alt="Latest release" />
-    </a>
-    <a href="https://srcgr.ph/discord">
-        <img src="https://img.shields.io/discord/969688426372825169?color=5765F2" alt="Discord" />
-    </a>
-    <a href="https://github.com/sourcegraph/sourcegraph/contributors/">
-        <img src="https://img.shields.io/github/contributors/sourcegraph/Sourcegraph.svg?color=000000" alt="Contributors" />
-    </a>
-</p>
-<br />
+[![build](https://badge.buildkite.com/00bbe6fa9986c78b8e8591cffeb0b0f2e8c4bb610d7e339ff6.svg?branch=master)](https://buildkite.com/sourcegraph/sourcegraph)
+[![code style: prettier](https://img.shields.io/badge/code_style-prettier-ff69b4.svg)](https://github.com/prettier/prettier)
 
-**Sourcegraph makes it easy to read, write, and fix code—even in big, complex codebases.**
+This project contains the source code and issue tracker for the Sourcegraph open-source
+server. Sourcegraph's goal is to make it so everyone, in every community, in every country, and in
+every industry can create products using the best technology.
 
-- **Code search:** Search all of your repositories across all branches and all code hosts.
-- **Code intelligence:** Navigate code, find references, see code owners, trace history, and more.
-- **Fix and refactor:** Roll out large-scale changes to many repositories at once and track big migrations.
+**Want to get Sourcegraph up and running with minimal fuss?** [Check out the
+Quickstart page][quickstart]. (The instructions on this page are for people who
+want to contribute to the Sourcegraph project, and are much more involved.)
 
-## Getting started
+[quickstart]: https://about.sourcegraph.com/docs
 
-- [Use Sourcegraph on the cloud or self-hosted](https://sourcegraph.com/docs/)
-- [Sourcegraph.com public code search](https://sourcegraph.com/search)
+**Can't get Sourcegraph to behave?** [Report an issue][report-issue] here or
+contact support@sourcegraph.com for one-on-one assistance.
 
-<br><br>
+**Want to suggest a new feature?** Create an issue on the
+[issues repository](/sourcegraph/issues).
 
-<img src="https://sourcegraph.com/home/banner.png" />
+**Want to report an error/bug?** You are in the right place, [report an issue on
+this project's issue tracker][report-issue].
 
-## Development
+[report-issue]: https://github.com/sourcegraph/sourcegraph/issues
 
-Refer to the [Developing Sourcegraph guide](https://docs-legacy.sourcegraph.com/dev) to get started.
+**Want to contribute to this project?** [Learn how to set up a local dev
+environment, start the Sourcegraph server, and run
+tests](./docs/local-development).
 
-### Documentation
+## Code of Conduct
 
-The `doc` directory has additional documentation for developing and understanding Sourcegraph:
+All interactions with the Sourcegraph open source project are governed by the
+[Sourcegraph Code of Conduct](./docs/conduct.md).
 
-- [Project FAQ](./doc/admin/faq.md)
-- [Architecture](./doc/dev/background-information/architecture/index.md): high-level architecture
-- [Database setup](./doc/dev/background-information/postgresql.md): database best practices
-- [Go style guide](./doc/dev/background-information/languages/go.md)
-- [Documentation style guide](https://handbook.sourcegraph.com/engineering/product_documentation)
-- [GraphQL API](./doc/api/graphql/index.md): useful tips when modifying the GraphQL API
-- [Contributing](./CONTRIBUTING.md)
+## Documentation
 
-## License
+The `docs` folder has a number of useful documents for getting started with this
+project.
 
-This repository contains primarily non-OSS-licensed files. See [LICENSE](LICENSE).
+- [Local development](./docs/local-development.md): **set up your development environment,** build, test, etc.
+- [Architecture](./docs/architecture.md): high-level architecture
+- [Database setup](./docs/storage.md): database setup and best practices
+- [Style guide](./docs/style.md)
+- [GraphQL API](./docs/api.md): useful tips when modifying the GraphQL API
 
-Copyright (c) 2018-present Sourcegraph Inc.
+> Note: this is the repository for the Sourcegraph open-source server.
+> If you are considering purchasing Sourcegraph for your company, go to
+> https://about.sourcegraph.com or email sales@sourcegraph.com to get in touch.

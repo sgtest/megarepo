@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	ct "github.com/daviddengcn/go-colortext"
+	"github.com/daviddengcn/go-colortext"
 )
 
 type clogger struct {
@@ -41,7 +41,7 @@ func (l *clogger) writeBuffers(line []byte) {
 	fmt.Printf("%s %*s | ", now, maxProcNameLength, l.proc)
 	ct.ResetColor()
 	l.buffers = append(l.buffers, line)
-	_, _ = l.buffers.WriteTo(os.Stdout)
+	l.buffers.WriteTo(os.Stdout)
 	l.buffers = l.buffers[0:0]
 	mutex.Unlock()
 }
@@ -87,6 +87,7 @@ func (l *clogger) writeLines() {
 			tick = nil
 		}
 	}
+
 }
 
 // write handler of logger.

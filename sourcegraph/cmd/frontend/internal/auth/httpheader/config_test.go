@@ -3,31 +3,28 @@ package httpheader
 import (
 	"testing"
 
-	"github.com/sourcegraph/sourcegraph/internal/conf"
+	"github.com/sourcegraph/sourcegraph/pkg/conf"
 	"github.com/sourcegraph/sourcegraph/schema"
 )
 
 func TestValidateCustom(t *testing.T) {
 	tests := map[string]struct {
-		input        conf.Unified
-		wantProblems conf.Problems
+		input        schema.SiteConfiguration
+		wantProblems []string
 	}{
-		"single": {
-			input: conf.Unified{SiteConfiguration: schema.SiteConfiguration{
-				AuthProviders: []schema.AuthProviders{
-					{HttpHeader: &schema.HTTPHeaderAuthProvider{Type: "http-header"}},
-				},
-			}},
-			wantProblems: nil,
-		},
 		"multiple": {
-			input: conf.Unified{SiteConfiguration: schema.SiteConfiguration{
+			input: schema.SiteConfiguration{
+				ExperimentalFeatures: &schema.ExperimentalFeatures{MultipleAuthProviders: "enabled"},
 				AuthProviders: []schema.AuthProviders{
 					{HttpHeader: &schema.HTTPHeaderAuthProvider{Type: "http-header"}},
 					{HttpHeader: &schema.HTTPHeaderAuthProvider{Type: "http-header"}},
 				},
-			}},
-			wantProblems: conf.NewSiteProblems("at most 1"),
+			},
+			wantProblems: []string{"at most 1"},
+		},
+		"deprecated auth.userIdentityHTTPHeader": {
+			input:        schema.SiteConfiguration{AuthUserIdentityHTTPHeader: "x"},
+			wantProblems: []string{"must set auth.provider", "auth.userIdentityHTTPHeader is deprecated"},
 		},
 	}
 	for name, test := range tests {

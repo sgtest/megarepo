@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
+#/bin/bash
 
 set -e
 
-docker exec -it "$(docker ps -aq -f name=phabricator$)" sh -c "cd /opt/bitnami/phabricator && bin/phd restart"
+docker exec -it $(docker ps -aq -f name=phabricator$) sh -c "cd /opt/bitnami/phabricator && bin/phd restart"

@@ -1,11 +1,9 @@
 package graphqlbackend
 
-import (
-	"github.com/sourcegraph/sourcegraph/internal/gitserver/gitdomain"
-)
+import "github.com/sourcegraph/sourcegraph/pkg/vcs/git"
 
 type gitSubmoduleResolver struct {
-	submodule gitdomain.Submodule
+	submodule git.Submodule
 }
 
 func (r *gitSubmoduleResolver) URL() string {

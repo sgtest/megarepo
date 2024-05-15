@@ -1,16 +1,17 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"strings"
 
-	"github.com/inconshreveable/log15" //nolint:logging // TODO move all logging to sourcegraph/log
 	"github.com/kr/text"
+	log15 "gopkg.in/inconshreveable/log15.v2"
 
-	"github.com/sourcegraph/sourcegraph/internal/env"
-	"github.com/sourcegraph/sourcegraph/internal/sysreq"
+	"github.com/sourcegraph/sourcegraph/pkg/env"
+	"github.com/sourcegraph/sourcegraph/pkg/sysreq"
+
+	"context"
 )
 
 const skipSysReqsEnvVar = "SRC_SKIP_REQS"

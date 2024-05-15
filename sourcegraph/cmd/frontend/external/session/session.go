@@ -1,14 +1,10 @@
-// Package session exports symbols from frontend/internal/session. See the
-// parent package godoc for more information.
 package session
 
-import "github.com/sourcegraph/sourcegraph/internal/session"
+import "github.com/sourcegraph/sourcegraph/cmd/frontend/internal/session"
 
 var (
-	ResetMockSessionStore   = session.ResetMockSessionStore
-	SetActor                = session.SetActor
-	SetActorFromUser        = session.SetActorFromUser
-	SetData                 = session.SetData
-	GetData                 = session.GetData
-	InvalidateSessionsByIDs = session.InvalidateSessionsByIDs
+	ResetMockSessionStore = session.ResetMockSessionStore
+	SetActor              = session.SetActor
+	SetData               = session.SetData
+	GetData               = session.GetData
 )

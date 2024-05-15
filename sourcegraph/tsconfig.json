@@ -1,34 +1,25 @@
 {
-  "extends": "./tsconfig.base.json",
-  "references": [
-    { "path": "client/template-parser" },
-    { "path": "client/build-config" },
-    { "path": "client/common" },
-    { "path": "client/shared" },
-    { "path": "client/shared/src/testing" },
-    { "path": "client/http-client" },
-    { "path": "client/branded" },
-    { "path": "client/web" },
-    { "path": "client/wildcard" },
-    { "path": "client/web/src/end-to-end" },
-    { "path": "client/web/src/regression" },
-    { "path": "client/web/src/integration" },
-    { "path": "client/browser" },
-    { "path": "client/browser/src/integration" },
-    { "path": "client/extension-api" },
-    { "path": "client/extension-api-types" },
-    { "path": "client/storybook" },
-    { "path": "client/testing" },
-    { "path": "schema" },
-    { "path": "client/codeintellify" },
-    { "path": "client/client-api" },
-    {
-      "path": "client/vscode"
-    },
-    { "path": "client/jetbrains" },
-    { "path": "client/observability-client" },
-    { "path": "client/observability-server" },
-    { "path": "client/cody-shared" },
-    { "path": "client/cody-ui" }
-  ]
+  "extends": "./node_modules/@sourcegraph/tsconfig/tsconfig.json",
+  "compilerOptions": {
+    "target": "es2017",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "typeRoots": ["./node_modules/@types", "./src/types"],
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "lib": ["es2017", "es2017.object", "dom", "dom.iterable"],
+    "jsx": "react",
+    "sourceMap": true,
+    "noEmit": true,
+    "downlevelIteration": true,
+    "skipLibCheck": true,
+    "noErrorTruncation": true,
+    "importHelpers": true,
+    "plugins": [
+      {
+        "name": "tslint-language-service"
+      }
+    ]
+  },
+  "include": ["src/**/*", "./*.ts"]
 }

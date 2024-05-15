@@ -2,85 +2,47 @@ package graphqlbackend
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sort"
 	"sync"
-	"time"
 
-	"github.com/graph-gophers/graphql-go"
-
-	"github.com/sourcegraph/log"
-
+	graphql "github.com/graph-gophers/graphql-go"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/db"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/graphqlbackend/graphqlutil"
-	"github.com/sourcegraph/sourcegraph/internal/actor"
-	"github.com/sourcegraph/sourcegraph/internal/auth"
-	"github.com/sourcegraph/sourcegraph/internal/authz"
-	"github.com/sourcegraph/sourcegraph/internal/conf"
-	"github.com/sourcegraph/sourcegraph/internal/database"
-	"github.com/sourcegraph/sourcegraph/internal/dotcom"
-	"github.com/sourcegraph/sourcegraph/lib/errors"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/authz"
+	"github.com/sourcegraph/sourcegraph/pkg/actor"
+	"github.com/sourcegraph/sourcegraph/pkg/conf"
 )
 
 type createAccessTokenInput struct {
-	User            graphql.ID
-	Scopes          []string
-	Note            string
-	DurationSeconds *int32
+	User   graphql.ID
+	Scopes []string
+	Note   string
 }
 
 func (r *schemaResolver) CreateAccessToken(ctx context.Context, args *createAccessTokenInput) (*createAccessTokenResult, error) {
-	// 🚨 SECURITY: Creating access tokens for any user by site admins is not
-	// allowed on Sourcegraph.com. This check is mostly the defense for a
-	// misconfiguration of the site configuration.
-	if dotcom.SourcegraphDotComMode() && conf.AccessTokensAllow() == conf.AccessTokensAdmin {
-		return nil, errors.Errorf("access token configuration value %q is disabled on Sourcegraph.com", conf.AccessTokensAllow())
-	}
-
+	// 🚨 SECURITY: Only site admins and the user can create an access token for a user.
 	userID, err := UnmarshalUserID(args.User)
 	if err != nil {
+		return nil, err
+	}
+	if err := backend.CheckSiteAdminOrSameUser(ctx, userID); err != nil {
 		return nil, err
 	}
 
 	switch conf.AccessTokensAllow() {
 	case conf.AccessTokensAll:
-		// 🚨 SECURITY: Only the current logged in user should be able to create a token
-		// for themselves. A site admin should NOT be allowed to do this since they could
-		// then use the token to impersonate a user and gain access to their private
-		// code.
-		if err := auth.CheckSameUser(ctx, userID); err != nil {
-			return nil, err
-		}
+		// Allow
 	case conf.AccessTokensAdmin:
-		// 🚨 SECURITY: The site has opted in to only allow site admins to create access
-		// tokens. In this case, they can create a token for any user.
-		if err := auth.CheckCurrentUserIsSiteAdmin(ctx, r.db); err != nil {
+		if err := backend.CheckCurrentUserIsSiteAdmin(ctx); err != nil {
 			return nil, errors.New("Access token creation has been restricted to admin users. Contact an admin user to create a new access token.")
 		}
 	case conf.AccessTokensNone:
+		fallthrough
 	default:
 		return nil, errors.New("Access token creation is disabled. Contact an admin user to enable.")
-	}
-
-	var expiresAt time.Time
-	if args.DurationSeconds != nil {
-		_, allowedOptions := conf.AccessTokensExpirationOptions()
-		maxDuration, err := getMaxExpiryDuration(allowedOptions)
-		if err != nil {
-			return nil, err
-		}
-
-		switch duration := *args.DurationSeconds; {
-		case duration <= 0:
-			return nil, errors.New("expiry must be in the future")
-		case duration > maxDuration:
-			return nil, errors.New("expiry exceeds maximum allowed")
-		default:
-			expiresAt = time.Now().Add(time.Duration(duration) * time.Second)
-		}
-	}
-
-	if expiresAt.IsZero() && !conf.AccessTokensAllowNoExpiration() {
-		return nil, errors.New("Access token creation requires a valid expiration.")
 	}
 
 	// Validate scopes.
@@ -93,38 +55,23 @@ func (r *schemaResolver) CreateAccessToken(ctx context.Context, args *createAcce
 			hasUserAllScope = true
 		case authz.ScopeSiteAdminSudo:
 			// 🚨 SECURITY: Only site admins may create a token with the "site-admin:sudo" scope.
-			if err := auth.CheckCurrentUserIsSiteAdmin(ctx, r.db); err != nil {
+			if err := backend.CheckCurrentUserIsSiteAdmin(ctx); err != nil {
 				return nil, err
-			} else if dotcom.SourcegraphDotComMode() {
-				return nil, errors.Errorf("creation of access tokens with scope %q is disabled on Sourcegraph.com", authz.ScopeSiteAdminSudo)
 			}
 		default:
-			return nil, errors.Errorf("unknown access token scope %q (valid scopes: %q)", scope, authz.AllScopes)
+			return nil, fmt.Errorf("unknown access token scope %q (valid scopes: %q)", scope, authz.AllScopes)
 		}
 
 		if _, seen := seenScope[scope]; seen {
-			return nil, errors.Errorf("access token scope %q may not be specified multiple times", scope)
+			return nil, fmt.Errorf("access token scope %q may not be specified multiple times", scope)
 		}
 		seenScope[scope] = struct{}{}
 	}
 	if !hasUserAllScope {
-		return nil, errors.Errorf("all access tokens must have scope %q", authz.ScopeUserAll)
+		return nil, fmt.Errorf("all access tokens must have scope %q", authz.ScopeUserAll)
 	}
 
-	uid := actor.FromContext(ctx).UID
-	id, token, err := r.db.AccessTokens().Create(ctx, userID, args.Scopes, args.Note, uid, expiresAt)
-	if err != nil {
-		return nil, err
-	}
-	logger := r.logger.Scoped("CreateAccessToken").
-		With(log.Int32("userID", uid))
-
-	if conf.CanSendEmail() {
-		if err := backend.NewUserEmailsService(r.db, logger).SendUserEmailOnAccessTokenChange(ctx, userID, args.Note, false); err != nil {
-			logger.Warn("Failed to send email to inform user of access token creation", log.Error(err))
-		}
-	}
-
+	id, token, err := db.AccessTokens.Create(ctx, userID, args.Scopes, args.Note, actor.FromContext(ctx).UID)
 	return &createAccessTokenResult{id: marshalAccessTokenID(id), token: token}, err
 }
 
@@ -149,69 +96,36 @@ func (r *schemaResolver) DeleteAccessToken(ctx context.Context, args *deleteAcce
 		return nil, errors.New("exactly one of byID or byToken must be specified")
 	}
 
-	var token *database.AccessToken
+	var token *db.AccessToken
+	var err error
 	switch {
 	case args.ByID != nil:
 		accessTokenID, err := unmarshalAccessTokenID(*args.ByID)
 		if err != nil {
 			return nil, err
 		}
-		t, err := r.db.AccessTokens().GetByID(ctx, accessTokenID)
+		token, err = db.AccessTokens.GetByID(ctx, accessTokenID)
 		if err != nil {
 			return nil, err
 		}
-		token = t
 
 		// 🚨 SECURITY: Only site admins and the user can delete a user's access token.
-		if err := auth.CheckSiteAdminOrSameUser(ctx, r.db, token.SubjectUserID); err != nil {
+		if err := backend.CheckSiteAdminOrSameUser(ctx, token.SubjectUserID); err != nil {
 			return nil, err
 		}
-		// 🚨 SECURITY: Only Sourcegraph Operator (SOAP) users can delete a
-		// Sourcegraph Operator's access token. If actor is not token owner,
-		// and they aren't a SOAP user, make sure the token owner is not a
-		// SOAP user.
-		if a := actor.FromContext(ctx); a.UID != token.SubjectUserID && !a.SourcegraphOperator {
-			tokenOwnerExtAccounts, err := r.db.UserExternalAccounts().List(ctx,
-				database.ExternalAccountsListOptions{UserID: token.SubjectUserID})
-			if err != nil {
-				return nil, errors.Wrap(err, "list external accounts for token owner")
-			}
-			for _, acct := range tokenOwnerExtAccounts {
-				// If the delete target is a SOAP user, then this non-SOAP user
-				// cannot delete its tokens.
-				if acct.ServiceType == auth.SourcegraphOperatorProviderType {
-					return nil, errors.Newf("%[1]q user %[2]d's token cannot be deleted by a non-%[1]q user",
-						auth.SourcegraphOperatorProviderType, token.SubjectUserID)
-				}
-			}
-		}
-
-		if err := r.db.AccessTokens().DeleteByID(ctx, token.ID); err != nil {
+		if err := db.AccessTokens.DeleteByID(ctx, token.ID, token.SubjectUserID); err != nil {
 			return nil, err
 		}
 
 	case args.ByToken != nil:
-		t, err := r.db.AccessTokens().GetByToken(ctx, *args.ByToken)
-		if err != nil {
-			return nil, err
-		}
-		token = t
-
 		// 🚨 SECURITY: This is easier than the ByID case because anyone holding the access token's
 		// secret value is assumed to be allowed to delete it.
-		if err := r.db.AccessTokens().DeleteByToken(ctx, *args.ByToken); err != nil {
+		if err := db.AccessTokens.DeleteByToken(ctx, *args.ByToken); err != nil {
 			return nil, err
 		}
-
 	}
-
-	logger := r.logger.Scoped("DeleteAccessToken").
-		With(log.Int32("userID", token.SubjectUserID))
-
-	if conf.CanSendEmail() {
-		if err := backend.NewUserEmailsService(r.db, logger).SendUserEmailOnAccessTokenChange(ctx, token.SubjectUserID, token.Note, true); err != nil {
-			logger.Warn("Failed to send email to inform user of access token deletion", log.Error(err))
-		}
+	if err != nil {
+		return nil, err
 	}
 
 	return &EmptyResponse{}, nil
@@ -220,28 +134,27 @@ func (r *schemaResolver) DeleteAccessToken(ctx context.Context, args *deleteAcce
 func (r *siteResolver) AccessTokens(ctx context.Context, args *struct {
 	graphqlutil.ConnectionArgs
 }) (*accessTokenConnectionResolver, error) {
-	// 🚨 SECURITY: Only site admins can list all access tokens. This is safe as the
-	// token values themselves are not stored in our database.
-	if err := auth.CheckCurrentUserIsSiteAdmin(ctx, r.db); err != nil {
+	// 🚨 SECURITY: Only site admins can list all access tokens.
+	if err := backend.CheckCurrentUserIsSiteAdmin(ctx); err != nil {
 		return nil, err
 	}
 
-	var opt database.AccessTokensListOptions
+	var opt db.AccessTokensListOptions
 	args.ConnectionArgs.Set(&opt.LimitOffset)
-	return &accessTokenConnectionResolver{db: r.db, opt: opt}, nil
+	return &accessTokenConnectionResolver{opt: opt}, nil
 }
 
 func (r *UserResolver) AccessTokens(ctx context.Context, args *struct {
 	graphqlutil.ConnectionArgs
 }) (*accessTokenConnectionResolver, error) {
 	// 🚨 SECURITY: Only site admins and the user can list a user's access tokens.
-	if err := auth.CheckSiteAdminOrSameUser(ctx, r.db, r.user.ID); err != nil {
+	if err := backend.CheckSiteAdminOrSameUser(ctx, r.user.ID); err != nil {
 		return nil, err
 	}
 
-	opt := database.AccessTokensListOptions{SubjectUserID: r.user.ID}
+	opt := db.AccessTokensListOptions{SubjectUserID: r.user.ID}
 	args.ConnectionArgs.Set(&opt.LimitOffset)
-	return &accessTokenConnectionResolver{db: r.db, opt: opt}, nil
+	return &accessTokenConnectionResolver{opt: opt}, nil
 }
 
 // accessTokenConnectionResolver resolves a list of access tokens.
@@ -249,16 +162,15 @@ func (r *UserResolver) AccessTokens(ctx context.Context, args *struct {
 // 🚨 SECURITY: When instantiating an accessTokenConnectionResolver value, the caller MUST check
 // permissions.
 type accessTokenConnectionResolver struct {
-	opt database.AccessTokensListOptions
+	opt db.AccessTokensListOptions
 
 	// cache results because they are used by multiple fields
 	once         sync.Once
-	accessTokens []*database.AccessToken
+	accessTokens []*db.AccessToken
 	err          error
-	db           database.DB
 }
 
-func (r *accessTokenConnectionResolver) compute(ctx context.Context) ([]*database.AccessToken, error) {
+func (r *accessTokenConnectionResolver) compute(ctx context.Context) ([]*db.AccessToken, error) {
 	r.once.Do(func() {
 		opt2 := r.opt
 		if opt2.LimitOffset != nil {
@@ -267,7 +179,7 @@ func (r *accessTokenConnectionResolver) compute(ctx context.Context) ([]*databas
 			opt2.Limit++ // so we can detect if there is a next page
 		}
 
-		r.accessTokens, r.err = r.db.AccessTokens().List(ctx, opt2)
+		r.accessTokens, r.err = db.AccessTokens.List(ctx, opt2)
 	})
 	return r.accessTokens, r.err
 }
@@ -277,19 +189,16 @@ func (r *accessTokenConnectionResolver) Nodes(ctx context.Context) ([]*accessTok
 	if err != nil {
 		return nil, err
 	}
-	if r.opt.LimitOffset != nil && len(accessTokens) > r.opt.LimitOffset.Limit {
-		accessTokens = accessTokens[:r.opt.LimitOffset.Limit]
-	}
 
 	var l []*accessTokenResolver
 	for _, accessToken := range accessTokens {
-		l = append(l, &accessTokenResolver{db: r.db, accessToken: *accessToken})
+		l = append(l, &accessTokenResolver{accessToken: *accessToken})
 	}
 	return l, nil
 }
 
 func (r *accessTokenConnectionResolver) TotalCount(ctx context.Context) (int32, error) {
-	count, err := r.db.AccessTokens().Count(ctx, r.opt)
+	count, err := db.AccessTokens.Count(ctx, r.opt)
 	return int32(count), err
 }
 
@@ -299,17 +208,4 @@ func (r *accessTokenConnectionResolver) PageInfo(ctx context.Context) (*graphqlu
 		return nil, err
 	}
 	return graphqlutil.HasNextPage(r.opt.LimitOffset != nil && len(accessTokens) > r.opt.Limit), nil
-}
-
-func getMaxExpiryDuration(allowedOptionsInDays []int) (int32, error) {
-	if len(allowedOptionsInDays) == 0 {
-		return 0, errors.New("no expiry options available")
-	}
-	var maxDays int = 0
-	for _, v := range allowedOptionsInDays {
-		if v > maxDays {
-			maxDays = v
-		}
-	}
-	return int32(maxDays * 86400), nil
 }

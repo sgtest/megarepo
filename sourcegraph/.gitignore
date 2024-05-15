@@ -1,17 +1,8 @@
-# Temporary directory for whatever you want
-.tmp/
-
-# Bazel
-/bazel-*
-.bazelrc-nix
-build_event_log.bin
+/vagrant_ansible_inventory_default
+/.vagrant
 
 # Vim
 *.swp
-
-# JetBrains/IntelliJ
-.idea
-.graphqlconfig
 
 # Emacs
 *~
@@ -25,9 +16,6 @@ build_event_log.bin
 *.o
 *.a
 *.so
-
-# C
-*.dylib
 
 # Mac OS X
 .DS_Store
@@ -47,8 +35,7 @@ grapher/ruby/rubysonar/target
 grapher/ruby/rubysonar/dependency-reduced-pom.xml
 grapher/ruby/yard/.bundle
 npm-debug.log
-pnpm-error.log
-pnpm-debug.log
+yarn-error.log
 .codemod.bookmark
 .elasticbeanstalk/
 
@@ -56,9 +43,25 @@ pnpm-debug.log
 
 /cmd/frontend/internal/graphqlbackend/node_modules
 
+/ui/artifacts
+/ui/node_modules
+/ui/assets/_goTemplates.js
+/ui/assets/analytics.js
+/ui/assets/bundle.js
+/ui/assets/bundle.css
+/ui/assets/sourcebox.js
+/ui/assets/sourcebox.css
+/ui/assets/test.js
+/ui/assets/test.css
+/ui/assets/vs
+/ui/assets/*.html
+/ui/assets/*.map
+/ui/.tmp
 *.json.actual
 
 eb-bundle.zip
+
+/cmd/frontend/internal/app/assets/distassets_vfsdata.go
 
 /release/
 
@@ -73,113 +76,25 @@ eb-bundle.zip
 *.sublime-workspace
 
 .bin/
-.env
-
-/vendor/
 
 .gtm/
 
+cmd/src/debug
 cmd/gitserver/debug
+cmd/indexer/debug
 
-# Client
-node_modules
+/dev/e2e/log.html
+/.gtm/
+
+# Web
+node_modules/
 package-lock.json
 .nyc_output/
 coverage/
 out/
-client/shared/src/schema/*.d.ts
+src/backend/graphqlschema.ts
+src/schema/*
 puppeteer/
 package-lock.json
-dist/
+/dist
 sourcegraph-webapp-*.tgz
-*.tsbuildinfo
-graphql-operations.ts
-*.module.scss.d.ts
-*.module.css.d.ts
-dll-bundle
-
-# Direnv
-.envrc
-.direnv
-
-# Docker images
-docker-images/prometheus/config/prometheus_targets.yml
-
-comment.txt
-
-.eslintcache
-storybook-static/
-
-# Certificates
-*.pem
-*.crt
-
-# tilt files
-/dev/tilt/generated-cluster
-/dev/tilt/tilt-watch-targets
-
-# sonarqube
-.scannerwork
-
-# sg command specific things, see ./dev/sg
-sg.config.overwrite.yaml
-# sg Google Cloud API OAuth token
-.sg.token.json
-
-# Lighthouse CI reports
-.lighthouseci/
-
-# Trivy security vulnerability reports
-*-security-report.html
-
-# CI annotations
-.annotate
-.annotate.lock
-annotations/
-.buildevent_file
-
-# Buildkite analytics files
-test-reports/
-
-# CI linter cache (used only in CI)
-.golangci-lint-cache
-
-# go workspace files shouldn't be committed
-go.work
-go.work.sum
-
-# binary
-/sg
-
-# SCIP
-index.scip
-
-# Buildkite helper and cache files
-/an
-/tr
-/cache-*.tar
-
-# Backward compatibility database tests patch, generated on the fly in CI
-# for `bazel test @sourcegraph_back_compat//...` targets.
-/dev/backcompat/back_compat_migrations.patch
-
-# Generated on CI only
-.aspect/bazelrc/ci.generated.bazelrc
-
-# nix
-/result
-/result-*
-
-# Windows
-/cmd/sourcegraph/__debug_bin.exe
-
-# For locally building and testing shared packages from the sourcegraph/cody repository on
-# the web client.
-/cody
-
-/playwright
-
-# JUnit execution reports
-junit.xml
-
-/enterprise/

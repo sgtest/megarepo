@@ -1,76 +1,20 @@
 {
+  "typescript.tsdk": "./node_modules/typescript/lib",
+  "tslint.nodePath": "./node_modules",
   "search.exclude": {
     "**/node_modules": true,
     "**/bower_components": true,
     "dist": true,
-    "ui/assets/": true,
-    "ui/assets/*.go": false,
-    "client/browser/build": true,
-    "**/out": true,
-    "**/__fixtures__/**": true,
-    "**/.cache": true,
-    "**/.nyc_output": true,
-    "doc/_resources/assets": true,
-    "**/.eslintcache": true,
-    "bazel*/**": true
-  },
-  "files.exclude": {
-    "**/*.scss.d.ts": true
+    "ui/assets": true
   },
   "files.associations": {
-    "**/dev/critical-config.json": "jsonc",
-    "**/dev/site-config.json": "jsonc",
-    "**/.mocharc.json": "jsonc"
+    "**/dev/config.json": "jsonc"
   },
   "json.schemas": [
     {
-      "fileMatch": ["dev/critical-config.json"],
-      "url": "/schema/critical/critical.schema.json"
-    },
-    {
-      "fileMatch": ["dev/site-config.json"],
+      "fileMatch": ["dev/config.json"],
       "url": "/schema/site.schema.json"
     }
   ],
-  "editor.formatOnSave": true,
-  "go.useLanguageServer": true,
-  "gopls": {
-    "build.allowImplicitNetworkAccess": true,
-    "local": "github.com/sourcegraph/sourcegraph"
-  },
-  "npm.packageManager": "pnpm",
-  "npm.runSilent": true,
-  "typescript.preferences.quoteStyle": "single",
-  "typescript.preferences.importModuleSpecifier": "relative",
-  "typescript.format.semicolons": "remove",
-  "typescript.tsc.autoDetect": "off",
-  "typescript.tsdk": "node_modules/typescript/lib",
-  "eslint.lintTask.enable": false,
-  "eslint.validate": ["javascript", "javascriptreact", "typescript", "typescriptreact"],
-  "editor.codeActionsOnSave": {},
-  "eslint.codeActionsOnSave.mode": "problems",
-  "eslint.options": {
-    "cache": true
-  },
-  "eslint.workingDirectories": ["./client/*"],
-  "go.lintTool": "golangci-lint",
-  "shellformat.flag": "-i 2 -ci",
-  "vscode-graphql.useSchemaFileDefinitions": true,
-  "nixEnvSelector.nixFile": "${workspaceRoot}/shell.nix",
-  "nix.enableLanguageServer": true,
-  "[nix]": {
-    "editor.insertSpaces": true,
-    "editor.tabSize": 2
-  },
-  "files.watcherExclude": {
-    "**/target": true
-  },
-  "[typescriptreact]": {
-    "editor.defaultFormatter": "esbenp.prettier-vscode"
-  },
-  "[typescript]": {
-    "editor.defaultFormatter": "esbenp.prettier-vscode"
-  },
-  "cody.codebase": "github.com/sourcegraph/sourcegraph",
-  "rust-analyzer.linkedProjects": ["docker-images/syntax-highlighter/Cargo.toml"]
+  "editor.formatOnSave": true
 }

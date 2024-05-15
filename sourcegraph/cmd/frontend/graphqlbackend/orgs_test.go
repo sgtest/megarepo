@@ -1,27 +1,26 @@
 package graphqlbackend
 
 import (
+	"context"
 	"testing"
 
-	"github.com/sourcegraph/sourcegraph/internal/database/dbmocks"
-	"github.com/sourcegraph/sourcegraph/internal/types"
+	"github.com/graph-gophers/graphql-go/gqltesting"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/db"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
 )
 
 func TestOrgs(t *testing.T) {
-	users := dbmocks.NewMockUserStore()
-	users.GetByCurrentAuthUserFunc.SetDefaultReturn(&types.User{SiteAdmin: true}, nil)
-
-	orgs := dbmocks.NewMockOrgStore()
-	orgs.ListFunc.SetDefaultReturn([]*types.Org{{Name: "org1"}, {Name: "org2"}}, nil)
-	orgs.CountFunc.SetDefaultReturn(2, nil)
-
-	db := dbmocks.NewMockDB()
-	db.UsersFunc.SetDefaultReturn(users)
-	db.OrgsFunc.SetDefaultReturn(orgs)
-
-	RunTests(t, []*Test{
+	resetMocks()
+	db.Mocks.Users.GetByCurrentAuthUser = func(context.Context) (*types.User, error) {
+		return &types.User{SiteAdmin: true}, nil
+	}
+	db.Mocks.Orgs.List = func(ctx context.Context, opt *db.OrgsListOptions) ([]*types.Org, error) {
+		return []*types.Org{{Name: "org1"}, {Name: "org2"}}, nil
+	}
+	db.Mocks.Orgs.Count = func(context.Context, db.OrgsListOptions) (int, error) { return 2, nil }
+	gqltesting.RunTests(t, []*gqltesting.Test{
 		{
-			Schema: mustParseGraphQLSchema(t, db),
+			Schema: GraphQLSchema,
 			Query: `
 				{
 					organizations {

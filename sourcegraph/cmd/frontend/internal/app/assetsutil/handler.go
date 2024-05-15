@@ -1,23 +1,23 @@
-// Package assetsutil is a utils package for static files.
 package assetsutil
 
 import (
+	"log"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 
-	"github.com/shurcooL/httpgzip"
-
-	"github.com/sourcegraph/sourcegraph/internal/conf"
-	"github.com/sourcegraph/sourcegraph/ui/assets"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/assets"
+	"github.com/sourcegraph/sourcegraph/pkg/env"
+	"github.com/sqs/httpgzip"
 )
 
-// NewAssetHandler creates the static asset handler. The handler should be wrapped into a middleware
-// that enables cross-origin requests to allow the loading of the Phabricator native extension assets.
-func NewAssetHandler(mux *http.ServeMux) http.Handler {
-	fs := httpgzip.FileServer(assets.Provider.Assets(), httpgzip.FileServerOptions{DisableDirListing: true})
+// Mount mounts the static asset handler.
+func Mount(mux *http.ServeMux) {
+	const urlPathPrefix = "/.assets"
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	fs := httpgzip.FileServer(assets.Assets, httpgzip.FileServerOptions{})
+	mux.Handle(urlPathPrefix+"/", http.StripPrefix(urlPathPrefix, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Kludge to set proper MIME type. Automatic MIME detection somehow detects text/xml under
 		// circumstances that couldn't be reproduced
 		if filepath.Ext(r.URL.Path) == ".svg" {
@@ -29,13 +29,6 @@ func NewAssetHandler(mux *http.ServeMux) http.Handler {
 			w.Header().Set("Content-Type", "application/javascript")
 		}
 
-		// Allow extensionHostFrame to be rendered in an iframe on trusted origins
-		corsOrigin := conf.Get().CorsOrigin
-		if filepath.Base(r.URL.Path) == "extensionHostFrame.html" && corsOrigin != "" {
-			w.Header().Set("Content-Security-Policy", "frame-ancestors "+corsOrigin)
-			w.Header().Set("X-Frame-Options", "allow-from "+corsOrigin)
-		}
-
 		// Only cache if the file is found. This avoids a race
 		// condition during deployment where a 404 for a
 		// not-fully-propagated asset can get cached by Cloudflare and
@@ -44,7 +37,7 @@ func NewAssetHandler(mux *http.ServeMux) http.Handler {
 		//
 		// Assets is backed by in-memory byte arrays, so this is a
 		// cheap operation.
-		f, err := assets.Provider.Assets().Open(r.URL.Path)
+		f, err := assets.Assets.Open(r.URL.Path)
 		if f != nil {
 			defer f.Close()
 		}
@@ -52,14 +45,33 @@ func NewAssetHandler(mux *http.ServeMux) http.Handler {
 			if isPhabricatorAsset(r.URL.Path) {
 				w.Header().Set("Cache-Control", "max-age=300, public")
 			} else {
-				w.Header().Set("Cache-Control", "immutable, max-age=31536000, public")
+				w.Header().Set("Cache-Control", "max-age=25200, public")
 			}
 		}
 
 		fs.ServeHTTP(w, r)
-	})
+	})))
+}
+
+var assetsRoot = env.Get("ASSETS_ROOT", "/.assets", "URL to web assets")
+
+func init() {
+	var err error
+	baseURL, err = url.Parse(assetsRoot)
+	if err != nil {
+		log.Fatalln("Parsing ASSETS_ROOT failed:", err)
+	}
 }
 
 func isPhabricatorAsset(path string) bool {
-	return strings.Contains(path, "phabricator.bundle.js")
+	if strings.Contains(path, "phabricator.bundle.js") {
+		return true
+	}
+	if strings.Contains(path, "sgdev.bundle.sj") {
+		return true
+	}
+	if strings.Contains(path, "umami.bundle.sj") {
+		return true
+	}
+	return false
 }

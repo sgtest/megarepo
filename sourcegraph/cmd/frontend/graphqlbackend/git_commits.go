@@ -2,102 +2,60 @@ package graphqlbackend
 
 import (
 	"context"
-	"strconv"
 	"sync"
 
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/graphqlbackend/graphqlutil"
-	"github.com/sourcegraph/sourcegraph/internal/database"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver/gitdomain"
-	"github.com/sourcegraph/sourcegraph/lib/errors"
-	"github.com/sourcegraph/sourcegraph/lib/pointers"
+	"github.com/sourcegraph/sourcegraph/pkg/vcs/git"
 )
 
 type gitCommitConnectionResolver struct {
-	db              database.DB
-	gitserverClient gitserver.Client
-	revisionRange   string
+	revisionRange string
 
 	first  *int32
 	query  *string
 	path   *string
-	follow bool
 	author *string
+	after  *string
 
-	// after corresponds to --after in the git log / git rev-spec commands. Not to be confused with
-	// "after" when used as an offset for pagination. For pagination we use "offset" as the name of
-	// the field. See next field.
-	after       *string
-	afterCursor *string
-	before      *string
-
-	repo *RepositoryResolver
+	repo *repositoryResolver
 
 	// cache results because it is used by multiple fields
 	once    sync.Once
-	commits []*gitdomain.Commit
+	commits []*git.Commit
 	err     error
 }
 
-// afterCursorAsInt will parse the afterCursor field and return it as an int. If no value is set, it
-// will return 0. It returns a non-nil error if there are any errors in parsing the input string.
-func (r *gitCommitConnectionResolver) afterCursorAsInt() (int, error) {
-	v := pointers.DerefZero(r.afterCursor)
-	if v == "" {
-		return 0, nil
-	}
-
-	return strconv.Atoi(v)
-}
-
-func (r *gitCommitConnectionResolver) compute(ctx context.Context) ([]*gitdomain.Commit, error) {
-	do := func() ([]*gitdomain.Commit, error) {
-		n := pointers.Deref(r.first, 0)
-
-		// PERF: only request extra if we request more than one result. A
-		// common scenario is requesting the latest commit that modified a
-		// file, but many files have only been modified by the commit that
-		// created them. If we request more than one commit, we have to
-		// traverse the entire git history to find a second commit that doesn't
-		// exist, which is useless information in the case that we only want
-		// the latest commit anyways.
-		//
-		// NOTE: in a world where we can view which fields were requested (our
-		// GraphQL library doesn't currently support this), we could make this
-		// conditional on whether `hasNextPage` was part of the request.
-		if n > 1 {
-			n += 1
+func (r *gitCommitConnectionResolver) compute(ctx context.Context) ([]*git.Commit, error) {
+	do := func() ([]*git.Commit, error) {
+		var n int32
+		if r.first != nil {
+			n = *r.first
+			n++ // fetch +1 additional result so we can determine if a next page exists
 		}
-
-		// If no value for afterCursor is set, then skip is 0. And this is fine as --skip=0 is the
-		// same as not setting the flag.
-		afterCursor, err := r.afterCursorAsInt()
-		if err != nil {
-			return []*gitdomain.Commit{}, errors.Wrap(err, "failed to parse afterCursor")
+		var query string
+		if r.query != nil {
+			query = *r.query
 		}
-
-		// Make sure the range revisions exist, in case the browser extension makes
-		// a request for a diff of a newly pushed PR.
-		_, err = r.gitserverClient.ResolveRevision(
-			ctx,
-			r.repo.RepoName(),
-			r.revisionRange,
-			gitserver.ResolveRevisionOptions{EnsureRevision: true},
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to resolve revision range")
+		var path string
+		if r.path != nil {
+			path = *r.path
 		}
-
-		return r.gitserverClient.Commits(ctx, r.repo.RepoName(), gitserver.CommitsOptions{
+		var author string
+		if r.author != nil {
+			author = *r.author
+		}
+		var after string
+		if r.after != nil {
+			after = *r.after
+		}
+		return git.Commits(ctx, backend.CachedGitRepo(r.repo.repo), git.CommitsOptions{
 			Range:        r.revisionRange,
 			N:            uint(n),
-			MessageQuery: pointers.DerefZero(r.query),
-			Author:       pointers.DerefZero(r.author),
-			After:        pointers.DerefZero(r.after),
-			Skip:         uint(afterCursor),
-			Before:       pointers.DerefZero(r.before),
-			Path:         pointers.DerefZero(r.path),
-			Follow:       r.follow,
+			MessageQuery: query,
+			Author:       author,
+			After:        after,
+			Path:         path,
 		})
 	}
 
@@ -105,7 +63,7 @@ func (r *gitCommitConnectionResolver) compute(ctx context.Context) ([]*gitdomain
 	return r.commits, r.err
 }
 
-func (r *gitCommitConnectionResolver) Nodes(ctx context.Context) ([]*GitCommitResolver, error) {
+func (r *gitCommitConnectionResolver) Nodes(ctx context.Context) ([]*gitCommitResolver, error) {
 	commits, err := r.compute(ctx)
 	if err != nil {
 		return nil, err
@@ -116,28 +74,12 @@ func (r *gitCommitConnectionResolver) Nodes(ctx context.Context) ([]*GitCommitRe
 		commits = commits[:*r.first]
 	}
 
-	resolvers := make([]*GitCommitResolver, len(commits))
+	resolvers := make([]*gitCommitResolver, len(commits))
 	for i, commit := range commits {
-		resolvers[i] = NewGitCommitResolver(r.db, r.gitserverClient, r.repo, commit.ID, commit)
+		resolvers[i] = toGitCommitResolver(r.repo, commit)
 	}
 
 	return resolvers, nil
-}
-
-func (r *gitCommitConnectionResolver) TotalCount(ctx context.Context) (*int32, error) {
-	if r.first != nil {
-		// Return indeterminate total count if the caller requested an incomplete list of commits
-		// (which means we'd need an extra and expensive Git operation to determine the total
-		// count). This is to avoid `totalCount` taking significantly longer than `nodes` to
-		// compute, which would be unexpected to many API clients.
-		return nil, nil
-	}
-	commits, err := r.compute(ctx)
-	if err != nil {
-		return nil, err
-	}
-	n := int32(len(commits))
-	return &n, nil
 }
 
 func (r *gitCommitConnectionResolver) PageInfo(ctx context.Context) (*graphqlutil.PageInfo, error) {
@@ -146,44 +88,7 @@ func (r *gitCommitConnectionResolver) PageInfo(ctx context.Context) (*graphqluti
 		return nil, err
 	}
 
-	totalCommits := len(commits)
-	// If no limit is set, we have retrieved all the commits and there is no next page.
-	if r.first == nil {
-		return graphqlutil.HasNextPage(false), nil
-	}
-
-	limit := int(*r.first)
-
-	// In the special case that only one commit was requested, we want
-	// to always say there is a next page because we didn't request an
-	// extra to know whether there were more.
-	//
-	// NOTE: this means that `hasNextPage` can possibly incorrectly
-	// return true when only one result is requested.
-	gotSingleRequestedCommit := limit == 1 && totalCommits == limit
-
-	// If a limit is set, we attempt to fetch N+1 commits to know if there is a next page or not. If
-	// we have more than N commits then we have a next page.
-	if totalCommits > limit || gotSingleRequestedCommit {
-		// Pagination logic below.
-		//
-		// Example:
-		// Request 1: first: 100
-		// Response 1: commits: 1 to 100, endCursor: 100
-		//
-		// Request 2: first: 100, afterCursor: 100 (endCursor from previous request)
-		// Response 2: commits: 101 to 200, endCursor: 200 (first + offset)
-		//
-		// Request 3: first: 50, afterCursor: 200 (endCursor from previous request)
-		// Response 3: commits: 201 to 250, endCursor: 250 (first + offset)
-		after, err := r.afterCursorAsInt()
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to parse afterCursor")
-		}
-
-		endCursor := limit + after
-		return graphqlutil.NextPageCursor(strconv.Itoa(endCursor)), nil
-	}
-
-	return graphqlutil.HasNextPage(false), nil
+	// If we have a limit, so we rely on having fetched +1 additional result in our limit to
+	// indicate whether or not a next page exists.
+	return graphqlutil.HasNextPage(r.first != nil && len(commits) > 0 && len(commits) > int(*r.first)), nil
 }

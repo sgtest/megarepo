@@ -6,14 +6,13 @@ package router
 
 import (
 	"github.com/gorilla/mux"
-
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/routevar"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/app/envvar"
+	"github.com/sourcegraph/sourcegraph/pkg/routevar"
 )
 
 const (
-	RobotsTxt    = "robots-txt"
-	SitemapXmlGz = "sitemap-xml-gz"
-	Favicon      = "favicon"
+	RobotsTxt = "robots-txt"
+	Favicon   = "favicon"
 
 	OpenSearch = "opensearch"
 
@@ -21,34 +20,28 @@ const (
 
 	Logout = "logout"
 
-	SignIn             = "sign-in"
-	SignOut            = "sign-out"
-	SignUp             = "sign-up"
-	RequestAccess      = "request-access"
-	UnlockAccount      = "unlock-account"
-	UnlockUserAccount  = "unlock-user-account"
-	Welcome            = "welcome"
-	SiteInit           = "site-init"
-	VerifyEmail        = "verify-email"
-	ResetPasswordInit  = "reset-password.init"
-	ResetPasswordCode  = "reset-password.code"
-	CheckUsernameTaken = "check-username-taken"
+	SignIn            = "sign-in"
+	SignOut           = "sign-out"
+	SignUp            = "sign-up"
+	SiteInit          = "site-init"
+	VerifyEmail       = "verify-email"
+	ResetPasswordInit = "reset-password.init"
+	ResetPasswordCode = "reset-password.code"
 
-	UsageStatsDownload = "usage-stats.download"
-
-	OneClickExportArchive = "one-click-export.archive"
-
-	LatestPing = "pings.latest"
+	RegistryExtensionBundle = "registry.extension.bundle"
 
 	OldToolsRedirect = "old-tools-redirect"
 	OldTreeRedirect  = "old-tree-redirect"
 
-	Editor = "editor"
+	GDDORefs = "gddo.refs"
+	Editor   = "editor"
 
 	Debug        = "debug"
 	DebugHeaders = "debug.headers"
 
 	GopherconLiveBlog = "gophercon.live.blog"
+
+	GoSymbolURL = "go-symbol-url"
 
 	UI = "ui"
 )
@@ -64,26 +57,22 @@ func newRouter() *mux.Router {
 	base.StrictSlash(true)
 
 	base.Path("/robots.txt").Methods("GET").Name(RobotsTxt)
-	base.Path("/sitemap{number:(?:_(?:[0-9]+))?}.xml.gz").Methods("GET").Name(SitemapXmlGz)
 	base.Path("/favicon.ico").Methods("GET").Name(Favicon)
 	base.Path("/opensearch.xml").Methods("GET").Name(OpenSearch)
 
 	base.Path("/-/logout").Methods("GET").Name(Logout)
 
 	base.Path("/-/sign-up").Methods("POST").Name(SignUp)
-	base.Path("/-/request-access").Methods("POST").Name(RequestAccess)
-	base.Path("/-/welcome").Methods("GET").Name(Welcome)
 	base.Path("/-/site-init").Methods("POST").Name(SiteInit)
 	base.Path("/-/verify-email").Methods("GET").Name(VerifyEmail)
 	base.Path("/-/sign-in").Methods("POST").Name(SignIn)
 	base.Path("/-/sign-out").Methods("GET").Name(SignOut)
-	base.Path("/-/unlock-account").Methods("POST").Name(UnlockAccount)
-	base.Path("/-/unlock-user-account").Methods("POST").Name(UnlockUserAccount)
 	base.Path("/-/reset-password-init").Methods("POST").Name(ResetPasswordInit)
 	base.Path("/-/reset-password-code").Methods("POST").Name(ResetPasswordCode)
 
-	base.Path("/-/check-username-taken/{username}").Methods("GET").Name(CheckUsernameTaken)
+	base.Path("/-/static/extension/{RegistryExtensionReleaseFilename}").Methods("GET").Name(RegistryExtensionBundle)
 
+	base.Path("/-/godoc/refs").Methods("GET").Name(GDDORefs)
 	base.Path("/-/editor").Methods("GET").Name(Editor)
 
 	base.Path("/-/debug/headers").Methods("GET").Name(DebugHeaders)
@@ -94,18 +83,16 @@ func newRouter() *mux.Router {
 	addOldTreeRedirectRoute(base)
 	base.Path("/tools").Methods("GET").Name(OldToolsRedirect)
 
-	base.Path("/site-admin/usage-statistics/archive").Methods("GET").Name(UsageStatsDownload)
-
-	base.Path("/site-admin/data-export/archive").Methods("POST").Name(OneClickExportArchive)
-
-	base.Path("/site-admin/pings/latest").Methods("GET").Name(LatestPing)
+	if envvar.SourcegraphDotComMode() {
+		base.PathPrefix("/go/").Methods("GET").Name(GoSymbolURL)
+	}
 
 	repoPath := `/` + routevar.Repo
 	repo := base.PathPrefix(repoPath + "/" + routevar.RepoPathDelim + "/").Subrouter()
 	repo.Path("/badge.svg").Methods("GET").Name(RepoBadge)
 
 	// Must come last
-	base.PathPrefix("/").Name(UI)
+	base.PathPrefix("/").Methods("GET").Name(UI)
 
 	return base
 }

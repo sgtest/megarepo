@@ -3,24 +3,20 @@ package graphqlbackend
 import (
 	"context"
 
-	"github.com/sourcegraph/sourcegraph/internal/database"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver/gitdomain"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
+	"github.com/sourcegraph/sourcegraph/pkg/vcs/git"
 )
 
 type hunkResolver struct {
-	db   database.DB
-	repo *RepositoryResolver
-	hunk *gitdomain.Hunk
+	repo *repositoryResolver
+	hunk *git.Hunk
 }
 
 func (r *hunkResolver) Author() signatureResolver {
 	return signatureResolver{
-		person: &PersonResolver{
-			db:              r.db,
-			name:            r.hunk.Author.Name,
-			email:           r.hunk.Author.Email,
-			includeUserInfo: true,
+		person: &personResolver{
+			name:  r.hunk.Author.Name,
+			email: r.hunk.Author.Email,
 		},
 		date: r.hunk.Author.Date,
 	}
@@ -50,10 +46,10 @@ func (r *hunkResolver) Message() string {
 	return r.hunk.Message
 }
 
-func (r *hunkResolver) Commit(ctx context.Context) (*GitCommitResolver, error) {
-	return NewGitCommitResolver(r.db, gitserver.NewClient("graphql.diff.hunk"), r.repo, r.hunk.CommitID, nil), nil
-}
-
-func (r *hunkResolver) Filename() string {
-	return r.hunk.Filename
+func (r *hunkResolver) Commit(ctx context.Context) (*gitCommitResolver, error) {
+	commit, err := git.GetCommit(ctx, backend.CachedGitRepo(r.repo.repo), r.hunk.CommitID)
+	if err != nil {
+		return nil, err
+	}
+	return toGitCommitResolver(r.repo, commit), nil
 }

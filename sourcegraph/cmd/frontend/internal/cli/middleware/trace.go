@@ -1,12 +1,12 @@
 package middleware
 
 import (
-	"log" //nolint:logging // TODO move all logging to sourcegraph/log
+	"log"
 	"net/http"
 	"net/http/httputil"
 	"strconv"
 
-	"github.com/sourcegraph/sourcegraph/internal/env"
+	"github.com/sourcegraph/sourcegraph/pkg/env"
 )
 
 var httpTrace, _ = strconv.ParseBool(env.Get("HTTP_TRACE", "false", "dump HTTP requests (including body) to stderr"))

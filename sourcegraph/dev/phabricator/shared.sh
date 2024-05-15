@@ -1,8 +1,6 @@
-#!/usr/bin/env bash
+network="phabricator-tier"
+db_volume="phabricator-db-volume"
+db_container="phabricator-data"
 
-export network="phabricator-tier"
-export db_volume="phabricator-db-volume"
-export db_container="phabricator-data"
-
-export app_volume="phabricator-volume"
-export app_container="phabricator"
+app_volume="phabricator-volume"
+app_container="phabricator"

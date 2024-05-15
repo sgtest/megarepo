@@ -2,323 +2,31 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"github.com/sourcegraph/sourcegraph/internal/env"
 	"net/http"
-	"strconv"
+	"net/url"
+	"strings"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/sourcegraph/log"
-	"go.opentelemetry.io/otel/attribute"
+	log15 "gopkg.in/inconshreveable/log15.v2"
 
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/inventory"
-	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/database"
-	"github.com/sourcegraph/sourcegraph/internal/database/dbcache"
-	"github.com/sourcegraph/sourcegraph/internal/dotcom"
-	"github.com/sourcegraph/sourcegraph/internal/errcode"
-	"github.com/sourcegraph/sourcegraph/internal/extsvc"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver"
-	"github.com/sourcegraph/sourcegraph/internal/httpcli"
-	"github.com/sourcegraph/sourcegraph/internal/repoupdater"
-	"github.com/sourcegraph/sourcegraph/internal/repoupdater/protocol"
-	"github.com/sourcegraph/sourcegraph/internal/trace"
-	"github.com/sourcegraph/sourcegraph/internal/types"
-	"github.com/sourcegraph/sourcegraph/internal/vcs"
-	"github.com/sourcegraph/sourcegraph/lib/errors"
+	opentracing "github.com/opentracing/opentracing-go"
+	otlog "github.com/opentracing/opentracing-go/log"
+	"github.com/pkg/errors"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/db"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/app/envvar"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
+	"github.com/sourcegraph/sourcegraph/pkg/api"
+	"github.com/sourcegraph/sourcegraph/pkg/conf"
+	"github.com/sourcegraph/sourcegraph/pkg/env"
+	"github.com/sourcegraph/sourcegraph/pkg/gitserver"
+	"github.com/sourcegraph/sourcegraph/pkg/inventory"
+	"github.com/sourcegraph/sourcegraph/pkg/rcache"
+	"github.com/sourcegraph/sourcegraph/pkg/repoupdater"
+	"github.com/sourcegraph/sourcegraph/pkg/repoupdater/protocol"
+	"github.com/sourcegraph/sourcegraph/pkg/vcs/git"
 )
-
-type ReposService interface {
-	Get(ctx context.Context, repo api.RepoID) (*types.Repo, error)
-	GetByName(ctx context.Context, name api.RepoName) (*types.Repo, error)
-	List(ctx context.Context, opt database.ReposListOptions) ([]*types.Repo, error)
-	ListIndexable(ctx context.Context) ([]types.MinimalRepo, error)
-	GetInventory(ctx context.Context, repoName api.RepoName, commitID api.CommitID, forceEnhancedLanguageDetection bool) (*inventory.Inventory, error)
-	RecloneRepository(ctx context.Context, repoID api.RepoID) error
-	ResolveRev(ctx context.Context, repo api.RepoName, rev string) (api.CommitID, error)
-}
-
-// NewRepos uses the provided `database.DB` to initialize a new RepoService.
-//
-// NOTE: The underlying cache is reused from Repos global variable to actually
-// make cache be useful. This is mostly a workaround for now until we come up a
-// more idiomatic solution.
-func NewRepos(logger log.Logger, db database.DB, client gitserver.Client) ReposService {
-	repoStore := db.Repos()
-	logger = logger.Scoped("repos")
-	return &repos{
-		logger:          logger,
-		db:              db,
-		gitserverClient: client,
-		store:           repoStore,
-		cache:           dbcache.NewIndexableReposLister(logger, repoStore),
-	}
-}
-
-type repos struct {
-	logger          log.Logger
-	db              database.DB
-	gitserverClient gitserver.Client
-	cf              httpcli.Doer
-	store           database.RepoStore
-	cache           *dbcache.IndexableReposLister
-}
-
-func (s *repos) Get(ctx context.Context, repo api.RepoID) (_ *types.Repo, err error) {
-	if Mocks.Repos.Get != nil {
-		return Mocks.Repos.Get(ctx, repo)
-	}
-
-	ctx, done := startTrace(ctx, "Get", repo, &err)
-	defer done()
-
-	return s.store.Get(ctx, repo)
-}
-
-// GetByName retrieves the repository with the given name. It will lazy sync a repo
-// not yet present in the database under certain conditions. See repos.Syncer.SyncRepo.
-func (s *repos) GetByName(ctx context.Context, name api.RepoName) (_ *types.Repo, err error) {
-	if Mocks.Repos.GetByName != nil {
-		return Mocks.Repos.GetByName(ctx, name)
-	}
-
-	ctx, done := startTrace(ctx, "GetByName", name, &err)
-	defer done()
-
-	repo, err := s.store.GetByName(ctx, name)
-	if err == nil {
-		return repo, nil
-	}
-
-	if !errcode.IsNotFound(err) {
-		return nil, err
-	}
-
-	if errcode.IsNotFound(err) && !dotcom.SourcegraphDotComMode() {
-		// The repo doesn't exist and we're not on sourcegraph.com, we should not lazy
-		// clone it.
-		return nil, err
-	}
-
-	newName, err := s.addRepoToSourcegraphDotCom(ctx, name)
-	if err != nil {
-		return nil, err
-	}
-
-	return s.store.GetByName(ctx, newName)
-
-}
-
-// addRepoToSourcegraphDotCom adds the repository with the given name to the database by calling
-// repo-updater when in sourcegraph.com mode. It's possible that the repo has
-// been renamed on the code host in which case a different name may be returned.
-// name is assumed to not exist as a repo in the database.
-func (s *repos) addRepoToSourcegraphDotCom(ctx context.Context, name api.RepoName) (addedName api.RepoName, err error) {
-	ctx, done := startTrace(ctx, "Add", name, &err)
-	defer done()
-
-	// Avoid hitting repo-updater (and incurring a hit against our GitHub/etc. API rate
-	// limit) for repositories that don't exist or private repositories that people attempt to
-	// access.
-	codehost := extsvc.CodeHostOf(name, extsvc.PublicCodeHosts...)
-	if codehost == nil {
-		return "", &database.RepoNotFoundErr{Name: name}
-	}
-
-	// Verify repo exists and is cloneable publicly before continuing to put load
-	// on repo-updater.
-	// For package hosts, we have no good metric to figure this out at the moment.
-	if !codehost.IsPackageHost() {
-		if err := s.isGitRepoPubliclyCloneable(ctx, name); err != nil {
-			return "", err
-		}
-	}
-
-	// Looking up the repo in repo-updater makes it sync that repo to the
-	// database on sourcegraph.com if that repo is from github.com or gitlab.com
-	lookupResult, err := repoupdater.DefaultClient.RepoLookup(ctx, protocol.RepoLookupArgs{Repo: name})
-	if lookupResult != nil && lookupResult.Repo != nil {
-		return lookupResult.Repo.Name, err
-	}
-	return "", err
-}
-
-var metricIsRepoCloneable = promauto.NewCounterVec(prometheus.CounterOpts{
-	Name: "src_frontend_repo_add_is_cloneable",
-	Help: "temporary metric to measure if this codepath is valuable on sourcegraph.com",
-}, []string{"status"})
-
-// isGitRepoPubliclyCloneable checks if a git repo with the given name would be
-// cloneable without auth - ie. if sourcegraph.com could clone it with a cloud_default
-// external service. This is explicitly without any auth, so we don't consume
-// any API rate limit, since many users visit private or bogus repos.
-// We deduce the unauthenticated clone URL from the repo name by simply adding .git
-// to it.
-// Name is verified by the caller to be for either of our public cloud default
-// hosts.
-func (s *repos) isGitRepoPubliclyCloneable(ctx context.Context, name api.RepoName) error {
-	// This is on the request path, don't block for too long if upstream is struggling.
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	status := "unknown"
-	defer func() {
-		metricIsRepoCloneable.WithLabelValues(status).Inc()
-	}()
-
-	// Speak git smart protocol to check if repo exists without cloning.
-	remoteURL, err := vcs.ParseURL("https://" + string(name) + ".git/info/refs?service=git-upload-pack")
-	if err != nil {
-		// No idea how to construct a remote URL for this repo, bail.
-		return &database.RepoNotFoundErr{Name: api.RepoName(name)}
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, remoteURL.String(), nil)
-	if err != nil {
-		return errors.Wrap(err, "failed to construct request to check if repository exists")
-	}
-
-	cf := httpcli.ExternalDoer
-	if s.cf != nil {
-		cf = s.cf
-	}
-
-	resp, err := cf.Do(req)
-	if err != nil {
-		return errors.Wrap(err, "failed to check if repository exists")
-	}
-
-	// No interest in the response body.
-	_ = resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		if ctx.Err() != nil {
-			status = "timeout"
-		} else {
-			status = "fail"
-		}
-		// Not cloneable without auth.
-		return &database.RepoNotFoundErr{Name: api.RepoName(name)}
-	}
-
-	status = "success"
-
-	return nil
-}
-
-func (s *repos) List(ctx context.Context, opt database.ReposListOptions) (repos []*types.Repo, err error) {
-	if Mocks.Repos.List != nil {
-		return Mocks.Repos.List(ctx, opt)
-	}
-
-	ctx, done := startTrace(ctx, "List", opt, &err)
-	defer func() {
-		if err == nil {
-			trace.FromContext(ctx).SetAttributes(
-				attribute.Int("result.len", len(repos)),
-			)
-		}
-		done()
-	}()
-
-	return s.store.List(ctx, opt)
-}
-
-// ListIndexable calls database.ListMinimalRepos, with tracing. It lists ALL
-// indexable repos. In addition, it only lists cloned repositories.
-//
-// The intended call site for this is the logic which assigns repositories to
-// zoekt shards.
-func (s *repos) ListIndexable(ctx context.Context) (repos []types.MinimalRepo, err error) {
-	ctx, done := startTrace(ctx, "ListIndexable", nil, &err)
-	defer func() {
-		if err == nil {
-			trace.FromContext(ctx).SetAttributes(
-				attribute.Int("result.len", len(repos)),
-			)
-		}
-		done()
-	}()
-
-	if dotcom.SourcegraphDotComMode() {
-		return s.cache.List(ctx)
-	}
-
-	return s.store.ListMinimalRepos(ctx, database.ReposListOptions{
-		OnlyCloned: true,
-	})
-}
-
-var getInventoryTimeout, _ = strconv.Atoi(env.Get("GET_INVENTORY_TIMEOUT", "5", "Time in minutes before cancelling getInventory requests. Raise this if your repositories are large and need a long time to process."))
-
-func (s *repos) GetInventory(ctx context.Context, repo api.RepoName, commitID api.CommitID, forceEnhancedLanguageDetection bool) (res *inventory.Inventory, err error) {
-	if Mocks.Repos.GetInventory != nil {
-		return Mocks.Repos.GetInventory(ctx, repo, commitID)
-	}
-
-	ctx, done := startTrace(ctx, "GetInventory", map[string]any{"repo": repo, "commitID": commitID}, &err)
-	defer done()
-
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(getInventoryTimeout)*time.Minute)
-	defer cancel()
-
-	invCtx, err := InventoryContext(s.logger, repo, s.gitserverClient, commitID, forceEnhancedLanguageDetection)
-	if err != nil {
-		return nil, err
-	}
-
-	root, err := s.gitserverClient.Stat(ctx, repo, commitID, "")
-	if err != nil {
-		return nil, err
-	}
-
-	// In computing the inventory, sub-tree inventories are cached based on the OID of the Git
-	// tree. Compared to per-blob caching, this creates many fewer cache entries, which means fewer
-	// stores, fewer lookups, and less cache storage overhead. Compared to per-commit caching, this
-	// yields a higher cache hit rate because most trees are unchanged across commits.
-	inv, err := invCtx.Entries(ctx, root)
-	if err != nil {
-		return nil, err
-	}
-	return &inv, nil
-}
-
-func (s *repos) RecloneRepository(ctx context.Context, repoID api.RepoID) (err error) {
-	if Mocks.Repos.RecloneRepository != nil {
-		return Mocks.Repos.RecloneRepository(ctx, repoID)
-	}
-
-	repo, err := s.Get(ctx, repoID)
-	if err != nil {
-		return errors.Wrap(err, fmt.Sprintf("error while fetching repo with ID %d", repoID))
-	}
-
-	ctx, done := startTrace(ctx, "RecloneRepository", repoID, &err)
-	defer done()
-
-	return repoupdater.DefaultClient.RecloneRepository(ctx, repo.Name)
-}
-
-// ResolveRev will return the absolute commit for a commit-ish spec in a repo.
-// If no rev is specified, HEAD is used.
-// Error cases:
-// * Repo does not exist: gitdomain.RepoNotExistError
-// * Commit does not exist: gitdomain.RevisionNotFoundError
-// * Empty repository: gitdomain.RevisionNotFoundError
-// * The user does not have permission: errcode.IsNotFound
-// * Other unexpected errors.
-func (s *repos) ResolveRev(ctx context.Context, repo api.RepoName, rev string) (commitID api.CommitID, err error) {
-	if Mocks.Repos.ResolveRev != nil {
-		return Mocks.Repos.ResolveRev(ctx, repo, rev)
-	}
-
-	ctx, done := startTrace(ctx, "ResolveRev", map[string]any{"repo": repo, "rev": rev}, &err)
-	defer done()
-
-	return s.gitserverClient.ResolveRevision(ctx, repo, rev, gitserver.ResolveRevisionOptions{EnsureRevision: true})
-}
 
 // ErrRepoSeeOther indicates that the repo does not exist on this server but might exist on an external Sourcegraph
 // server.
@@ -329,4 +37,212 @@ type ErrRepoSeeOther struct {
 
 func (e ErrRepoSeeOther) Error() string {
 	return fmt.Sprintf("repo not found at this location, but might exist at %s", e.RedirectURL)
+}
+
+var Repos = &repos{}
+
+type repos struct{}
+
+func (s *repos) Get(ctx context.Context, repo api.RepoID) (_ *types.Repo, err error) {
+	if Mocks.Repos.Get != nil {
+		return Mocks.Repos.Get(ctx, repo)
+	}
+
+	ctx, done := trace(ctx, "Repos", "Get", repo, &err)
+	defer done()
+
+	return db.Repos.Get(ctx, repo)
+}
+
+// GetByURI retrieves the repository with the given URI. If the URI refers to a repository on a known external
+// service (such as a code host) that is not yet present in the database, it will automatically look up the
+// repository externally and add it to the database before returning it.
+func (s *repos) GetByURI(ctx context.Context, uri api.RepoURI) (_ *types.Repo, err error) {
+	if Mocks.Repos.GetByURI != nil {
+		return Mocks.Repos.GetByURI(ctx, uri)
+	}
+
+	ctx, done := trace(ctx, "Repos", "GetByURI", uri, &err)
+	defer done()
+
+	repo, err := db.Repos.GetByURI(ctx, uri)
+	if err != nil && envvar.SourcegraphDotComMode() {
+		// Automatically add repositories on Sourcegraph.com.
+		if err := s.Add(ctx, uri); err != nil {
+			return nil, err
+		}
+		return db.Repos.GetByURI(ctx, uri)
+	} else if err != nil {
+		if !conf.GetTODO().DisablePublicRepoRedirects && strings.HasPrefix(strings.ToLower(string(uri)), "github.com/") {
+			return nil, ErrRepoSeeOther{RedirectURL: (&url.URL{
+				Scheme:   "https",
+				Host:     "sourcegraph.com",
+				Path:     string(uri),
+				RawQuery: url.Values{"utm_source": []string{conf.DeployType()}}.Encode(),
+			}).String()}
+		}
+		return nil, err
+	}
+
+	return repo, nil
+}
+
+// Add adds the repository with the given URI. The URI is mapped to a repository by consulting the
+// repo-updater, which contains information about all configured code hosts and the URIs that they
+// handle.
+func (s *repos) Add(ctx context.Context, uri api.RepoURI) (err error) {
+	if Mocks.Repos.Add != nil {
+		return Mocks.Repos.Add(uri)
+	}
+
+	ctx, done := trace(ctx, "Repos", "Add", uri, &err)
+	defer done()
+
+	// Avoid hitting the repoupdater (and incurring a hit against our GitHub/etc. API rate
+	// limit) for repositories that don't exist or private repositories that people attempt to
+	// access.
+	if gitserverRepo := quickGitserverRepo(uri); gitserverRepo != nil {
+		if err := gitserver.DefaultClient.IsRepoCloneable(ctx, *gitserverRepo); err != nil {
+			return err
+		}
+	}
+
+	// Try to look up and add the repo.
+	result, err := repoupdater.DefaultClient.RepoLookup(ctx, protocol.RepoLookupArgs{Repo: uri})
+	if err != nil {
+		return err
+	}
+	if result.Repo != nil {
+		// Allow anonymous users on Sourcegraph.com to enable repositories just by visiting them, but
+		// everywhere else, require server admins to explicitly enable repositories.
+		enableAutoAddedRepos := envvar.SourcegraphDotComMode()
+		if err := s.Upsert(ctx, api.InsertRepoOp{
+			URI:          result.Repo.URI,
+			Description:  result.Repo.Description,
+			Fork:         result.Repo.Fork,
+			Archived:     result.Repo.Archived,
+			Enabled:      enableAutoAddedRepos,
+			ExternalRepo: result.Repo.ExternalRepo,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *repos) Upsert(ctx context.Context, op api.InsertRepoOp) error {
+	return db.Repos.Upsert(ctx, op)
+}
+
+// DEPRECATED: TryInsertNewBatch should be removed after the deprecated
+// serveGitoliteUpdateReposDeprecated function is removed.
+func (s *repos) TryInsertNewBatch(ctx context.Context, repos []api.InsertRepoOp) error {
+	return db.Repos.TryInsertNewBatch(ctx, repos)
+}
+
+func (s *repos) List(ctx context.Context, opt db.ReposListOptions) (repos []*types.Repo, err error) {
+	if Mocks.Repos.List != nil {
+		return Mocks.Repos.List(ctx, opt)
+	}
+
+	ctx, done := trace(ctx, "Repos", "List", opt, &err)
+	defer func() {
+		if err == nil {
+			span := opentracing.SpanFromContext(ctx)
+			span.LogFields(otlog.Int("result.len", len(repos)))
+		}
+		done()
+	}()
+
+	return db.Repos.List(ctx, opt)
+}
+
+var inventoryCache = rcache.New("inv")
+
+func (s *repos) GetInventory(ctx context.Context, repo *types.Repo, commitID api.CommitID) (res *inventory.Inventory, err error) {
+	if Mocks.Repos.GetInventory != nil {
+		return Mocks.Repos.GetInventory(ctx, repo, commitID)
+	}
+
+	ctx, done := trace(ctx, "Repos", "GetInventory", map[string]interface{}{"repo": repo.URI, "commitID": commitID}, &err)
+	defer done()
+
+	// Cap GetInventory operation to some reasonable time.
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+
+	if !git.IsAbsoluteRevision(string(commitID)) {
+		return nil, errors.Errorf("non-absolute CommitID for Repos.GetInventory: %v", commitID)
+	}
+
+	// Try cache first
+	cacheKey := fmt.Sprintf("%s:%s", repo.URI, commitID)
+	if b, ok := inventoryCache.Get(cacheKey); ok {
+		var inv inventory.Inventory
+		if err := json.Unmarshal(b, &inv); err == nil {
+			return &inv, nil
+		}
+		log15.Warn("Repos.GetInventory failed to unmarshal cached JSON inventory", "repo", repo.URI, "commitID", commitID, "err", err)
+	}
+
+	// Not found in the cache, so compute it.
+	inv, err := s.GetInventoryUncached(ctx, repo, commitID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Store inventory in cache.
+	b, err := json.Marshal(inv)
+	if err != nil {
+		return nil, err
+	}
+	inventoryCache.Set(cacheKey, b)
+
+	return inv, nil
+}
+
+func (s *repos) GetInventoryUncached(ctx context.Context, repo *types.Repo, commitID api.CommitID) (res *inventory.Inventory, err error) {
+	if Mocks.Repos.GetInventoryUncached != nil {
+		return Mocks.Repos.GetInventoryUncached(ctx, repo, commitID)
+	}
+
+	ctx, done := trace(ctx, "Repos", "GetInventoryUncached", map[string]interface{}{"repo": repo.URI, "commitID": commitID}, &err)
+	defer done()
+
+	files, err := git.ReadDir(ctx, CachedGitRepo(repo), commitID, "", true)
+	if err != nil {
+		return nil, err
+	}
+	return inventory.Get(ctx, files)
+}
+
+var indexerAddr = env.Get("SRC_INDEXER", "indexer:3179", "The address of the indexer service.")
+
+func (s *repos) RefreshIndex(ctx context.Context, repo *types.Repo) (err error) {
+	if Mocks.Repos.RefreshIndex != nil {
+		return Mocks.Repos.RefreshIndex(ctx, repo)
+	}
+
+	if !repo.Enabled {
+		return nil
+	}
+
+	ctx, done := trace(ctx, "Repos", "RefreshIndex", map[string]interface{}{"repo": repo.URI}, &err)
+	defer done()
+
+	// make staticcheck happy about "this value of ctx is never used (SA4006)". Not
+	// using _ in the actual assignment above in case someone forgets to use it
+	// when ctx is used below.
+	_ = ctx
+
+	go func() {
+		resp, err := http.Get("http://" + indexerAddr + "/refresh?repo=" + string(repo.URI))
+		if err != nil {
+			log15.Error("RefreshIndex failed", "error", err)
+			return
+		}
+		resp.Body.Close()
+	}()
+
+	return nil
 }

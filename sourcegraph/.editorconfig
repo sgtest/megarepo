@@ -1,3 +1,4 @@
+
 root = true
 
 [*]
@@ -11,23 +12,8 @@ indent_size = 4
 [*.go]
 indent_style = tab
 
-[{*.kt,*.java,*.kts,*.lua,*.js,*.jsx,*.json,*.yml,*.yaml,*.md,.babelrc,.stylelintrc,*.proto}]
+[{*.js,*.json,*.yml,*.md,.babelrc,.stylelintrc}]
 indent_size = 2
 
 [*.md]
 trim_trailing_whitespace = false
-
-[{*.sh, *.bash}]
-indent_style = space
-indent_size = 2
-switch_case_indent = true
-
-[**/node_modules/**]
-ignore = true
-
-# shfmt shouldn't format third-party script codecov.sh
-[dev/ci/codecov.sh]
-ignore = true
-
-[*.nix]
-indent_size = 2

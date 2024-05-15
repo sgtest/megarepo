@@ -1,8 +1,6 @@
 package jscontext
 
-import (
-	"testing"
-)
+import "testing"
 
 func TestIsBot(t *testing.T) {
 	tests := map[string]bool{

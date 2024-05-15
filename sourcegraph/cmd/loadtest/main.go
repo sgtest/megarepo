@@ -4,15 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/sourcegraph/log"
-
-	"github.com/sourcegraph/sourcegraph/internal/env"
-	"github.com/sourcegraph/sourcegraph/internal/sanitycheck"
-	"github.com/sourcegraph/sourcegraph/lib/errors"
+	"github.com/sourcegraph/sourcegraph/pkg/env"
+	log15 "gopkg.in/inconshreveable/log15.v2"
 )
 
 var (
@@ -27,13 +25,8 @@ type GQLSearchVars struct {
 }
 
 func main() {
-	sanitycheck.Pass()
-
-	log.Init(log.Resource{Name: "loadtest"})
-	logger := log.Scoped("loadtest")
-
-	if err := run(logger); err != nil {
-		logger.Fatal("run failed", log.Error(err))
+	if err := run(); err != nil {
+		log.Fatal(err)
 	}
 }
 
@@ -41,7 +34,7 @@ func frontendURL(thePath string) string {
 	return fmt.Sprintf("%s:%s%s", FrontendHost, FrontendPort, thePath)
 }
 
-func run(logger log.Logger) error {
+func run() error {
 	var searchQueries []GQLSearchVars
 	if err := json.Unmarshal([]byte(SearchQueriesEnv), &searchQueries); err != nil {
 		return err
@@ -53,7 +46,7 @@ func run(logger log.Logger) error {
 	}
 
 	if len(searchQueries) == 0 {
-		logger.Warn("No search queries specified. Hanging indefinitely")
+		log.Printf("No search queries specified. Hanging indefinitely")
 		select {}
 	}
 
@@ -61,48 +54,46 @@ func run(logger log.Logger) error {
 	for {
 		for _, v := range searchQueries {
 			<-ticker.C
-			go func() {
-				if count, err := search(v); err != nil {
-					logger.Error("Error issuing search query", log.String("query", v.Query), log.Error(err))
-				} else {
-					logger.Info("Search results", log.String("query", v.Query), log.Int("matchCount", count))
+			go func(v GQLSearchVars) (err error) {
+				defer func() {
+					if err != nil {
+						log15.Error("Error issuing search query", "query", v.Query, "error", err)
+					}
+				}()
+
+				gqlQuery := GraphQLQuery{Query: gqlSearch, Variables: v}
+				b, err := json.Marshal(gqlQuery)
+				if err != nil {
+					return fmt.Errorf("failed to marshal query: %s", err)
 				}
-			}()
+				resp, err := http.Post(frontendURL("/.api/graphql?Search"), "application/json", bytes.NewReader(b))
+				if err != nil {
+					return fmt.Errorf("response error: %s", err)
+				}
+				var res GraphQLResponseSearch
+				if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+					return fmt.Errorf("could not decode response body: %s", err)
+				}
+				log15.Info("Search results", "query", v.Query, "resultCount", len(res.Data.Search.Results.Results))
+				return nil
+			}(v)
 		}
 	}
-}
-
-func search(v GQLSearchVars) (int, error) {
-	gqlQuery := GraphQLQuery{Query: gqlSearch, Variables: v}
-	b, err := json.Marshal(gqlQuery)
-	if err != nil {
-		return 0, errors.Errorf("failed to marshal query: %s", err)
-	}
-	resp, err := http.Post(frontendURL("/.api/graphql?Search"), "application/json", bytes.NewReader(b))
-	if err != nil {
-		return 0, errors.Errorf("response error: %s", err)
-	}
-	defer resp.Body.Close()
-	var res GraphQLResponseSearch
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return 0, errors.Errorf("could not decode response body: %s", err)
-	}
-	return len(res.Data.Search.Results.Results), nil
 }
 
 type GraphQLResponseSearch struct {
 	Data struct {
 		Search struct {
 			Results struct {
-				Results []any `json:"results"`
+				Results []interface{} `json:"results"`
 			} `json:"results"`
 		} `json:"search"`
 	} `json:"data"`
 }
 
 type GraphQLQuery struct {
-	Query     string `json:"query"`
-	Variables any    `json:"variables"`
+	Query     string      `json:"query"`
+	Variables interface{} `json:"variables"`
 }
 
 const gqlSearch = `query Search(

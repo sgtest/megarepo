@@ -10,28 +10,23 @@ import (
 	"testing"
 
 	"github.com/gorilla/mux"
-
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/globals"
 	uirouter "github.com/sourcegraph/sourcegraph/cmd/frontend/internal/app/ui/router"
-	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/database/dbmocks"
-	"github.com/sourcegraph/sourcegraph/internal/dotcom"
-	"github.com/sourcegraph/sourcegraph/internal/errcode"
-	"github.com/sourcegraph/sourcegraph/internal/types"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/types"
+	"github.com/sourcegraph/sourcegraph/pkg/api"
+	"github.com/sourcegraph/sourcegraph/pkg/errcode"
 )
 
 func init() {
-	// Enable SourcegraphDotComMode for all tests in this package.
-	dotcom.MockSourcegraphDotComMode(fakeTB{}, true)
+	// Enable SourcegraphDotComMode
+	globals.AppURL = &url.URL{Scheme: "https", Host: "sourcegraph.com"}
+
+	// Reinit router
+	initRouter()
 }
 
-type fakeTB struct{}
-
-func (fakeTB) Cleanup(func()) {}
-
 func TestRouter(t *testing.T) {
-	InitRouter(dbmocks.NewMockDB())
-	router := Router()
 	tests := []struct {
 		path      string
 		wantRoute string
@@ -109,24 +104,7 @@ func TestRouter(t *testing.T) {
 			wantVars:  map[string]string{"Repo": "r", "Rev": "@v", "Path": "/d/f"},
 		},
 
-		// raw
-		{
-			path:      "/r@v/-/raw",
-			wantRoute: routeRaw,
-			wantVars:  map[string]string{"Repo": "r", "Rev": "@v", "Path": ""},
-		},
-		{
-			path:      "/r@v/-/raw/f",
-			wantRoute: routeRaw,
-			wantVars:  map[string]string{"Repo": "r", "Rev": "@v", "Path": "/f"},
-		},
-		{
-			path:      "/r@v/-/raw/d/f",
-			wantRoute: routeRaw,
-			wantVars:  map[string]string{"Repo": "r", "Rev": "@v", "Path": "/d/f"},
-		},
-
-		// sourcegraph.com redirects
+		// about.sourcegraph.com redirects
 		{
 			path:      "/about",
 			wantRoute: routeAboutSubdomain,
@@ -137,23 +115,11 @@ func TestRouter(t *testing.T) {
 			wantRoute: routeAboutSubdomain,
 			wantVars:  map[string]string{"Path": "privacy"},
 		},
-		{
-			path:      "/help/terms",
-			wantRoute: routeAboutSubdomain,
-			wantVars:  map[string]string{"Path": "help/terms"},
-		},
 
 		// sign-in
 		{
 			path:      "/sign-in",
 			wantRoute: uirouter.RouteSignIn,
-			wantVars:  map[string]string{},
-		},
-
-		// request-access
-		{
-			path:      "/request-access",
-			wantRoute: uirouter.RouteRequestAccess,
 			wantVars:  map[string]string{},
 		},
 
@@ -187,6 +153,13 @@ func TestRouter(t *testing.T) {
 			wantVars:  map[string]string{},
 		},
 
+		// legacy editor auth
+		{
+			path:      "/editor-auth",
+			wantRoute: routeLegacyEditorAuth,
+			wantVars:  map[string]string{},
+		},
+
 		// legacy login
 		{
 			path:      "/login",
@@ -207,7 +180,7 @@ func TestRouter(t *testing.T) {
 				routeMatch mux.RouteMatch
 				routeName  string
 			)
-			match := router.Match(&http.Request{Method: "GET", URL: &url.URL{Path: tst.path}}, &routeMatch)
+			match := Router().Match(&http.Request{Method: "GET", URL: &url.URL{Path: tst.path}}, &routeMatch)
 			if match {
 				routeName = routeMatch.Route.GetName()
 			}
@@ -222,11 +195,8 @@ func TestRouter(t *testing.T) {
 }
 
 func TestRouter_RootPath(t *testing.T) {
-	InitRouter(dbmocks.NewMockDB())
-	router := Router()
-
 	tests := []struct {
-		repo   api.RepoName
+		repo   api.RepoURI
 		exists bool
 	}{
 		{
@@ -248,26 +218,26 @@ func TestRouter_RootPath(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 			}
 
-			// Mock GetByName to return the proper repo not found error type.
-			backend.Mocks.Repos.GetByName = func(ctx context.Context, name api.RepoName) (*types.Repo, error) {
-				if name != tst.repo {
+			// Mock GetByURI to return the proper repo not found error type.
+			backend.Mocks.Repos.GetByURI = func(ctx context.Context, uri api.RepoURI) (*types.Repo, error) {
+				if uri != tst.repo {
 					panic("unexpected")
 				}
 				if tst.exists {
-					return &types.Repo{Name: name}, nil
+					return &types.Repo{URI: uri}, nil
 				}
 				return nil, &errcode.Mock{Message: "repo not found", IsNotFound: true}
 			}
 			// Perform a request that we expect to redirect to the about subdomain.
 			rec := httptest.NewRecorder()
 			req := &http.Request{Method: "GET", URL: &url.URL{Path: "/" + string(tst.repo)}}
-			router.ServeHTTP(rec, req)
+			Router().ServeHTTP(rec, req)
 			if !tst.exists {
 				// expecting redirect
 				if rec.Code != http.StatusTemporaryRedirect {
 					t.Fatalf("got code %v want %v", rec.Code, http.StatusTemporaryRedirect)
 				}
-				wantLoc := "https://sourcegraph.com/" + string(tst.repo)
+				wantLoc := "https://about.sourcegraph.com/" + string(tst.repo)
 				if got := rec.Header().Get("Location"); got != wantLoc {
 					t.Fatalf("got location %q want location %q", got, wantLoc)
 				}

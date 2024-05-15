@@ -2,173 +2,101 @@ package cli
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
+	"crypto/tls"
 	"fmt"
-	"log" //nolint:logging // TODO move all logging to sourcegraph/log
+	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
-	"github.com/go-logr/stdr"
-	"github.com/graph-gophers/graphql-go"
-	"github.com/graph-gophers/graphql-go/relay"
 	"github.com/keegancsmith/tmpfriend"
-	sglog "github.com/sourcegraph/log"
-	"github.com/throttled/throttled/v2"
-	"github.com/throttled/throttled/v2/store/redigostore"
-
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/enterprise"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/envvar"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/db"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/db/dbconn"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/globals"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/graphqlbackend"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/app/ui"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/app/pkg/updatecheck"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/bg"
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/httpapi"
-	oce "github.com/sourcegraph/sourcegraph/cmd/frontend/oneclickexport"
-	"github.com/sourcegraph/sourcegraph/internal/adminanalytics"
-	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/auth/userpasswd"
-	"github.com/sourcegraph/sourcegraph/internal/authz"
-	"github.com/sourcegraph/sourcegraph/internal/conf"
-	"github.com/sourcegraph/sourcegraph/internal/conf/conftypes"
-	"github.com/sourcegraph/sourcegraph/internal/conf/deploy"
-	"github.com/sourcegraph/sourcegraph/internal/database"
-	connections "github.com/sourcegraph/sourcegraph/internal/database/connections/live"
-	"github.com/sourcegraph/sourcegraph/internal/database/migration/store"
-	"github.com/sourcegraph/sourcegraph/internal/encryption/keyring"
-	"github.com/sourcegraph/sourcegraph/internal/env"
-	"github.com/sourcegraph/sourcegraph/internal/extsvc"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver"
-	"github.com/sourcegraph/sourcegraph/internal/goroutine"
-	internalgrpc "github.com/sourcegraph/sourcegraph/internal/grpc"
-	"github.com/sourcegraph/sourcegraph/internal/grpc/defaults"
-	"github.com/sourcegraph/sourcegraph/internal/highlight"
-	"github.com/sourcegraph/sourcegraph/internal/httpserver"
-	"github.com/sourcegraph/sourcegraph/internal/observation"
-	"github.com/sourcegraph/sourcegraph/internal/oobmigration"
-	"github.com/sourcegraph/sourcegraph/internal/ratelimit"
-	"github.com/sourcegraph/sourcegraph/internal/redispool"
-	"github.com/sourcegraph/sourcegraph/internal/service"
-	"github.com/sourcegraph/sourcegraph/internal/sysreq"
-	"github.com/sourcegraph/sourcegraph/internal/updatecheck"
-	"github.com/sourcegraph/sourcegraph/internal/users"
-	"github.com/sourcegraph/sourcegraph/internal/version"
-	"github.com/sourcegraph/sourcegraph/internal/version/upgradestore"
-	"github.com/sourcegraph/sourcegraph/lib/errors"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/cli/loghandlers"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/goroutine"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/pkg/discussions/mailreply"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/pkg/siteid"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/pkg/useractivity"
+	"github.com/sourcegraph/sourcegraph/pkg/conf"
+	"github.com/sourcegraph/sourcegraph/pkg/debugserver"
+	"github.com/sourcegraph/sourcegraph/pkg/env"
+	"github.com/sourcegraph/sourcegraph/pkg/processrestart"
+	"github.com/sourcegraph/sourcegraph/pkg/sysreq"
+	"github.com/sourcegraph/sourcegraph/pkg/tracer"
+	"golang.org/x/crypto/acme/autocert"
+	log15 "gopkg.in/inconshreveable/log15.v2"
 )
 
 var (
-	printLogo = env.MustGetBool("LOGO", false, "print Sourcegraph logo upon startup")
+	trace          = env.Get("SRC_LOG_TRACE", "HTTP", "space separated list of trace logs to show. Options: all, HTTP, build, github")
+	traceThreshold = env.Get("SRC_LOG_TRACE_THRESHOLD", "", "show traces that take longer than this")
 
-	httpAddr = env.Get("SRC_HTTP_ADDR", func() string {
-		if env.InsecureDev {
-			return "127.0.0.1:3080"
-		}
-		return ":3080"
-	}(), "HTTP listen address for app and HTTP API")
-	httpAddrInternal = envvar.HTTPAddrInternal
+	printLogo, _ = strconv.ParseBool(env.Get("LOGO", "false", "print Sourcegraph logo upon startup"))
 
-	// dev browser extension ID. You can find this by going to chrome://extensions
+	httpAddr         = env.Get("SRC_HTTP_ADDR", ":3080", "HTTP listen address for app and HTTP API")
+	httpsAddr        = env.Get("SRC_HTTPS_ADDR", ":3443", "HTTPS (TLS) listen address for app and HTTP API. Only used if manual tls cert and key are specified.")
+	httpAddrInternal = env.Get("SRC_HTTP_ADDR_INTERNAL", ":3090", "HTTP listen address for internal HTTP API. This should never be exposed externally, as it lacks certain authz checks.")
+
+	appURL                  = conf.GetTODO().AppURL
+	disableBrowserExtension = conf.GetTODO().DisableBrowserExtension
+
+	tlsCert = conf.GetTODO().TlsCert
+	tlsKey  = conf.GetTODO().TlsKey
+
+	// dev browser browser extension ID. You can find this by going to chrome://extensions
 	devExtension = "chrome-extension://bmfbcejdknlknpncfpeloejonjoledha"
 	// production browser extension ID. This is found by viewing our extension in the chrome store.
 	prodExtension = "chrome-extension://dgjhfomjieaadpoljlnidmbgkdffpack"
 )
 
-// InitDB initializes and returns the global database connection and sets the
-// version of the frontend in our versions table.
-func InitDB(logger sglog.Logger) (*sql.DB, error) {
-	sqlDB, err := connections.EnsureNewFrontendDB(observation.ContextWithLogger(logger, &observation.TestContext), "", "frontend")
-	if err != nil {
-		return nil, errors.Errorf("failed to connect to frontend database: %s", err)
+func configureAppURL() (*url.URL, error) {
+	var hostPort string
+	if strings.HasPrefix(httpAddr, ":") {
+		// Prepend localhost if HTTP listen addr is just a port.
+		hostPort = "127.0.0.1" + httpAddr
+	} else {
+		hostPort = httpAddr
 	}
+	if appURL == "" {
+		appURL = "http://<http-addr>"
+	}
+	appURL = strings.Replace(appURL, "<http-addr>", hostPort, -1)
 
-	if err := upgradestore.New(database.NewDB(logger, sqlDB)).UpdateServiceVersion(context.Background(), version.Version()); err != nil {
+	u, err := url.Parse(appURL)
+	if err != nil {
 		return nil, err
 	}
 
-	return sqlDB, nil
+	return u, nil
 }
-
-type LazyDebugserverEndpoint struct {
-	GlobalRateLimiterState       http.Handler
-	ListAuthzProvidersEndpoint   http.Handler
-	GitserverReposStatusEndpoint http.Handler
-}
-
-type SetupFunc func(database.DB, conftypes.UnifiedWatchable) enterprise.Services
 
 // Main is the main entrypoint for the frontend server program.
-func Main(ctx context.Context, observationCtx *observation.Context, ready service.ReadyFunc, debugserverEndpoints *LazyDebugserverEndpoint, enterpriseSetupHook SetupFunc, enterpriseMigratorHook store.RegisterMigratorsUsingConfAndStoreFactoryFunc) error {
-	logger := observationCtx.Logger
+func Main() error {
+	log.SetFlags(0)
+	log.SetPrefix("")
 
-	if err := tryAutoUpgrade(ctx, observationCtx, ready, enterpriseMigratorHook); err != nil {
-		return errors.Wrap(err, "frontend.tryAutoUpgrade")
-	}
-
-	sqlDB, err := InitDB(logger)
-	if err != nil {
-		return err
-	}
-	db := database.NewDB(logger, sqlDB)
-
-	// Used by opentelemetry logging
-	stdr.SetVerbosity(10)
-
-	if os.Getenv("SRC_DISABLE_OOBMIGRATION_VALIDATION") != "" {
-		logger.Warn("Skipping out-of-band migrations check")
-	} else {
-		outOfBandMigrationRunner := oobmigration.NewRunnerWithDB(observationCtx, db, oobmigration.RefreshInterval)
-
-		if err := outOfBandMigrationRunner.SynchronizeMetadata(ctx); err != nil {
-			return errors.Wrap(err, "failed to synchronize out of band migration metadata")
-		}
-
-		if err := oobmigration.ValidateOutOfBandMigrationRunner(ctx, db, outOfBandMigrationRunner); err != nil {
-			return errors.Wrap(err, "failed to validate out of band migrations")
-		}
-	}
-
-	userpasswd.Init()
-	highlight.Init()
-
-	// override site config first
-	if err := overrideSiteConfig(ctx, logger, db); err != nil {
-		return errors.Wrap(err, "failed to apply site config overrides")
-	}
-	globals.ConfigurationServerFrontendOnly = conf.InitConfigurationServerFrontendOnly(newConfigurationSource(logger, db))
-	conf.MustValidateDefaults()
-
-	// now we can init the keyring, as it depends on site config
-	if err := keyring.Init(ctx); err != nil {
-		return errors.Wrap(err, "failed to initialize encryption keyring")
-	}
-
-	if err := overrideGlobalSettings(ctx, logger, db); err != nil {
-		return errors.Wrap(err, "failed to override global settings")
-	}
-
-	// now the keyring is configured it's safe to override the rest of the config
-	// and that config can access the keyring
-	if err := overrideExtSvcConfig(ctx, logger, db); err != nil {
-		return errors.Wrap(err, "failed to override external service config")
-	}
-
-	// Run enterprise setup hook
-	enterpriseServices := enterpriseSetupHook(db, conf.DefaultClient())
-
-	ui.InitRouter(db)
+	// Filter trace logs
+	d, _ := time.ParseDuration(traceThreshold)
+	tracer.Init(tracer.Filter(loghandlers.Trace(strings.Fields(trace), d)))
 
 	if len(os.Args) >= 2 {
 		switch os.Args[1] {
 		case "help", "-h", "--help":
-			log.Printf("Version: %s", version.Version())
+			log.Printf("Version: %s", env.Version)
 			log.Print()
 
-			log.Print(env.HelpString())
+			env.PrintHelp()
 
 			log.Print()
-			ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			for _, st := range sysreq.Check(ctx, skippedSysReqs()) {
 				log.Printf("%s:", st.Name)
@@ -195,7 +123,7 @@ func Main(ctx context.Context, observationCtx *observation.Context, ready servic
 		}
 	}
 
-	printConfigValidation(logger)
+	printConfigValidation()
 
 	cleanup := tmpfriend.SetupOrNOOP()
 	defer cleanup()
@@ -206,256 +134,212 @@ func Main(ctx context.Context, observationCtx *observation.Context, ready servic
 		return err
 	}
 
-	globals.WatchExternalURL()
+	go debugserver.Start()
 
-	goroutine.Go(func() { bg.CheckRedisCacheEvictionPolicy() })
-	goroutine.Go(func() { bg.DeleteOldCacheDataInRedis() })
-	goroutine.Go(func() { bg.DeleteOldEventLogsInPostgres(context.Background(), logger, db) })
-	goroutine.Go(func() { bg.DeleteOldSecurityEventLogsInPostgres(context.Background(), logger, db) })
-	goroutine.Go(func() { bg.ScheduleStoreTokenUsage(ctx, db) })
-	goroutine.Go(func() { bg.UpdatePermissions(ctx, logger, db) })
-	goroutine.Go(func() { updatecheck.Start(logger, db) })
-	goroutine.Go(func() { adminanalytics.StartAnalyticsCacheRefresh(context.Background(), db) })
-	goroutine.Go(func() { users.StartUpdateAggregatedUsersStatisticsTable(context.Background(), db) })
+	if err := dbconn.ConnectToDB(""); err != nil {
+		log.Fatal(err)
+	}
 
-	schema, err := graphqlbackend.NewSchema(
-		db,
-		gitserver.NewClient("graphql.schemaresolver"),
-		[]graphqlbackend.OptionalResolver{enterpriseServices.OptionalResolver},
-	)
+	siteid.Init()
+
+	var err error
+	globals.AppURL, err = configureAppURL()
 	if err != nil {
 		return err
 	}
 
-	rateLimitWatcher, err := makeRateLimitWatcher()
-	if err != nil {
-		return err
-	}
-
-	server, err := makeExternalAPI(db, logger, schema, enterpriseServices, rateLimitWatcher)
-	if err != nil {
-		return err
-	}
-
-	internalAPI, err := makeInternalAPI(db, logger, schema, enterpriseServices, rateLimitWatcher)
-	if err != nil {
-		return err
-	}
-
-	routines := []goroutine.BackgroundRoutine{server}
-	if internalAPI != nil {
-		routines = append(routines, internalAPI)
-	}
-
-	oce.GlobalExporter = oce.NewDataExporter(db, logger)
-
-	debugserverEndpoints.GlobalRateLimiterState = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		info, err := ratelimit.GetGlobalLimiterState(r.Context())
-		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to read rate limiter state: %q", err.Error()), http.StatusInternalServerError)
-			return
-		}
-		resp, err := json.MarshalIndent(info, "", "  ")
-		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to marshal rate limiter state: %q", err.Error()), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(resp)
+	go bg.ApplyUserOrgMap(context.Background())
+	goroutine.Go(func() {
+		bg.MigrateOrgSlackWebhookURLs(context.Background())
 	})
-	debugserverEndpoints.GitserverReposStatusEndpoint = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		repo := r.FormValue("repo")
-		if repo == "" {
-			http.Error(w, "missing 'repo' param", http.StatusBadRequest)
-			return
-		}
-
-		status, err := db.GitserverRepos().GetByName(r.Context(), api.RepoName(repo))
-		if err != nil {
-			http.Error(w, fmt.Sprintf("fetching repository status: %q", err), http.StatusInternalServerError)
-			return
-		}
-
-		resp, err := json.MarshalIndent(status, "", "  ")
-		if err != nil {
-			http.Error(w, fmt.Sprintf("failed to marshal status: %q", err.Error()), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(resp)
+	goroutine.Go(func() {
+		bg.StartLangServers(context.Background())
 	})
-	debugserverEndpoints.ListAuthzProvidersEndpoint = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		type providerInfo struct {
-			ServiceType        string `json:"service_type"`
-			ServiceID          string `json:"service_id"`
-			ExternalServiceURL string `json:"external_service_url"`
-		}
+	goroutine.Go(func() { bg.MigrateExternalAccounts(context.Background()) })
+	goroutine.Go(mailreply.StartWorker)
+	go updatecheck.Start()
+	go useractivity.MigrateUserActivityData(context.Background())
 
-		_, providers := authz.GetProviders()
-		infos := make([]providerInfo, len(providers))
-		for i, p := range providers {
-			_, id := extsvc.DecodeURN(p.URN())
-
-			// Note that the ID marshalling below replicates code found in `graphqlbackend`.
-			// We cannot import that package's code into this one (see /dev/check/go-dbconn-import.sh).
-			infos[i] = providerInfo{
-				ServiceType:        p.ServiceType(),
-				ServiceID:          p.ServiceID(),
-				ExternalServiceURL: fmt.Sprintf("%s/site-admin/external-services/%s", globals.ExternalURL(), relay.MarshalID("ExternalService", id)),
-			}
-		}
-
-		resp, err := json.MarshalIndent(infos, "", "  ")
-		if err != nil {
-			http.Error(w, "failed to marshal infos: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(resp)
-	})
-
-	if printLogo {
-		// This is not a log entry and is usually disabled
-		println(fmt.Sprintf("\n\n%s\n\n", logoColor))
-	}
-	logger.Info(fmt.Sprintf("✱ Sourcegraph is ready at: %s", globals.ExternalURL()))
-	ready()
-
-	goroutine.MonitorBackgroundRoutines(context.Background(), routines...)
-	return nil
-}
-
-func makeExternalAPI(db database.DB, logger sglog.Logger, schema *graphql.Schema, enterprise enterprise.Services, rateLimiter graphqlbackend.LimitWatcher) (goroutine.BackgroundRoutine, error) {
-	listener, err := httpserver.NewListener(httpAddr)
-	if err != nil {
-		return nil, err
+	tlsCertAndKey := tlsCert != "" && tlsKey != ""
+	useTLS := httpsAddr != "" && (tlsCertAndKey || (globals.AppURL.Scheme == "https" && conf.GetTODO().TlsLetsencrypt != "off"))
+	if useTLS && globals.AppURL.Scheme == "http" {
+		log15.Warn("TLS is enabled but app url scheme is http", "appURL", globals.AppURL)
 	}
 
 	// Create the external HTTP handler.
-	externalHandler, err := newExternalHTTPHandler(
-		db,
-		schema,
-		rateLimiter,
-		&httpapi.Handlers{
-			GitHubSyncWebhook:               enterprise.ReposGithubWebhook,
-			GitLabSyncWebhook:               enterprise.ReposGitLabWebhook,
-			BitbucketServerSyncWebhook:      enterprise.ReposBitbucketServerWebhook,
-			BitbucketCloudSyncWebhook:       enterprise.ReposBitbucketCloudWebhook,
-			PermissionsGitHubWebhook:        enterprise.PermissionsGitHubWebhook,
-			BatchesGitHubWebhook:            enterprise.BatchesGitHubWebhook,
-			BatchesGitLabWebhook:            enterprise.BatchesGitLabWebhook,
-			BatchesBitbucketServerWebhook:   enterprise.BatchesBitbucketServerWebhook,
-			BatchesBitbucketCloudWebhook:    enterprise.BatchesBitbucketCloudWebhook,
-			BatchesAzureDevOpsWebhook:       enterprise.BatchesAzureDevOpsWebhook,
-			BatchesChangesFileGetHandler:    enterprise.BatchesChangesFileGetHandler,
-			BatchesChangesFileExistsHandler: enterprise.BatchesChangesFileExistsHandler,
-			BatchesChangesFileUploadHandler: enterprise.BatchesChangesFileUploadHandler,
-			SCIMHandler:                     enterprise.SCIMHandler,
-			NewCodeIntelUploadHandler:       enterprise.NewCodeIntelUploadHandler,
-			NewComputeStreamHandler:         enterprise.NewComputeStreamHandler,
-			CodeInsightsDataExportHandler:   enterprise.CodeInsightsDataExportHandler,
-			SearchJobsDataExportHandler:     enterprise.SearchJobsDataExportHandler,
-			SearchJobsLogsHandler:           enterprise.SearchJobsLogsHandler,
-			NewDotcomLicenseCheckHandler:    enterprise.NewDotcomLicenseCheckHandler,
-			NewChatCompletionsStreamHandler: enterprise.NewChatCompletionsStreamHandler,
-			NewCodeCompletionsHandler:       enterprise.NewCodeCompletionsHandler,
-		},
-		enterprise.NewExecutorProxyHandler,
-	)
+	externalHandler, err := newExternalHTTPHandler(context.Background())
 	if err != nil {
-		return nil, errors.Errorf("create external HTTP handler: %v", err)
+		return err
 	}
-	httpServer := &http.Server{
-		Handler:      externalHandler,
-		ReadTimeout:  75 * time.Second,
-		WriteTimeout: 10 * time.Minute,
-	}
-
-	server := httpserver.New(listener, httpServer, makeServerOptions()...)
-	logger.Debug("HTTP running", sglog.String("on", httpAddr))
-	return server, nil
-}
-
-func makeInternalAPI(
-	db database.DB,
-	logger sglog.Logger,
-	schema *graphql.Schema,
-	enterprise enterprise.Services,
-	rateLimiter graphqlbackend.LimitWatcher,
-) (goroutine.BackgroundRoutine, error) {
-	if httpAddrInternal == "" {
-		return nil, nil
-	}
-
-	listener, err := httpserver.NewListener(httpAddrInternal)
-	if err != nil {
-		return nil, err
-	}
-
-	grpcServer := defaults.NewServer(logger)
 
 	// The internal HTTP handler does not include the auth handlers.
-	internalHandler := newInternalHTTPHandler(
-		schema,
-		db,
-		grpcServer,
-		enterprise.NewCodeIntelUploadHandler,
-		enterprise.RankingService,
-		enterprise.NewComputeStreamHandler,
-		rateLimiter,
-	)
-	internalHandler = internalgrpc.MultiplexHandlers(grpcServer, internalHandler)
+	internalHandler := newInternalHTTPHandler()
 
-	httpServer := &http.Server{
-		Handler:     internalHandler,
-		ReadTimeout: 75 * time.Second,
-		// Higher since for internal RPCs which can have large responses
-		// (eg git archive). Should match the timeout used for git archive
-		// in gitserver.
-		WriteTimeout: time.Hour,
+	// serve will serve externalHandler on l. It additionally handles graceful restarts.
+	srv := &httpServers{}
+
+	// Start HTTPS server.
+	if useTLS {
+		var tlsConf *tls.Config
+
+		// Configure tlsConf
+		if tlsCertAndKey {
+			// Manual
+			cert, err := tls.X509KeyPair([]byte(tlsCert), []byte(tlsKey))
+			if err != nil {
+				return err
+			}
+			tlsConf = &tls.Config{
+				NextProtos:   []string{"h2", "http/1.1"},
+				Certificates: []tls.Certificate{cert},
+			}
+		} else {
+			// LetsEncrypt
+			m := &autocert.Manager{
+				Prompt:     autocert.AcceptTOS,
+				HostPolicy: autocert.HostWhitelist(globals.AppURL.Host),
+				Cache:      db.CertCache,
+			}
+			// m.TLSConfig uses m's GetCertificate as well as enabling ACME
+			// "tls-alpn-01" challenges.
+			tlsConf = m.TLSConfig()
+			// We register paths on our HTTP handler so that we can do ACME
+			// "http-01" challenges.
+			srv.SetWrapper(m.HTTPHandler)
+		}
+
+		l, err := net.Listen("tcp", httpsAddr)
+		if err != nil {
+			// Fatal if we manually specified TLS or enforce lets encrypt
+			if tlsCertAndKey || conf.GetTODO().TlsLetsencrypt == "on" {
+				log.Fatalf("Could not bind to address %s: %v", httpsAddr, err)
+			} else {
+				log15.Warn("Failed to bind to HTTPS port, TLS disabled", "address", httpsAddr, "error", err)
+			}
+		}
+
+		if l != nil {
+			l = tls.NewListener(l, tlsConf)
+			log15.Debug("HTTPS running", "on", l.Addr())
+			srv.GoServe(l, &http.Server{
+				Handler:      externalHandler,
+				ReadTimeout:  75 * time.Second,
+				WriteTimeout: 60 * time.Second,
+			})
+		}
 	}
 
-	server := httpserver.New(listener, httpServer, makeServerOptions()...)
-	logger.Debug("HTTP (internal) running", sglog.String("on", httpAddrInternal))
-	return server, nil
+	// Start HTTP server.
+	if httpAddr != "" {
+		l, err := net.Listen("tcp", httpAddr)
+		if err != nil {
+			return err
+		}
+
+		log15.Debug("HTTP running", "on", httpAddr)
+		srv.GoServe(l, &http.Server{
+			Handler:      externalHandler,
+			ReadTimeout:  75 * time.Second,
+			WriteTimeout: 60 * time.Second,
+		})
+	}
+
+	if httpAddrInternal != "" {
+		l, err := net.Listen("tcp", httpAddrInternal)
+		if err != nil {
+			return err
+		}
+
+		log15.Debug("HTTP (internal) running", "on", httpAddrInternal)
+		srv.GoServe(l, &http.Server{
+			Handler:     internalHandler,
+			ReadTimeout: 75 * time.Second,
+			// Higher since for internal RPCs which can have large responses
+			// (eg git archive). Should match the timeout used for git archive
+			// in gitserver.
+			WriteTimeout: time.Hour,
+		})
+	}
+
+	go func() {
+		<-processrestart.WillRestart
+		// Block forever so we don't return from main func and exit this process. Package processrestart takes care
+		// of killing and restarting this process externally.
+		srv.wg.Add(1)
+
+		log15.Debug("Stopping HTTP server due to imminent restart")
+		srv.Close()
+	}()
+
+	if printLogo {
+		fmt.Println(" ")
+		fmt.Println(logoColor)
+		fmt.Println(" ")
+	}
+	fmt.Printf("✱ Sourcegraph is ready at: %s\n", appURL)
+
+	srv.Wait()
+	return nil
 }
 
-func makeServerOptions() (options []httpserver.ServerOptions) {
-	if deploy.IsDeployTypeKubernetes(deploy.Type()) {
-		// On kubernetes, we want to wait an additional 5 seconds after we receive a
-		// shutdown request to give some additional time for the endpoint changes
-		// to propagate to services talking to this server like the LB or ingress
-		// controller. We only do this in frontend and not on all services, because
-		// frontend is the only publicly exposed service where we don't control
-		// retries on connection failures (see httpcli.InternalClient).
-		options = append(options, httpserver.WithPreShutdownPause(time.Second*5))
-	}
+type httpServers struct {
+	mu      sync.Mutex
+	wg      sync.WaitGroup
+	servers []*http.Server
+	wrapper func(http.Handler) http.Handler
+}
 
-	return options
+// SetWrapper will set the wrapper for serve. All handlers served by are
+// passed through w.
+func (s *httpServers) SetWrapper(w func(http.Handler) http.Handler) {
+	s.mu.Lock()
+	s.wrapper = w
+	s.mu.Unlock()
+}
+
+// GoServe serves srv in a new goroutine. If serve returns an error other than
+// http.ErrServerClosed it will fatal.
+func (s *httpServers) GoServe(l net.Listener, srv *http.Server) {
+	s.addServer(srv)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		if err := srv.Serve(l); err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+}
+
+func (s *httpServers) addServer(srv *http.Server) *http.Server {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.wrapper != nil {
+		srv.Handler = s.wrapper(srv.Handler)
+	}
+	s.servers = append(s.servers, srv)
+	return srv
+}
+
+// Close closes all servers added
+func (s *httpServers) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, srv := range s.servers {
+		srv.Close()
+	}
+	s.servers = nil
+}
+
+// Wait waits until all servers are closed.
+func (s *httpServers) Wait() {
+	s.wg.Wait()
 }
 
 func isAllowedOrigin(origin string, allowedOrigins []string) bool {
 	for _, o := range allowedOrigins {
-		if o == "*" || o == origin {
+		if o == origin {
 			return true
 		}
 	}
 	return false
-}
-
-func makeRateLimitWatcher() (*graphqlbackend.BasicLimitWatcher, error) {
-	var store throttled.GCRAStoreCtx
-	var err error
-	pool := redispool.Cache.Pool()
-	store, err = redigostore.NewCtx(pool, "gql:rl:", 0)
-	if err != nil {
-		return nil, err
-	}
-
-	return graphqlbackend.NewBasicLimitWatcher(sglog.Scoped("BasicLimitWatcher"), store), nil
-}
-
-// GetInternalAddr returns the address of the internal HTTP API server.
-func GetInternalAddr() string {
-	return httpAddrInternal
 }

@@ -2,47 +2,47 @@ package ui
 
 import (
 	"net/http"
+	"regexp"
+
+	log15 "gopkg.in/inconshreveable/log15.v2"
 
 	"github.com/gorilla/mux"
-	"github.com/inconshreveable/log15" //nolint:logging // TODO move all logging to sourcegraph/log
+	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go/ext"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-
-	"github.com/sourcegraph/log"
-
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/handlerutil"
-	"github.com/sourcegraph/sourcegraph/internal/database"
-	"github.com/sourcegraph/sourcegraph/internal/errcode"
-	"github.com/sourcegraph/sourcegraph/internal/lazyregexp"
-	"github.com/sourcegraph/sourcegraph/internal/trace"
-	"github.com/sourcegraph/sourcegraph/lib/errors"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/pkg/handlerutil"
+	"github.com/sourcegraph/sourcegraph/pkg/errcode"
 )
 
-var goSymbolReg = lazyregexp.New("/info/GoPackage/(.+)$")
+var goSymbolReg = regexp.MustCompile("/info/GoPackage/(.+)$")
 
 // serveRepoLanding simply redirects the old (sourcegraph.com/<repo>/-/info) repo landing page
 // URLs directly to the repo itself (sourcegraph.com/<repo>).
-func serveRepoLanding(db database.DB) func(http.ResponseWriter, *http.Request) error {
-	logger := log.Scoped("serveRepoLanding")
-	return func(w http.ResponseWriter, r *http.Request) error {
-		legacyRepoLandingCounter.Inc()
+func serveRepoLanding(w http.ResponseWriter, r *http.Request) error {
+	legacyRepoLandingCounter.Inc()
 
-		repo, commitID, err := handlerutil.GetRepoAndRev(r.Context(), logger, db, mux.Vars(r))
-		if err != nil {
-			if errcode.IsHTTPErrorCode(err, http.StatusNotFound) {
-				return &errcode.HTTPErr{Status: http.StatusNotFound, Err: err}
-			}
-			return errors.Wrap(err, "GetRepoAndRev")
+	repo, commitID, err := handlerutil.GetRepoAndRev(r.Context(), mux.Vars(r))
+	if err != nil {
+		if errcode.IsHTTPErrorCode(err, http.StatusNotFound) {
+			return &errcode.HTTPErr{Status: http.StatusNotFound, Err: err}
 		}
-		http.Redirect(w, r, "/"+string(repo.Name)+"@"+string(commitID), http.StatusMovedPermanently)
-		return nil
+		return errors.Wrap(err, "GetRepoAndRev")
 	}
+	http.Redirect(w, r, "/"+string(repo.URI)+"@"+string(commitID), http.StatusMovedPermanently)
+	return nil
 }
 
 func serveDefLanding(w http.ResponseWriter, r *http.Request) (err error) {
-	tr, ctx := trace.New(r.Context(), "serveDefLanding")
-	defer tr.EndWithErr(&err)
+	span, ctx := opentracing.StartSpanFromContext(r.Context(), "serveDefLanding")
 	r = r.WithContext(ctx)
+	defer func() {
+		if err != nil {
+			ext.Error.Set(span, true)
+			span.SetTag("err", err.Error())
+		}
+		span.Finish()
+	}()
 
 	legacyDefLandingCounter.Inc()
 
@@ -54,17 +54,22 @@ func serveDefLanding(w http.ResponseWriter, r *http.Request) (err error) {
 	return nil
 }
 
-var legacyDefLandingCounter = promauto.NewCounter(prometheus.CounterOpts{
+var legacyDefLandingCounter = prometheus.NewCounter(prometheus.CounterOpts{
 	Namespace: "src",
 	Name:      "legacy_def_landing_webapp",
 	Help:      "Number of times a legacy def landing page has been served.",
 })
 
-var legacyRepoLandingCounter = promauto.NewCounter(prometheus.CounterOpts{
+var legacyRepoLandingCounter = prometheus.NewCounter(prometheus.CounterOpts{
 	Namespace: "src",
 	Name:      "legacy_repo_landing_webapp",
 	Help:      "Number of times a legacy repo landing page has been served.",
 })
+
+func init() {
+	prometheus.MustRegister(legacyDefLandingCounter)
+	prometheus.MustRegister(legacyRepoLandingCounter)
+}
 
 // serveDefRedirectToDefLanding redirects from /REPO/refs/... and
 // /REPO/def/... URLs to the def landing page. Those URLs used to

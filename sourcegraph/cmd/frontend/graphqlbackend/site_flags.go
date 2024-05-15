@@ -3,73 +3,82 @@ package graphqlbackend
 import (
 	"context"
 
-	"github.com/sourcegraph/sourcegraph/cmd/frontend/envvar"
-	"github.com/sourcegraph/sourcegraph/internal/dotcom"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/internal/app/envvar"
 
-	"github.com/sourcegraph/sourcegraph/internal/auth"
-	"github.com/sourcegraph/sourcegraph/internal/conf"
-	"github.com/sourcegraph/sourcegraph/internal/database"
-	"github.com/sourcegraph/sourcegraph/internal/licensing"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/db"
+	"github.com/sourcegraph/sourcegraph/pkg/conf"
 )
 
 func (r *siteResolver) NeedsRepositoryConfiguration(ctx context.Context) (bool, error) {
-	// 🚨 SECURITY: The site alerts may contain sensitive data, so only site
-	// admins may view them.
-	if err := auth.CheckCurrentUserIsSiteAdmin(ctx, r.db); err != nil {
-		// TODO(dax): This should return err once the site flags query is fixed for users
+	if envvar.SourcegraphDotComMode() {
 		return false, nil
 	}
 
-	return needsRepositoryConfiguration(ctx, r.db)
-}
-
-func needsRepositoryConfiguration(ctx context.Context, db database.DB) (bool, error) {
-	kinds := make([]string, 0, len(database.ExternalServiceKinds))
-	for kind, config := range database.ExternalServiceKinds {
-		if config.CodeHost {
-			kinds = append(kinds, kind)
-		}
+	// 🚨 SECURITY: The site alerts may contain sensitive data, so only site
+	// admins may view them.
+	if err := backend.CheckCurrentUserIsSiteAdmin(ctx); err != nil {
+		return false, err
 	}
 
-	count, err := db.ExternalServices().Count(ctx, database.ExternalServicesListOptions{
-		Kinds: kinds,
+	return needsRepositoryConfiguration(), nil
+}
+
+func needsRepositoryConfiguration() bool {
+	cfg := conf.Get()
+	return len(cfg.Github) == 0 && len(cfg.Gitlab) == 0 && len(cfg.ReposList) == 0 && len(cfg.AwsCodeCommit) == 0 && len(cfg.Gitolite) == 0 && len(cfg.BitbucketServer) == 0
+}
+
+func (r *siteResolver) NoRepositoriesEnabled(ctx context.Context) (bool, error) {
+	if envvar.SourcegraphDotComMode() {
+		return false, nil
+	}
+
+	// 🚨 SECURITY: The site alerts may contain sensitive data, so only site
+	// admins may view them.
+	if err := backend.CheckCurrentUserIsSiteAdmin(ctx); err != nil {
+		return false, err
+	}
+
+	return noRepositoriesEnabled(ctx)
+}
+
+func noRepositoriesEnabled(ctx context.Context) (bool, error) {
+	// Fastest way to see if even a single enabled repository exists.
+	repos, err := db.Repos.List(ctx, db.ReposListOptions{
+		Enabled:     true,
+		Disabled:    false,
+		LimitOffset: &db.LimitOffset{Limit: 1},
 	})
 	if err != nil {
 		return false, err
 	}
-	return count == 0, nil
+	return len(repos) == 0, nil
+}
+
+func (*siteResolver) ExternalAuthEnabled() bool {
+	for _, p := range conf.AuthProviders() {
+		if p.Builtin == nil {
+			return true // has a non-builtin auth provider
+		}
+	}
+	return false
+}
+
+func (*siteResolver) ConfigurationNotice(ctx context.Context) bool {
+	// 🚨 SECURITY: Only the site admin cares about this. Leaking a boolean wouldn't be a security
+	// vulnerability, but just in case this method is changed to return more information, let's lock
+	// it down.
+	if err := backend.CheckCurrentUserIsSiteAdmin(ctx); err != nil {
+		return false
+	}
+
+	messages, err := conf.Validate(conf.Raw())
+	return len(messages) > 0 || err != nil
+}
+
+func (*siteResolver) DisableBuiltInSearches() bool {
+	return conf.Get().DisableBuiltInSearches
 }
 
 func (*siteResolver) SendsEmailVerificationEmails() bool { return conf.EmailVerificationRequired() }
-
-func (r *siteResolver) FreeUsersExceeded(ctx context.Context) (bool, error) {
-	if dotcom.SourcegraphDotComMode() {
-		return false, nil
-	}
-
-	info, err := getConfiguredProductLicenseInfo()
-	if err != nil {
-		return false, err
-	}
-	// Only show alert if the license is a free plan.
-	if !info.Plan.IsFreePlan() {
-		return false, nil
-	}
-
-	userCount, err := r.db.Users().Count(
-		ctx,
-		&database.UsersListOptions{
-			ExcludeSourcegraphOperators: true,
-		},
-	)
-	if err != nil {
-		return false, err
-	}
-
-	return licensing.NoLicenseWarningUserCount <= int32(userCount), nil
-}
-
-func (r *siteResolver) ExternalServicesFromFile() bool { return envvar.ExtsvcConfigFile() != "" }
-func (r *siteResolver) AllowEditExternalServicesWithFile() bool {
-	return envvar.ExtsvcConfigAllowEdits()
-}

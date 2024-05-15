@@ -1,15 +1,15 @@
 package middleware
 
 import (
+	"fmt"
 	"html/template"
-	"log" //nolint:logging // TODO move all logging to sourcegraph/log
+	"log"
 	"net/http"
 	"path"
 	"strings"
 
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/globals"
-	"github.com/sourcegraph/sourcegraph/internal/trace"
-	"github.com/sourcegraph/sourcegraph/lib/errors"
+	"github.com/sourcegraph/sourcegraph/pkg/trace"
 )
 
 // goImportMetaTag represents a go-import meta tag.
@@ -36,9 +36,9 @@ var goImportMetaTagTemplate = template.Must(template.New("").Parse(`<html><head>
 //
 // It implements the following mapping:
 //
-//  1. If the username (first path element) is "sourcegraph", consider it to be a vanity
-//     import path pointing to github.com/sourcegraph/<repo> as the clone URL.
-//  2. All other requests are served with 404 Not Found.
+// 1. If the username (first path element) is "sourcegraph", consider it to be a vanity
+//    import path pointing to github.com/sourcegraph/<repo> as the clone URL.
+// 2. All other requests are served with 404 Not Found.
 //
 // 🚨 SECURITY: This handler is served to all clients, even on private servers to clients who have
 // not authenticated. It must not reveal any sensitive information.
@@ -51,7 +51,7 @@ func SourcegraphComGoGetHandler(next http.Handler) http.Handler {
 
 		trace.SetRouteName(req, "middleware.go-get")
 		if !strings.HasPrefix(req.URL.Path, "/") {
-			err := errors.Errorf("req.URL.Path doesn't have a leading /: %q", req.URL.Path)
+			err := fmt.Errorf("req.URL.Path doesn't have a leading /: %q", req.URL.Path)
 			log.Println(err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -61,7 +61,7 @@ func SourcegraphComGoGetHandler(next http.Handler) http.Handler {
 		// It's a vanity import path that maps to "github.com/{sourcegraph,sqs}/*" clone URLs.
 		pathElements := strings.Split(req.URL.Path[1:], "/")
 		if len(pathElements) >= 2 && (pathElements[0] == "sourcegraph" || pathElements[0] == "sqs") {
-			host := globals.ExternalURL().Host
+			host := globals.AppURL.Host
 
 			user := pathElements[0]
 			repo := pathElements[1]

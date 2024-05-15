@@ -1,31 +1,18 @@
-//go:build tools
 // +build tools
 
 package main
 
 import (
-	// zoekt-* used in sourcegraph/server docker image build
-	_ "github.com/sourcegraph/zoekt/cmd/zoekt-archive-index"
-	_ "github.com/sourcegraph/zoekt/cmd/zoekt-git-index"
-	_ "github.com/sourcegraph/zoekt/cmd/zoekt-sourcegraph-indexserver"
-	_ "github.com/sourcegraph/zoekt/cmd/zoekt-webserver"
-
-	// go-mockgen is used to codegen mockable interfaces, used in precise code intel tests
-	_ "github.com/derision-test/go-mockgen/v2/cmd/go-mockgen"
-
-	// used in schema pkg
+	_ "github.com/google/zoekt/cmd/zoekt-archive-index"
+	_ "github.com/google/zoekt/cmd/zoekt-sourcegraph-indexserver"
+	_ "github.com/google/zoekt/cmd/zoekt-webserver"
+	_ "github.com/kevinburke/differ"
+	_ "github.com/kevinburke/go-bindata/go-bindata"
+	_ "github.com/mattn/goreman"
 	_ "github.com/sourcegraph/go-jsonschema/cmd/go-jsonschema-compiler"
-
-	_ "golang.org/x/tools/cmd/goimports"
-	// used in many places
+	_ "github.com/sourcegraph/godockerize"
 	_ "golang.org/x/tools/cmd/stringer"
-
-	// Used for cody-gateway to generate a GraphQL client
-	_ "github.com/Khan/genqlient"
-
-	// Used to generate schema
-	_ "chainguard.dev/apko/pkg/lock"
-	_ "github.com/pseudomuto/protoc-gen-doc"
-
-	_ "github.com/maxbrunsfeld/counterfeiter/v6"
+	_ "honnef.co/go/tools/cmd/megacheck"
+	_ "honnef.co/go/tools/cmd/staticcheck"
+	_ "honnef.co/go/tools/cmd/unused"
 )

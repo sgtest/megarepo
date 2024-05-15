@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/inconshreveable/log15" //nolint:logging // TODO move all logging to sourcegraph/log
+	"gopkg.in/inconshreveable/log15.v2"
 )
 
 func TestNotNoisey(t *testing.T) {
@@ -83,7 +83,7 @@ func TestTrace_Threshold(t *testing.T) {
 	}
 }
 
-func mkRecord(lvl log15.Lvl, msg string, ctx ...any) log15.Record {
+func mkRecord(lvl log15.Lvl, msg string, ctx ...interface{}) log15.Record {
 	return log15.Record{
 		Lvl: lvl,
 		Msg: msg,

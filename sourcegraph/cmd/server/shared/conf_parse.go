@@ -1,7 +1,7 @@
 package shared
 
 import (
-	"log" //nolint:logging // TODO move all logging to sourcegraph/log
+	"log"
 	"os"
 )
 

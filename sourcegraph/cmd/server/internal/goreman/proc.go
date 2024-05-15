@@ -1,14 +1,13 @@
 package goreman
 
 import (
-	"log" //nolint:logging // TODO move all logging to sourcegraph/log
+	"errors"
+	"log"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/sourcegraph/sourcegraph/lib/errors"
 )
 
 var (
@@ -18,9 +17,7 @@ var (
 
 // stop specified proc.
 func stopProc(proc string, kill bool) error {
-	procM.Lock()
 	p, ok := procs[proc]
-	procM.Unlock()
 	if !ok {
 		return errors.New("Unknown proc: " + proc)
 	}
@@ -52,15 +49,13 @@ func stopProc(proc string, kill bool) error {
 
 // start specified proc. if proc is started already, return nil.
 func startProc(proc string) error {
-	procM.Lock()
 	p, ok := procs[proc]
-	procM.Unlock()
 	if !ok {
 		return errors.New("Unknown proc: " + proc)
 	}
 
 	p.mu.Lock()
-	if p.cmd != nil {
+	if procs[proc].cmd != nil {
 		p.mu.Unlock()
 		return nil
 	}
@@ -71,15 +66,8 @@ func startProc(proc string) error {
 		wg.Done()
 		p.mu.Unlock()
 		if !stopped {
-			switch procDiedAction {
-			case Shutdown:
-				log.Printf("%s died. Shutting down...", proc)
-				signals <- syscall.SIGINT
-			case Ignore:
-				log.Printf("%s died.", proc)
-			default:
-				log.Fatalf("%s died. Unknown ProcDiedAction %v", proc, procDiedAction)
-			}
+			log.Printf("%s died. Shutting down...", proc)
+			signals <- syscall.SIGINT
 		}
 	}()
 	return nil
@@ -87,44 +75,40 @@ func startProc(proc string) error {
 
 // startProcs starts the processes.
 func startProcs() {
-	for _, proc := range names() {
-		_ = startProc(proc)
+	for proc := range procs {
+		startProc(proc)
 	}
 }
 
-var waitProcsOnce sync.Once
-
 // waitProcs waits for processes to complete.
 func waitProcs() error {
-	waitProcsOnce.Do(func() {
-		go func() {
-			wg.Wait()
-			signals <- syscall.SIGINT
-		}()
-		signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
-		<-signals
+	go func() {
+		wg.Wait()
+		signals <- syscall.SIGINT
+	}()
+	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	<-signals
 
-		stopped := make(chan struct{})
-		go func() {
-			stopProcs(false)
-			close(stopped)
-		}()
+	stopped := make(chan struct{})
+	go func() {
+		stopProcs(false)
+		close(stopped)
+	}()
 
-		// New signal chan to avoid built up buffered signals
-		sc2 := make(chan os.Signal, 10)
-		signal.Notify(sc2, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	// New signal chan to avoid built up buffered signals
+	sc2 := make(chan os.Signal, 10)
+	signal.Notify(sc2, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 
-		select {
-		case <-sc2:
-			// Second signal received, do a hard exit
-			stopProcs(true)
-		case <-time.NewTimer(10 * time.Second).C:
-			// 10 seconds has passed, kill
-			stopProcs(true)
-		case <-stopped:
-			// Happy case, just continue
-		}
-	})
+	select {
+	case <-sc2:
+		// Second signal received, do a hard exit
+		stopProcs(true)
+	case <-time.NewTimer(10 * time.Second).C:
+		// 10 seconds has passed, kill
+		stopProcs(true)
+	case <-stopped:
+		// Happy case, just continue
+	}
 
 	return nil
 }
@@ -133,23 +117,12 @@ func stopProcs(kill bool) {
 	// TODO we probably need a well defined order for shutting down, since
 	// something may want to finish writing to postgres for example.
 	var wg sync.WaitGroup
-	for _, proc := range names() {
+	for proc := range procs {
 		wg.Add(1)
-		go func() {
+		go func(proc string) {
 			defer wg.Done()
-			_ = stopProc(proc, kill)
-		}()
+			stopProc(proc, kill)
+		}(proc)
 	}
 	wg.Wait()
-}
-
-func names() (names []string) {
-	procM.Lock()
-	defer procM.Unlock()
-
-	for proc := range procs {
-		names = append(names, proc)
-	}
-
-	return names
 }

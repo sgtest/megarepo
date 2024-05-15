@@ -2,53 +2,44 @@ package graphqlbackend
 
 import (
 	"context"
-	"io"
-	"io/fs"
+	"os"
 	"path"
-	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/graphqlbackend/graphqlutil"
-	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/trace"
-	"github.com/sourcegraph/sourcegraph/lib/errors"
+	"github.com/sourcegraph/sourcegraph/pkg/api"
+	"github.com/sourcegraph/sourcegraph/pkg/vcs/git"
 )
 
-func (r *GitTreeEntryResolver) IsRoot() bool {
-	cleanPath := path.Clean(r.Path())
-	return cleanPath == "/" || cleanPath == "." || cleanPath == ""
+func (r *gitTreeEntryResolver) IsRoot() bool {
+	path := path.Clean(r.path)
+	return path == "/" || path == "." || path == ""
 }
 
 type gitTreeEntryConnectionArgs struct {
 	graphqlutil.ConnectionArgs
 	Recursive bool
-	// If Ancestors is true and the tree is loaded from a subdirectory, we will
-	// return a flat list of all entries in all parent directories.
-	Ancestors bool
+	// If recurseSingleChild is true, we will return a flat list of every
+	// directory and file in a single-child nest.
+	RecursiveSingleChild bool
 }
 
-func (r *GitTreeEntryResolver) Entries(ctx context.Context, args *gitTreeEntryConnectionArgs) ([]*GitTreeEntryResolver, error) {
+func (r *gitTreeEntryResolver) Entries(ctx context.Context, args *gitTreeEntryConnectionArgs) ([]*gitTreeEntryResolver, error) {
 	return r.entries(ctx, args, nil)
 }
 
-func (r *GitTreeEntryResolver) Directories(ctx context.Context, args *gitTreeEntryConnectionArgs) ([]*GitTreeEntryResolver, error) {
-	return r.entries(ctx, args, func(fi fs.FileInfo) bool { return fi.Mode().IsDir() })
+func (r *gitTreeEntryResolver) Directories(ctx context.Context, args *gitTreeEntryConnectionArgs) ([]*gitTreeEntryResolver, error) {
+	return r.entries(ctx, args, func(fi os.FileInfo) bool { return fi.Mode().IsDir() })
 }
 
-func (r *GitTreeEntryResolver) Files(ctx context.Context, args *gitTreeEntryConnectionArgs) ([]*GitTreeEntryResolver, error) {
-	return r.entries(ctx, args, func(fi fs.FileInfo) bool { return !fi.Mode().IsDir() })
+func (r *gitTreeEntryResolver) Files(ctx context.Context, args *gitTreeEntryConnectionArgs) ([]*gitTreeEntryResolver, error) {
+	return r.entries(ctx, args, func(fi os.FileInfo) bool { return !fi.Mode().IsDir() })
 }
 
-func (r *GitTreeEntryResolver) entries(ctx context.Context, args *gitTreeEntryConnectionArgs, filter func(fi fs.FileInfo) bool) (_ []*GitTreeEntryResolver, err error) {
-	tr, ctx := trace.New(ctx, "GitTreeEntryResolver.entries")
-	defer tr.EndWithErr(&err)
-
-	if args.First != nil && *args.First < 0 {
-		return nil, errors.Newf("invalid argument for first, must be non-negative")
-	}
-
-	it, err := r.gitserverClient.ReadDir(ctx, r.commit.repoResolver.RepoName(), api.CommitID(r.commit.OID()), r.Path(), args.Recursive)
+func (r *gitTreeEntryResolver) entries(ctx context.Context, args *gitTreeEntryConnectionArgs, filter func(fi os.FileInfo) bool) ([]*gitTreeEntryResolver, error) {
+	entries, err := git.ReadDir(ctx, backend.CachedGitRepo(r.commit.repo.repo), api.CommitID(r.commit.oid), r.path, r.isRecursive || args.Recursive)
 	if err != nil {
 		if strings.Contains(err.Error(), "file does not exist") { // TODO proper error value
 			// empty tree is not an error
@@ -56,79 +47,41 @@ func (r *GitTreeEntryResolver) entries(ctx context.Context, args *gitTreeEntryCo
 			return nil, err
 		}
 	}
-	defer it.Close()
-
-	entries := make([]fs.FileInfo, 0)
-
-	for {
-		entry, err := it.Next()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return nil, err
-		}
-		entries = append(entries, entry)
-	}
-
-	// When using recursive: true on gitserverClient.ReadDir, we get entries for
-	// all parent trees (directories) from git as well, so we filter those out.
-	// Ideally, we fix this in the ReadDir API, but this might have other unforseen
-	// side-effects so we will revisit that later.
-	// Example output from git for ls-tree cmd/gitserver with -r -t (recursive: true):
-	// cmd
-	// gitserver
-	// [...] files in cmd/gitserver and deeper.
-	// To drop those, we just have to drop as many entries as the level of nesting
-	// r.Path is at.
-	if args.Recursive && !r.IsRoot() {
-		entries = entries[len(strings.Split(strings.Trim(r.Path(), "/"), "/")):]
-	}
-
-	maxResolvers := len(entries)
-	if args.First != nil && int(*args.First) < maxResolvers {
-		maxResolvers = int(*args.First)
-	}
 
 	sort.Sort(byDirectory(entries))
 
-	resolvers := make([]*GitTreeEntryResolver, 0, maxResolvers)
-	for _, entry := range entries {
-		if len(resolvers) >= maxResolvers {
-			break
-		}
+	if args.First != nil && len(entries) > int(*args.First) {
+		entries = entries[:int(*args.First)]
+	}
 
-		// Apply any additional filtering
+	var prefix string
+	if r.path != "" {
+		prefix = r.path + "/"
+	}
+
+	var l []*gitTreeEntryResolver
+	for _, entry := range entries {
 		if filter == nil || filter(entry) {
-			opts := GitTreeEntryResolverOpts{
-				Commit: r.Commit(),
-				Stat:   entry,
-			}
-			resolvers = append(resolvers, NewGitTreeEntryResolver(r.db, r.gitserverClient, opts))
+			l = append(l, &gitTreeEntryResolver{
+				commit: r.commit,
+				path:   prefix + entry.Name(), // relies on git paths being cleaned already
+				stat:   entry,
+			})
 		}
 	}
 
-	if args.Ancestors && !r.IsRoot() {
-		p := r.Path()
-		p = strings.Trim(p, "/")
-		parent := NewGitTreeEntryResolver(r.db, r.gitserverClient, GitTreeEntryResolverOpts{
-			Commit: r.commit,
-			Stat:   CreateFileInfo(filepath.Dir(p), true),
-		})
-		parentEntries, err := parent.entries(ctx, &gitTreeEntryConnectionArgs{
-			Ancestors: true,
-		}, nil)
+	if !args.Recursive && args.RecursiveSingleChild && len(l) == 1 {
+		subEntries, err := l[0].entries(ctx, args, filter)
 		if err != nil {
 			return nil, err
 		}
-		resolvers = append(parentEntries, resolvers...)
+		l = append(l, subEntries...)
 	}
 
-	return resolvers, nil
+	return l, nil
 }
 
-// byDirectory implements sort.Sortable and orders directories before files.
-type byDirectory []fs.FileInfo
+type byDirectory []os.FileInfo
 
 func (s byDirectory) Len() int {
 	return len(s)

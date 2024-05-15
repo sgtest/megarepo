@@ -5,9 +5,8 @@ import (
 	"html/template"
 	"net/http"
 
-	"github.com/inconshreveable/log15" //nolint:logging // TODO move all logging to sourcegraph/log
-
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/globals"
+	log15 "gopkg.in/inconshreveable/log15.v2"
 )
 
 var openSearchDescription = template.Must(template.New("").Parse(`
@@ -26,16 +25,14 @@ func openSearch(w http.ResponseWriter, r *http.Request) {
 		BaseURL   string
 		SearchURL string
 	}
-	externalURL := globals.ExternalURL()
-	externalURLStr := externalURL.String()
 	data := vars{
-		BaseURL:   externalURLStr,
-		SearchURL: externalURLStr + "/search?q={searchTerms}",
+		BaseURL:   globals.AppURL.String(),
+		SearchURL: globals.AppURL.String() + "/search?q={searchTerms}",
 	}
-	if externalURLStr == "https://sourcegraph.com" {
+	if globals.AppURL.String() == "https://sourcegraph.com" {
 		data.SiteName = "Sourcegraph"
 	} else {
-		data.SiteName = "Sourcegraph (" + externalURL.Host + ")"
+		data.SiteName = "Sourcegraph (" + globals.AppURL.Host + ")"
 	}
 
 	var buf bytes.Buffer

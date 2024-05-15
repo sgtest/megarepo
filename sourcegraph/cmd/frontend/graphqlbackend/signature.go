@@ -3,16 +3,15 @@ package graphqlbackend
 import (
 	"time"
 
-	"github.com/sourcegraph/sourcegraph/internal/database"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver/gitdomain"
+	"github.com/sourcegraph/sourcegraph/pkg/vcs/git"
 )
 
 type signatureResolver struct {
-	person *PersonResolver
+	person *personResolver
 	date   time.Time
 }
 
-func (r signatureResolver) Person() *PersonResolver {
+func (r signatureResolver) Person() *personResolver {
 	return r.person
 }
 
@@ -20,16 +19,14 @@ func (r signatureResolver) Date() string {
 	return r.date.Format(time.RFC3339)
 }
 
-func toSignatureResolver(db database.DB, sig *gitdomain.Signature, includeUserInfo bool) *signatureResolver {
+func toSignatureResolver(sig *git.Signature) *signatureResolver {
 	if sig == nil {
 		return nil
 	}
 	return &signatureResolver{
-		person: &PersonResolver{
-			db:              db,
-			name:            sig.Name,
-			email:           sig.Email,
-			includeUserInfo: includeUserInfo,
+		person: &personResolver{
+			name:  sig.Name,
+			email: sig.Email,
 		},
 		date: sig.Date,
 	}

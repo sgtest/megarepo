@@ -2,108 +2,127 @@ package graphqlbackend
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"time"
 
+	"github.com/sourcegraph/go-langserver/pkg/lsp"
+	"github.com/sourcegraph/sourcegraph/cmd/frontend/backend"
 	"github.com/sourcegraph/sourcegraph/cmd/frontend/graphqlbackend/graphqlutil"
-	"github.com/sourcegraph/sourcegraph/internal/api"
-	"github.com/sourcegraph/sourcegraph/internal/database"
-	"github.com/sourcegraph/sourcegraph/internal/gitserver"
-	"github.com/sourcegraph/sourcegraph/internal/search/result"
-	"github.com/sourcegraph/sourcegraph/internal/search/symbol"
-	"github.com/sourcegraph/sourcegraph/internal/types"
+	"github.com/sourcegraph/sourcegraph/pkg/api"
+	"github.com/sourcegraph/sourcegraph/pkg/symbols/protocol"
+	"github.com/sourcegraph/sourcegraph/xlang/uri"
+	log15 "gopkg.in/inconshreveable/log15.v2"
 )
 
 type symbolsArgs struct {
 	graphqlutil.ConnectionArgs
-	Query           *string
-	IncludePatterns *[]string
+	Query *string
 }
 
-func (r *GitTreeEntryResolver) Symbols(ctx context.Context, args *symbolsArgs) (*symbolConnectionResolver, error) {
-	symbols, err := symbol.DefaultZoektSymbolsClient().Compute(
-		ctx,
-		types.MinimalRepo{ID: r.commit.repoResolver.id, Name: r.commit.repoResolver.name},
-		api.CommitID(r.commit.oid),
-		r.commit.inputRev,
-		args.Query,
-		args.First,
-		args.IncludePatterns,
-	)
+func (r *repositoryResolver) Symbols(ctx context.Context, args *symbolsArgs) (*symbolConnectionResolver, error) {
+	var rev string
+	if r.repo.IndexedRevision != nil {
+		rev = string(*r.repo.IndexedRevision)
+	}
+	commit, err := r.Commit(ctx, &repositoryCommitArgs{Rev: rev})
+	if err != nil {
+		return nil, err
+	}
+	symbols, err := computeSymbols(ctx, commit, args.Query, args.First)
 	if err != nil && len(symbols) == 0 {
 		return nil, err
 	}
-	return &symbolConnectionResolver{
-		symbols: symbolResultsToResolvers(r.db, r.commit, symbols),
-		first:   args.First,
-	}, nil
+	return &symbolConnectionResolver{symbols: symbols, first: args.First}, nil
 }
 
-func (r *GitTreeEntryResolver) Symbol(ctx context.Context, args *struct {
-	Line      int32
-	Character int32
-}) (*symbolResolver, error) {
-	symbolMatch, err := symbol.DefaultZoektSymbolsClient().GetMatchAtLineCharacter(
-		ctx,
-		types.MinimalRepo{ID: r.commit.repoResolver.id, Name: r.commit.repoResolver.name},
-		api.CommitID(r.commit.oid),
-		r.Path(),
-		int(args.Line),
-		int(args.Character),
-	)
-	if err != nil || symbolMatch == nil {
-		return nil, err
-	}
-	return &symbolResolver{r.db, r.commit, symbolMatch}, nil
-}
-
-func (r *GitCommitResolver) Symbols(ctx context.Context, args *symbolsArgs) (*symbolConnectionResolver, error) {
-	symbols, err := symbol.DefaultZoektSymbolsClient().Compute(
-		ctx,
-		types.MinimalRepo{ID: r.repoResolver.id, Name: r.repoResolver.name},
-		api.CommitID(r.oid),
-		r.inputRev,
-		args.Query,
-		args.First,
-		args.IncludePatterns,
-	)
+func (r *gitTreeEntryResolver) Symbols(ctx context.Context, args *symbolsArgs) (*symbolConnectionResolver, error) {
+	symbols, err := computeSymbols(ctx, r.commit, args.Query, args.First)
 	if err != nil && len(symbols) == 0 {
 		return nil, err
 	}
-	return &symbolConnectionResolver{
-		symbols: symbolResultsToResolvers(r.db, r, symbols),
-		first:   args.First,
-	}, nil
+	return &symbolConnectionResolver{symbols: symbols, first: args.First}, nil
 }
 
-func symbolResultsToResolvers(db database.DB, commit *GitCommitResolver, symbolMatches []*result.SymbolMatch) []symbolResolver {
-	symbolResolvers := make([]symbolResolver, 0, len(symbolMatches))
-	for _, symbolMatch := range symbolMatches {
-		symbolResolvers = append(symbolResolvers, toSymbolResolver(db, commit, symbolMatch))
+func (r *gitCommitResolver) Symbols(ctx context.Context, args *symbolsArgs) (*symbolConnectionResolver, error) {
+	symbols, err := computeSymbols(ctx, r, args.Query, args.First)
+	if err != nil && len(symbols) == 0 {
+		return nil, err
 	}
-	return symbolResolvers
-}
-
-func toSymbolResolver(db database.DB, commit *GitCommitResolver, sr *result.SymbolMatch) symbolResolver {
-	return symbolResolver{
-		db:          db,
-		commit:      commit,
-		SymbolMatch: sr,
-	}
+	return &symbolConnectionResolver{symbols: symbols, first: args.First}, nil
 }
 
 type symbolConnectionResolver struct {
 	first   *int32
-	symbols []symbolResolver
+	symbols []*symbolResolver
 }
 
 func limitOrDefault(first *int32) int {
 	if first == nil {
-		return symbol.DefaultSymbolLimit
+		return 100
 	}
 	return int(*first)
 }
 
-func (r *symbolConnectionResolver) Nodes(ctx context.Context) ([]symbolResolver, error) {
+func computeSymbols(ctx context.Context, commit *gitCommitResolver, query *string, first *int32) (res []*symbolResolver, err error) {
+	// TODO!(sqs): limit to path
+	ctx, done := context.WithTimeout(ctx, 5*time.Second)
+	defer done()
+	defer func() {
+		if ctx.Err() != nil && len(res) == 0 {
+			err = errors.New("processing symbols is taking longer than expected. Try again in a while")
+		}
+	}()
+	searchArgs := protocol.SearchArgs{
+		CommitID: api.CommitID(commit.oid),
+		First:    limitOrDefault(first) + 1, // add 1 so we can determine PageInfo.hasNextPage
+		Repo:     commit.repo.repo.URI,
+	}
+	if query != nil {
+		searchArgs.Query = *query
+	}
+	baseURI, err := uri.Parse("git://" + string(commit.repo.repo.URI) + "?" + string(commit.oid))
+	if err != nil {
+		return nil, err
+	}
+	symbols, err := backend.Symbols.ListTags(ctx, searchArgs)
+	if baseURI == nil {
+		return
+	}
+	resolvers := make([]*symbolResolver, 0, len(symbols))
+	for _, symbol := range symbols {
+		resolver := toSymbolResolver(symbolToLSPSymbolInformation(symbol, baseURI), strings.ToLower(symbol.Language), commit)
+		if resolver == nil {
+			continue
+		}
+		resolvers = append(resolvers, resolver)
+	}
+	return resolvers, err
+}
+
+func toSymbolResolver(symbol lsp.SymbolInformation, lang string, commitResolver *gitCommitResolver) *symbolResolver {
+	resolver := &symbolResolver{
+		symbol:   symbol,
+		language: lang,
+	}
+	uri, err := uri.Parse(string(symbol.Location.URI))
+	if err != nil {
+		log15.Warn("Omitting symbol with invalid URI from results.", "uri", symbol.Location.URI, "error", err)
+		return nil
+	}
+	symbolRange := symbol.Location.Range // copy
+	resolver.location = &locationResolver{
+		resource: &gitTreeEntryResolver{
+			commit: commitResolver,
+			path:   uri.Fragment,
+			stat:   createFileInfo(uri.Fragment, false), // assume the path refers to a file (not dir)
+		},
+		lspRange: &symbolRange,
+	}
+	return resolver
+}
+
+func (r *symbolConnectionResolver) Nodes(ctx context.Context) ([]*symbolResolver, error) {
 	symbols := r.symbols
 	if len(r.symbols) > limitOrDefault(r.first) {
 		symbols = symbols[:limitOrDefault(r.first)]
@@ -116,45 +135,36 @@ func (r *symbolConnectionResolver) PageInfo(ctx context.Context) (*graphqlutil.P
 }
 
 type symbolResolver struct {
-	db     database.DB
-	commit *GitCommitResolver
-	*result.SymbolMatch
+	symbol   lsp.SymbolInformation
+	language string
+	location *locationResolver
 }
 
-func (r symbolResolver) Name() string { return r.Symbol.Name }
+func (r *symbolResolver) Name() string { return r.symbol.Name }
 
-func (r symbolResolver) ContainerName() *string {
-	if r.Symbol.Parent == "" {
+func (r *symbolResolver) ContainerName() *string {
+	if r.symbol.ContainerName == "" {
 		return nil
 	}
-	return &r.Symbol.Parent
+	return &r.symbol.ContainerName
 }
 
-func (r symbolResolver) Kind() string /* enum SymbolKind */ {
-	kind := r.Symbol.LSPKind()
-	if kind == 0 {
-		return "UNKNOWN"
-	}
-	return strings.ToUpper(kind.String())
+func (r *symbolResolver) Kind() string /* enum SymbolKind */ {
+	return strings.ToUpper(r.symbol.Kind.String())
 }
 
-func (r symbolResolver) Language() string { return r.Symbol.Language }
+func (r *symbolResolver) Language() string { return r.language }
 
-func (r symbolResolver) Location() *locationResolver {
-	stat := CreateFileInfo(r.Symbol.Path, false)
-	sr := r.Symbol.Range()
-	opts := GitTreeEntryResolverOpts{
-		Commit: r.commit,
-		Stat:   stat,
+func (r *symbolResolver) Location() *locationResolver { return r.location }
+
+func (r *symbolResolver) URL() string { return r.urlPath(r.location.URL()) }
+
+func (r *symbolResolver) CanonicalURL() string { return r.urlPath(r.location.CanonicalURL()) }
+
+func (r *symbolResolver) urlPath(prefix string) string {
+	url := prefix
+	if backend.IsLanguageSupported(r.language) {
+		url += "$references"
 	}
-	return &locationResolver{
-		resource: NewGitTreeEntryResolver(r.db, gitserver.NewClient("graphql.symbols"), opts),
-		lspRange: &sr,
-	}
+	return url
 }
-
-func (r symbolResolver) URL(ctx context.Context) (string, error) { return r.Location().URL(ctx) }
-
-func (r symbolResolver) CanonicalURL() string { return r.Location().CanonicalURL() }
-
-func (r symbolResolver) FileLocal() bool { return r.Symbol.FileLimited }
